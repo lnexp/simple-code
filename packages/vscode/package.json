@@ -1,0 +1,113 @@
+{
+  "name": "SimpleCode",
+  "displayName": "SimpleCode",
+  "description": "在侧边栏里跑 simple-code agent",
+  "version": "0.1.0",
+  "icon": "assets/marketplace-icon.png",
+  "type": "module",
+  "publisher": "lnexp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lnexp/simple-code"
+  },
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": [
+    "AI"
+  ],
+  "main": "./dist/extension.cjs",
+  "$comment": [
+    "name 是 SimpleCode（含大写）。vsce 对 name 的常见约束是不允许 scope 和空格，",
+    "大写实测放行（2026-08-26，vsce 3.9.2 打包通过，vsixmanifest 里 Identity Id",
+    "与 DisplayName 均为 SimpleCode）。它没有 @simple-code/ 前缀：vsix 的扩展",
+    "id 不允许带 scope。这个包是终端产物，没有任何地方 import 它，所以改名不",
+    "影响工作区引用（同类扩展同样用无 scope 的短名）。",
+    "",
+    "**main 是 .cjs，不是 .js。** 扩展宿主用 require() 加载，产物必须是 CJS；",
+    "而 type: module 会让 Node 把这个包里所有 .js 都按 ESM 解析——**包括 dist**。",
+    "叫 extension.js 的话激活直接失败，报「This file is being treated as an ES",
+    "module」，界面上的表现只是面板一直转圈。踩过，日志里才看得到原因。",
+    "",
+    "那为什么不干脆去掉 type: module？因为源码是 ESM，去掉之后 vitest 加载",
+    "src/*.ts 会报错。两边都要满足，就只能靠扩展名区分。",
+    "",
+    "activationEvents 只有 onStartupFinished：setContext（isCursor）要在用户",
+    "点开容器图标之前跑，靠 onView 激活就晚了半拍——when 卡在 false 上，",
+    "Cursor 里的入口要等第二次刷新才出现。",
+    "",
+    "**双注册：默认挂 secondarySidebar，引擎 < 1.106 或 Cursor 落 activitybar。**",
+    "Cursor 拒第三方副栏容器的静态注册（reserved for agent UI）——副栏",
+    "view 无家可归；用户可像 CC 一样手动 Move View 移进副栏（用户容器",
+    "覆盖不受拒）。互斥靠 view 的 when（context key",
+    "simpleCode.noSecondarySidebar，extension.ts 按引擎版本+uriScheme 设）：",
+    "两套 view 同一时刻只有",
+    "一个可见；view 全隐藏的",
+    "容器 VS Code 不显示图标，所以 VS Code 里不会多出一个活动栏图标。",
+    "同一个 provider 实例注册两个 viewType——when 互斥保证 resolve 只发生",
+    "在其中一边。",
+    "",
+    "历史：9e8e2a7 起就是 secondarySidebar；687726b（2026-09-10）因 **Cursor",
+    "3.19.19** 对第三方扩展的 secondarySidebar manifest 校验直接报错丢弃（容器",
+    "不注册、入口整个消失，workbench.desktop.main.js 实测定位）临时降级到",
+    "activitybar。若哪天要回装 Cursor，那套降级理由重新成立。",
+    "",
+    "engines.vscode 1.106 是 secondarySidebar 正式可用的下限（1.97-1.105 藏在",
+    "contribSecondarySideBar 提案后面，装老版本会静默回落进 Explorer）。"
+  ],
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "simple-code-activity",
+          "title": "SimpleCode",
+          "icon": "assets/icon.svg"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "simple-code",
+          "title": "SimpleCode",
+          "icon": "assets/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "simple-code": [
+        {
+          "id": "simpleCode.chat",
+          "name": "对话",
+          "type": "webview",
+          "when": "!simpleCode.noSecondarySidebar"
+        }
+      ],
+      "simple-code-activity": [
+        {
+          "id": "simpleCode.chat.cursor",
+          "name": "对话",
+          "type": "webview",
+          "when": "simpleCode.noSecondarySidebar"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "@simple-code/core": "workspace:*",
+    "@vscode/codicons": "0.0.46-24",
+    "dompurify": "^3.4.14",
+    "highlight.js": "^11.12.0",
+    "marked": "^18.0.11",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@types/vscode": "~1.106.0"
+  },
+  "scripts": {
+    "package": "node ../../scripts/build.mjs && vsce package --no-dependencies",
+    "deploy": "node ../../scripts/deploy.mjs"
+  }
+}

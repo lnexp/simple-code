@@ -1,0 +1,16 @@
+{
+  "name": "@simple-code/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "webfetch": "./src/webfetch-bin.ts",
+    "websearch": "./src/websearch-bin.ts",
+    "apply-patch": "./dist/apply-patch.js",
+    "memory": "./dist/memory.js"
+  },
+  "dependencies": {
+    "@simple-code/core": "workspace:*",
+    "highlight.js": "^11.12.0"
+  }
+}

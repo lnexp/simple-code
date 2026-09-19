@@ -1,0 +1,43 @@
+{
+  "$comment": [
+    "webview 侧的类型环境：多了 DOM 和 JSX。",
+    "",
+    "**故意没把 @types/node 去掉**，虽然 webview 跑在浏览器里没有 Node。原因是",
+    "webview 通过 `import type { AgentEvent } from '@simple-code/core'` 拉进了",
+    "core 的类型定义，而那些定义本身引用 Node 类型（fs、process、NodeJS 命名",
+    "空间）。写 types: [] 的话 tsc 报三十多个 core 内部的错——那不是我们的代码",
+    "有问题，是类型解析的传递依赖。",
+    "",
+    "**所以「webview 误用 Node API」这条防线不在 tsc，在构建**：build.mjs 里",
+    "webview 那个 target 是 platform: 'browser'，真引用了 node 模块会构建失败；",
+    "另有一条测试断言产物里不含 node 模块引用。",
+    "",
+    "反向那条仍然在：宿主侧的 tsconfig.json 没有 DOM，宿主代码用 window 会报错。"
+  ],
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx"
+  },
+  "include": [
+    "webview/**/*.ts",
+    "webview/**/*.tsx",
+    "test/markdown.test.ts",
+    "test/toolrow.test.ts",
+    "test/stream-spacing.test.ts",
+    "test/footer-wiring.test.ts",
+    "test/model-picker.test.ts",
+    "test/menu.test.ts",
+    "test/history-wiring.test.ts",
+    "test/copy-wiring.test.ts",
+    "test/user-image-wiring.test.ts",
+    "test/pathlink.test.ts",
+    "test/path-wiring.test.ts",
+    "test/process-group.test.ts",
+    "test/fold-wiring.test.ts",
+    "test/folder-tabs.test.ts",
+    "test/folder-switch-wiring.test.ts",
+    "test/ctx-wiring.test.ts",
+    "test/user-clamp.test.ts"
+  ]
+}

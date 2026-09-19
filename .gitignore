@@ -1,0 +1,37 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 工作区状态：配置可能含 API key 字面量，记忆是运行时数据
+.simple-code/
+
+# 一次性 API 探针（scratch/README.md 说明其用途，脚本本身保留）
+scratch/node_modules/
+scratch/package-lock.json
+
+.DS_Store
+
+# pnpm
+.pnpm-store/
+
+# 会话状态。每个工作区自己的历史，不进版本控制
+.simple-code/memory/
+*.vsix
+
+# 不发布层（2026-09-18 发布决策）：设计文档含内部讨论与参考实现对照，
+# 探针/导出属开发杂物——都留在工作区，不进公开仓库
+docs/
+scratch/
+test.md
+# agent 协作约定：含参考实现的本机路径对照与内部取舍记录，只对本机开发有意义
+AGENTS.md
+CLAUDE.md
+# 一次性数据修复脚本（2026-09-07 烧图事件善后），对使用者无意义
+scripts/restore-burned-image.mjs
+
+# LLM 请求 dump（分析材料，含真实对话，绝不进版本控制/发布
+request*.json
+
+# 构建产物：build.mjs 从仓库根拷进包目录（marketplace 页面/许可用），权威版本在根目录
+packages/vscode/README.md
+packages/vscode/LICENSE

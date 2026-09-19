@@ -1,0 +1,435 @@
+import { spawn } from 'node:child_process'
+import { createWriteStream } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { isAbsolute, join, resolve } from 'node:path'
+import type { ToolDefinition } from '../llm/types.ts'
+import type { ApprovalConfig } from './approval.ts'
+import { classify, DEFAULT_HIDDEN_ALLOW, DEFAULT_NETWORK_ALLOW } from './approval.ts'
+import { appendLead, appendNonPathFrom, appendPath, dirHint, loadAlways } from './approval-always.ts'
+import { LOG_DEFAULT_LINES } from './memory.ts'
+import { truncateOutput } from './truncate.ts'
+import type { Tool, ToolContext, ToolOutput } from './types.ts'
+
+export type BashConfig = {
+  defaultTimeoutMs: number
+  maxTimeoutMs: number
+  maxOutputChars: number
+  /** SIGTERM 到 SIGKILL 之间的宽限期（3 秒） */
+  killGraceMs: number
+  /** 传给子进程的环境变量白名单。不在表里的一律不传（§12） */
+  envPassthrough: string[]
+  /** 审批判定的白名单（approval.md §6）。undefined = 内置默认 */
+  approval?: ApprovalConfig
+}
+
+/** 工具定义按配置生成——描述里的默认/上限秒数必须与实际行为一致
+ * （「描述永远真话」：写死数字的话，用户改配置后模型拿到的还是旧数） */
+const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinition => ({
+  name: 'bash',
+  // description 要说清楚**什么时候该用**，不只是能干什么——这对触发率有实测影响
+  // 结构化（2026-09-17 v2 拍板）：一行流水 1857 字符互相淹，【】节标题+换行
+  // 让模型按需跳节——内容不变，只加结构
+  description:
+    '在工作区里执行一条 shell 命令：查看文件、运行构建与测试、检查 git 状态、' +
+    '装依赖等一切要动命令行的事。输出合并 stdout 与 stderr 按时序返回。\n' +
+    '【长任务/后台】测试/构建/install 直接跑：超时自动转后台、输出接进日志文件并给出路径，稍后 tail 回访。' +
+    '主动起服务**必须重定向输出**——`(python3 -m http.server 8123 >/tmp/sc.log 2>&1 & echo $! >/tmp/sc.pid)`，' +
+    '裸 `cmd &` 的输出没人接会在写满管道后卡住。调试用 curl，回看输出 `cat /tmp/sc.log`，收尾 `kill $(cat /tmp/sc.pid)`。' +
+    '后台进程在用户界面显示、由用户决定是否关闭，agent 结束任务前应收尾自己的服务。\n' +
+    '【审批】路径出工作区（读放行仅限 .simple-code 子树，其余读也拦）、进隐藏目录（.env、.ssh 类）、' +
+    '网络命令（curl 等）、含 $()/解释器的命令——执行前会请用户放行；被拒时如实转告用户、说明需要什么，不要换写法绕。\n' +
+    '【网络】"$SIMPLE_CODE_WEBFETCH" <url>（HTML 转 markdown，可接管道）；"$SIMPLE_CODE_WEBSEARCH" <query>。\n' +
+    '【自查】查 SC 自身运作（上下文分区/记忆/审批/排障）：grep "<关键词>" "$SIMPLE_CODE_DOC"。\n' +
+    // LSP 命令格式按注入条件拼（2026-09-17 两次拍板）：env 里有桥才写这段——
+    // 描述与实际能力永远一致。分工与 APPLY_PATCH 对齐（v2）：system prompt
+    // 的工具约定管「该用哪个」（分流句+语言无关在那边），这里只留命令格式
+    (env.SIMPLE_CODE_LSP !== undefined
+      ? '【符号检索】"$SIMPLE_CODE_LSP" refs <file>:<行>[:<列>]（查符号引用）；definition（跳定义）；symbols <file>（文件符号表）；' +
+        'hover（类型信息）；calls-in/calls-out（谁调用这里/这里调用谁）。报「无 LSP 桥」= 桥已不在（宿主窗口关闭），回落 grep。\n'
+      : '') +
+    '【补丁】改既有文件用 "$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n' +
+    '*** Begin Patch\n*** Update File: 路径（相对工作区根）\n@@\n 照抄文件里已有的行（上下文）\n-要删的行\n+要加的行\n@@\n 另一处改动的上下文行\n-旧行\n+新行\n*** End Patch\nPATCH' +
+    '（上下文与删除行须与文件逐行一致且各留一个前导空格，空行也不例外——写补丁前先用 grep -n 定位、' +
+    "sed -n 'N,Mp' 读目标区域当前原文，上下文照抄，凭记忆写是脱靶的最常见原因；匹配不到即失败，错误指明文件与首行；" +
+    '支持 Add/Delete/Update File、*** Move to: 改名、*** End of File 末尾锚、多 @@ 按序替换，整个补丁原子落盘）。\n' +
+    '【记忆】"$SIMPLE_CODE_MEMORY" show <turn|last> [--steps 3-5]（turn jsonl 按 step 分组、长内容已裁剪）；' +
+    'search <关键词> [--ctx]（跨 turns+summaries 窗口命中，--ctx 附所在 step 渲染，定位格式 turn-000012:step4；多个候选词用 OR：' +
+    '「越权 OR 误弹 OR 抢戏」，同一件事的当时用词未必记得准，一次多试）；' +
+    '分工：宽搜/正则/多词混合直接 grep memory 的 turns 目录（jsonl 全量落盘，不截断），' +
+    'search 用于定位格式与渲染续接；' +
+    `log [-n ${LOG_DEFAULT_LINES}]（每 turn 一行总览，先扫再下钻）。\n` +
+    '【教训】"$SIMPLE_CODE_LESSON" list | read <name> | search <关键词> | ' +
+    'write（五段 heredoc JSON 走 stdin，字段 name/title/description/symptom/misjudged/rootCause/fix/verified，格式自动组装）。' +
+    '调试一轮没修好先查教训，失败 ≥2 次后成功用 write 记一条。\n' +
+    '【技能】（只读，用户点名才用）"$SIMPLE_CODE_SKILL" list | read <name>。',
+  parameters: {
+    type: 'object',
+    properties: {
+      command: { type: 'string', description: '要执行的 shell 命令' },
+      cwd: {
+        type: 'string',
+        description:
+          '工作目录，相对于工作区根目录。默认为根目录。' +
+          '优先用本参数而不是在命令里 cd——每条命令都是独立进程，cd 不会跨调用生效。',
+      },
+      timeout: {
+        type: 'number',
+        description:
+          `超时秒数，默认 ${Math.round(config.defaultTimeoutMs / 1000)}，最大 ${Math.round(config.maxTimeoutMs / 1000)}。` +
+          '超时**不会杀掉命令**：自动转入后台，' +
+          '输出继续写进日志文件，返回里带 pid 和日志路径——稍后 tail 回访进展、' +
+          '判定卡死就 kill。长任务（全量测试、构建）可放心直接跑',
+      },
+    },
+    required: ['command'],
+  },
+})
+
+type Args = { command: string; cwd: string; timeoutMs: number }
+
+export function createBashTool(config: BashConfig, env: NodeJS.ProcessEnv = {}): Tool {
+  return {
+    name: 'bash',
+    definition: definitionOf(config, env),
+    async execute(input, ctx): Promise<ToolOutput> {
+      const parsed = parseArgs(input, config, ctx.root)
+      if (typeof parsed === 'string') {
+        // 参数错误也是正常返回。写成模型读得懂的散文而不是校验器堆栈：
+        // 前者模型会重新组织参数再试，后者通常只会重复同样的错（CLAUDE.md §4.2）
+        return { output: parsed, exitCode: -1, isError: true }
+      }
+      const denied = await checkApproval(parsed, config, ctx)
+      if (denied) return denied
+      return run(parsed, config, ctx)
+    },
+  }
+}
+
+// ---------------------------------------------------------------- 审批
+
+/** 审批闸门（approval.md §4.1）。没有 requestApproval 就连判定都不跑——
+ * 注入审批是宿主的责任，core 的默认行为是不设防。返回非 null = 拦下 */
+async function checkApproval(
+  args: Args,
+  config: BashConfig,
+  ctx: ToolContext,
+): Promise<ToolOutput | null> {
+  if (!ctx.requestApproval) return null
+  // always 白名单每条命令读一次盘：判定要拿它（allow 路径也走这），
+  // 文件几十字节，频率可忽略
+  const always = loadAlways(ctx.root)
+  // 合并而非二选一：schema 的 approval 段 prefault({})，config.approval
+  // 永远是对象——`config.approval ?? { …alwaysLeads… }` 的右边从未执行，
+  // approval.json 的白名单从未进过判定（真机 python3 批了还弹的根因）。
+  // 用户配置（settings）与运行时 always（approval.json）两个来源在这里
+  // 汇成一份判定输入
+  // nonPathFrom 两个来源：settings（手写）+ approval.json（卡上采集）。
+  // 同键时 approval.json 覆盖——它是用户在卡上后拍的板，新决定盖旧的
+  const verdict = classify(args.command, ctx.root, {
+    hiddenAllow: config.approval?.hiddenAllow ?? DEFAULT_HIDDEN_ALLOW,
+    networkAllow: config.approval?.networkAllow ?? DEFAULT_NETWORK_ALLOW,
+    nonPathFrom: { ...config.approval?.nonPathFrom, ...always.nonPathFrom },
+    alwaysLeads: always.leads,
+    alwaysPaths: always.paths,
+  })
+  // cwd 越界：命令字符串按 root 锚定判定，实际却在 cwd 下执行——
+  // 两个锚点被劈开即是绕过（cwd=家目录时 `echo > Desktop/foo` 判成
+  // 项目内、实写桌面）。取严合并：cwd 出 root 一律问，且不给 always
+  // 通道——越界 cwd 每次都该过目，不该被「始终允许」记忆掉
+  const rootPrefix = ctx.root.endsWith('/') ? ctx.root : `${ctx.root}/`
+  if (args.cwd !== ctx.root && !args.cwd.startsWith(rootPrefix)) {
+    return askCwdEscape(ctx, args.cwd)
+  }
+  if (verdict.kind === 'allow') return null
+
+  // always 预览：解释器/网络命令记命令名（verdict 直接带）；项目外
+  // 路径记目录（dirHint 算：目录记本身、文件记父目录，过宽不给）
+  const alwaysHint =
+    verdict.kind === 'ask'
+      ? verdict.alwaysLead !== undefined
+        ? { kind: 'lead' as const, lead: verdict.alwaysLead }
+        : verdict.nonPathFrom !== undefined
+          ? { kind: 'nonpath' as const, ...verdict.nonPathFrom }
+          : verdict.category === 'external_dir'
+            ? (() => {
+                const dir = dirHint(verdict.detail)
+                return dir === null ? undefined : { kind: 'path' as const, dir }
+              })()
+            : undefined
+      : undefined
+
+  // 中断兜底：宿主收到 abort 应自行 resolve 'deny'，但没做的话这里
+  // race 一层，审批等待不至于变成「中断后还挂着」
+  const aborted = new Promise<'deny'>((res) => {
+    ctx.signal.addEventListener('abort', () => res('deny'), { once: true })
+  })
+  const decision = await Promise.race([
+    ctx.requestApproval({
+      command: args.command,
+      toolCallId: ctx.toolCallId ?? '',
+      category: verdict.category,
+      detail: verdict.detail,
+      reason: verdict.reason,
+      ...(alwaysHint ? { always: alwaysHint } : {}),
+    }),
+    aborted,
+  ])
+  // always = 本次放行 + 落盘（下次起免审）。落盘失败不拦本次执行——
+  // 白名单只是减烦机制，不该反过来阻塞干活
+  if (decision === 'always' && alwaysHint) {
+    try {
+      if (alwaysHint.kind === 'lead') appendLead(ctx.root, alwaysHint.lead)
+      else if (alwaysHint.kind === 'nonpath') appendNonPathFrom(ctx.root, alwaysHint.lead, alwaysHint.from)
+      else appendPath(ctx.root, alwaysHint.dir)
+    } catch (err) {
+      process.stderr.write(
+        `approval.json 写入失败（本次仍放行）：${err instanceof Error ? err.message : String(err)}\n`,
+      )
+    }
+  }
+  // { deny: '...' } 与裸 'deny' 同走拒绝，前者带用户的话
+  if (decision === 'allow' || decision === 'always') return null
+  const feedback = typeof decision === 'object' ? decision.deny.trim() : ''
+  const note = ctx.signal.aborted ? '等待审批时被用户中断' : '用户拒绝了这条命令'
+  return {
+    output:
+      `审批被拒绝：${verdict.reason}。${note}。` +
+      (feedback ? `用户反馈：${feedback}。` : '') +
+      '如果任务确实需要这个操作，向用户说明需要做什么；不要换写法绕过审批。',
+    exitCode: -1,
+    isError: true,
+  }
+}
+
+/** cwd 越界的弹卡：无 always 通道（越界 cwd 不该被记忆放行） */
+async function askCwdEscape(ctx: ToolContext, cwd: string): Promise<ToolOutput | null> {
+  const aborted = new Promise<'deny'>((res) => {
+    ctx.signal.addEventListener('abort', () => res('deny'), { once: true })
+  })
+  const decision = await Promise.race([
+    ctx.requestApproval!({
+      command: `(cwd=${cwd})`,
+      toolCallId: ctx.toolCallId ?? '',
+      category: 'external_dir',
+      detail: cwd,
+      reason: `cwd 超出工作区：命令将在 ${cwd} 下执行，而审批按工作区判定路径`,
+    }),
+    aborted,
+  ])
+  if (decision === 'allow' || decision === 'always') return null
+  const note = ctx.signal.aborted ? '等待审批时被用户中断' : '用户拒绝了这个 cwd'
+  return {
+    output: `审批被拒绝：cwd 超出工作区（${cwd}）。${note}。在项目内跑，或向用户说明需要这个目录的理由。`,
+    exitCode: -1,
+    isError: true,
+  }
+}
+
+// ---------------------------------------------------------------- 参数
+
+/** 返回字符串表示校验失败，内容就是给模型看的话 */
+function parseArgs(input: unknown, config: BashConfig, root: string): Args | string {
+  if (typeof input !== 'object' || input === null) {
+    return '参数需要是一个对象，至少包含 command 字段。请重新组织参数后再试。'
+  }
+  const raw = input as Record<string, unknown>
+
+  if (typeof raw.command !== 'string' || raw.command.trim() === '') {
+    return '参数 command 需要是一个非空字符串，内容为要执行的 shell 命令。请重新组织参数后再试。'
+  }
+
+  if (raw.cwd !== undefined && typeof raw.cwd !== 'string') {
+    return '参数 cwd 需要是字符串，表示相对于工作区根目录的路径。请重新组织参数后再试。'
+  }
+  // 绝对路径原样用，相对路径基于工作区根解析。第一版没有权限边界，
+  // 这里不做越界检查——真要限制得靠沙箱，路径校验挡不住 `cd .. && ...`
+  const cwd = raw.cwd ? (isAbsolute(raw.cwd) ? raw.cwd : resolve(root, raw.cwd)) : root
+
+  if (raw.timeout !== undefined && (typeof raw.timeout !== 'number' || !(raw.timeout > 0))) {
+    return '参数 timeout 需要是一个正数，单位为秒。请重新组织参数后再试。'
+  }
+  const timeoutMs = raw.timeout
+    ? Math.min(raw.timeout * 1000, config.maxTimeoutMs)
+    : config.defaultTimeoutMs
+
+  return { command: raw.command, cwd, timeoutMs }
+}
+
+// ---------------------------------------------------------------- 执行
+
+type Outcome = { exitCode: number; note: string }
+
+function run(args: Args, config: BashConfig, ctx: ToolContext): Promise<ToolOutput> {
+  return new Promise((resolveOutput) => {
+    // `exec 2>&1` 在 **fd 层**把 stderr 并进 stdout，必须这样做才能保住时序。
+    // 在 Node 侧把 child.stdout 和 child.stderr 两个流拼起来是不行的：那是两条
+    // 独立的 pipe，事件投递顺序和写入顺序无关。实测 `echo a; echo b>&2; echo c`
+    // 稳定得到 a c b——错得很安静，看起来只是"偶尔顺序怪怪的"
+    // 子 agent 权限上限（t6100 拍板「逐级只减不增」）：起子进程的这一层
+    // 把自己的审批范围（root ∪ approval.json 的 alwaysPaths）写进环境，
+    // 子 sc 启动时校验 --root 必须落在其中——父 agent 借 sc 把自己的
+    // 审批范围扩大一圈（直接干会弹卡、借 sc 静默放行）的路在这里堵死。
+    // 不走 envPassthrough：这值必须是本层的事实，从更外层继承来的值
+    // 在这里被覆盖——每过一个 agent 层就收窄一次
+    const child = spawn('bash', ['-c', `exec 2>&1\n${args.command}`], {
+      cwd: args.cwd,
+      // 独立进程组。少了它 kill 只能杀掉 bash 自己，它派生的子进程会变成孤儿
+      // 继续跑
+      detached: true,
+      env: {
+        ...buildEnv(config.envPassthrough),
+        SIMPLE_CODE_ROOTS: JSON.stringify([ctx.root, ...loadAlways(ctx.root).paths]),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    let output = ''
+    const collect = (chunk: Buffer) => {
+      // 非 UTF-8 用替换字符而不是抛——bash 输出二进制垃圾是常事
+      const text = chunk.toString('utf8')
+      output += text
+      ctx.onRawOutput?.(text)
+    }
+    child.stdout.on('data', collect)
+    // stderr 此时应该是空的（已在 fd 层重定向），但 bash 自身启动失败的报错
+    // 会走这里，仍要收
+    child.stderr.on('data', collect)
+
+    const finish = (outcome: Outcome) => {
+      cleanup()
+      const body = truncateOutput(output, config.maxOutputChars, ctx.rawPath)
+      resolveOutput({
+        output: body + outcome.note || '(命令没有任何输出)',
+        exitCode: outcome.exitCode,
+        isError: outcome.exitCode !== 0,
+      })
+    }
+
+    // 超时转后台：不杀（2026-09-08 拍板，取代「超时即杀」）。同步等待的
+    // 价值在超时那一刻已经归零，但进程多半仍有产出——构建慢、测试多、
+    // 或卡在外部依赖上。输出接进日志文件、pid 交给登记簿，控制权还给
+    // 调用方：稍后 tail 看进展还是判定卡死 kill 掉，都是 agent 的决策
+    let detached = false
+    const timer = setTimeout(() => {
+      detached = true
+      const pid = child.pid ?? -1
+      const logPath = join(tmpdir(), `sc-bg-${pid}.log`)
+      let stream: ReturnType<typeof createWriteStream> | null = null
+      try {
+        stream = createWriteStream(logPath, { flags: 'w' })
+        // 超时前已收的输出一并落盘——回访时 tail 一次看全，不用翻历史
+        stream.write(output)
+      } catch {
+        stream = null // 磁盘满之类：接不了就不接，进程照跑
+      }
+      const intoFile = (chunk: Buffer): void => {
+        stream?.write(chunk)
+      }
+      child.stdout.removeAllListeners('data')
+      child.stdout.on('data', intoFile)
+      child.stderr.removeAllListeners('data')
+      child.stderr.on('data', intoFile)
+      child.on('close', () => stream?.end())
+      ctx.bg?.register(pid, args.command, logPath)
+      // 组长（这个 bash）随时可能先于组员退出——`... & echo; sleep; curl`
+      // 跑完就走，nohup 起的服务被 init 收养继续跑（t886 实测 mvn 占着
+      // 8081，UI 上却空空如也）。转后台这一刻先扫一次组，组长之后再死
+      // 也有组员顶着；不 await——转后台的返回不该等一次 ps
+      void ctx.bg?.collect(pid)
+      clearTimeout(timer)
+      ctx.signal.removeEventListener('abort', onAbort)
+      resolveOutput({
+        output:
+          `命令超过 ${Math.round(args.timeoutMs / 1000)} 秒未结束，已转入后台继续运行，输出没有丢：\n` +
+          `  进程组 pid  ${pid}\n  日志       ${logPath}\n` +
+          `稍后回访进展：tail -30 '${logPath}'；判定卡死或不再需要：kill ${pid}（输入框上方的残留进程列表也能终止）。` +
+          `超时前已有的输出：\n${truncateOutput(output, config.maxOutputChars, ctx.rawPath)}`,
+        exitCode: -1,
+        // 转后台是正常流不是失败——模型该做的是稍后回访，不是当错误善后
+        isError: false,
+      })
+    }, args.timeoutMs)
+
+    const onAbort = () => {
+      if (detached) return // 已转后台的进程不属于本次调用，留给后续轮次/用户
+      killGroup(child.pid, config.killGraceMs)
+      finish({ exitCode: -1, note: '\n[用户中断，命令已终止]' })
+    }
+    ctx.signal.addEventListener('abort', onAbort, { once: true })
+
+    // 所有退出路径收口到这里，清理只写一遍（CLAUDE.md §4.5）
+    function cleanup() {
+      clearTimeout(timer)
+      ctx.signal.removeEventListener('abort', onAbort)
+      child.stdout.removeAllListeners()
+      child.stderr.removeAllListeners()
+    }
+
+    child.on('error', (e) => {
+      // spawn 本身失败（bash 不存在、cwd 不存在）。抛出去会打断 loop
+      finish({ exitCode: -1, note: `\n[命令无法启动：${e.message}]` })
+    })
+
+    child.on('close', (code, signal) => {
+      if (ctx.signal.aborted) return // onAbort 已经收过尾
+      if (detached) {
+        // 转后台后组长退出：流收尾挂在 detach 里，这里不 finish——但要把
+        // 登记簿里那条死掉的组长换成还活着的组员（t886），否则 UI 上整条
+        // 记录消失、用户看不到也关不掉真正还在跑的进程
+        void ctx.bg?.reap()
+        return
+      }
+      // 后台残留登记：只在命令文本含 `&` 时做——留孤儿的命令几乎必含 &，
+      // 而每条命令都跑一次 ps（几十 ms）不值得。close 路径才有意义：超时/
+      // 中断已 killGroup，组里不会有活口
+      const outcome = {
+        exitCode: code ?? -1,
+        note: signal ? `\n[命令被信号 ${signal} 终止]` : '',
+      }
+      const noteBg = ctx.bg && args.command.includes('&') ? ctx.bg.collect(child.pid!) : undefined
+      // collect 不 reject（ps 失败内部吞掉），但 finally 保险；undefined 分支
+      // 必须直落 finish——可选链漏掉它的话前台命令永远不 resolve（测试抓的）
+      if (noteBg) noteBg.finally(() => finish(outcome))
+      else finish(outcome)
+    })
+  })
+}
+
+/**
+ * 杀整个进程组，不是只杀直接子进程。
+ *
+ * 负号 pid 表示进程组。先 SIGTERM 给清理机会，宽限期后 SIGKILL 强杀。
+ * 两次 kill 都可能因为进程已退出而抛 ESRCH，忽略即可。
+ */
+function killGroup(pid: number | undefined, graceMs: number): void {
+  if (pid === undefined) return
+  try {
+    process.kill(-pid, 'SIGTERM')
+  } catch {
+    return // 已经没了
+  }
+  const timer = setTimeout(() => {
+    try {
+      process.kill(-pid, 'SIGKILL')
+    } catch {
+      // 已经退出了
+    }
+  }, graceMs)
+  // 宽限期不该拖住进程退出
+  timer.unref()
+}
+
+/**
+ * 白名单构造 env，不继承父进程。
+ *
+ * 默认 spawn 会把全部环境变量传给 bash，其中包含 API key——agent 一句 `env`
+ * 就能看到，并且可以把它写进任何地方（§12）。
+ */
+function buildEnv(passthrough: string[]): Record<string, string> {
+  const env: Record<string, string> = {}
+  for (const name of passthrough) {
+    const value = process.env[name]
+    if (value !== undefined) env[name] = value
+  }
+  return env
+}

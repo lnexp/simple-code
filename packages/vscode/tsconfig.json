@@ -1,0 +1,29 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src/**/*.ts", "test/**/*.ts", "test/copy-wiring.test.ts"],
+  "exclude": [
+    "test/markdown.test.ts",
+    "test/toolrow.test.ts",
+    "test/stream-spacing.test.ts",
+    "test/footer-wiring.test.ts",
+    "test/model-picker.test.ts",
+    "test/menu.test.ts",
+    "test/history-wiring.test.ts",
+    "test/copy-wiring.test.ts",
+    "test/user-image-wiring.test.ts",
+    "test/pathlink.test.ts",
+    "test/path-wiring.test.ts",
+    "test/process-group.test.ts",
+    "test/fold-wiring.test.ts",
+    "test/folder-tabs.test.ts",
+    "test/folder-switch-wiring.test.ts",
+    "test/ctx-wiring.test.ts",
+    "test/user-clamp.test.ts"
+  ],
+  "$comment": [
+    "排除的这些测试要 DOM 类型（toolrow 还要 JSX），而这个 project 没有 DOM lib、",
+    "没开 jsx——那是宿主侧的防线，见 tsconfig.webview.json 的说明，不能为了让测试",
+    "过就给宿主开 DOM。它们改由 tsconfig.webview.json 检查，所以每加一个这样的",
+    "测试要同时改两份 tsconfig：这边 exclude，那边 include。只改一边会漏检。"
+  ]
+}

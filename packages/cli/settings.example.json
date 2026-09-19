@@ -1,0 +1,27 @@
+{
+  "provider": "my-gateway",
+  "model": "claude-opus-4-8",
+  "providers": {
+    "my-gateway": {
+      "protocol": "anthropic-messages",
+      "baseUrl": "https://your-gateway.example.com",
+      "apiKey": "${SIMPLE_CODE_API_KEY}",
+      "models": {
+        "claude-opus-4-8": {
+          "contextWindow": 200000,
+          "capabilities": { "images": true, "reasoning": true }
+        }
+      }
+    }
+  },
+  "request": {
+    "maxTokens": 8000,
+    "thinking": "adaptive"
+  },
+  "bash": {
+    "defaultTimeoutMs": 60000,
+    "approval": {
+      "nonPathFrom": { "xcli": 2 }
+    }
+  }
+}

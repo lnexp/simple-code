@@ -1,0 +1,438 @@
+import { describe, expect, it } from 'vitest'
+import type { LLMEvent } from '../src/llm/events.ts'
+import { anthropicMessages } from '../src/llm/protocols/anthropic-messages.ts'
+import { parseSSE } from '../src/llm/protocols/utils/sse.ts'
+import type { Message, Request, Usage } from '../src/llm/types.ts'
+import { eventsFromFixture, readFixture, shape } from './helpers.ts'
+
+const FIXTURE = 'anthropic-messages.tool-call.sse'
+
+const baseRequest = (over: Partial<Request> = {}): Request => ({
+  model: 'm',
+  maxTokens: 100,
+  thinking: 'adaptive',
+  effort: 'high',
+  reasoningDisplay: 'summarized',
+  system: 'S',
+  tools: [],
+  messages: [],
+  ...over,
+})
+
+const body = (over: Partial<Request> = {}) =>
+  anthropicMessages.buildRequest(baseRequest(over), {
+    baseUrl: 'https://x.test',
+    apiKey: 'k',
+  }).body as Record<string, unknown>
+
+/** 喂合成的 SSE。fixture 覆盖不到的分支（缓存命中、message_delta 只带输出侧）只能这样测 */
+async function feed(events: [string, Record<string, unknown>][]): Promise<LLMEvent[]> {
+  const sse = events
+    .map(([name, data]) => `event: ${name}\ndata: ${JSON.stringify({ type: name, ...data })}\n\n`)
+    .join('')
+  async function* once() {
+    yield new TextEncoder().encode(sse)
+  }
+  const out: LLMEvent[] = []
+  for await (const llmEv of anthropicMessages.parseStream(parseSSE(once()))) out.push(llmEv)
+  return out
+}
+
+describe('anthropic-messages / parseStream', () => {
+  it('流 EOF 但没收到 message_stop：当断流抛错，不当成功', async () => {
+    // 网关超时掐断的表现正是「干净 EOF、无终止事件」。当成功处理的话
+    // turn 会静默正常收尾——没有错误、没有落盘、界面什么都不显示
+    await expect(
+      feed([['message_start', { message: { usage: { input_tokens: 1, output_tokens: 0 } } }]]),
+    ).rejects.toMatchObject({ detail: { kind: 'server', retryable: true } })
+  })
+
+  it('从录制的 fixture 解出完整事件序列', async () => {
+    const events = await eventsFromFixture(anthropicMessages.parseStream, FIXTURE)
+
+    expect(shape(events)).toEqual([
+      'message_start',
+      'tool_input_start',
+      'tool_input_delta',
+      'tool_input_delta',
+      'tool_input_delta',
+      'tool_input_delta',
+      'tool_input_end',
+      'finish',
+    ])
+  })
+
+  it('分片的 JSON 累积成对象——分片确实切在字符串字面量中间', async () => {
+    const raw = (await readFixture(FIXTURE)).toString('utf8')
+    // 先证明前提：这份 fixture 的分片是 `{"command": / "l / s"}`，
+    // 若某次重录变成一整块发出，这个测试就没测到累积逻辑了
+    expect(raw).toContain('"partial_json":"\\"l"')
+
+    const events = await eventsFromFixture(anthropicMessages.parseStream, FIXTURE)
+    const end = events.find((e) => e.type === 'tool_input_end')
+    expect(end).toMatchObject({ name: 'bash', input: { command: 'ls' } })
+    expect(end?.type === 'tool_input_end' && end.id).toMatch(/^toolu_/)
+  })
+
+  it('stop_reason=tool_use 映射成 tool-calls', async () => {
+    const events = await eventsFromFixture(anthropicMessages.parseStream, FIXTURE)
+    expect(events.at(-1)).toMatchObject({ type: 'finish', reason: 'tool-calls' })
+  })
+
+  it('message_delta 只带输出侧时，不清零输入侧 usage', async () => {
+    // 必须用合成 SSE：录制那次的网关在 message_delta 里回了完整 usage
+    // （含 input_tokens: 392），拿 fixture 测这条等于测了个空集合——
+    // 覆盖式实现也能通过。官方 API 的 message_delta 只有 output_tokens
+    const events = await feed([
+      ['message_start', { message: { usage: { input_tokens: 392, output_tokens: 16 } } }],
+      ['message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 47 } }],
+      ['message_stop', {}],
+    ])
+    const finish = events.at(-1)
+    if (finish?.type !== 'finish') throw new Error('最后一个事件应该是 finish')
+
+    expect(finish.usage.inputTokens).toBe(392)
+    expect(finish.usage.outputTokens).toBe(47)
+  })
+
+  it('未知的 content block 类型整块忽略，不会落进 tool 分支', async () => {
+    // redacted_thinking 是安全系统屏蔽推理内容时发的，它没有 id 也没有 name。
+    // 写成「不是 text 也不是 thinking 就当 tool_use」的话，会产生一个 id=''
+    // 的幽灵 tool call，而且 content_block_stop 认不出它、永远不结算
+    const events = await feed([
+      ['message_start', { message: { usage: {} } }],
+      [
+        'content_block_start',
+        { index: 0, content_block: { type: 'redacted_thinking', data: 'x' } },
+      ],
+      [
+        'content_block_delta',
+        { index: 0, delta: { type: 'input_json_delta', partial_json: '{}' } },
+      ],
+      ['content_block_stop', { index: 0 }],
+      ['message_delta', { delta: { stop_reason: 'end_turn' } }],
+      ['message_stop', {}],
+    ])
+    expect(shape(events)).toEqual(['message_start', 'finish'])
+  })
+
+  it('未知块之后的正常 tool_use 仍然正确', async () => {
+    // 对照组：证明上一条不是因为整个流都被吞了
+    const events = await feed([
+      ['content_block_start', { index: 0, content_block: { type: 'redacted_thinking' } }],
+      ['content_block_stop', { index: 0 }],
+      [
+        'content_block_start',
+        { index: 1, content_block: { type: 'tool_use', id: 'toolu_1', name: 'bash' } },
+      ],
+      [
+        'content_block_delta',
+        { index: 1, delta: { type: 'input_json_delta', partial_json: '{"a":1}' } },
+      ],
+      ['content_block_stop', { index: 1 }],
+      ['message_stop', {}],
+    ])
+    expect(events.find((e) => e.type === 'tool_input_end')).toMatchObject({
+      id: 'toolu_1',
+      input: { a: 1 },
+    })
+  })
+
+  it('error 事件抛 LLMStreamError 而不是当成正常结束', async () => {
+    const bytes = await readFixture('anthropic-messages.error.sse')
+    expect(bytes.toString('utf8')).toContain('"type":"error"') // 前提
+
+    const run = async () => {
+      const out = []
+      async function* once() {
+        yield bytes
+      }
+      for await (const e of anthropicMessages.parseStream(parseSSE(once()))) out.push(e)
+      return out
+    }
+    await expect(run()).rejects.toThrow('模型不存在')
+  })
+})
+
+describe('anthropic-messages / usage 的三个输入字段', () => {
+  // 实测确证的加法关系（design.md 附录 A）：三者之和 = 完整输入量。
+  // 用合成 SSE 而不是 fixture——录到的那次缓存字段全是 0，
+  // 拿它测「三个字段各自独立读取」等于测了个空集合
+  const startUsage = async (usage: Record<string, number>) => {
+    // message_stop 只是满足「流完整结束」的校验，usage 相关断言不依赖它
+    const events = await feed([
+      ['message_start', { message: { usage } }],
+      ['message_stop', {}],
+    ])
+    const start = events[0]
+    if (start?.type !== 'message_start') throw new Error('第一个事件应该是 message_start')
+    return start.usage
+  }
+
+  const totalInput = (u: Usage) =>
+    u.inputTokens + u.cacheCreationInputTokens + u.cacheReadInputTokens
+
+  it('热缓存时三个字段各自读出，不做减法', async () => {
+    const usage = await startUsage({
+      input_tokens: 29,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 23263,
+      output_tokens: 5,
+    })
+    expect(usage.inputTokens).toBe(29)
+    expect(usage.cacheReadInputTokens).toBe(23263)
+    // 只读 inputTokens 会把 23292 读成 29——这正是必须三者相加的原因
+    expect(totalInput(usage)).toBe(23292)
+  })
+
+  it('冷缓存与热缓存的总和一致', async () => {
+    const cold = await startUsage({
+      input_tokens: 29,
+      cache_creation_input_tokens: 23263,
+      cache_read_input_tokens: 0,
+    })
+    const hot = await startUsage({
+      input_tokens: 29,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 23263,
+    })
+    expect(totalInput(cold)).toBe(totalInput(hot))
+    // 对照组：总和相等但分布不同，说明确实读的是两个不同字段
+    expect(cold.cacheCreationInputTokens).not.toBe(hot.cacheCreationInputTokens)
+  })
+})
+
+describe('anthropic-messages / buildRequest', () => {
+  it('caching 断点放在 system 的最后一个 block', () => {
+    expect(body().system).toEqual([
+      { type: 'text', text: 'S', cache_control: { type: 'ephemeral' } },
+    ])
+  })
+
+  it('tool schema 用 input_schema 而不是 parameters', () => {
+    const tools = body({
+      tools: [{ name: 'bash', description: 'd', parameters: { type: 'object' } }],
+    }).tools
+    expect(tools).toEqual([{ name: 'bash', description: 'd', input_schema: { type: 'object' } }])
+  })
+
+  it('canonical 的 tool 消息降成 role:user —— Anthropic 没有 tool 角色', () => {
+    const messages: Message[] = [
+      { role: 'assistant', parts: [{ type: 'tool_call', id: 't1', name: 'bash', input: {} }] },
+      {
+        role: 'tool',
+        parts: [
+          { type: 'tool_result', toolCallId: 't1', output: 'ok', isError: false },
+          { type: 'tool_result', toolCallId: 't2', output: 'boom', isError: true },
+        ],
+      },
+    ]
+    const wire = body({ messages }).messages as Record<string, unknown>[]
+
+    // role 直传会发出 { role: 'tool' }，Anthropic 400
+    expect(wire.map((m) => m.role)).toEqual(['assistant', 'user'])
+    // 一条 tool 消息里的多个结果留在同一条 user 消息里，不拆开。
+    // 末尾那个 cache_control 是缓存断点——这里用 toEqual 而不是 toMatchObject，
+    // 顺带守住"断点只打在最后一个块上"
+    expect(wire[1]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 't1', content: 'ok', is_error: false },
+        {
+          type: 'tool_result',
+          tool_use_id: 't2',
+          content: 'boom',
+          is_error: true,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    })
+  })
+
+  it('assistant 不会被一起降成 user', () => {
+    // 对照组：上一条锁住了 tool → user，这条锁住 assistant 不受影响。
+    // 少了它的话「role 全写死成 user」也能让上一条通过
+    const messages: Message[] = [
+      { role: 'user', parts: [{ type: 'text', text: '问' }] },
+      { role: 'assistant', parts: [{ type: 'text', text: '答' }] },
+    ]
+    const wire = body({ messages }).messages as Record<string, unknown>[]
+    expect(wire.map((m) => m.role)).toEqual(['user', 'assistant'])
+  })
+
+  it('没有 signature 的 reasoning 整块丢弃，绝不自造', () => {
+    const messages: Message[] = [
+      {
+        role: 'assistant',
+        parts: [
+          { type: 'reasoning', text: '想了想' },
+          { type: 'reasoning', text: '又想了想', encrypted: 'sig-abc' },
+        ],
+      },
+    ]
+    const content = (body({ messages }).messages as { content: unknown[] }[])[0]?.content
+    expect(content).toEqual([{ type: 'thinking', thinking: '又想了想', signature: 'sig-abc' }])
+  })
+
+  it('thinking=disabled 时不发 display', () => {
+    expect(body({ thinking: 'disabled' }).thinking).toEqual({ type: 'disabled' })
+    expect(body({ thinking: 'adaptive' }).thinking).toEqual({
+      type: 'adaptive',
+      display: 'summarized',
+    })
+  })
+
+  it('baseUrl 末尾多余的斜杠不会拼出双斜杠', () => {
+    const built = anthropicMessages.buildRequest(baseRequest(), {
+      baseUrl: 'https://x.test//',
+      apiKey: 'k',
+    })
+    expect(built.url).toBe('https://x.test/v1/messages')
+  })
+})
+
+describe('anthropic-messages / 缓存断点', () => {
+  const text = (t: string): Message => ({ role: 'user', parts: [{ type: 'text', text: t }] })
+
+  /** 数一下整个请求里有几个 cache_control，不管藏在哪一层 */
+  const countBreakpoints = (over: Partial<Request> = {}): number =>
+    JSON.stringify(body(over)).split('"cache_control"').length - 1
+
+  const messagesOf = (over: Partial<Request>) =>
+    body(over).messages as { content: Record<string, unknown>[] }[]
+
+  it('历史再长也只打两个断点：system 一个、最后一条消息一个', () => {
+    // 四个断点是硬上限。每条消息都打的话短会话看着一切正常，
+    // 等历史攒到第五条才 400——那种错最难联想到是这里
+    const many = Array.from({ length: 20 }, (_, i) => text(`第 ${i} 条`))
+
+    expect(countBreakpoints({ messages: many })).toBe(2)
+    expect(countBreakpoints({ messages: [text('就一条')] })).toBe(2)
+  })
+
+  it('断点落在最后一条消息上，前面的一个都没有', () => {
+    const wire = messagesOf({ messages: [text('旧'), text('新')] })
+
+    expect(wire[0]?.content[0]).not.toHaveProperty('cache_control')
+    expect(wire[1]?.content[0]).toHaveProperty('cache_control')
+  })
+
+  it('最后一条消息以 thinking 结尾时，断点往前挪到能打的块上', () => {
+    // thinking 块不能直接打 cache_control，是官方明列的例外，打上去会 400
+    const withThinking: Message = {
+      role: 'assistant',
+      parts: [
+        { type: 'text', text: '我想想' },
+        { type: 'reasoning', text: '推理', encrypted: 'sig' },
+      ],
+    }
+    const wire = messagesOf({ messages: [withThinking] })
+
+    // 前提：thinking 块确实在、确实排在最后，不然这条测的是别的东西
+    expect(wire[0]?.content[1]).toMatchObject({ type: 'thinking' })
+    expect(wire[0]?.content[1]).not.toHaveProperty('cache_control')
+    expect(wire[0]?.content[0]).toHaveProperty('cache_control')
+  })
+
+  it('整条消息都是 thinking 时不打，也不崩', () => {
+    const onlyThinking: Message = {
+      role: 'assistant',
+      parts: [{ type: 'reasoning', text: '推理', encrypted: 'sig' }],
+    }
+
+    expect(countBreakpoints({ messages: [onlyThinking] })).toBe(1) // 只剩 system 那个
+  })
+
+  it('没有消息时不崩', () => {
+    expect(countBreakpoints({ messages: [] })).toBe(1)
+  })
+})
+
+describe('anthropic-messages / parseError', () => {
+  const err = (status: number, type: string, message = 'm', headers?: Headers) =>
+    anthropicMessages.parseError(status, { error: { type, message } }, headers)
+
+  it('429 可重试，401 不可重试', () => {
+    expect(err(429, 'rate_limit_error')).toMatchObject({ kind: 'rate_limit', retryable: true })
+    expect(err(401, 'authentication_error')).toMatchObject({ kind: 'auth', retryable: false })
+    expect(err(529, 'overloaded_error')).toMatchObject({ kind: 'server', retryable: true })
+  })
+
+  it('context overflow 认文案而不是类型——它的类型也是 invalid_request_error', () => {
+    const overflow = err(400, 'invalid_request_error', 'prompt is too long: 250000 tokens')
+    expect(overflow.kind).toBe('context_overflow')
+    expect(overflow.retryable).toBe(false)
+
+    // 对照组：同样是 invalid_request_error，文案不匹配时不能误判成 overflow
+    expect(err(400, 'invalid_request_error', 'model not found').kind).toBe('invalid_request')
+  })
+
+  it('retry-after-ms 优先于 retry-after', () => {
+    const h = new Headers({ 'retry-after-ms': '1500', 'retry-after': '60' })
+    expect(err(429, 'rate_limit_error', 'm', h).retryAfterMs).toBe(1500)
+    expect(
+      err(429, 'rate_limit_error', 'm', new Headers({ 'retry-after': '2' })).retryAfterMs,
+    ).toBe(2000)
+  })
+
+  it('没有 Retry-After 时不产生 retryAfterMs 字段', () => {
+    expect(err(429, 'rate_limit_error')).not.toHaveProperty('retryAfterMs')
+  })
+})
+
+describe('tool_result 带图（web-tools D4）', () => {
+  const img = { type: 'image' as const, data: 'QUJD', mimeType: 'image/png' }
+  const withImages = [
+    {
+      role: 'tool' as const,
+      parts: [
+        {
+          type: 'tool_result' as const,
+          toolCallId: 'call_1',
+          output: '抓到了',
+          isError: false,
+          images: [img],
+        },
+      ],
+    },
+  ]
+
+  it('带图：content 变 blocks，图前文后', () => {
+    const messages = body({ messages: withImages }).messages as Array<{
+      role: string
+      content: unknown
+    }>
+    expect(messages[0]?.role).toBe('user')
+    // 最后一条消息会带 cache_control 断点（withCacheBreakpoint），与本用例无关
+    expect(messages[0]?.content).toEqual([
+      expect.objectContaining({
+        type: 'tool_result',
+        tool_use_id: 'call_1',
+        content: [
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: 'image/png', data: 'QUJD' },
+          },
+          { type: 'text', text: '抓到了' },
+        ],
+        is_error: false,
+      }),
+    ])
+  })
+
+  it('纯文本：content 保持 string——wire 形状不无谓变化', () => {
+    const messages = body({
+      messages: [
+        {
+          role: 'tool' as const,
+          parts: [
+            { type: 'tool_result' as const, toolCallId: 'call_1', output: 'ok', isError: false },
+          ],
+        },
+      ],
+    }).messages as Array<{ content: Array<{ type: string; content: unknown }> }>
+    const block = messages[0]?.content[0]
+    expect(block?.type).toBe('tool_result')
+    expect(block?.content).toBe('ok')
+  })
+})

@@ -1,0 +1,10 @@
+event: error
+data: {"type":"error","error":{"type":"api_error","message":"模型不存在"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+: gateway-keepalive
+
+: gateway-keepalive
+

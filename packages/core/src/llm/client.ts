@@ -1,0 +1,217 @@
+import type { LLMEvent } from './events.ts'
+import {
+  LLMStreamError,
+  type Protocol,
+  type ProtocolError,
+  type ProviderContext,
+} from './protocol.ts'
+import { parseSSE } from './protocols/utils/sse.ts'
+import { logRun } from '../runlog.ts'
+import { describeError } from '../tools/describe.ts'
+import type { Request } from './types.ts'
+
+export type SendOptions = {
+  protocol: Protocol
+  provider: ProviderContext
+  signal: AbortSignal
+  fetchImpl?: typeof fetch
+  /**
+   * 两个数据块之间的最大间隔。不传就没有超时——测试和 fixture 回放
+   * 走这条路（喂完就结束，本来也挂不住）。
+   */
+  idleTimeoutMs?: number
+  /** 运行日志里的来源标记：主对话不传，内部请求传 'summary' / 'merge' / 'vision-relay' */
+  tag?: string
+  /** 运行日志里的目录标识（多根并行时区分是谁在请求）。完整路径，不猜 basename */
+  folder?: string
+}
+
+/**
+ * 唯一发 HTTP 的地方。协议层只描述请求长什么样，发送、超时、abort 收在这里
+ * ——重试逻辑（loop/retry.ts）才有一个明确的包裹点。
+ */
+export async function* sendRequest(
+  request: Request,
+  options: SendOptions,
+): AsyncIterable<LLMEvent> {
+  const { url, headers, body } = options.protocol.buildRequest(request, options.provider)
+  const doFetch = options.fetchImpl ?? fetch
+  const startedAt = Date.now()
+  /** 流自然走完才算成功；消费者提前 break（少见）单独标记 */
+  let completed = false
+  let failure: { kind: string; message: string } | undefined
+
+  // 计时器盖住 fetch 和读流两段。fetch 那段也要盖：连上了但响应头一直不来
+  // 同样是挂住，而且现象一模一样（进程不动，没有任何输出）
+  const clock = startIdleClock(options.idleTimeoutMs, options.signal)
+  try {
+    const response = await doFetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: clock.signal,
+    })
+
+    if (!response.ok) {
+      throw new LLMStreamError(
+        options.protocol.parseError(response.status, await safeJson(response), response.headers),
+      )
+    }
+    if (!response.body) {
+      throw new LLMStreamError(emptyBodyError(response.status))
+    }
+
+    yield* options.protocol.parseStream(parseSSE(clock.watch(response.body)))
+    completed = true
+  } catch (error) {
+    // abort 的原因有两个，**必须分开**：用户中断不该重试（retry.ts:44 靠
+    // throwIfAborted 挡掉），空闲超时该重试。两者都表现为 AbortError，
+    // 光看异常类型分不出来，所以问计时器自己有没有开火
+    if (clock.firedIdle) {
+      failure = { kind: 'server', message: `idle ${options.idleTimeoutMs ?? 0}ms` }
+      throw new LLMStreamError(idleTimeoutError(options.idleTimeoutMs ?? 0))
+    }
+    if (options.signal.aborted) {
+      failure = { kind: 'aborted', message: 'user interrupt' }
+      throw error
+    }
+    failure =
+      error instanceof LLMStreamError
+        ? { kind: error.detail.kind, message: error.detail.message }
+        : { kind: 'network', message: describeError(error) }
+    throw error
+  } finally {
+    clock.stop()
+    // 每次尝试一行（重试 3 次就是 3 行）。中断（用户 abort）不计失败——
+    // 那不是模型的问题，kind 记 'aborted' 便于区分
+    const incomplete = !failure && !completed
+    logRun({
+      ev: 'llm',
+      model: request.model,
+      ...(options.folder ? { folder: options.folder } : {}),
+      ...(options.tag ? { tag: options.tag } : {}),
+      ms: Date.now() - startedAt,
+      ...(failure ? { error: failure } : {}),
+      ...(incomplete ? { incomplete: true } : {}),
+    })
+  }
+}
+
+type IdleClock = {
+  /** 传给 fetch 和用来中止读流。没配超时的话就是原来那个 signal */
+  signal: AbortSignal
+  /** 包住字节流，每读到一块就重置计时 */
+  watch(body: ReadableStream<Uint8Array>): AsyncIterable<Uint8Array>
+  /** 已经因为空闲而开火了吗——用来把它和用户中断区分开 */
+  readonly firedIdle: boolean
+  stop(): void
+}
+
+/**
+ * 空闲计时器。**口径是「两块数据之间的间隔」，不是「请求总时长」**——
+ * 每次 chunk 到达即重设计时器。
+ *
+ * 总时长上限会误杀慢慢吐十分钟的长回答；空闲超时只在真的不动了时触发。
+ */
+function startIdleClock(timeoutMs: number | undefined, outer: AbortSignal): IdleClock {
+  if (timeoutMs === undefined) {
+    return { signal: outer, watch: readAll, firedIdle: false, stop: () => {} }
+  }
+
+  const controller = new AbortController()
+  let fired = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+
+  const onOuterAbort = () => controller.abort(outer.reason)
+  outer.addEventListener('abort', onOuterAbort, { once: true })
+
+  const arm = () => {
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      fired = true
+      controller.abort()
+    }, timeoutMs)
+  }
+  arm()
+
+  return {
+    signal: controller.signal,
+    watch: async function* (body) {
+      const reader = body.getReader()
+      try {
+        for (;;) {
+          // **不能只 await reader.read()。** abort 一个 AbortController 不会
+          // 中止已经拿在手里的 reader 的 pending read——真实 fetch 的 body
+          // 恰好和 signal 绑定所以看着像生效，但那是 fetch 实现的行为，
+          // 流挂住时我们要自己醒来。踩过：三条测试直接跑到 vitest 超时
+          const { done, value } = await Promise.race([reader.read(), abortsAsRejection(controller)])
+          if (done) return
+          if (value) {
+            arm() // 收到东西就重新计时，这才是「空闲」而不是「总时长」
+            yield value
+          }
+        }
+      } finally {
+        // cancel 而不是 releaseLock：超时时底层连接还开着，不 cancel 就漏一条
+        void reader.cancel().catch(() => {})
+      }
+    },
+    get firedIdle() {
+      return fired
+    },
+    stop: () => {
+      clearTimeout(timer)
+      outer.removeEventListener('abort', onOuterAbort)
+    },
+  }
+}
+
+/** 变成一个 abort 时 reject 的 promise，好跟 read 竞速 */
+function abortsAsRejection(controller: AbortController): Promise<never> {
+  return new Promise((_resolve, reject) => {
+    const signal = controller.signal
+    if (signal.aborted) return reject(signal.reason ?? new Error('aborted'))
+    signal.addEventListener('abort', () => reject(signal.reason ?? new Error('aborted')), {
+      once: true,
+    })
+  })
+}
+
+/** 不带超时时的透传。ReadableStream 本身就是 AsyncIterable，但类型上不是 */
+async function* readAll(body: ReadableStream<Uint8Array>): AsyncIterable<Uint8Array> {
+  const reader = body.getReader()
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) return
+      if (value) yield value
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+const idleTimeoutError = (ms: number): ProtocolError => ({
+  kind: 'server',
+  message: `模型响应停了 ${Math.round(ms / 1000)} 秒没有新内容，已中止本次请求`,
+  // 可重试。挂起大多是网关抽风，重发一次通常就好了——不像截断：那个重发必然再次截断，这个不会
+  retryable: true,
+})
+
+/**
+ * 错误响应体可能不是 JSON（网关的 HTML 错误页、空 body）。解析失败就交个空对象，
+ * 让 parseError 落到按状态码分类——在这里抛异常会把真正的错误信息盖掉
+ */
+async function safeJson(response: Response): Promise<unknown> {
+  try {
+    return await response.json()
+  } catch {
+    return {}
+  }
+}
+
+const emptyBodyError = (status: number): ProtocolError => ({
+  kind: 'server',
+  message: `HTTP ${status} 响应没有 body，无法读取流`,
+  retryable: true,
+})

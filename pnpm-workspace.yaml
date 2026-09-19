@@ -1,0 +1,8 @@
+packages:
+  - 'packages/*'
+allowBuilds:
+  # esbuild 的安装脚本是把它自己的原生二进制链进 .bin，不放行就没有可执行文件
+  '@vscode/vsce-sign': set this to true or false
+  esbuild: true
+  keytar: set this to true or false
+  tree-sitter-bash: set this to true or false

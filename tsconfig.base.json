@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+
+    // 相对 import 一律写 `./x.ts`。这样 `node packages/cli/src/main.ts` 能直接跑
+    // ——Node 的 ESM 解析器不认无扩展名的相对路径，而 vitest 认，所以这个差异
+    // 测试全绿也照样暴露不出来（踩过：230 个测试通过，CLI 起不来）
+    "allowImportingTsExtensions": true,
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  }
+}
