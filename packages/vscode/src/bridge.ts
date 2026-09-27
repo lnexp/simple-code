@@ -6,6 +6,10 @@ import {
   type ModelRef,
   type Session,
   toHydrateRows,
+
+  openDbReadOnly,
+  MEMORY_RELATIVE,
+  type TaskManifest,
 } from '@simple-code/core'
 import {
   type ApprovalCategory,
@@ -16,6 +20,12 @@ import {
   watchIdle,
 } from '@simple-code/core'
 import {
+  createTaskCenter,
+  readModel,
+  type TaskApprovalQ,
+  type TaskChoiceStore,
+} from './tasks.ts'
+import {
   type ChatItem,
   type ChatView,
   emptyView,
@@ -24,6 +34,10 @@ import {
 } from '../webview/events.ts'
 import type { ApprovalRequest, RegionRanges, ToHost, ToWebview } from './protocol.ts'
 import { join } from 'node:path'
+import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
+import { execFile as execFileCb } from 'node:child_process'
+import { promisify } from 'node:util'
+const execFile = promisify(execFileCb)
 
 /**
  * 面板的全部逻辑：ready 握手、发消息、中断、事件转发。
@@ -44,6 +58,17 @@ export type BridgeDeps = {
    * session/core 对 UI 形态无感
    */
   session: (requestApproval: NonNullable<SessionOptions['requestApproval']>) => Promise<Session>
+  /**
+   * 任务 session 工厂（task-v3）：同一个库，`task=owner 域` + `skipLock`
+   * （同进程对话已持锁）。bridge 不自己建——session 的构造全在 panel 层
+   * （vscode-impl.md §7 的接线纪律），这里只拿工厂
+   */
+  taskSession: (
+    task: TaskManifest,
+    requestApproval: (q: TaskApprovalQ) => Promise<'allow' | 'always' | 'deny' | { deny: string }>,
+  ) => Promise<Session>
+  /** 任务模型选择的持久化（透传 TaskCenter）。不传 = 任务配置内存态 */
+  choiceStore?: TaskChoiceStore
   folder: string
   /**
    * 后台可见状态变了，路由层该重推 folders 了。两类触发点：一轮结束
@@ -100,6 +125,8 @@ export type Bridge = {
   attach: () => void
   /** 轮在不在跑。路由层用来渲染其他文件夹的 ● 后台标记 */
   isRunning: () => boolean
+  /** 任一分身在跑（router 并进 folder tab 绿点） */
+  anyRunning: () => boolean
   /**
    * 挂起中的审批数。路由层用它给后台文件夹的标签点角标——卡片本身不跨
    * 标签显示（怕人在没有对话上下文时误批），但「那边有事等着」要能看见
@@ -114,6 +141,8 @@ export type Bridge = {
   detach: () => void
   /** settings.json 变更：重建 session 重读配置。跑着/挂着审批时约到轮结束 */
   requestReload: () => void
+  /** 分身任务面板要基线（attach 已含；此口留给路由层切回时直调） */
+  rehydrateTasks: () => void
   /**
    * 扩展停用。中断正在跑的 loop 并关 session——进程都要没了，没有
    * 「跑完再说」的余地
@@ -165,6 +194,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
   let preset: string | undefined
   let presets: string[] = []
   let imagesEnabled = false
+  /** 当前模型的上下文窗口。底栏的环形水位要拿它当分母——页脚那个
+   *  「上下文 X」本来就按窗口报，两处口径必须一样 */
+  let contextWindow = 0
   /**
    * 面板还开着吗。关了之后事件照收（跑着的轮不打断）、post 进黑洞，
    * 跑完再释放。**重开面板把它翻回 true**——事件循环一直在 bridge 里，
@@ -230,8 +262,13 @@ export function createBridge(deps: BridgeDeps): Bridge {
       | { kind: 'lead'; lead: string }
       | { kind: 'path'; dir: string }
       | { kind: 'nonpath'; lead: string; from: number }
+      | { kind: 'paths'; dirs: string[] }
+    /** 分身任务弹的卡：任务名，卡片标注来源 */
+    task?: string
   }): Promise<'allow' | 'always' | 'deny' | { deny: string }> => {
-    if (!approvalOn) return Promise.resolve('allow')
+    // 分支的卡按分支自己的开关判（2026-09-22 拍板）；主干/缺省走 folder 级
+    const on = q.task !== undefined ? tasks.approvalOnOf(q.task) : approvalOn
+    if (!on) return Promise.resolve('allow')
     const id = ++approvalSeq
     logRun({
       ev: 'approval_ask',
@@ -250,6 +287,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
       detail: q.detail,
       reason: q.reason,
       ...(q.always ? { always: q.always } : {}),
+      ...(q.task !== undefined ? { task: q.task } : {}),
     }
     post(card)
     // 后台文件夹的卡不弹到当前界面，角标是唯一的可见信号——挂上就通知
@@ -303,12 +341,16 @@ export function createBridge(deps: BridgeDeps): Bridge {
   /**
    * 当前轮的用户气泡。**user 消息是 App 本地 append 的，不在事件流里**——
    * 镜像不补它的话，跑着的时候重开面板会看到一段没有问题的回答。
-   * fold 时随重放一起收编进基线后置 null
+   * 必须是数组：插话（running 时 send）会再来一条，单数槽位的话后者
+   * 把前者顶掉——轮内切走再切回，第一条 user 气泡就"被改写"成插话
+   * 内容（ai-legal-advisor turn-822 实测）。fold 时随重放一起收编进
+   * 基线后清空。顺序上插话排在全部过程前面——镜像本来是近似视图，
+   * 精确位置只有 fold 重读 messages() 才有
    */
-  let pendingUser: ChatItem | null = null
+  let pendingUsers: ChatItem[] = []
 
   const mirrorView = (): ChatView => {
-    const items = pendingUser ? [...baseItems, pendingUser] : [...baseItems]
+    const items = [...baseItems, ...pendingUsers]
     let view = { ...emptyView(), items, contextTokens: lastContextTokens, lastTiming }
     for (const { ev, at } of replay) view = reduce(view, ev, at)
     return view
@@ -330,7 +372,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // 页脚只有 lastFooter 一条内存路，重启就丢
     baseItems = hydrateItems(session.historyRows())
     replay = []
-    pendingUser = null
+    pendingUsers = []
     // fold 本身就是一次基线同步：标记置上，warmUp 不再重读（重读也不重叠
     // ——replay 已清零——但没必要，messages() 全量读一次是有代价的）
     baselineSynced = true
@@ -341,12 +383,30 @@ export function createBridge(deps: BridgeDeps): Bridge {
     deps.post(msg)
   }
 
-  /**
-   * 关闭中的 session（锁还没放掉）。新 session 要等它——不然「关面板立刻
-   * 重开」会撞上文件锁：旧 session 的 close 排在它的创建 promise 后面，
-   * 新的 getSession 却已经去 acquireLock 了，报「目录已被占用」。用户看到
-   * 的就是「关一下再开就坏了」，还复现不稳定
-   */
+  // ── 任务中心（task-v3）──────────────────────────────────────
+  // 审批中枢在上面刚定义好——任务中心的 labeled 审批闭包引用它
+  const tasks = createTaskCenter({
+    folder: deps.folder,
+    post,
+    session: deps.taskSession,
+    requestApproval,
+    ...(deps.choiceStore !== undefined ? { choiceStore: deps.choiceStore } : {}),
+    ...(deps.setTimer !== undefined ? { setTimer: deps.setTimer } : {}),
+  })
+  /** 派活闸门在这里：fork 写活库（reserved 行+跳段），要对话静止在轮边界 */
+  const dispatchTask = (brief: string): void => {
+    const busy = (): string | null => (running ? '主任务正在跑——等这轮跑完再开任务' : null)
+    void tasks.dispatch(brief, busy).then((error) => {
+      if (error !== null) post({ type: 'fatal', message: error })
+    })
+  }
+
+  /** 关闭任务（task-v3）：不碰对话的 session——owner 还俗后对话下次装配
+   *  自然看到该段。失败提示走 fatal，任务保留可重试 */
+  const doCloseTask = async (name: string): Promise<void> => {
+    const r = await tasks.close(name)
+    if (!r.ok) post({ type: 'fatal', message: r.error ?? '关闭失败' })
+  }
   let closing: Promise<void> | null = null
 
   const getSession = (): Promise<Session> => {
@@ -369,12 +429,6 @@ export function createBridge(deps: BridgeDeps): Bridge {
     return pending
   }
 
-  const readModel = (session: Session): ModelRef => ({
-    provider: session.config.config.provider,
-    // LoadedConfig.model 是模型**规格**（contextWindow 等），id 在 config.model
-    model: session.config.config.model,
-  })
-
   /** 模型相关的显示状态一把全刷。分开刷早晚漏一个，现象是界面停在上一个模型 */
   const refresh = (session: Session): void => {
     current = readModel(session)
@@ -388,6 +442,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // 拦截口径不一致的话，UI 放行的图在 core 被拒、或反过来）
     imagesEnabled =
       session.config.model.capabilities.images || session.config.vision !== null
+    contextWindow = session.config.model.contextWindow
   }
 
   /**
@@ -447,6 +502,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
       presets,
       approvalOn,
       imagesEnabled,
+      contextWindow,
     })
 
   /**
@@ -556,7 +612,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
       // `if (running) return` 把它静默扔掉——用户消息石沉大海（2026-09-17
       // 实测）。core 的 send 在 running 时入队（tasks.push newInput）并
       // 返回空流，工具批次边界插入；镜像补 pendingUser 让气泡先上屏
-      pendingUser = { kind: 'user', text, ...(images && images.length > 0 ? { images } : {}) }
+      pendingUsers.push({ kind: 'user', text, ...(images && images.length > 0 ? { images } : {}) })
       pushState()
       void getSession().then(async (s) => {
         try {
@@ -571,8 +627,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // 切走再切回后 hydrate 重建的行没有它——镜像在 fold 时补（见 finally）
     const turnStartedAt = Date.now()
     running = true
-    // user 气泡进镜像（App 本地 append 的，事件流里没有）。见 pendingUser 注释
-    pendingUser = { kind: 'user', text, ...(images && images.length > 0 ? { images } : {}) }
+    // user 气泡进镜像（App 本地 append 的，事件流里没有）。见 pendingUsers 注释
+    pendingUsers.push({ kind: 'user', text, ...(images && images.length > 0 ? { images } : {}) })
     pushState()
     let session: Session | null = null
     try {
@@ -587,6 +643,15 @@ export function createBridge(deps: BridgeDeps): Bridge {
             ...(lastTiming ?? { ttftMs: 0, totalMs: 0 }),
             inputTokens: agentEv.usage.inputTokens,
             outputTokens: agentEv.usage.outputTokens,
+          }
+        }
+        // 首字/总耗时也要存：只存 step_finish 的话 fold 后切回，底栏显示
+        // 「首字 0ms · 总 0ms」（reduce 用 0 垫缺的字段）
+        if (agentEv.type === 'request_timing') {
+          lastTiming = {
+            ...(lastTiming ?? { inputTokens: 0, outputTokens: 0 }),
+            ttftMs: agentEv.ttftMs,
+            totalMs: agentEv.totalMs,
           }
         }
         // 后台进程快照不走 'agent' 透传：它不是聊天条目，webview 的 reduce
@@ -643,12 +708,18 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // 的注释）——打开了面板就不在那个理由的射程内了。副作用是配置写错
     // 会在开面板时就报出来，比憋到第一次发送才报要好
     void warmUp()
+    // 任务快照 + 各任务面板基线（切走期间 task_agent 被路由过滤，靠这里补）
+    tasks.rehydrate()
   }
 
   return {
     attach,
     isRunning: () => running,
+    // 分身是否在跑——router 合并进 folder tab 绿点（2026-09-22 真机反馈：
+    // 分支干活时目录名前的绿点不亮）
+    anyRunning: () => tasks.anyRunning(),
     pendingApprovals: () => pendingApprovals.size,
+    rehydrateTasks: () => tasks.rehydrate(),
     handle: (msg) => {
       switch (msg.type) {
         case 'ready':
@@ -662,10 +733,14 @@ export function createBridge(deps: BridgeDeps): Bridge {
           if (lastUser && !running) void send(lastUser.text, lastUser.images)
           return
         case 'setModel':
-          void switchModel(msg.choice)
+          // task：改分支 session 的（控件区跟分支走）。models 列表全
+          // folder 一份，分支的合法性由同一份配置保证
+          if (msg.task !== undefined) void tasks.setModel(msg.task, msg.choice)
+          else void switchModel(msg.choice)
           return
         case 'setEffort':
-          void switchEffort(msg.effort)
+          if (msg.task !== undefined) void tasks.setEffort(msg.task, msg.effort)
+          else void switchEffort(msg.effort)
           return
         case 'interrupt':
           // session 还没建就中断是空操作，不用判断
@@ -680,6 +755,10 @@ export function createBridge(deps: BridgeDeps): Bridge {
           )
           return
         case 'setApprovalEnabled':
+          if (msg.task !== undefined) {
+            tasks.setApprovalOn(msg.task, msg.on)
+            return
+          }
           approvalOn = msg.on
           pushState()
           return
@@ -689,11 +768,39 @@ export function createBridge(deps: BridgeDeps): Bridge {
             post({ type: 'bg_processes', items: s.terminateBg(msg.pid) })
           })
           return
+        case 'task_dispatch':
+          dispatchTask(msg.brief)
+          return
+        case 'task_send': {
+          const error = tasks.send(msg.task, msg.text)
+          if (error !== null) post({ type: 'fatal', message: error })
+          return
+        }
+        case 'task_open':
+          // 只补基线，不报错——切走的瞬间任务被关闭是正常竞态
+          tasks.open(msg.task)
+          return
+        case 'task_close':
+          void doCloseTask(msg.name)
+          return
+        case 'task_stop':
+          tasks.stop(msg.name)
+          return
         case 'get_regions': {
           void (async () => {
             try {
-              const session = await getSession()
-              const tail = lastRegionLine(session.root)
+              // 任务视图看任务的 session；regions.jsonl 主任务和任务
+              // 交错写，尾行按 owner 过滤——不过滤就是「最后写入者赢」
+              // （任务面板显示主任务的数字）
+              const session =
+                msg.task !== undefined
+                  ? ((await tasks.sessionOf(msg.task)) ?? (await getSession()))
+                  : await getSession()
+              // 注意用 memoryRoot 不是 root：root 永远是工作区（审批/bash/
+              // notes 共享侧），记忆库在 memoryRoot
+              // 用 session.owner 过滤——msg.task 是人起的任务名（runs 键），
+              // 和 owner（'task-xxx'）不是同一个字符串，拿它过滤永远空
+              const tail = lastRegionLine(session.memoryRoot, session.owner)
               // 老行没有冷温热/floor 字段（2026-09-11 拆分前）——缺的当 0，
               // 「历史行 + 新面板」的过渡期口径，新记录自然齐
               const info = tail
@@ -786,11 +893,12 @@ export function createBridge(deps: BridgeDeps): Bridge {
 
     dispose: () => {
       // 幂等：面板 detach 已关过（pending 为 null）时什么都不做。
-      // 扩展停用没有「跑完再说」的余地——中断 + 关
+      // 扩展停用没有「跑完再说」的余地——中断 + 关；分身任务一并关
       ready = false
       attached = false
       for (const id of pendingApprovals.keys()) finishApproval(id, 'deny')
       void pending?.then((s) => s.interrupt())
+      tasks.dispose()
       closeSession()
     },
   }

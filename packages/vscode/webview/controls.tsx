@@ -38,10 +38,13 @@ export function ModelPicker({
   current,
   models,
   running,
+  task,
 }: {
   current: ModelRef | null
   models: ModelRef[]
   running: boolean
+  /** 控件跟分支走（2026-09-22 拍板）：选择打到分支 session。undefined = 主干 */
+  task: string | undefined
 }) {
   // 配置还没加载完（session 是惰性建的）时整个不显示，不显示一个空下拉
   if (models.length === 0) return null
@@ -70,7 +73,7 @@ export function ModelPicker({
       options={options}
       // payload 直接带 ModelRef，不用下标/拼接串反查——模型名本身可以含
       // `/`，拼了还要猜从哪断（同 core ModelRef 的理由）
-      onPick={(choice) => post({ type: 'setModel', choice })}
+      onPick={(choice) => post({ type: 'setModel', choice, ...(task !== undefined ? { task } : {}) })}
     />
   )
 }
@@ -89,11 +92,14 @@ export function PresetPicker({
   presets,
   running,
   current,
+  task,
 }: {
   preset: string | undefined
   presets: string[]
   running: boolean
   current: ModelRef | null
+  /** 同 ModelPicker：选择打到分支 session */
+  task: string | undefined
 }) {
   if (presets.length === 0 || current === null) return null
 
@@ -125,14 +131,18 @@ export function PresetPicker({
       options={options}
       // 带上当前模型：预设从属于模型，core 要靠 provider/model 判断是不是
       // 「同模型换预设」（那条路径不清 effort）
-      // `current` 来自 bridge 的 readModel，**只含 provider/model 不含 preset**
-      // ——所以选「默认」时直接展开就是干净的，不用显式 delete
+      // `current` 自带 preset（readModel 带上了——不然 switchEffort 会把
+      // 线路选择洗掉），所以选「默认」必须显式构造干净的选择，展开 current
+      // 会带着旧 preset 发出去，等于没切
       onPick={(name) =>
         post({
           type: 'setModel',
-          choice: name === undefined ? { ...current } : { ...current, preset: name },
+          choice: name === undefined
+            ? { provider: current.provider, model: current.model }
+            : { ...current, preset: name },
+          ...(task !== undefined ? { task } : {}),
         })
-      }
+     }
     />
   )
 }
@@ -167,10 +177,13 @@ export function EffortPicker({
   effort,
   overridden,
   running,
+  task,
 }: {
   effort: Effort | null
   overridden: boolean
   running: boolean
+  /** 同 ModelPicker：选择打到分支 session */
+  task: string | undefined
 }) {
   // session 还没建起来时才不渲染。**不按模型能力过滤**——见上
   if (effort === null) return null
@@ -201,7 +214,9 @@ export function EffortPicker({
       on={overridden}
       disabled={running}
       options={options}
-      onPick={(value) => post({ type: 'setEffort', effort: value })}
+      onPick={(value) =>
+        post({ type: 'setEffort', effort: value, ...(task !== undefined ? { task } : {}) })
+      }
     />
   )
 }

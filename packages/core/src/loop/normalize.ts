@@ -47,7 +47,11 @@ export function normalizeWithOrigin(
   const tagged = removeOrphanOutputs(
     ensureCallOutputsPresent(messages.map((msg, origin) => ({ msg, origin }))),
   )
-  return { messages: tagged.map((t) => t.msg), origin: tagged.map((t) => t.origin) }
+  // reasoning 整块丢弃（compaction-v2 §0.3）会产生 parts 全空的壳——纯推理
+  // 的 assistant 消息丢完 reasoning 什么都不剩，发出去是 400。dropParts 里
+  // 「变空即删」在这里推广成通用 pass：空壳没有信息量，归档里有原文
+  const kept = tagged.filter((t) => t.msg.parts.length > 0)
+  return { messages: kept.map((t) => t.msg), origin: kept.map((t) => t.origin) }
 }
 
 /** 一条消息 + 它在**归一化前**的下标。null = 这一趟新插进来的 */

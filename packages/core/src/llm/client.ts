@@ -41,6 +41,16 @@ export async function* sendRequest(
   let completed = false
   let failure: { kind: string; message: string } | undefined
 
+  // 卡点日志（定位宿主同步卡死用，2026-09-21）：**冻住的进程写不了日志**，
+  // 所以检查点全部写在「即将进入的阶段」之前——runlog 里最后一条 ev 就是
+  // 卡住的那段。词表：llm_req（fetch 前）→ llm_resp（响应头已到，流阶段）
+  // → llm（完成，finally 里）。loop 侧另有 tool_run/tool_img 补齐工具段
+  logRun({
+    ev: 'llm_req',
+    model: request.model,
+    ...(options.folder ? { folder: options.folder } : {}),
+    ...(options.tag ? { tag: options.tag } : {}),
+  })
   // 计时器盖住 fetch 和读流两段。fetch 那段也要盖：连上了但响应头一直不来
   // 同样是挂住，而且现象一模一样（进程不动，没有任何输出）
   const clock = startIdleClock(options.idleTimeoutMs, options.signal)
@@ -61,7 +71,20 @@ export async function* sendRequest(
       throw new LLMStreamError(emptyBodyError(response.status))
     }
 
-    yield* options.protocol.parseStream(parseSSE(clock.watch(response.body)))
+    logRun({
+      ev: 'llm_resp',
+      model: request.model,
+      ...(options.folder ? { folder: options.folder } : {}),
+      ...(options.tag ? { tag: options.tag } : {}),
+    })
+    const events = options.protocol.parseStream(parseSSE(clock.watch(response.body)))
+    for await (const ev of events) {
+      // 重置放在**内容层**（每产出一个真实事件），不放在字节层：网关心跳
+      // （SSE 注释行 / ping 事件）也是字节但不是内容，按字节重置等于被
+      // 心跳无限续命——ai-legal-advisor 曾因此挂 12 分钟（2026-09-21）
+      clock.touch()
+      yield ev
+    }
     completed = true
   } catch (error) {
     // abort 的原因有两个，**必须分开**：用户中断不该重试（retry.ts:44 靠
@@ -100,22 +123,26 @@ export async function* sendRequest(
 type IdleClock = {
   /** 传给 fetch 和用来中止读流。没配超时的话就是原来那个 signal */
   signal: AbortSignal
-  /** 包住字节流，每读到一块就重置计时 */
+  /** 包住字节流，只透传不重置——重置在 touch（内容层） */
   watch(body: ReadableStream<Uint8Array>): AsyncIterable<Uint8Array>
+  /** 内容层重置：每产出一个真实 LLMEvent 调一次。心跳（注释行/ping）在
+   * SSE 或协议层就被丢掉，够不到这里——这正是按内容不按字节的点 */
+  touch(): void
   /** 已经因为空闲而开火了吗——用来把它和用户中断区分开 */
   readonly firedIdle: boolean
   stop(): void
 }
 
 /**
- * 空闲计时器。**口径是「两块数据之间的间隔」，不是「请求总时长」**——
- * 每次 chunk 到达即重设计时器。
+ * 空闲计时器。**口径是「两块内容之间的间隔」，不是「请求总时长」**——
+ * 每产出一个真实 LLMEvent（touch）重置一次。曾经按字节（chunk）重置，
+ * 被网关心跳续命成无限挂死（2026-09-21 修）。
  *
  * 总时长上限会误杀慢慢吐十分钟的长回答；空闲超时只在真的不动了时触发。
  */
 function startIdleClock(timeoutMs: number | undefined, outer: AbortSignal): IdleClock {
   if (timeoutMs === undefined) {
-    return { signal: outer, watch: readAll, firedIdle: false, stop: () => {} }
+    return { signal: outer, watch: readAll, touch: () => {}, firedIdle: false, stop: () => {} }
   }
 
   const controller = new AbortController()
@@ -146,16 +173,16 @@ function startIdleClock(timeoutMs: number | undefined, outer: AbortSignal): Idle
           // 流挂住时我们要自己醒来。踩过：三条测试直接跑到 vitest 超时
           const { done, value } = await Promise.race([reader.read(), abortsAsRejection(controller)])
           if (done) return
-          if (value) {
-            arm() // 收到东西就重新计时，这才是「空闲」而不是「总时长」
-            yield value
-          }
+          if (value) yield value
         }
       } finally {
         // cancel 而不是 releaseLock：超时时底层连接还开着，不 cancel 就漏一条
         void reader.cancel().catch(() => {})
       }
     },
+    // fetch 阶段（响应头之前）没有事件可 touch，靠创建时的初始 arm 覆盖：
+    // 头一直不来就是「第一个内容永远不来」，到点开火
+    touch: arm,
     get firedIdle() {
       return fired
     },

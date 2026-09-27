@@ -1,4 +1,7 @@
 export type { LoadedConfig, LoadOptions, ModelRef } from './config/load.ts'
+export { expandEnv } from './config/env.ts'
+export { deepMerge } from './config/denylist.ts'
+export { LLM_PROXY_PORT, forwardBlock, forwardLine } from './remote.ts'
 export {
   GLOBAL_CONFIG_PATH,
   listModels,
@@ -61,10 +64,24 @@ export type { SetTimer } from './session/idle.ts'
 export { watchIdle } from './session/idle.ts'
 export type { Lock } from './session/lock.ts'
 export { acquireLock, LOCK_RELATIVE, LockHeldError } from './session/lock.ts'
+export {
+  TASK_TURN_GAP,
+  flipTaskLive,
+  finalizeTask,
+  forkTask,
+  listTaskManifests,
+  readTaskManifest,
+  scopeOf,
+  type TaskManifest,
+} from './session/task.ts'
+export type { TaskScope } from './session/store.ts'
+export { SegmentFullError } from './session/store.ts'
+export { openStore } from './session/store.ts'
 export type { Session, SessionOptions } from './session/session.ts'
 export { getSession, toHydrateRows, type HydratePart, type HydrateRow } from './session/session.ts'
 export type { Store } from './session/store.ts'
-export { type HistoryRow, lastRegionLine, MEMORY_RELATIVE, openStore } from './session/store.ts'
+export { type HistoryRow, lastRegionLine, MEMORY_RELATIVE } from './session/store.ts'
+export { openDbReadOnly } from './session/db.ts'
 export type { BashConfig } from './tools/bash.ts'
 export { createBashTool } from './tools/bash.ts'
 export type { RawSink, Tool, ToolContext, ToolOutput } from './tools/types.ts'
@@ -84,14 +101,14 @@ export {
 export {
   listNotes,
   listNoteCards,
+  searchNotes,
   NOTES_INDEX_LIMIT,
   readNote,
-  updateNote,
   writeNote,
   type NoteCard,
   type NoteMeta,
 } from './tools/note.ts'
-export { listSkills, readSkill } from './tools/skill.ts'
+export { listSkills, readSkill, searchSkills } from './tools/skill.ts'
 export type { PatchHunk, PatchChunk } from './tools/applypatch.ts'
 export type { WebfetchConfig } from './tools/webfetch.ts'
 export { createWebfetchTool } from './tools/webfetch.ts'
@@ -105,3 +122,6 @@ export type {
 } from './tools/mcp.ts'
 export { listMcpTools, callMcpTool } from './tools/mcp.ts'
 export { describeError } from './tools/describe.ts'
+export type { EnsureShimsOptions, ShimEntry } from './shims.ts'
+export { ensureShims, probeNode, resolveNodeBin } from './shims.ts'
+export { PrefixBrokenError, findBreak, fingerprint } from './loop/prefix-guard.ts'

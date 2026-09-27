@@ -331,15 +331,23 @@ export function indexMembers(summaries: Summary[]): Summary[] {
  *   模型给一段「（摘要生成中）」写摘要
  * - **supersededBy = null**：已经被上层吃掉的不能再吃一次。正常流程到不了
  *   非 null 还 inContext 的状态（apply 会一起翻掉），这条是防御
- * - **连续**（covers_to + 1 == 下一个的 covers_from）：中间有洞的话 L1 的
- *   覆盖区间会把洞盖进去，apply 时拼装的 findCovering 会吞掉洞里那个 turn
- *   的 live 消息——历史凭空消失，不报错。**正常流程下洞不存在**（卸载严格
- *   从最老开始，inContext 的 L0 天然是前缀），但实现不能默默依赖它，
- *   校验断了就返回 null（不合这批），下次空闲再看
+ * - **连续或空缝可跨**（covers_to + 1 == 下一个的 covers_from，或中间的
+ *   缝是纯死空间）：中间有洞的话 L1 的覆盖区间会把洞盖进去，apply 时拼装
+ *   的 findCovering 会吞掉洞里那个 turn 的 live 消息——历史凭空消失，
+ *   不报错。**正常流程下洞不存在**（卸载严格从最老开始，inContext 的 L0
+ *   天然是前缀），但实现不能默默依赖它，校验断了就返回 null（不合这批），
+ *   下次空闲再看。唯一的合法例外是 **fork 预留号段的死尾巴**：任务关闭后
+ *   没用完的预留段谁也不会再写（任务关了、对话在 fork 那一刻就跳过了），
+ *   它把摘要链永久切成两段——每 fork 一次索引地板就永久抬一行。跨它的
+ *   判据在 `chainable` 里，三重保险见那里的注释
  *
  * 返回 null = 没有可合并的。
  */
-export function pickMergeGroup(summaries: Summary[], mergeFactor: number): MergeGroup | null {
+export function pickMergeGroup(
+  summaries: Summary[],
+  mergeFactor: number,
+  gapHasContent?: (from: number, to: number) => boolean,
+): MergeGroup | null {
   const eligible = indexMembers(summaries)
   const levels = [...new Set(eligible.map((s) => s.level))].sort((a, b) => a - b)
 
@@ -360,8 +368,58 @@ export function pickMergeGroup(summaries: Summary[], mergeFactor: number): Merge
 
     for (const summary of layer) {
       const last = run[run.length - 1]
-      // 连续才延长；断了先看前一段够不够，够就地返回，不够从当前重新数
-      if (last && summary.coversFrom === last.coversTo + 1) {
+      const chainable = (last: Summary, next: Summary): boolean => {
+        if (next.coversFrom === last.coversTo + 1) return true
+        // fork 预留号段留下的死缝（task-v3）：对话在 fork 时跳过整段，任务
+        // 关闭后没用完的尾巴谁也不会再写。可跨，但三重保险缺一不可——
+        // 任何一条不满足都意味着缝里有内容、跨过去会静默丢历史：
+        // ① 缝里没有被【新节点的 covers】罩住的摘要行：有摘要就有被它盖着
+        //    的历史，消息行可能还已被 applyPendingMerges 整删——跨过去后
+        //    新节点的 covers 罩住它，coversActive 把它收掉，而它的内容没
+        //    进新节点的 text。判据不是「缝里没有任何行」——**罩着缝两侧
+        //    的上层节点**也跟缝相交，那样判会把空缝全锁死：真库 L2 大节点
+        //    （covers 1–663613）罩住老区所有空缝，五条空缝全部不可跨，
+        //    金字塔永久碎着、索引区悬在配额上方 53%（2026-09-25 实测
+        //    18243/11900，事件 pickmergegroup-gap-crossing）。精确口径：
+        //    会出事的只有「完整落进本次合并组跨度 [本组首成员, next] 里」
+        //    的行——跨过缝两侧的上层节点至少一端伸出跨度外，新节点罩不
+        //    住它，放行。跨度用当前 run 的首成员：run 比 mergeFactor 长
+        //    时实际只合前 mergeFactor 条，这里判得更宽 = 更保守，安全
+        // ② 缝里没有可见消息行：未摘要的活内容（如前沿段）会被新节点的
+        //    covers 罩住，装配的 findCovering 从此不渲染原文
+        // ③ 缝里没有外主 steps：任务活着时它的 step 在缝里（owner 分治，
+        //    ②查不见）——跨过去等它关闭合并回来，经历摘要落在新节点
+        //    covers 里面被收掉，任务经历丢失。①② 由本函数/调用方各查
+        //    一半：① 用手头的 summaries 纯查，②③ 走 store 的
+        //    gapHasContent
+        if (!gapHasContent) return false
+        const from = last.coversTo
+        const to = next.coversFrom
+        // run[0] 必在：调用方只在 last（= run 尾成员）存在时调本函数
+        const spanFrom = run[0]?.coversFrom
+        if (spanFrom === undefined) return false
+        if (
+          summaries.some(
+            (x) =>
+              x.coversTo > from &&
+              x.coversFrom < to &&
+              x.coversFrom >= spanFrom &&
+              x.coversTo <= next.coversTo,
+          )
+        )
+          return false
+        return !gapHasContent(from, to)
+      }
+      // 连续才延长；断了先看前一段够不够，够就地返回，不够从当前重新数。
+      // 连续的同一层还得**同 owner**（task-v3）：任务视角的可见集里混着
+      // 对话的行和自己的私有行，混着合会让私有父行顶替对话的成员——对话
+      // 看不见那个父行，成员被幽灵顶掉，历史凭空缺一块。对话视角全
+      // owner=null，此约束自然不生效
+      if (
+        last &&
+        chainable(last, summary) &&
+        (summary.owner ?? null) === (last.owner ?? null)
+      ) {
         run.push(summary)
       } else {
         const done = flush()
@@ -438,65 +496,88 @@ export function buildMergeRequest(
 }
 
 /**
- * 存根段水位检查——三级递进的第二级核心（2026-09-12 拍板）。
+ * 摘要进场判定（compaction-v2 §0.4/§0.5，2026-09-24 拍板）——**只搭压缩点
+ * 的车**（前缀不变式：进场改写前缀中段）。
  *
- * 原文 →（触发线）存根 →（本函数）摘要进场。摘要在手也不急着用：存根比
- * 摘要便宜地保留真实头部文本，只有装配后的存根段超过 `stubTokens`（默认
- * 16k，与 floorTokens 同量级）才让最老的 ready 摘要翻 `in_context` 进场
- * 顶替。这条线之前的行为是「卸载时 ready 的当场顶替」（两级绑死），连续
- * 使用中 idle 摘要跟不上时 floor 外原文全文堆积（实测 121k 未卸载）——解绑后触发线一到原文就塌缩成存根，窗口控制不再依赖
- * 摘要进度。
+ * 三层从新往旧：保底区（floorStart 起，原文全保真）→ 存根区（保底上方
+ * 最多 stubTurns 轮 **且** 最多 stubTokens，先到先停）→ 区外段摘要行进场。
  *
- * **进场时机有两个调用方**（都汇到这）：run 循环发请求前（runStep），和
- * 摘要生成完成后（session 的 idle 链尾）。缺第二个的话，idle 里刚生成的
- * L0 要等到下一次用户消息才有机会进场，纯 idle 时段索引区冻结（merge-e2e
- * 的级联用例当场抓到）。
+ * **判据是位置制，不是水位**：2026-09-12 的水位闸（存根段超 16k 才进场）
+ * 在 v2 的节奏下退役——四趟车都卸后每趟只新卸一小段增量，水位几乎永远
+ * 不再冲高，判据永远不开、老段摘要进不来（这正是 v2 要治的病）。改从
+ * 保底往上**数实际存在的轮行**定界：fork 的预留号段缝（turn 号 +10000
+ * 的空洞）数不进去——按「段尾之后又过几轮」做减法的话，fork 缝会把
+ * 6 轮虚报成 1020 轮。
  *
- * 激活顺序最老优先；`activateSummary` 只认段头已卸的段（段头没卸说明推进
- * 线没到过，顶了会吞掉还在场的 live 原文）。全激活完仍超线 = 没有更多
- * ready 摘要了 → kick 主动催一次（不阻塞，summarizeIdle 自带并发闸）。
+ * 进场条件：段的 live 消息**全部**在存根区天花板之外（更老）。跨在
+ * 天花板上的段不进——半存根半摘要没有意义，等它整段老化出界。
+ * activateSummary 自带段头已卸校验（推进线没到过的段顶了会抢跑吞掉
+ * 还在场的原文），这里不重复判。
  *
- * 每激活一条重新装配算水位：激活顶替掉的是它 covers 的整个 step 区间，
- * 增量算容易和 covers 的边界口径漂，装配口径是唯一不会错的。ready 摘要
- * 十几条的量级，循环成本可忽略
+ * 区外还有 step 没被任何摘要盖住 → kick 催一把（不阻塞本轮，
+ * summarizeIdle 自带并发闸）
  */
-export function drainStubWater(opts: {
-  /** 装配出「要发出去的那份」+ 每条消息的 step 归属。水位必须是装配口径
-   * ——顶替判断和请求同一把尺子 */
-  assemble: () => { messages: Message[]; stepOf: Map<Message, number> }
+export function activateBeyondStubZone(opts: {
+  live: LiveMessage[]
+  /** 保底区第一条消息的下标（run.ts floorStartIndex 的产出） */
+  floorStart: number
+  stubTurns: number
   stubTokens: number
   summaries: () => Summary[]
   activateSummary: (stepId: number) => boolean
-  /** 已卸 step 集合——滞留的判定键 */
-  unloadedSteps: () => Set<number>
   kick?: () => void
 }): void {
-  // **滞留 = 装配后 step 已卸但摘要未顶替的内容**（存根和裁不动的原文都算）。
-  // 只算存根的旧口径有个洞：纯文本段裁不动、没有存根形态，不把它算上的话
-  // 触发卸载后它原文全文在场，token 一点不降（merge-e2e 纯文本夹具当场抓到）
-  const water = (): number => {
-    const unloaded = opts.unloadedSteps()
-    const { messages, stepOf } = opts.assemble()
-    let sum = 0
-    for (const message of messages) {
-      const stepId = stepOf.get(message)
-      if (stepId !== undefined && unloaded.has(stepId)) {
-        sum += estimateMessageTokens(message.parts)
-      }
-    }
-    return sum
-  }
-  if (water() <= opts.stubTokens) return
+  const ceiling = stubCeiling(opts.live, opts.floorStart, opts.stubTurns, opts.stubTokens)
+  if (ceiling === 0) return
   const ready = opts
     .summaries()
     .filter((s) => s.status === 'ready' && !s.inContext && s.supersededBy === null)
-    .sort((a, b) => a.coversFrom - b.coversFrom)
-  // coversFrom 是段的第一个 step，activateSummary 按它定位段
   for (const summary of ready) {
-    if (water() <= opts.stubTokens) break
-    opts.activateSummary(summary.coversFrom)
+    // 段内 live 消息全在 ceiling 之外（下标更小 = 更老）才进场
+    const indices = opts.live
+      .map((entry, index) => ({ index, stepId: entry.stepId }))
+      .filter((e) => e.stepId >= summary.coversFrom && e.stepId <= summary.coversTo)
+    if (indices.length > 0 && indices.every((e) => e.index < ceiling)) {
+      opts.activateSummary(summary.coversFrom)
+    }
   }
-  // 水位仍超线：没有 ready 摘要可顶了，剩下的滞留在等自己的 L0——催一把
-  if (water() > opts.stubTokens) opts.kick?.()
+  // 区外还有 step 没被任何（未失效的）摘要盖住——在等自己的 L0，催一把。
+  // 只认未失效的行：superseded 的段由它的链根负责，别替它们 kick
+  const covered = new Set<number>()
+  for (const s of opts.summaries()) {
+    if (s.supersededBy !== null) continue
+    for (let id = s.coversFrom; id <= s.coversTo; id++) covered.add(id)
+  }
+  const uncovered = opts.live.some((entry, index) => index < ceiling && !covered.has(entry.stepId))
+  if (uncovered) opts.kick?.()
+}
+
+/**
+ * 存根区天花板的下标：live[ceiling..floorStart) 是存根区，比 ceiling 更老
+ * 的（下标更小）都在区外。从保底往上（下标递减）数，两个上界先到先停。
+ */
+function stubCeiling(
+  live: LiveMessage[],
+  floorStart: number,
+  stubTurns: number,
+  stubTokens: number,
+): number {
+  let turns = 0
+  let tokens = 0
+  let lastTurn: number | null = null
+  for (let i = floorStart - 1; i >= 0; i--) {
+    const entry = live[i]
+    if (!entry) continue
+    // 新的一轮：区里已经装满 stubTurns 轮就停在第 31 轮门口
+    if (entry.turnId !== lastTurn) {
+      if (turns >= stubTurns) return i + 1
+      turns++
+      lastTurn = entry.turnId
+    }
+    tokens += estimateMessageTokens(entry.message.parts)
+    // 这条把区撑到 stubTokens——它自己算区外，先到先停
+    if (tokens >= stubTokens) return i + 1
+  }
+  return 0
 }
 

@@ -12,7 +12,7 @@
  * 低复杂度命令（cat 凭证、curl 载荷），不防针对性攻破。
  */
 
-import { expandTilde } from './approval-always.ts'
+import { dirHint, expandTilde } from './approval-always.ts'
 import { existsSync, realpathSync } from 'node:fs'
 import { isAbsolute, resolve } from 'node:path'
 import { astSegments } from './shell-ast.ts'
@@ -33,6 +33,12 @@ export type ApprovalVerdict =
        * 触发必然是 verb + 文件参数之后的位）。位 <2 的卡不给（cat
        * /etc/passwd 的参数全是路径，这个选项只是噪音） */
       nonPathFrom?: { lead: string; from: number }
+      /** 方案 1（2026-09-21 拍板）：multi 触发点全是 external_dir、每个
+       * 都收敛出合法目录（dirHint 非 null——家目录/根过宽不记）且去重
+       * 后 ≤5 个时的批量 always 预览。掺任何别的类别（解释器/网络/
+       * 隐藏路径）不给——粒度不一的东西一键全记，等于替用户批了
+       * 没细看的 */
+      alwaysPaths?: string[]
     }
 
 /** 审批类别。UI 用它显示标签（external_dir 等），detail 是触发物 */
@@ -137,6 +143,38 @@ export function classify(command: string, root: string, cfg: ApprovalConfig): Ap
     if (cmd.startsWith('"$SIMPLE_CODE_APPLY_PATCH"')) {
       const v = patchVerdict(cmd, root, cfg)
       if (v) return v
+      // 不带引号的分隔符要一并查：body 会被 shell 展开（反引号替换
+      // tree-sitter 不解析，看不见），同一条命令前面挂个 `cd X &&` 就拦、
+      // 裸着就放，是两个答案（2026-09-21 修）。带引号的分隔符 body 是
+      // 字面量，AST 判定不会误报——那正是本文件 AST 化的初衷
+      const reason = unquotedHeredocReason(cmd)
+      if (reason && !leadAllowed('"$SIMPLE_CODE_APPLY_PATCH"', [], cfg)) {
+        return {
+          kind: 'ask',
+          category: 'unparseable',
+          detail: 'unquoted heredoc',
+          reason,
+          // 与 AST 路径同语义：始终允许这个 bin 的一切内联形态（展开风险
+          // 是批的时候自己接受的）
+          alwaysLead: '$SIMPLE_CODE_APPLY_PATCH',
+        }
+      }
+    }
+    // 其余自家 bin（NOTE/LESSON 的 write 吃 heredoc stdin）：
+    // 子命令语义固定，但**不带引号的分隔符 body 会被 shell 展开**（$( )
+    // 任意命令，通道的不变式校验管不到 shell 层）——与 APPLY_PATCH 同
+    // 语义弹卡。带引号的 heredoc（所有用法样例的形态）body 是字面量，照放
+    // （2026-09-24 收口；patch 子命令 2026-09-27 退役，write 的洞继续堵着）
+    const lead = /\S+/.exec(cmd)?.[0] ?? ''
+    const heredocReason = unquotedHeredocReason(cmd)
+    if (heredocReason && !leadAllowed(lead, [], cfg)) {
+      return {
+        kind: 'ask',
+        category: 'unparseable',
+        detail: 'unquoted heredoc',
+        reason: heredocReason,
+        alwaysLead: unquote(lead),
+      }
     }
     return { kind: 'allow' }
   }
@@ -199,7 +237,9 @@ export function classify(command: string, root: string, cfg: ApprovalConfig): Ap
 /** 多段触发的合并展示（2026-09-15 拍板）：首中即返会展示「最无害的段」——
  * `cd /Users/dev && python3 - <<EOF` 弹的是 cd 的项目外路径，python3
  * 任意代码被遮住。点「允许一次」放行的是整条命令，理由该覆盖整条命令。
- * multi 不给 alwaysLead——多处触发无法收敛成安全粒度（同隐藏路径的口径）。
+ * multi 不给 alwaysLead——多处触发无法收敛成安全粒度（同隐藏路径的口径）；
+ * 唯一的例外是同质 external_dir（2026-09-21 方案 1）：一次看多个目录是
+ * 常态场景，逐个批是纯摩擦，给「始终允许这 N 个目录」的批量 always。
  * 段内（单命令多 token）仍是首中即返：judge 核心流收集化侵入大，
  * 单命令双触发场景边缘 */
 function mergeAsks(asks: Extract<ApprovalVerdict, { kind: 'ask' }>[]): ApprovalVerdict {
@@ -215,11 +255,28 @@ function mergeAsks(asks: Extract<ApprovalVerdict, { kind: 'ask' }>[]): ApprovalV
   }
   // 上限 8 条：长脚本逐行触发会收集出几十条，全列反而读不动
   const head = lines.length > 8 ? [...lines.slice(0, 8)!, `等 ${lines.length} 处`] : lines
+  // 批量 always 的判据：全是 external_dir、每个 dirHint 都收敛出合法
+  // 目录、去重后 ≤5 个（一笔大账逼你分开看）
+  const dirs = new Set<string>()
+  let batchAlways = true
+  for (const a of asks) {
+    if (a.category !== 'external_dir') {
+      batchAlways = false
+      break
+    }
+    const d = dirHint(a.detail)
+    if (d === null) {
+      batchAlways = false
+      break
+    }
+    dirs.add(d)
+  }
   return {
     kind: 'ask',
     category: 'multi',
     detail: head.join('；'),
     reason: `命令有多处需要审批：\n${head.map((l, i) => `${i + 1}. ${l}`).join('\n')}`,
+    ...(batchAlways && dirs.size <= 5 ? { alwaysPaths: [...dirs] } : {}),
   }
 }
 
@@ -500,13 +557,42 @@ function classifySegment(
  * 原样在内，两边通用。补丁上下文里的同名行**抽不到也不该抽到**——补丁
  * 格式的所有内容行必带 +/-/空格前缀，行首 *** 只能是真标记 */
 const PATCH_PATH_RE = /^\*\*\* (?:Update|Add|Delete) File: (.+)$|^\*\*\* Move to: (.+)$/gm
+
+/** APPLY_PATCH 通道对 .simple-code 成长区的豁免（2026-09-27 拍板）：
+ *  note/lesson/skill 的 patch 子命令退役后，编辑统一走 APPLY_PATCH。
+ *  当年子命令是规则 0 的可信通道（免审），退役后通道语义由这道豁免
+ *  承接——**只豁免这一个通道**，裸 shell（rm/cp/tee）写这些目录照旧
+ *  走 pathVerdict 弹卡。只认成长区（notes/skills/lessons——模型自助
+ *  成长的内容区，write 本就免审）；记忆档案（turns/summaries/state.db/
+ *  events）不豁免，「往 turn 文件塞假记忆」的攻击面原封不动。用户级
+ *  （~/.simple-code）不豁免——项目外写保留审批门槛（绝对路径不带 root
+ *  前缀自然豁免不到）。已知口子（拍板时已交代）：通道豁免连带放行
+ *  *** Delete File——删除动作在命令文本里全可见。 */
+const patchChannelExempt = (raw: string, root: string): boolean => {
+  let p = raw
+  const r = root.endsWith('/') ? root : `${root}/`
+  if (p.startsWith(r)) p = p.slice(r.length)
+  else if (p.startsWith('/') || p.startsWith('~')) return false
+  const seg = p.split('/').filter((x) => x !== '' && x !== '.')
+  return seg[0] === '.simple-code' && (seg[1] === 'notes' || seg[1] === 'skills' || seg[1] === 'lessons')
+}
+
 function patchVerdict(cmd: string, root: string, cfg: ApprovalConfig): ApprovalVerdict | null {
   for (const m of cmd.matchAll(PATCH_PATH_RE)) {
     const p = (m[1] ?? m[2] ?? '').trim()
     if (p === '') continue
+    if (patchChannelExempt(p, root)) continue
     const v = pathVerdict(p, root, cfg, true)
     if (v.kind === 'ask') return v
   }
+  return null
+}
+
+/** 不带引号 heredoc 的展开风险（AST 判定）。解析器未就绪时返回 null——
+ * 这里不能退化成字符串级「含 $() / 反引号就问」：引号 heredoc 的 body 是
+ * 字面量，那正是 AST 化的初衷（approval-ast.test.ts 锁着这条行为） */
+function unquotedHeredocReason(cmd: string): string | null {
+  for (const s of astSegments(cmd) ?? []) if (s.unparseable) return s.unparseable
   return null
 }
 

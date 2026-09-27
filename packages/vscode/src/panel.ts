@@ -1,13 +1,15 @@
-import { type Effort, getSession } from '@simple-code/core'
+import { forwardBlock, forwardLine, getSession, scopeOf } from '@simple-code/core'
 import { existsSync, readFileSync, statSync as fsStatSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import * as vscode from 'vscode'
-import { createBridge, type SavedChoice } from './bridge.ts'
+import { createBridge } from './bridge.ts'
 import { renderHtml } from './html.ts'
 import { bestCandidate } from './openfile-resolve.ts'
 import type { ToHost } from './protocol.ts'
 import { createRouter, type Router } from './router.ts'
+import { remoteSettingsPath, syncRemoteSettings, type RemoteSyncResult } from './remote.ts'
+import { asSavedChoice, EFFORTS } from './saved-choice.ts'
 
 /**
  * 侧边栏面板。**这个文件只做接线**——把 vscode 的对象接到 bridge.ts 上。
@@ -38,6 +40,14 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private router: Router | undefined
   /** seed 只该发生一次（第一次 resolveWebviewView）。之后的选择 router 自己存 */
   private folderSeeded = false
+
+  /**
+   * Remote-SSH（settings.remote.json 方案）：远端会话读独立配置文件。同步
+   * **每个面板实例只跑一次**（session 工厂可能每个文件夹各调一遍，隧道
+   * 通不通不会变）；失败也不重试——用户重连/开新窗口自然再试
+   */
+  private remoteSync: Promise<RemoteSyncResult> | undefined
+  private remoteCardShown = false
 
   /**
    * `state` 是**工作区级**的 Memento（`context.workspaceState`）。选全局还是
@@ -101,7 +111,24 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         createBridge({
           // post 由路由层注入（后台过滤）；这里只接最终出口——view 可能换
           post: (msg) => void post(msg),
-          session: (requestApproval) => getSession(f, { requestApproval }),
+          session: async (requestApproval) =>
+            getSession(f, { requestApproval, ...(await this.remoteGlobalPath()) }),
+          // 任务 session（task-v3）：同一个库同一个 root，owner 域 +
+          // skipLock（同进程对话已持锁，第二个 acquireLock 会撞自己）
+          taskSession: async (manifest, requestApproval) =>
+            getSession(f, {
+              task: scopeOf(manifest),
+              skipLock: true,
+              requestApproval,
+              ...(await this.remoteGlobalPath()),
+            }),
+          // 分支模型选择的持久化（2026-09-22 拍板）：键 = 任务目录本身，
+          // 目录删除（合并/丢弃）后键成残留垃圾——Memento 小对象，不追着清
+          choiceStore: {
+            get: (dir) =>
+              asSavedChoice(this.state.get(modelKey(dir)) ?? null),
+            set: (dir, choice) => void this.state.update(modelKey(dir), choice),
+          },
           openExternal: (url) => vscode.env.openExternal(vscode.Uri.parse(url)),
           // vscode.open 而不是 showTextDocument：后者只收文本文件，vscode.open
           // 对图片/二进制交给对应的编辑器（PNG 会开内置预览，和 view_image 体验闭环）
@@ -198,6 +225,47 @@ export class ChatPanel implements vscode.WebviewViewProvider {
    * 惰性重建时 loadConfig 重读）。生命周期跟 panel（subscriptions 里），
    * 文件夹增删时 setFolders 顺带重建这份集合 */
   private settingsWatchers: vscode.FileSystemWatcher[] = []
+
+  /**
+   * Remote-SSH 的配置前置（settings.remote.json 方案）：远端会话把
+   * globalPath 指到独立的 settings.remote.json，建会话前先从本机代理同步
+   * 一次。本地会话零变化（返回空对象）。同步失败不拦会话——远端已有旧
+   * 文件就用旧的，没有才会在建会话时炸（那时指引卡已经弹过）。失败只弹
+   * 一次卡：同一实例里每个文件夹的工厂都会走到这，隧道通不通不会变
+   */
+  private async remoteGlobalPath(): Promise<{ globalPath?: string }> {
+    if (vscode.env.remoteName === undefined) return {}
+    this.remoteSync ??= syncRemoteSettings()
+    const result = await this.remoteSync
+    // 失败不缓存：一次失败后被 ??= 钉死，隧道修好了（弹窗自动添加/手动
+    // 补 Host 块）同一个窗口里也永远不重试，只能整窗 reload——实测用户
+    // 卡在这。成功的缓存照旧（多文件夹的工厂都走这，省重复拉取）
+    if (!result.ok) this.remoteSync = undefined
+    if (!result.ok && !this.remoteCardShown) {
+      this.remoteCardShown = true
+      // 主机名从工作区 authority 拿（ssh-remote+<host>）——跟伴生扩展
+      // offerForward 同一来源。刚连上远端还没开文件夹时拿不到 authority，
+      // 用 SSH_CONNECTION 第三段（远端地址，sshd 注入）兜底——空窗口恰是
+      // 「刚连上」最常见的时候，裸行兜底等于没兜（用户没法直接用）
+      const authority = vscode.workspace.workspaceFolders?.[0]?.uri.authority ?? ''
+      let host = authority.startsWith('ssh-remote+') ? authority.slice('ssh-remote+'.length) : ''
+      if (!host) {
+        const conn = process.env.SSH_CONNECTION?.split(/\s+/)
+        if (conn && conn.length >= 3) host = conn[2] ?? ''
+      }
+      const block = host ? forwardBlock(host) : `${forwardLine()}\n`
+      void vscode.window
+        .showInformationMessage(
+          'SimpleCode：连不上本机代理（127.0.0.1:15432），配置沿用远端已有的旧文件。' +
+            '把复制的配置块粘到本机 ~/.ssh/config 末尾，断开远端连接重连即建隧道。',
+          '复制隧道配置块',
+        )
+        .then((choice) => {
+          if (choice === '复制隧道配置块') void vscode.env.clipboard.writeText(block)
+        })
+    }
+    return { globalPath: result.path }
+  }
   private watchSettings(): void {
     for (const w of this.settingsWatchers) w.dispose()
     this.settingsWatchers = []
@@ -212,7 +280,11 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       w.onDidDelete(reload)
       this.settingsWatchers.push(w)
     }
-    wire(vscode.workspace.createFileSystemWatcher(escapeGlob(join(homedir(), '.simple-code', 'settings.json'))))
+    // Remote-SSH：全局配置实际是 settings.remote.json（本文件扩展全权
+    // 拥有，同步时原子替换）——监听它；本地仍监听 settings.json
+    const globalName =
+      vscode.env.remoteName === undefined ? 'settings.json' : 'settings.remote.json'
+    wire(vscode.workspace.createFileSystemWatcher(escapeGlob(join(homedir(), '.simple-code', globalName))))
     for (const f of vscode.workspace.workspaceFolders ?? []) {
       wire(vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(f, '.simple-code/settings.json')))
     }
@@ -227,7 +299,6 @@ const modelKey = (folder: string) => `simpleCode.model:${folder}`
 /** 多根工作区的上次选择（design.md §7）。失效（被移出工作区）时 pickFolder 回落 [0] */
 const FOLDER_KEY = 'simpleCode.folder'
 
-const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 
 /**
  * Memento 里读回来的东西形状对不上就当没有。`as` 强转会把脏数据带进 core。
@@ -235,18 +306,6 @@ const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
  * effort 单独校验成枚举而不是「是字符串就收」：档位是要往请求体里塞的，
  * 塞个乱七八糟的值进去是服务端 400，而且从错误信息里看不出是 storage 脏了
  */
-function asSavedChoice(value: unknown): SavedChoice | null {
-  if (typeof value !== 'object' || value === null) return null
-  const { provider, model, effort } = value as {
-    provider?: unknown
-    model?: unknown
-    effort?: unknown
-  }
-  if (typeof provider !== 'string' || typeof model !== 'string') return null
-  const valid = EFFORTS.find((e) => e === effort)
-  return valid ? { provider, model, effort: valid } : { provider, model }
-}
-
 /** workspaceFolders 全列表。路径去尾斜杠：`/a/b` 和 `/a/b/` 会被当成两个
  * 文件夹各建一份记忆。空工作区
  * 时给 home 兜底——core 需要一个真实目录放 .simple-code/，路由层从此

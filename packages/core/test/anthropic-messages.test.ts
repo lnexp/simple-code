@@ -95,6 +95,52 @@ describe('anthropic-messages / parseStream', () => {
     expect(finish.usage.outputTokens).toBe(47)
   })
 
+  it('拒答的 stop_details 原样透传到 finish 事件上', async () => {
+    // 2026-09-23 实测：Opus 5 的 reasoning_extraction 拒答是 HTTP 200 +
+    // 空 content + stop_reason refusal。stop_details 里的 explanation 是
+    // 用户能看懂的唯一线索，丢了它这轮就是「模型什么都没说」
+    const events = await feed([
+      ['message_start', { message: { usage: { input_tokens: 100 } } }],
+      [
+        'message_delta',
+        {
+          delta: {
+            stop_reason: 'refusal',
+            stop_details: {
+              type: 'refusal',
+              category: 'reasoning_extraction',
+              explanation: 'blocked under commercial terms',
+            },
+          },
+          usage: { output_tokens: 0 },
+        },
+      ],
+      ['message_stop', {}],
+    ])
+    const finish = events.at(-1)
+    if (finish?.type !== 'finish') throw new Error('最后一个事件应该是 finish')
+
+    expect(finish.reason).toBe('content-filter')
+    expect(finish.refusal).toEqual({
+      category: 'reasoning_extraction',
+      explanation: 'blocked under commercial terms',
+    })
+  })
+
+  it('非拒答的 stop_reason 不带 refusal 字段', async () => {
+    // finish.refusal 是可选字段——协议层只在 content-filter 时给。别的
+    // 结束原因带上它的话，消费端会以为拒答了
+    const events = await feed([
+      ['message_start', { message: { usage: {} } }],
+      ['message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } }],
+      ['message_stop', {}],
+    ])
+    const finish = events.at(-1)
+    if (finish?.type !== 'finish') throw new Error('最后一个事件应该是 finish')
+
+    expect(finish).not.toHaveProperty('refusal')
+  })
+
   it('未知的 content block 类型整块忽略，不会落进 tool 分支', async () => {
     // redacted_thinking 是安全系统屏蔽推理内容时发的，它没有 id 也没有 name。
     // 写成「不是 text 也不是 thinking 就当 tool_use」的话，会产生一个 id=''
@@ -249,6 +295,21 @@ describe('anthropic-messages / buildRequest', () => {
     })
   })
 
+  it('历史里的裸串 input 归一成对象——tool_use.input 必须是对象，原样回传必 500', () => {
+    // 存量毒：本修复出生前进历史的截断残串。出生侧已堵（tool-stream
+    // parseInput），这条锁住回传侧——别处的裸串（手改 jsonl、旧版本
+    // 会话）也拦得住
+    const messages: Message[] = [
+      {
+        role: 'assistant',
+        parts: [{ type: 'tool_call', id: 't1', name: 'bash', input: '{"command":"ls' }],
+      },
+    ]
+    const wire = body({ messages }).messages as Record<string, any>[]
+    const block = wire[0]!.content[0] as Record<string, unknown>
+    expect(block.input).toEqual({ _raw: '{"command":"ls' })
+  })
+
   it('assistant 不会被一起降成 user', () => {
     // 对照组：上一条锁住了 tool → user，这条锁住 assistant 不受影响。
     // 少了它的话「role 全写死成 user」也能让上一条通过
@@ -293,6 +354,7 @@ describe('anthropic-messages / buildRequest', () => {
 
 describe('anthropic-messages / 缓存断点', () => {
   const text = (t: string): Message => ({ role: 'user', parts: [{ type: 'text', text: t }] })
+  const reply = (t: string): Message => ({ role: 'assistant', parts: [{ type: 'text', text: t }] })
 
   /** 数一下整个请求里有几个 cache_control，不管藏在哪一层 */
   const countBreakpoints = (over: Partial<Request> = {}): number =>
@@ -301,20 +363,42 @@ describe('anthropic-messages / 缓存断点', () => {
   const messagesOf = (over: Partial<Request>) =>
     body(over).messages as { content: Record<string, unknown>[] }[]
 
-  it('历史再长也只打两个断点：system 一个、最后一条消息一个', () => {
+  it('历史够长时打满四个断点：system 一个 + 末尾三条消息各一个', () => {
     // 四个断点是硬上限。每条消息都打的话短会话看着一切正常，
     // 等历史攒到第五条才 400——那种错最难联想到是这里
     const many = Array.from({ length: 20 }, (_, i) => text(`第 ${i} 条`))
 
-    expect(countBreakpoints({ messages: many })).toBe(2)
+    expect(countBreakpoints({ messages: many })).toBe(4)
     expect(countBreakpoints({ messages: [text('就一条')] })).toBe(2)
+    expect(countBreakpoints({ messages: [text('甲'), text('乙')] })).toBe(3)
   })
 
-  it('断点落在最后一条消息上，前面的一个都没有', () => {
-    const wire = messagesOf({ messages: [text('旧'), text('新')] })
+  it('断点落在末尾三条消息上，更早的一个都没有', () => {
+    const wire = messagesOf({
+      messages: [text('旧一'), text('旧二'), text('旧三'), text('新')],
+    })
 
     expect(wire[0]?.content[0]).not.toHaveProperty('cache_control')
     expect(wire[1]?.content[0]).toHaveProperty('cache_control')
+    expect(wire[2]?.content[0]).toHaveProperty('cache_control')
+    expect(wire[3]?.content[0]).toHaveProperty('cache_control')
+  })
+
+  it('上一请求的断点位置在新请求里原位保留（无回看网关的命中前提）', () => {
+    // 请求 = 上一请求 + assistant + user，所以上一请求的末条在新请求里
+    // 恒为倒数第三条。真 API 靠 20 块回看找旧条目；只认「断点位置精确
+    // 相同」的网关靠这个钉子（2026-09-23 modelbest 实测 miss 的根因）
+    const prev = [text('问一'), reply('答一'), text('问二')]
+    const prevWire = messagesOf({ messages: prev })
+    expect(prevWire[2]?.content[0]).toHaveProperty('cache_control')
+
+    const next = [...prev, reply('答二'), text('问三')]
+    const nextWire = messagesOf({ messages: next })
+    // 同一个 index、同一块内容，断点原位保留
+    expect(nextWire[2]?.content[0]).toHaveProperty('cache_control')
+    expect(nextWire[4]?.content[0]).toHaveProperty('cache_control')
+    // 中间那条（本请求的倒数第二）也钉上——覆盖只追加一条的插话轮
+    expect(nextWire[3]?.content[0]).toHaveProperty('cache_control')
   })
 
   it('最后一条消息以 thinking 结尾时，断点往前挪到能打的块上', () => {

@@ -1,13 +1,15 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-
 /**
  * skill 库的只读检索（$SIMPLE_CODE_SKILL 的内核）。
  *
  * 和 lesson 的分工：lesson 是模型的自助成长区（可写），skill 是**用户
- * 指令区**——用户点名才触发、模型只有读的份（写入走 bash 保留审批门槛，
- * 这是 turn 318 拍的板）。所以这里只有 list/read，没有 write。
+ * 指令区**：本工具只读（list/read/search）。编辑出口只有一个——
+ * $SIMPLE_CODE_APPLY_PATCH（2026-09-27 拍板：编辑方言收敛，通道豁免见
+ * approval.ts；2026-09-24 的 patch 子命令同批退役）。**用户级
+ * （~/.simple-code）在项目外**，APPLY_PATCH 够不着，项目外写保留 bash
+ * 审批门槛；同名时用户级覆盖项目级，改项目级等于改了个被遮住的文件。
  *
  * 两级目录、同名覆盖（system prompt 的约定原样落进代码）：
  * - 项目 `.simple-code/skills/<name>/SKILL.md`
@@ -58,6 +60,15 @@ export function listSkills(root: string): string[] {
         ' ~/.simple-code/skills/<name>/SKILL.md（用户级同名覆盖项目级）。',
     )
   }
+  // 尾行挂钩（2026-09-26 拍板，替代 system prompt 常驻）：可选组件的装机
+  // 指南在 self.md 第 11 节——list 是「不确定该怎么做时」的自然落点，
+  // 在这指路 = 零常驻成本。searchSkills 按行首 [项目|用户] 匹配，尾行
+  // 无此标记自动跳过，不会误进搜索结果
+  out.push(
+    '可选组件（未随包）：agent-browser 浏览器自动化 / opencli 登录态浏览器 /' +
+      ' officecli Office 文档 / cua-driver 桌面 App——任务命中未装时问用户再装，' +
+      '装法见 grep 可选能力 "$SIMPLE_CODE_DOC"',
+  )
   return out
 }
 
@@ -71,6 +82,32 @@ export function readSkill(root: string, name: string): string {
     `skill ${name} 不存在。看了：${fileOf(root, name, '用户')} 和 ${fileOf(root, name, '项目')}。` +
       '可用清单：skill list。',
   )
+}
+
+/** 全文搜索（lesson/note search 同款格式）。可见性沿 listSkills 的覆盖
+ *  语义：用户级同名遮项目级——被遮住的项目级不进结果（搜到改不了的
+ *  文件是误导）。2026-09-24 补的缺口：skill 曾只有 list/read 没有 search */
+export function searchSkills(root: string, query: string): string {
+  const q = query.toLowerCase().trim()
+  if (!q) throw new Error('search 需要 query，如 skill search 截图')
+  const hits: string[] = []
+  for (const line of listSkills(root)) {
+    if (line.startsWith('没有已装的 skill')) break
+    // listSkills 的行格式：name  [项目|用户]  description
+    const m = /^(\S+)\s+\[(项目|用户)\]/.exec(line)
+    if (!m) continue
+    const name = m[1] as string
+    const src = m[2] as '项目' | '用户'
+    const text = readFileSync(fileOf(root, name, src), 'utf8')
+    const hay = `${name} ${text}`.toLowerCase()
+    const at = hay.indexOf(q)
+    if (at === -1) continue
+    const window = hay.slice(Math.max(0, at - 40), at + 80).replace(/\s+/g, ' ')
+    hits.push(`  ${name}  [${src}]\n    …${window}…`)
+  }
+  return hits.length === 0
+    ? `没有 skill 命中「${query}」。list 看全量清单。`
+    : `${hits.length} 条命中：\n${hits.join('\n')}`
 }
 
 function fileOf(root: string, name: string, src: '项目' | '用户'): string {

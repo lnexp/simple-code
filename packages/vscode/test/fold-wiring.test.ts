@@ -57,6 +57,7 @@ const state = (running: boolean): ToWebview => ({
       presets: [],
   approvalOn: true,
   imagesEnabled: false,
+  contextWindow: 0,
 })
 
 /** 截图里那个形状：说明 → 命令 → 说明 → 命令 → 最终回答 */

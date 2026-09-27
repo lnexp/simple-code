@@ -8,6 +8,7 @@ import {
   watchIdle,
 } from '@simple-code/core'
 import type { ApprovalShared } from './run.ts'
+import { bracketPaste, type PasteBox } from './paste.ts'
 import { createRenderer, type Sink } from './render.ts'
 
 export type ReplOptions = {
@@ -147,15 +148,29 @@ async function handleSlash(session: Session, sink: Sink, text: string): Promise<
  */
 export async function runRepl(options: ReplOptions): Promise<number | 'reload'> {
   const { session, sink } = options
+  // 括号粘贴：整段缓冲等回车（paste.ts 开头注释写了为什么必须拦在这层）。
+  // 提示打在整段到达时——不回显全文，多行回显会把提示符搅乱，用户自己
+  // 刚粘的内容心里有数
+  const paste: PasteBox = {
+    pending: null,
+    onArrive: (_text, lines) => {
+      sink.err(`（已收到 ${lines} 行粘贴，回车发送 / 输入文字追加发送 / Ctrl-C 丢弃）\n`)
+    },
+  }
+  const source = bracketPaste(options.input, paste)
+  // 只对真终端开 bracketed paste 模式（管道/测试不开，序列也写了没人发）。
+  // 结束时关回去——不关的话终端留着这个模式，退出后粘贴行为变怪
+  const tty = (options.input as { isTTY?: boolean }).isTTY === true
+  if (tty) options.output.write('\x1b[?2004h')
   const rl = createInterface({
-    input: options.input,
+    input: source,
     output: options.output,
     prompt: PROMPT,
     // 历史上翻属于「全功能」那一档，但 readline 白送，不要白不要
     historySize: 100,
   })
 
-  const interrupts = watchInterrupts(rl, session, sink, options.now ?? Date.now)
+  const interrupts = watchInterrupts(rl, session, sink, options.now ?? Date.now, paste)
   let failed = false
   /**
    * 读到 EOF 之后 readline 已经自己关了，再 prompt() 会抛 ERR_USE_AFTER_CLOSE。
@@ -180,6 +195,18 @@ export async function runRepl(options: ReplOptions): Promise<number | 'reload'> 
 
   try {
     for await (const line of rl) {
+      // 待发的粘贴优先：空回车=整段发送，非空=追加到粘贴段后面一起发
+      // （「粘个日志再补一句"帮我看看"」是一个自然动作）。粘贴待发时
+      // agent 不在跑，审批滞留行与它不共存，所以这条放在 consumeStolen 之前
+      if (paste.pending !== null) {
+        const text = line.trim() === '' ? paste.pending : `${paste.pending}\n${line.trim()}`
+        paste.pending = null
+        idle.disarm()
+        interrupts.disarm()
+        if (await runTurn(session, sink, text)) failed = true
+        prompt()
+        continue
+      }
       // 审批吃剩的行（用户对 [y/n] 的答复）在这里被丢掉——见
       // ApprovalShared 的注释。空行检查之前
       if (options.approvalShared?.consumeStolen()) {
@@ -213,6 +240,7 @@ export async function runRepl(options: ReplOptions): Promise<number | 'reload'> 
     // 定时器不清的话进程挂在事件循环上不退出——`/exit` 之后光标卡住几秒，
     // 看起来像死机（Node 的 timer 是 ref 的）
     idle.disarm()
+    if (tty) options.output.write('\x1b[?2004l')
   }
 
   if (!closed) rl.close()
@@ -220,10 +248,24 @@ export async function runRepl(options: ReplOptions): Promise<number | 'reload'> 
   return failed ? 1 : 0
 }
 
-function watchInterrupts(rl: Interface, session: Session, sink: Sink, now: () => number) {
+function watchInterrupts(
+  rl: Interface,
+  session: Session,
+  sink: Sink,
+  now: () => number,
+  paste: PasteBox,
+) {
   let armedAt = 0
 
   rl.on('SIGINT', () => {
+    // 有待发粘贴时 Ctrl-C 只丢粘贴——连按退出那套语义会让「想丢粘贴」的
+    // 用户意外退出整个 REPL
+    if (paste.pending !== null) {
+      paste.pending = null
+      sink.err('（已丢弃粘贴）\n')
+      rl.prompt()
+      return
+    }
     // 光标这时停在用户打了一半的输入后面，先换行，否则提示叠上去
     sink.err('\n')
 

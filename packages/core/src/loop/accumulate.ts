@@ -1,4 +1,5 @@
 import type { AgentEvent } from '../events.ts'
+import type { RefusalDetail } from '../llm/events.ts'
 import type { FinishReason, Message, Part, ToolCallPart, Usage } from '../llm/types.ts'
 import type { StreamEvent } from './retry.ts'
 
@@ -13,6 +14,8 @@ export type Accumulator = {
   parts: Part[]
   usage: Usage
   finish: FinishReason
+  /** content-filter 拒答的详情，run 拿它把「模型为什么没说话」透传给用户 */
+  refusal?: RefusalDetail
   /** 未收尾的块。流中途断掉时靠它决定要不要补一个 end 事件 */
   open: OpenBlock
 }
@@ -85,7 +88,10 @@ export function accumulate(state: Accumulator, ev: StreamEvent): [Accumulator, A
       ]
 
     case 'finish':
-      return [{ ...state, usage: ev.usage, finish: ev.reason }, []]
+      return [
+        { ...state, usage: ev.usage, finish: ev.reason, ...(ev.refusal ? { refusal: ev.refusal } : {}) },
+        [],
+      ]
   }
 }
 

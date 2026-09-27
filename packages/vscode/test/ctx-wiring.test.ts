@@ -65,6 +65,7 @@ const state: ToWebview = {
       presets: [],
   approvalOn: true,
   imagesEnabled: false,
+  contextWindow: 0,
 }
 
 const finish: ToWebview = {
@@ -154,5 +155,36 @@ describe('上下文分析面板接线', () => {
     old.clickCtx()
     old.send({ type: 'regions', info })
     expect(old.html()).toContain('上下文分析') // 老记录（无 ranges）照常出表
+  })
+})
+
+/**
+ * V2 版式（2026-09-20 拍板）的**结构**断言，不是内容。
+ *
+ * 旧版每行一根 `min(pct,8)*4` 的短条：70% 的空闲和 8.5% 的未卸载画出来
+ * 一样长，看图得到的结论是反的。改成顶部一条按真实比例的堆叠总览条，
+ * 空闲不进堆叠（露出的轨道底色就是它）。这条测试盯住那个「真实比例」——
+ * 退回截断实现的话 width 就不再等于占比，断言会挂
+ */
+describe('上下文面板 V2 版式', () => {
+  it('堆叠条按真实比例、空闲不进段；每行有色点', () => {
+    const app = mount()
+    app.send(state)
+    app.send(finish)
+    app.clickCtx()
+    app.send({ type: 'regions', info })
+    const html = app.html()
+
+    // 堆叠条存在，且段数 = 行数 − 1（空闲那行不进堆叠）
+    expect(html).toContain('ctx-stack')
+    const segs = html.split('ctx-stack')[1]?.split('</div>')[0] ?? ''
+    expect(segs.match(/<span/g)?.length).toBe(8)
+
+    // 真实比例：live 44,007 / 256,000 = 17.19%，不被截断到 8%
+    expect(segs).toContain('width: 17.19')
+    // 旧版的表格结构已经不在
+    expect(html).not.toContain('ctx-table')
+    // 每行一个色点
+    expect(html.match(/ctx-dot/g)?.length).toBe(9)
   })
 })

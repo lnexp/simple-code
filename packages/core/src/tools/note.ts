@@ -3,24 +3,27 @@
  * 与 lesson（教训库）同目录形态：`<root>/.simple-code/notes/<name>.md`。
  * **与 lesson 的本质差异：lesson 是事件史（append-only，踩坑经过写完
  * 就是历史）；note 是活文档（结论会演进，必须跟着改）**——索引里躺着
- * 过时描述比没有更糟，模型会按旧结论行事。所以有 update，且 created
- * 跨修改保留（「这条结论多老了」的信息不因改写丢失）。
+ * 过时描述比没有更糟，模型会按旧结论行事。所以结论演进是常态操作：
+ * 同名 write 整条重写（created 重新起算）或 $SIMPLE_CODE_APPLY_PATCH
+ * 局部改（front matter 不动，created 跨修改保留——「这条结论多老了」
+ * 的信息不因改写丢失）。update/patch 子命令 2026-09-27 退役（拍板：
+ * 编辑方言收敛到 APPLY_PATCH 一个，通道豁免见 approval.ts）。
  *
  * 与 lesson 的关键差异——**有 LRU**：描述索引是 system 常驻区的一部分，
  * 条数无上限的话常驻区会被慢慢吃掉。所以文件带 yaml 头记 created/lastRead，
- * 索引只收最近使用的 30 条；被挤出索引的文件**永远不删**，`$SIMPLE_CODE_NOTE
+ * 索引只收最近使用的 20 条；被挤出索引的文件**永远不删**，`$SIMPLE_CODE_NOTE
  * list` 全量可列、read 照常——淘汰失去的只是常驻提醒，不是记忆本身。
  *
  * 「最近使用」的定义是 `$SIMPLE_CODE_NOTE read`（工具可见的读取），
  * 不是文件 mtime：git checkout 会把 mtime 全部重置为检出时刻，跨机器
  * 复制后排序失真；yaml 头是文档内容，跟着文件走。
  */
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { localStamp } from './timestamp.ts'
 
 /** 进 system 索引的最大条数。30 条 × ~20 token ≈ 600 token 常驻成本 */
-export const NOTES_INDEX_LIMIT = 30
+export const NOTES_INDEX_LIMIT = 20
 
 const notesDir = (root: string) => join(root, '.simple-code', 'notes')
 
@@ -103,7 +106,7 @@ export function writeNote(
       return false
     }
   }
-  if (exists()) throw new Error(`${name} 已存在。note 是活文档，改内容用 update ${name}（静默覆盖会丢旧结论）`)
+  if (exists()) throw new Error(`${name} 已存在。note 是活文档：改内容用同名 write 整条重写，或 $SIMPLE_CODE_APPLY_PATCH 局部改（.simple-code/notes/${name}.md）`)
   const text =
     `---\nname: ${name}\ndescription: ${description}\ncreated: ${localStamp()}\n---\n\n` +
     `# ${input.title.trim()}\n\n${input.body.trim()}\n`
@@ -111,41 +114,6 @@ export function writeNote(
   const path = join(notesDir(root), `${name}.md`)
   writeFileSync(path, text, 'utf8')
   return `已写入 ${path}（${name}）`
-}
-
-/**
- * 改写一条 note：**给哪段改哪段**（title/description/body 皆可省，省略的
- * 保留旧值）。created 保留；lastRead 更新——修改是比读更强的使用信号，
- * 改过的结论理应浮到 LRU 前排。
- */
-export function updateNote(
-  root: string,
-  name: string,
-  patch: { title?: string; description?: string; body?: string },
-): string {
-  const path = join(notesDir(root), `${slug(name)}.md`)
-  let old: string
-  try {
-    old = readFileSync(path, 'utf8')
-  } catch {
-    throw new Error(`没有这条 note：${name}（list 看全部；新结论用 write）`)
-  }
-  const meta = parseNoteMeta(old)
-  const oldTitle = noteTitle(old)
-  const oldBody = old.replace(/^---\s*\n[\s\S]*?\n---\n?/, '').replace(/^#\s.*\n+/, '').trim()
-  const title = patch.title?.trim() || oldTitle || ''
-  const description =
-    (patch.description ?? '').replace(/\s+/g, ' ').trim() || meta.description || title
-  const body = patch.body !== undefined ? patch.body.trim() : oldBody
-  if (!patch.title && !patch.description && patch.body === undefined) {
-    throw new Error('update 至少给一段（title:/description:/---/正文），全不给就什么都不改了')
-  }
-  const now = localStamp()
-  const text =
-    `---\nname: ${slug(name)}\ndescription: ${description}\ncreated: ${meta.created ?? now}\nlastRead: ${now}\n---\n\n` +
-    `# ${title}\n\n${body}\n`
-  writeFileSync(path, text, 'utf8')
-  return `已更新 ${path}（title${patch.title ? '✓' : '—'} description${patch.description ? '✓' : '—'} 正文${patch.body !== undefined ? '✓' : '—'}）`
 }
 
 /**
@@ -177,4 +145,25 @@ export function listNotes(root: string): string {
   return cards
     .map((c) => `- ${c.name}${c.description ? ` — ${c.description}` : ''}`)
     .join('\n')
+}
+
+/** 全文搜索（lesson search 同款格式：name + 描述行 + 命中窗口）。
+ *  2026-09-24 补的缺口：note 曾只有 list 全量倒出（费 token）没有 search，
+ *  而教训/事件都有——检索入口碎片化，note 是盲格 */
+export function searchNotes(root: string, query: string): string {
+  const q = query.toLowerCase().trim()
+  if (!q) throw new Error('search 需要 query，如 note search 压缩')
+  const dir = notesDir(root)
+  if (!existsSync(dir)) return '还没有任何 note。'
+  const hits: string[] = []
+  for (const f of readdirSync(dir).filter((x) => x.endsWith('.md')).sort()) {
+    const text = readFileSync(join(dir, f), 'utf8')
+    const at = text.toLowerCase().indexOf(q)
+    if (at === -1) continue
+    const name = f.replace('.md', '')
+    const desc = /^description:\s*(.+)$/m.exec(text)?.[1]?.trim() ?? ''
+    const window = text.slice(Math.max(0, at - 40), at + 80).replace(/\s+/g, ' ')
+    hits.push(`  ${name}${desc ? `  —  ${desc}` : ''}\n    …${window}…`)
+  }
+  return hits.length === 0 ? `没有 note 命中「${query}」。` : `${hits.length} 条命中：\n${hits.join('\n')}`
 }

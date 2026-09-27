@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ApprovalCategory } from '@simple-code/core'
 import { createBridge, type SavedChoice } from '../src/bridge.ts'
 import type { ToHost, ToWebview } from '../src/protocol.ts'
+import type { ChatItem } from '../webview/events.ts'
 
 /**
  * 面板逻辑。这里的 bug **都不抛异常**：消息丢了界面就一直空着，状态没复位
@@ -41,10 +42,15 @@ function fakeSession(
   // 想测驱动行为的用例自己传 setTimer 并配正数。
   // provider/model 是当前选中的那一对，providers 供 listModels 拍平。
   // **三个模型的配置 effort 刻意不同**：换模型时能看出档位回落到了哪个
-  const specs: Record<string, { effort: Effort; capabilities: { images: boolean } }> = {
-    'p/fake-model-1': { effort: 'high', capabilities: { images: true } },
-    'p/fake-model-2': { effort: 'medium', capabilities: { images: false } },
-    'q/fake-model-1': { effort: 'low', capabilities: { images: false } },
+  // contextWindow：底栏环形水位的分母。三个模型给不同的值——换模型时
+  // 环的比例要跟着变，值都一样就测不出「分母有没有跟着刷」
+  const specs: Record<
+    string,
+    { effort: Effort; capabilities: { images: boolean }; contextWindow: number }
+  > = {
+    'p/fake-model-1': { effort: 'high', capabilities: { images: true }, contextWindow: 200_000 },
+    'p/fake-model-2': { effort: 'medium', capabilities: { images: false }, contextWindow: 128_000 },
+    'q/fake-model-1': { effort: 'low', capabilities: { images: false }, contextWindow: 64_000 },
   }
   const config = {
     provider: 'p',
@@ -199,6 +205,9 @@ function harness(
       capturedApproval = requestApproval
       return fake.session
     },
+    taskSession: async () => {
+      throw new Error('本用例不测任务')
+    },
     folder: '/tmp/x',
     openExternal: async (url) => {
       opened.push(url)
@@ -253,6 +262,7 @@ describe('ready 握手', () => {
       presets: [],
         approvalOn: true,
         imagesEnabled: false,
+        contextWindow: 0,
       },
     ])
   })
@@ -281,6 +291,8 @@ describe('ready 握手', () => {
       approvalOn: true,
       // capabilities 是模型级：model-1 开了图，切换后 state 里要跟着变
       imagesEnabled: true,
+      // 窗口同样是模型级：底栏环形水位拿它当分母
+      contextWindow: 200_000,
     })
   })
 })
@@ -315,6 +327,9 @@ describe('运行状态', () => {
         built += 1
         return fakeSession().session
       },
+      taskSession: async () => {
+        throw new Error('本用例不测任务')
+      },
       folder: '/tmp/x',
       openExternal: async () => false,
       openFile: async () => {},
@@ -342,6 +357,9 @@ describe('运行状态', () => {
       session: async () => {
         throw new Error('配置读不到')
       },
+      taskSession: async () => {
+        throw new Error('本用例不测任务')
+      },
       folder: '/tmp/x',
       openExternal: async () => false,
       openFile: async () => {},
@@ -364,6 +382,7 @@ describe('运行状态', () => {
       presets: [],
       approvalOn: true,
       imagesEnabled: false,
+      contextWindow: 0,
     })
   })
 
@@ -458,6 +477,9 @@ describe('session 只建一次', () => {
       session: async () => {
         built++
         return fake.session
+      },
+      taskSession: async () => {
+        throw new Error('本用例不测任务')
       },
       folder: '/tmp/x',
       openExternal: async () => false,
@@ -834,6 +856,8 @@ describe('图片输入', () => {
     expect(h.setModel).toHaveBeenCalledWith({ provider: 'p', model: 'fake-model-2' })
     expect(h.posted.filter((m) => m.type === 'state').at(-1)).toMatchObject({
       imagesEnabled: false,
+      // 换模型时窗口跟着刷（fake-model-2 是 128k）
+      contextWindow: 128_000,
     })
   })
 
@@ -924,6 +948,31 @@ describe('会话延续', () => {
     expect(hydrate?.items.filter((i) => i.kind === 'assistant')).toHaveLength(1)
   })
 
+  it('**轮跑完切走再切回：底栏首字/总耗时还在**（不是 0ms）', async () => {
+    // 2026-09-23 真机：底栏「首字 0ms · 总 0ms」。宿主只存了 step_finish 的
+    // 用量，request_timing 没存，fold 清 replay 后 hydrate 只剩一半
+    const h = harness({
+      events: [
+        { type: 'request_timing', ttftMs: 321, totalMs: 4567 },
+        { type: 'step_finish', usage: usage(), contextTokens: 9 },
+      ],
+    })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'send', text: '问' })
+    await settle()
+    h.bridge.detach()
+    await settle()
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    expect(hydrateOf(h.posted).at(-1)?.lastTiming).toEqual({
+      ttftMs: 321,
+      totalMs: 4567,
+      inputTokens: 1,
+      outputTokens: 1,
+    })
+  })
+
   it('**切走再切回：重建的 session 也恢复 saved 模型**（显示与请求分裂的根因）', async () => {
     // 实测：UI 显示 model-a，请求全是默认的
     // model-b。根因是 onSessionReady 用 models.length>0 一刀切提前 return，
@@ -940,6 +989,9 @@ describe('会话延续', () => {
         const f = fakeSession()
         made.push(f)
         return f.session
+      },
+      taskSession: async () => {
+        throw new Error('本用例不测任务')
       },
       folder: '/tmp/x',
       openExternal: async () => true,
@@ -1086,6 +1138,9 @@ describe('会话延续 > 关开竞态', () => {
     const bridge = createBridge({
       post: (m) => posted.push(m),
       session: factory,
+      taskSession: async () => {
+        throw new Error('本用例不测任务')
+      },
       folder: '/tmp/x',
       openExternal: async () => true,
       openFile: async () => {},
@@ -1236,5 +1291,34 @@ describe('settings 热重载（requestReload）', () => {
     h.release()
     await settle()
     expect(h.close).toHaveBeenCalled()
+  })
+})
+
+describe('插话镜像', () => {
+  it('**轮内插话不顶掉第一条 user 气泡**（ai-legal-advisor turn-822 回归）', async () => {
+    // 单数 pendingUser 槽位的翻车：插话的 send 覆盖槽位，轮内重开面板
+    // （attach 推镜像）只剩插话一条——第一条 user「被改写」。数组化后
+    // 两条都在
+    const h = harness({
+      hang: true,
+      events: [{ type: 'step_finish', usage: usage(), contextTokens: 0 }],
+    })
+    h.bridge.handle({ type: 'ready' })
+    h.bridge.handle({ type: 'send', text: '你来实现吧' })
+    await settle()
+    h.bridge.handle({ type: 'send', text: 'VPN回来了，你再重试下' })
+    await settle()
+    // 模拟轮内重开面板：重新 ready 触发 attach 推 hydrate
+    const before = h.posted.length
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    const hydrates = h.posted
+      .slice(before)
+      .filter((m): m is Extract<ToWebview, { type: 'hydrate' }> => m.type === 'hydrate')
+    const users = (hydrates.at(-1)?.items ?? []).filter(
+      (i): i is Extract<ChatItem, { kind: 'user' }> => i.kind === 'user',
+    )
+    expect(users.map((u) => u.text)).toEqual(['你来实现吧', 'VPN回来了，你再重试下'])
+    h.release()
   })
 })

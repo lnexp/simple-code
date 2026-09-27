@@ -55,9 +55,11 @@ export type ToHost =
    * 换模型。**带 provider**——同名模型可以配在两个 provider 下，只给名字有
    * 二义性（core 的 ModelRef 注释）
    */
-  | { type: 'setModel'; choice: ModelRef }
+  /** task：发给分支 session（切换分支后控件区跟分支走，2026-09-22 拍板）。
+   *  缺省 = 主干 */
+  | { type: 'setModel'; choice: ModelRef; task?: string }
   /** 换推理深度。`null` = 撤掉覆盖，回到配置里那个值 */
-  | { type: 'setEffort'; effort: Effort | null }
+  | { type: 'setEffort'; effort: Effort | null; task?: string }
   /** 审批气泡的答复（approval_request 的回执） */
   /** folder：后台文件夹的审批卡回执路由用；缺省 = 当前文件夹 */
   | {
@@ -68,20 +70,35 @@ export type ToHost =
       feedback?: string
       folder?: string
     }
-  /** 输入框下的审批开关（approval.md §4.2 两态） */
-  | { type: 'setApprovalEnabled'; on: boolean }
+  /** 输入框下的审批开关（approval.md §4.2 两态）。task：分支自己的开关
+   *  （2026-09-22 拍板：审批配置跟分支走）；缺省 = 主干/folder 级 */
+  | { type: 'setApprovalEnabled'; on: boolean; task?: string }
   /** 用户点掉一个后台残留进程。宿主 TERM 后回一条 bg_processes 更新列表。
    *  folder：该进程所属的 bridge——多根下 registry 各目录独立，pid 只在
    *  原目录有账，不带 folder 会被路由到当前 bridge 而杀空（用户拍板：
    *  进程条按目录隔离显示，但跨目录的 × 必须打到正确的 bridge） */
   | { type: 'bg_kill'; pid: number; folder?: string }
-  /** 要一份上下文分区快照（点状态行「上下文 X」弹出面板）。响应是 regions */
-  | { type: 'get_regions' }
+  /** 要一份上下文分区快照（点状态行「上下文 X」弹出面板）。响应是 regions。
+   *  task：查分支的库——上下文环跟着分支走，不拿主干的数字骗人 */
+  | { type: 'get_regions'; task?: string }
   /**
    * 往上拉到顶了，要更早的历史。cursor = 上一页返回的 `next`（第一次
    * null——从最新的归档行起）。响应是一条 historyPage
    */
   | { type: 'fetchHistory'; cursor: number | null }
+  /** 分支：从最新回答 fork（`/task` 或分支条 + 按钮都走这）。主干在跑会被拒
+   *  （fork 要拷记忆库）。brief 是分支的第一条消息 */
+  | { type: 'task_dispatch'; brief: string }
+  /** 分支：往分支发消息（切换分支后输入框的目标）。分支跑着 = 插话入队
+   *  （core 的 newInput 语义），空闲 = 起新一轮 */
+  | { type: 'task_send'; task: string; text: string; images?: ImageInput[] }
+  /** 选中了某个分支（切换视图）：宿主补一份该分支的基线（单一真相，
+   *  webview 的增量投影不跨 attach 存活） */
+  | { type: 'task_open'; task: string }
+  /** 关闭任务（task-v3：唯一的生命周期操作。在跑会先停，摘要排空后收尾） */
+  | { type: 'task_close'; name: string }
+  /** 中断任务正在跑的轮（与对话的停止同一语义，通用控件） */
+  | { type: 'task_stop'; name: string }
 
 export type ToWebview =
   /** core 的事件**原样透传**，不在宿主侧翻译。翻译是 webview 的事 */
@@ -96,6 +113,8 @@ export type ToWebview =
       expiresAt: number
       /** 发卡的是哪个文件夹——后台跑着的轮弹的卡带这个，卡片上标注 */
       folder?: string
+      /** 分身任务弹的卡带这个：任务名。卡片标注来源，面板内过滤也靠它 */
+      task?: string
       id: number
       command: string
       toolCallId: string
@@ -110,6 +129,9 @@ export type ToWebview =
         | { kind: 'lead'; lead: string }
         | { kind: 'path'; dir: string }
         | { kind: 'nonpath'; lead: string; from: number }
+        /** paths：multi 卡同质 external_dir 的批量目录（方案 1，
+         * 2026-09-21）——按钮「始终允许这 N 个目录」 */
+        | { kind: 'paths'; dirs: string[] }
     }
   /** 气泡关掉（答复/超时/中断）。webview 重载后收不到它——超时兜底在宿主 */
   /** folder：非 active 文件夹的卡关掉时路由层标注，webview 按 (folder,id) 关卡 */
@@ -168,6 +190,11 @@ export type ToWebview =
        * 出去被 400 的话消息留在 context 里，之后每轮都 400（design.md §726）
        */
       imagesEnabled: boolean
+      /**
+       * 当前模型的上下文窗口。底栏环形水位的分母——0 表示还没建 session
+       * （建之前 contextTokens 也是 0，那时按钮本来就不渲染）
+       */
+      contextWindow: number
     }
   /**
    * 扩展侧出了 webview 自己看不到的错（配置加载失败、拿不到文件锁、core 抛了
@@ -204,6 +231,46 @@ export type ToWebview =
    * 单根没有这个概念，不占空间
    */
   | { type: 'folders'; folders: FolderState[]; active: string }
+  /**
+   * 分身任务的全量快照（有变化才发）。folder 由路由注入（approval 同款）：
+   * 任务跟目录走，切走即清、切回由宿主镜像补发
+   */
+  | { type: 'tasks'; tasks: TaskState[]; folder?: string; /** 分支上限（+ 入口的显隐判据，宿主是唯一真相） */ limit: number }
+  /** 分身任务的流事件（task_agent → 任务面板的增量）。只在 active 直发 */
+  | { type: 'task_agent'; name: string; event: AgentEvent; at: number; folder?: string }
+  /** 分身任务面板的基线（切回/重开时补发，整体替换该任务的 items） */
+  | {
+      type: 'task_hydrate'
+      name: string
+      items: ChatItem[]
+      folder?: string
+      /** 同 hydrate：底栏水位/上一轮用量，不带的话切回任务底栏清空 */
+      contextTokens?: number
+      lastTiming?: ChatView['lastTiming']
+    }
+
+/** 任务的卡片状态（task-v3）。任务是**可交互的平行对话流**（2026-09-22
+ * 拍板，推翻早前「一次性任务书」形态）：切过去能继续打字，跑着时输入插话
+ * 入队、空闲时起新一轮。closing = 关闭收尾中（摘要排空）。 */
+export type TaskState = {
+  name: string
+  status: 'running' | 'idle' | 'error' | 'closing'
+  /** 最后一条 assistant 文本（分支条摘要预览用） */
+  lastText: string
+  /** status = error 时的原因 */
+  error?: string
+  /** 控件区跟着分支走（同一次拍板）：模型/深度/预设/窗口是分支 session
+   *  自己的账。session 还没建好时 current 为 null——控件显示空态。
+   *  models/presets/approvalOn/imagesEnabled 不带：配置全 folder 一份，
+   *  UI 借主干的 */
+  current: ModelRef | null
+  effort: Effort | null
+  effortOverridden: boolean
+  preset?: string
+  contextWindow: number
+  /** 分支自己的审批开关（内存态，对齐主干） */
+  approvalOn: boolean
+}
 
 /** 单个文件夹的显示状态：路径 + 它的轮是否在跑（后台轮的 ● 标记） */
 export type FolderState = {

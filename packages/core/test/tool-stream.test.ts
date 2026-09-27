@@ -23,9 +23,9 @@ describe('ToolStream', () => {
 
     // 对照组：Responses 在 output_item.done 时重发完整 arguments。若这里用
     // append，buf 会变成 '{"command":"ls"}{"command":"ls"}'，parse 失败后
-    // 退化成原始串——工具层收到的就不是对象了
+    // 归一成 { _raw } 对象（裸串进历史会毒回传，见 parseInput 注释）
     const appended = appendTool(s, 'item_1', '{"command":"ls"}')
-    expect(flushTools(appended)[0]?.input).toBe('{"command":"ls"}{"command":"ls"}')
+    expect(flushTools(appended)[0]?.input).toEqual({ _raw: '{"command":"ls"}{"command":"ls"}' })
 
     const replaced = replaceTool(s, 'item_1', '{"command":"ls"}')
     expect(flushTools(replaced)[0]?.input).toEqual({ command: 'ls' })
@@ -54,11 +54,20 @@ describe('ToolStream', () => {
     expect(flushTools(s)[0]?.input).toEqual({})
   })
 
-  it('非法 JSON 不抛，保留原始串交给工具层报错', () => {
+  it('非法 JSON 不抛，包成 { _raw } 对象出生——裸串进历史回传必 500', () => {
     let s = startTool(emptyToolStream(), '0', 'call_1', 'bash')
     s = appendTool(s, '0', '{"command":"ls') // 被截断
     expect(() => flushTools(s)).not.toThrow()
-    expect(flushTools(s)[0]?.input).toBe('{"command":"ls')
+    expect(flushTools(s)[0]?.input).toEqual({ _raw: '{"command":"ls' })
+  })
+
+  it('合法 JSON 但整体不是对象（字符串/数组）同样归一——parse 成功的裸串照样毒历史', () => {
+    let s = startTool(emptyToolStream(), '0', 'call_1', 'bash')
+    s = appendTool(s, '0', '"半截文本"') // JSON.parse 成功，结果是字符串
+    expect(flushTools(s)[0]?.input).toEqual({ _raw: '半截文本' })
+    let s2 = startTool(emptyToolStream(), '0', 'call_2', 'bash')
+    s2 = appendTool(s2, '0', '[1,2]')
+    expect(flushTools(s2)[0]?.input).toEqual({ _raw: '[1,2]' })
   })
 
   it('操作是纯的：不改入参，同一 state 重复喂得到同样结果', () => {

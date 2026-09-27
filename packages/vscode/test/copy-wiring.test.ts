@@ -59,6 +59,7 @@ const state: ToWebview = {
       presets: [],
   approvalOn: true,
   imagesEnabled: false,
+  contextWindow: 0,
 }
 
 describe('代码块复制接线', () => {

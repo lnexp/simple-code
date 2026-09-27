@@ -5,10 +5,21 @@ import type { BgRegistry } from './bg.ts'
 export type { ImageInput }
 
 export type ToolContext = {
+  /** 记忆库根（分身任务 = 任务目录）。bash 往子进程注入
+   *  SIMPLE_CODE_MEMORY_DIR——$SIMPLE_CODE_MEMORY 靠它认自己的库 */
+  memoryRoot?: string
   /** 工作区根目录的绝对路径。工具的相对路径都基于它解析 */
   root: string
   /** 用户中断。中断时正在跑的命令跟着杀，不等它跑完（design.md §5.2） */
   signal: AbortSignal
+  /**
+   * 插话软中断：用户在工具执行期间发了新消息（排队插话由 runLoop 在迭代
+   * 顶投递）。与 signal（stop，中断即杀）不同——**不杀**：bash 听到它就把
+   * 执行中的命令转后台、控制权还给循环，命令继续跑、输出接日志文件。
+   * 没有它，一条 11 分钟的 bash 会把用户的问题扣住 11 分钟（2026-09-21）。
+   * 用不到的忽略即可；信号每次插话换新，只命中当时正在执行的那一个工具
+   */
+  interjectSignal?: AbortSignal
   /** 本条工具调用在事件流里的 id。bash 的审批卡靠它锚到对应命令行下方。
    * 可选：ephemeral/单测构造 ctx 时不必填，工具层用空串兜底 */
   toolCallId?: string
@@ -55,6 +66,7 @@ export type ToolContext = {
       | { kind: 'lead'; lead: string }
       | { kind: 'path'; dir: string }
       | { kind: 'nonpath'; lead: string; from: number }
+      | { kind: 'paths'; dirs: string[] }
   }) => Promise<'allow' | 'always' | 'deny' | { deny: string }>
   /**
    * 视觉转述（vision relay）：主模型无视觉且配置了 visionModel 时由 session
@@ -62,7 +74,12 @@ export type ToolContext = {
    * 没注入 = 无转述能力，工具走老路（图原样返回，发送出口换占位文本）。
    * 抛错 = 转述失败，工具层负责降级提示
    */
-  visionRelay?: (image: { data: string; mimeType: string }, focus: string) => Promise<string>
+  visionRelay?: (
+    image: { data: string; mimeType: string },
+    focus: string,
+    /** 主循环的中断信号。轮内转述传它——不传的话请求打不断（见 makeVisionRelay） */
+    signal?: AbortSignal,
+  ) => Promise<string>
   /**
    * 后台进程登记簿（bg.ts）。可选：CLI/ephemeral/单测不注入，bash 的
    * 残留抓取随之跳过——工具行为不变，只是没人记账。

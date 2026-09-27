@@ -1,6 +1,6 @@
 {
   "name": "simple-code",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "typecheck": "tsc --noEmit -p packages/core && tsc --noEmit -p packages/cli && tsc --noEmit -p packages/vscode && tsc --noEmit -p packages/vscode/tsconfig.webview.json",
+    "typecheck": "tsc --noEmit -p packages/core && tsc --noEmit -p packages/cli && tsc --noEmit -p packages/vscode && tsc --noEmit -p packages/companion && tsc --noEmit -p packages/vscode/tsconfig.webview.json",
     "test": "pnpm typecheck && vitest run",
     "test:watch": "vitest",
     "lint": "biome check .",

@@ -30,6 +30,7 @@ const says = (role: Message['role'], text: string): Message => ({
 })
 
 const summary = (over: Partial<Summary> & Pick<Summary, 'coversFrom' | 'coversTo'>): Summary => ({
+  owner: null,
   id: over.coversFrom,
   level: 0,
   name: '',
@@ -87,6 +88,7 @@ async function runOnce(options: {
     },
     maxIterations: 5,
     memory: {
+      cues: () => new Map(),
       contextWindow: options.contextWindow,
       targetRatio: 0.5,
       // 时间维度给「不触发」的值：这些用例只测预算这一条触发路径
@@ -95,8 +97,8 @@ async function runOnce(options: {
       lastResponseAt: () => null,
       markResponded: () => {},
       stubTokens: 1e9,
-    unloadedSteps: () => new Set<number>(),
-    floorTokens: 1,
+      stubTurns: 1e9,
+        floorTokens: 1,
       // 0 是为了让预算就是窗口本身，用例里的数字直接可推算
       safetyMargin: 0,
       clipThresholdChars: 1_000,

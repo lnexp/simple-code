@@ -1,0 +1,7 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "$comment": [
+    "伴生扩展只有宿主侧代码（无 webview），不涉及 DOM 分流的 tsconfig 拆分"
+  ]
+}

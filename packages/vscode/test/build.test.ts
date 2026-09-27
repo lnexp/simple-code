@@ -115,6 +115,35 @@ describe('扩展构建产物', () => {
       expect(webview).not.toContain('new Function')
     })
 
+    it('**不含 navigator 引用（远端 exthost 迁移守卫）**', () => {
+      // zod 的 Cloudflare 探测（typeof navigator）在远端 vscode-server 的
+      // exthost 里炸：那里 navigator 是 VS Code 的 PendingMigrationError
+      // 迁移守卫（throwing getter），typeof 也触发 getter 直接抛错，模块
+      // 加载即失败——本机 Electron exthost 的 navigator 是真全局，本机
+      // 永远复现不了（2026-09-27 memeda 远端首装暴露）。build.mjs 用
+      // define 把 navigator 钉成 undefined（探测分支被常量折叠整体消除），
+      // 这两条断言锁住 define 不被弄丢。webview 是浏览器，navigator 是
+      // 真的，不受此限
+      expect(extension).not.toContain('typeof navigator')
+      expect(extension).not.toMatch(/navigator\?\./)
+      // companion 同款（UI kind 只跑本机，但同款代码同款风险）
+      const companion = readFileSync(`${root}packages/companion/dist/extension.cjs`, 'utf8')
+      expect(companion).not.toContain('typeof navigator')
+      expect(companion).not.toMatch(/navigator\?\./)
+    })
+
+    it('**构建确定：模块路径标签一律根相对（absWorkingDir 钉死）**', () => {
+      // esbuild 把模块路径打进 bundle（sourcemap 注释 + 模块名字符串），
+      // 相对谁算默认取 process.cwd()——不钉 absWorkingDir 的话，仓库根
+      // `node scripts/build.mjs` 与 packages/* 下 `pnpm run package` 产出
+      // 同码不同 md5 的产物（2026-09-27 实案：374a/cb4d/7fe6 三版），
+      // 「md5 一致 = 装机一致」的判据被 cwd 漂移污染。根相对（不带
+      // ../ 前缀）是钉死后的唯一形态，出现 ../../ 前缀即 define 回归
+      for (const f of ['packages/vscode/dist/extension.cjs', 'packages/companion/dist/extension.cjs']) {
+        expect(readFileSync(`${root}${f}`, 'utf8')).not.toContain('"../../node_modules/')
+      }
+    })
+
     it('**没把 core 打进来**', () => {
       // webview 只 import type，运行时不该有 core 的一行代码。真打进来的话
       // 产物里会出现 SQLite、子进程 spawn 这些浏览器里根本不存在的东西

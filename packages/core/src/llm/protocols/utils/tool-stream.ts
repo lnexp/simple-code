@@ -1,4 +1,5 @@
 import type { ToolCallPart } from '../../types.ts'
+import { asToolInput } from './wire.ts'
 
 /**
  * tool call 的增量 JSON 累积。三个协议共用，但写入语义不同：
@@ -70,15 +71,18 @@ const toPart = (e: ToolEntry): ToolCallPart => ({
 
 /**
  * parse 失败不抛。模型偶尔会产生截断或非法的 JSON，抛异常会打断整个 loop。
- * 保留原始串交给工具层——那里的参数校验会返回一条模型读得懂的散文错误
- * （CLAUDE.md §4.2），模型看到后会重新组织参数再试，这是自我修正的机会。
+ * 失败/非对象一律包成 { _raw: 原文 } 的对象出生——形状保证回传合法
+ * （见 wire.ts asToolInput 的账），原文保留给工具层：参数校验返回一条
+ * 模型读得懂的散文错误（CLAUDE.md §4.2），模型看到后重新组织参数再试。
  */
-function parseInput(buf: string): unknown {
+function parseInput(buf: string): Record<string, unknown> {
   // 无参数的工具不会产生任何 delta，buf 是空串。JSON.parse('') 会抛
   if (buf === '') return {}
   try {
-    return JSON.parse(buf)
+    // 合法 JSON 但整体不是对象（'"foo"' / '[1,2]'）同样要归一——
+    // parse 成功的裸串照样毒历史，catch 只堵得住一半
+    return asToolInput(JSON.parse(buf))
   } catch {
-    return buf
+    return { _raw: buf }
   }
 }

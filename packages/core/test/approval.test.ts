@@ -58,6 +58,30 @@ describe('规则 0：自家 bin', () => {
     // 行首 *** 只能是真标记（所以 patchVerdict 无误抽，也不用防）
     allow(`"$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: docs/x.md\n@@\n ctx\n+*** Update File: /etc/evil\n*** End Patch\nPATCH`)
   })
+
+  it('自家 bin 的带引号 heredoc 照放（通道语义，body 是字面量）', () => {
+    allow(`"$SIMPLE_CODE_NOTE" write <<'MD'\nname: foo\ntitle: t\ndescription: d\n---\n正文\nMD`)
+    allow(`"$SIMPLE_CODE_LESSON" write <<'JSON'\n{"name":"foo","title":"t","description":"d"}\nJSON`)
+  })
+
+  it('APPLY_PATCH 通道豁免 .simple-code 成长区（notes/skills/lessons，2026-09-27 拍板）', () => {
+    // note/lesson/skill 的 patch 子命令退役后由这道豁免承接通道免审语义
+    allow(`"$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: .simple-code/notes/foo.md\n@@\n a\n-b\n+c\n*** End Patch\nPATCH`)
+    allow(`"$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: .simple-code/lessons/foo.md\n@@\n a\n-b\n+c\n*** End Patch\nPATCH`)
+    allow(`"$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: .simple-code/skills/foo/SKILL.md\n@@\n a\n-b\n+c\n*** End Patch\nPATCH`)
+    // 绝对路径（root 前缀内）同豁免；记忆档案不豁免
+    allow(`"$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: ${ROOT}/.simple-code/notes/foo.md\n@@\n a\n-b\n+c\n*** End Patch\nPATCH`)
+    blocked(
+      `"$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: .simple-code/turns/turn-000001.jsonl\n@@\n x\n+y\n*** End Patch\nPATCH`,
+      '要写入 .simple-code 数据',
+    )
+    blocked(
+      `"$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: ~/.simple-code/skills/foo/SKILL.md\n@@\n x\n+y\n*** End Patch\nPATCH`,
+      '项目外',
+    )
+    // 豁免只给 APPLY_PATCH 通道：裸 shell 写这些目录照旧弹卡
+    blocked('rm .simple-code/notes/foo.md', '要写入 .simple-code 数据')
+  })
 })
 
 describe('规则 1：看不懂就问', () => {

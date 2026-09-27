@@ -26,8 +26,12 @@ const TAIL = 200
  * 描述永远真话（改这里别忘不了描述，它自己跟着变） */
 export const LOG_DEFAULT_LINES = 20
 
-/** 从 cwd 向上冒泡找 .simple-code/memory（bash 的 cwd 可能是子目录） */
+/** 从 cwd 向上冒泡找 .simple-code/memory（bash 的 cwd 可能是子目录）。
+ *  分身任务先看 SIMPLE_CODE_MEMORY_DIR（bash 注入）：cwd 是主 folder，
+ *  冒泡只会找到主干的库，分身自己的 turns 在任务目录 */
 export function findMemoryRoot(cwd: string): string | undefined {
+  const injected = process.env.SIMPLE_CODE_MEMORY_DIR
+  if (injected) return join(injected, '.simple-code', 'memory')
   let dir = cwd
   for (;;) {
     const candidate = join(dir, '.simple-code', 'memory')

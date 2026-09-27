@@ -58,10 +58,14 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
     '分工：宽搜/正则/多词混合直接 grep memory 的 turns 目录（jsonl 全量落盘，不截断），' +
     'search 用于定位格式与渲染续接；' +
     `log [-n ${LOG_DEFAULT_LINES}]（每 turn 一行总览，先扫再下钻）。\n` +
+    '【note】"$SIMPLE_CODE_NOTE" list（全量清单，含被挤出索引的）| read <name>（全文+喂 LRU 心跳）| ' +
+    'search <关键词> | write <<\'MD\'（heredoc 四段：name/title/description/正文，新结论当场记一条）。' +
+    '改内容：同名 write 整条重写，或 "$SIMPLE_CODE_APPLY_PATCH" 局部改（.simple-code/notes/，免审批）。\n' +
     '【教训】"$SIMPLE_CODE_LESSON" list | read <name> | search <关键词> | ' +
     'write（五段 heredoc JSON 走 stdin，字段 name/title/description/symptom/misjudged/rootCause/fix/verified，格式自动组装）。' +
-    '调试一轮没修好先查教训，失败 ≥2 次后成功用 write 记一条。\n' +
-    '【技能】（只读，用户点名才用）"$SIMPLE_CODE_SKILL" list | read <name>。',
+    '调试一轮没修好先查教训，失败 ≥2 次后成功用 write 记一条。局部改走 "$SIMPLE_CODE_APPLY_PATCH"（.simple-code/lessons/，免审批）。\n' +
+    '【技能】（点名或不确定怎么做时查用）"$SIMPLE_CODE_SKILL" list | read <name> | search <关键词>。' +
+    '改项目级 SKILL.md 走 "$SIMPLE_CODE_APPLY_PATCH"（免审批）；用户级在 ~/.simple-code，写走 bash 审批。',
   parameters: {
     type: 'object',
     properties: {
@@ -143,19 +147,22 @@ async function checkApproval(
   if (verdict.kind === 'allow') return null
 
   // always 预览：解释器/网络命令记命令名（verdict 直接带）；项目外
-  // 路径记目录（dirHint 算：目录记本身、文件记父目录，过宽不给）
+  // 路径记目录（dirHint 算：目录记本身、文件记父目录，过宽不给）；
+  // multi 同质 external_dir 记一组目录（方案 1，approval.ts 算好带来）
   const alwaysHint =
     verdict.kind === 'ask'
       ? verdict.alwaysLead !== undefined
         ? { kind: 'lead' as const, lead: verdict.alwaysLead }
         : verdict.nonPathFrom !== undefined
           ? { kind: 'nonpath' as const, ...verdict.nonPathFrom }
-          : verdict.category === 'external_dir'
-            ? (() => {
-                const dir = dirHint(verdict.detail)
-                return dir === null ? undefined : { kind: 'path' as const, dir }
-              })()
-            : undefined
+          : verdict.alwaysPaths !== undefined
+            ? { kind: 'paths' as const, dirs: verdict.alwaysPaths }
+            : verdict.category === 'external_dir'
+              ? (() => {
+                  const dir = dirHint(verdict.detail)
+                  return dir === null ? undefined : { kind: 'path' as const, dir }
+                })()
+              : undefined
       : undefined
 
   // 中断兜底：宿主收到 abort 应自行 resolve 'deny'，但没做的话这里
@@ -180,7 +187,8 @@ async function checkApproval(
     try {
       if (alwaysHint.kind === 'lead') appendLead(ctx.root, alwaysHint.lead)
       else if (alwaysHint.kind === 'nonpath') appendNonPathFrom(ctx.root, alwaysHint.lead, alwaysHint.from)
-      else appendPath(ctx.root, alwaysHint.dir)
+      else if ('dir' in alwaysHint) appendPath(ctx.root, alwaysHint.dir)
+      else for (const d of alwaysHint.dirs) appendPath(ctx.root, d)
     } catch (err) {
       process.stderr.write(
         `approval.json 写入失败（本次仍放行）：${err instanceof Error ? err.message : String(err)}\n`,
@@ -279,6 +287,9 @@ function run(args: Args, config: BashConfig, ctx: ToolContext): Promise<ToolOutp
       env: {
         ...buildEnv(config.envPassthrough),
         SIMPLE_CODE_ROOTS: JSON.stringify([ctx.root, ...loadAlways(ctx.root).paths]),
+        // 记忆库实际位置：分身任务的 $SIMPLE_CODE_MEMORY 靠它查自己的库
+        // （cwd 冒泡会找到主干的——分身 cwd 就是主 folder）
+        SIMPLE_CODE_MEMORY_DIR: ctx.memoryRoot ?? ctx.root,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -305,12 +316,13 @@ function run(args: Args, config: BashConfig, ctx: ToolContext): Promise<ToolOutp
       })
     }
 
-    // 超时转后台：不杀（2026-09-08 拍板，取代「超时即杀」）。同步等待的
-    // 价值在超时那一刻已经归零，但进程多半仍有产出——构建慢、测试多、
-    // 或卡在外部依赖上。输出接进日志文件、pid 交给登记簿，控制权还给
-    // 调用方：稍后 tail 看进展还是判定卡死 kill 掉，都是 agent 的决策
+    // 转后台：不杀（2026-09-08 拍板，取代「超时即杀」）。同步等待的价值
+    // 归零的那一刻——超时，或用户插话要插队（2026-09-21）——进程多半仍有
+    // 产出：构建慢、测试多、或卡在外部依赖上。输出接进日志文件、pid 交给
+    // 登记簿，控制权还给调用方：稍后 tail 看进展还是判定卡死 kill 掉，
+    // 都是 agent 的决策
     let detached = false
-    const timer = setTimeout(() => {
+    const toBackground = (headline: string) => {
       detached = true
       const pid = child.pid ?? -1
       const logPath = join(tmpdir(), `sc-bg-${pid}.log`)
@@ -338,9 +350,10 @@ function run(args: Args, config: BashConfig, ctx: ToolContext): Promise<ToolOutp
       void ctx.bg?.collect(pid)
       clearTimeout(timer)
       ctx.signal.removeEventListener('abort', onAbort)
+      ctx.interjectSignal?.removeEventListener('abort', onInterject)
       resolveOutput({
         output:
-          `命令超过 ${Math.round(args.timeoutMs / 1000)} 秒未结束，已转入后台继续运行，输出没有丢：\n` +
+          `${headline}，已转入后台继续运行，输出没有丢：\n` +
           `  进程组 pid  ${pid}\n  日志       ${logPath}\n` +
           `稍后回访进展：tail -30 '${logPath}'；判定卡死或不再需要：kill ${pid}（输入框上方的残留进程列表也能终止）。` +
           `超时前已有的输出：\n${truncateOutput(output, config.maxOutputChars, ctx.rawPath)}`,
@@ -348,7 +361,16 @@ function run(args: Args, config: BashConfig, ctx: ToolContext): Promise<ToolOutp
         // 转后台是正常流不是失败——模型该做的是稍后回访，不是当错误善后
         isError: false,
       })
-    }, args.timeoutMs)
+    }
+    const timer = setTimeout(
+      () => toBackground(`命令超过 ${Math.round(args.timeoutMs / 1000)} 秒未结束`),
+      args.timeoutMs,
+    )
+
+    // 插话软中断：用户的消息排在队首等下轮迭代投递，别让一条长命令把
+    // 它扣住——立刻转后台（不杀，进程照跑），问题先进上下文
+    const onInterject = () => toBackground('用户插话（有新输入要处理）')
+    ctx.interjectSignal?.addEventListener('abort', onInterject, { once: true })
 
     const onAbort = () => {
       if (detached) return // 已转后台的进程不属于本次调用，留给后续轮次/用户
@@ -361,6 +383,7 @@ function run(args: Args, config: BashConfig, ctx: ToolContext): Promise<ToolOutp
     function cleanup() {
       clearTimeout(timer)
       ctx.signal.removeEventListener('abort', onAbort)
+      ctx.interjectSignal?.removeEventListener('abort', onInterject)
       child.stdout.removeAllListeners()
       child.stderr.removeAllListeners()
     }

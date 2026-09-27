@@ -15,6 +15,13 @@ export type Sink = { out: (s: string) => void; err: (s: string) => void }
 /** 工具输出显示多少行就够看了。bash 那边已经按 maxOutputChars 截过一次 */
 const MAX_RESULT_LINES = 20
 
+/** 毫秒 → 「X 分钟」/「X 秒」，unloaded 的 stale 文案自证用 */
+const fmtInterval = (ms: number | null): string => {
+  if (ms === null) return '?'
+  const min = Math.round(ms / 60_000)
+  return min >= 1 ? `${min} 分钟` : `${Math.round(ms / 1000)} 秒`
+}
+
 export type Renderer = {
   on: (agentEv: AgentEvent) => void
   /** 跑完之后调一次，打总计。只有一步时不打——那跟上一行一模一样 */
@@ -183,10 +190,12 @@ export function createRenderer(
         // 像是数据被弄坏了——而实际上原文还在，只是不占上下文了。
         // 文案按触发原因分开（方案 A）：budget 才真的是「接近上限」；
         // stale 是缓存过期搭车压缩，预算没超也说「接近上限」是误导；
+        // stale 文案带实际间隔（sinceMs）自证到没到 TTL（2026-09-20，
+        // 起因「感觉没到 5 分钟却触发了」查无数据）
         // force 是超限自救、连保底区一起卸，严重度跟前两者完全不同
         const text =
           agentEv.reason === 'stale'
-            ? `刚才这发缓存已过期、横竖全价，顺手把最早的 ${agentEv.count} 条归档了，之后基数更小`
+            ? `距上次响应 ${fmtInterval(agentEv.sinceMs)}，缓存已过期、横竖全价，顺手把最早的 ${agentEv.count} 条归档了，之后基数更小`
             : agentEv.reason === 'force'
               ? `超出模型上限，紧急归档 ${agentEv.count} 条（含最近上下文）`
               : `上下文接近上限，最早的 ${agentEv.count} 条已归档到磁盘，模型需要时会自己读回来`

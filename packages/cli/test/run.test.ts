@@ -1,4 +1,5 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -240,9 +241,10 @@ describe('出错时的退出码', () => {
 })
 
 describe('injectLocalTools（终端裸跑自补工具路径）', () => {
-  it('变量缺失时指向同目录对应 bin；已有注入不覆盖；缺文件跳过', async () => {
+  it('变量缺失时指向 shim；已有注入不覆盖；缺文件跳过', async () => {
     const { injectLocalTools } = await import('../src/run.ts')
     const dir = await mkdtemp(join(tmpdir(), 'sc-inject-'))
+    const binDir = await mkdtemp(join(tmpdir(), 'sc-shim-'))
     dirs.push(dir)
     await writeFile(join(dir, 'webfetch.js'), '#!/usr/bin/env node\n', { mode: 0o755 })
     await writeFile(join(dir, 'note.js'), '#!/usr/bin/env node\n', { mode: 0o755 })
@@ -253,8 +255,10 @@ describe('injectLocalTools（终端裸跑自补工具路径）', () => {
       delete process.env.SIMPLE_CODE_WEBFETCH
       delete process.env.SIMPLE_CODE_LESSON // 本进程可能带扩展注入的值——清了才验「缺文件跳过」
       process.env.SIMPLE_CODE_NOTE = '/host/injected/note.js'
-      await injectLocalTools(dir)
-      expect(process.env.SIMPLE_CODE_WEBFETCH).toBe(join(dir, 'webfetch.js'))
+      await injectLocalTools(dir, binDir)
+      // shim 而非脚本本体：PATH 无 node 的机器靠它用宿主 node 跑（shims.ts）
+      expect(process.env.SIMPLE_CODE_WEBFETCH).toBe(join(binDir, 'sc-webfetch'))
+      await expect(access(join(binDir, 'sc-webfetch'), fsConstants.X_OK)).resolves.toBeUndefined()
       expect(process.env.SIMPLE_CODE_NOTE).toBe('/host/injected/note.js') // 不覆盖
       expect(process.env.SIMPLE_CODE_LESSON).toBeUndefined() // 目录里没有 → 跳过
     } finally {

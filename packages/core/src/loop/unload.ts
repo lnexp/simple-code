@@ -8,6 +8,18 @@ export type ClipOptions = {
   keepHeadChars: number
   /** 归档路径，写进通知里 */
   archive: string
+  /**
+   * 卸载同时把 reasoning part 整块丢弃（compaction-v2 §0.3，2026-09-24
+   * 重开 t444 的否决项）。老轮的推理对当前决策没有价值，却是存根区的
+   * 头号质量（实测每轮 4.36k → 1.05k，-76%）。原文在 turns 归档里，
+   * cat 得回来。
+   *
+   * **当前工具轮（pending tool loop）必须传 false**：anthropic 续发
+   * tool result 时要求带 thinking 的 assistant 消息原样在场（配对底线，
+   * CC `clear_thinking` 同款只保最后一轮）。调用方（run.ts）按「最后一条
+   * user 消息之后」划界
+   */
+  dropReasoning?: boolean
 }
 
 /**
@@ -20,10 +32,13 @@ export type ClipOptions = {
  *   `saved <= 0` → 这条永远选不中 → 它所在的 step 永远不标 unloaded →
  *   摘要永远不生效」。§11.5 把出局判据从「省不省得到」换成「在不在保底区外」
  *   之后，那条因果链断了：短消息裁不动照样出局。
- * - **reasoning 不再整块删。** design.md §9.9「历史轮次的推理对当前决策没有
- *   价值」仍然成立，但处理方式换了——老 step 整条被摘要顶替，reasoning 跟着
- *   整条一起不发，不需要单独删。留着它还有一个好处：段还没被摘要盖住时，
- *   推理块和它后面的 tool_call 仍然配对完整。
+ * - **reasoning 整块丢弃**（2026-09-24 重开，compaction-v2 §0.3）：一度
+ *   反过来（「reasoning 不再整块删」），但那是摘要进场还靠水位闸的年代——
+ *   位置制下存根区常驻几十轮，reasoning 全量回传成了存根区的头号质量
+ *   （每轮 4.36k，占 76%）。design.md §9.9 原文就是「卸载时整块丢弃」，
+ *   代码漂移过一次，这次收敛回文档。anthropic 侧丢弃是官方支持的操作
+ *   （`clear_thinking_20251015` 同思路）；openai 侧 `reasoning_content`
+ *   本来就是输出侧扩展字段，不要求回传历史。
  *
  * 阈值默认 1000 字符，依据是提案 §8.2 的实测：命中 474/8038 段（5.9%）、
  * 全语料省 18%。500 能到 22% 但命中段数翻倍——1000 字符约 12 行输出，
@@ -40,7 +55,13 @@ export type ClipOptions = {
  * 纯函数，不碰数据库、不碰文件。调用方负责先把原文标记落库。
  */
 export function unloadMessage(msg: Message, opts: ClipOptions): Message {
-  return { ...msg, parts: msg.parts.map((part) => unloadPart(part, opts)) }
+  const drop = opts.dropReasoning === true
+  return {
+    ...msg,
+    parts: msg.parts
+      
+      .filter((part) => !(drop && part.type === 'reasoning')).map((part) => unloadPart(part, opts)),
+  }
 }
 
 function unloadPart(part: Part, opts: ClipOptions): Part {

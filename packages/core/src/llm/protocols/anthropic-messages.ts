@@ -1,4 +1,4 @@
-import type { LLMEvent, SSEMessage } from '../events.ts'
+import type { LLMEvent, RefusalDetail, SSEMessage } from '../events.ts'
 import {
   LLMStreamError,
   mergeBody,
@@ -15,7 +15,7 @@ import {
   startTool,
   type ToolStream,
 } from './utils/tool-stream.ts'
-import { asNumber, asObject, asString, readRetryAfter } from './utils/wire.ts'
+import { asNumber, asObject, asString, asToolInput, readRetryAfter } from './utils/wire.ts'
 
 // wire 格式的东西不要和 canonical 的 Message / Part 混（CLAUDE.md §3.2）。
 // 这些类型只在本文件内部出现。
@@ -83,35 +83,43 @@ const toWireMessage = (msg: Message): WireMessage => ({
 const CACHE_CONTROL = { type: 'ephemeral' } as const
 
 /**
- * 在**最后一条**消息的末尾打一个断点。
+ * 从后往前**最多三条**消息，各在末尾打一个断点（加 system 一个，正好用满
+ * 四个断点的硬上限）。
  *
- * 下一轮请求的前缀完整包含这一轮，读的时候能命中，只有新增的部分按未缓存
- * 计价。历史越长省得越多——不打的话每轮都要把整个历史全价重发一遍，成本
- * 随轮次二次增长。
+ * 末条是本请求的写入点；倒数第二、三条钉住**上一请求的断点位置**。官方
+ * 文档的读取规则是从断点往回找既有条目（lookback window 20 个 block），
+ * 所以真 API 上末条一个断点就够；但中转网关未必实现回看——只认「断点
+ * 位置精确相同」的条目，断点随尾前移就每轮全量 miss（2026-09-23 实测
+ * modelbest 网关：内容前缀逐字段一致、增量 4 个 block，仍 cache miss）。
+ * 把上一请求的断点位置钉住，命中就不再依赖回看。
  *
- * 断点位置每轮都变，这是对的：写入总是新的，读取会从断点往回找既有条目
- * （官方文档的 lookback window 是 20 个 block）。**不能变的是断点落在的
- * 内容**——放在每轮都变的东西上（时间戳之类）就永远读不中。
+ * 钉倒数第三条就够了：请求 = 上一请求 + assistant + user（一轮模型调用
+ * 恰好追加这两条——工具轮是 tool_use/tool_result 对，收尾轮是回答/下一
+ * 句），所以上一请求的末条恒为本次的倒数第三条。倒数第二条覆盖只追加
+ * 一条的插话轮。实测锚点：请求 b 末条 468 → 请求 a 的 468 正是倒数第三条。
  *
- * 只打一个。四个断点是硬上限，每条消息都打的话历史一长就 400，而且那个错
- * 要到会话变长才出现。
+ * 多写不亏：缓存写入按断点间的**增量段**计价，前面的断点命中走读、
+ * 未命中也只是把该段写一遍——总写入量恒等于整个前缀一遍，不会翻倍。
  *
- * thinking 块不能直接打（官方明列的例外），所以从后往前找第一个不是
- * thinking 的块。整条消息都是 thinking 就不打——退回没有断点的状态，
+ * thinking 块不能直接打（官方明列的例外），所以每条消息里从后往前找
+ * 第一个不是 thinking 的块。整条消息都是 thinking 就跳过它——少一个钉子
  * 不会更糟。
  */
 function withCacheBreakpoint(wire: WireMessage[]): WireMessage[] {
-  const lastIndex = wire.length - 1
-  const last = wire[lastIndex]
-  if (!last) return wire
-
-  const at = last.content.findLastIndex((block) => block.type !== 'thinking')
-  if (at === -1) return wire
-
-  const content = last.content.map((block, index) =>
-    index === at ? { ...block, cache_control: CACHE_CONTROL } : block,
-  )
-  return wire.with(lastIndex, { ...last, content })
+  const out = [...wire]
+  for (let i = wire.length - 1; i >= 0 && i >= wire.length - 3; i--) {
+    const m = out[i]
+    if (!m) continue
+    const at = m.content.findLastIndex((block) => block.type !== 'thinking')
+    if (at === -1) continue
+    out[i] = {
+      ...m,
+      content: m.content.map((block, j) =>
+        j === at ? { ...block, cache_control: CACHE_CONTROL } : block,
+      ),
+    }
+  }
+  return out
 }
 
 function toWireContent(part: Part): WireContent | null {
@@ -130,7 +138,9 @@ function toWireContent(part: Part): WireContent | null {
         ? { type: 'thinking', thinking: part.text, signature: part.encrypted }
         : null
     case 'tool_call':
-      return { type: 'tool_use', id: part.id, name: part.name, input: part.input }
+      // input 归一成对象（asToolInput）：历史里的裸串（本修复出生前住进
+      // 去的存量毒）原样回传必 500——tool_use.input 必须是对象
+      return { type: 'tool_use', id: part.id, name: part.name, input: asToolInput(part.input) }
     case 'tool_result':
       // 带图时 content 是 blocks 数组（图 + 文本都排进去）；纯文本保持
       // string——wire 形状不无谓变化，兼容对 block 数组支持不完整的实现
@@ -168,6 +178,8 @@ type State = {
   tools: ToolStream
   usage: Usage
   stopReason: FinishReason
+  /** 拒答详情（stop_details）。只在 stopReason 是 content-filter 时有 */
+  refusal?: RefusalDetail
   /** message_stop 到过没有。SSE 流可以「正常 EOF 但没送终止事件」——
    *  网关超时掐断就是这个形态，不校验的话半截流会被当成完整回答 */
   finished: boolean
@@ -198,7 +210,17 @@ function reduce(state: State, msg: SSEMessage): [State, LLMEvent[]] {
     case 'message_delta':
       return onMessageDelta(state, ev)
     case 'message_stop':
-      return [{ ...state, finished: true }, [{ type: 'finish', reason: state.stopReason, usage: state.usage }]]
+      return [
+        { ...state, finished: true },
+        [
+          {
+            type: 'finish',
+            reason: state.stopReason,
+            usage: state.usage,
+            ...(state.refusal ? { refusal: state.refusal } : {}),
+          },
+        ],
+      ]
     case 'error':
       throw new LLMStreamError(toError(asObject(ev.error), 0))
     default:
@@ -291,10 +313,28 @@ function onBlockStop(state: State, ev: Record<string, unknown>): [State, LLMEven
 }
 
 function onMessageDelta(state: State, ev: Record<string, unknown>): [State, LLMEvent[]] {
-  const stopReason = toFinishReason(asObject(ev.delta).stop_reason)
+  const delta = asObject(ev.delta)
+  const stopReason = toFinishReason(delta.stop_reason)
+  // 拒答的 stop_details 就在同一个 delta 里，只有拒答时才有。category 和
+  // explanation 官方文档都说可为 null，都按「没有就不带」处理
+  let refusal: RefusalDetail | undefined
+  if (stopReason === 'content-filter') {
+    const details = asObject(delta.stop_details)
+    const category = asString(details.category)
+    const explanation = asString(details.explanation)
+    if (category !== '' || explanation !== '') {
+      refusal = {
+        ...(category !== '' ? { category } : {}),
+        ...(explanation !== '' ? { explanation } : {}),
+      }
+    }
+  }
   // message_delta 的 usage 只带输出侧字段，输入侧必须保留 message_start 的值。
   // 直接覆盖会把 input 清零，而且不报错——只是 token 统计悄悄变小
-  return [{ ...state, stopReason, usage: toUsage(ev.usage, state.usage) }, []]
+  return [
+    { ...state, stopReason, ...(refusal ? { refusal } : {}), usage: toUsage(ev.usage, state.usage) },
+    [],
+  ]
 }
 
 // ---------------------------------------------------------------- usage

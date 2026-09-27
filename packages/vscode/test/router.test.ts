@@ -6,7 +6,10 @@ import type { ToHost, ToWebview } from '../src/protocol.ts'
 /** 假 bridge：记录调用，post 全部转给路由注入的（测过滤） */
 function makeFakeBridgeDeps() {
   const sent: ToWebview[] = []
-  const calls: Array<{ folder: string, method: 'attach' | 'detach' | 'requestReload' | 'dispose' }> = []
+  const calls: Array<{
+    folder: string
+    method: 'attach' | 'detach' | 'requestReload' | 'dispose' | 'rehydrateTasks'
+  }> = []
   let folders = ['/w/a', '/w/b']
   type Fake = Bridge & {
     _post: (m: ToWebview) => void
@@ -27,7 +30,9 @@ function makeFakeBridgeDeps() {
         _pending: 0,
         attach: () => calls.push({ folder, method: 'attach' }),
         isRunning: () => made.get(folder)?._running ?? false,
+        anyRunning: () => false,
         pendingApprovals: () => made.get(folder)?._pending ?? 0,
+        rehydrateTasks: () => calls.push({ folder, method: 'rehydrateTasks' }),
         handle: () => {},
         detach: () => calls.push({ folder, method: 'detach' }),
         requestReload: () => calls.push({ folder, method: 'requestReload' }),
@@ -41,6 +46,20 @@ function makeFakeBridgeDeps() {
 }
 
 describe('多根路由（router）', () => {
+  it('tasks 快照触发 folders 重发（分身跑起来 → tab 绿点亮）', () => {
+    const { deps, sent, made } = makeFakeBridgeDeps()
+    const r = createRouter(deps)
+    r.handle({ type: 'ready' })
+    const before = sent.filter((m) => m.type === 'folders').length
+    // 分身状态变化：bridge 内部 postTasks 走 bridgePost → router 应重发 folders
+    ;(made.get('/w/a') as unknown as { _post: (m: ToWebview) => void })._post({
+      type: 'tasks',
+      tasks: [{ name: 't', status: 'running' }],
+    } as ToWebview)
+    const after = sent.filter((m) => m.type === 'folders').length
+    expect(after).toBe(before + 1)
+  })
+
   it('ready：spawn active=[0] 并 attach，推 folders 清单', () => {
     const { deps, sent } = makeFakeBridgeDeps()
     const r = createRouter(deps)
@@ -80,7 +99,7 @@ describe('多根路由（router）', () => {
     r.handle({ type: 'switchFolder', folder: '/w/a' }) // b 转后台
     const bg = made.get('/w/b')!
     bg._post({ type: 'state', running: true, folder: '/w/b', current: null, models: [], effort: null, effortOverridden: false,
-      presets: [], approvalOn: true, imagesEnabled: false })
+      presets: [], approvalOn: true, imagesEnabled: false, contextWindow: 0 })
     bg._post({ type: 'agent', event: { type: 'text_delta', text: 'x' } as never, at: 1 })
     bg._post({ type: 'approval_request', id: 1, expiresAt: 1, command: 'rm /etc/x', toolCallId: 't', category: 'external_dir', detail: '/etc/x', reason: '项目外' })
     expect(sent.filter((m) => m.type === 'state').length).toBe(0)

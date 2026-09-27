@@ -39,6 +39,12 @@ export type Summary = {
   head: string | null
   /** 原文归档文件（工作区相对路径），卸载时填 */
   archivePath: string | null
+  /**
+   * 摘要归属（task-v3）：null=对话的，'task-xxx'=任务私有的。组装不读它
+   * （可见性在 store 的视角过滤做掉了）；它是给摘要器用的——合并只吃同
+   * owner 的连续段，进场（flipSummary）只翻自己 owner 的行
+   */
+  owner: string | null
 }
 
 /**
@@ -75,31 +81,72 @@ export type UnloadedRef = { archivePath: string; turnId: number; stepId: number 
  * 而「遍历 live 消息、遇到被覆盖的就替换」那种写法要额外处理后一种，
  * 位置还容易插错。
  */
-export function assembleContext(
-  live: LiveMessage[],
-  summaries: Summary[],
-  /** 热区摘要的叶子正文，按 summary id。没有的按温区渲染（只给键） */
-  bodies: ReadonlyMap<number, string> = new Map(),
-): Message[] {
+/** 拼装计划的一条：一个 step 段的 live 消息块，或一条摘要行（二选一） */
+type PlanEntry =
+  | { live: LiveMessage[]; summary?: undefined }
+  | { live?: undefined; summary: Summary }
+
+/**
+ * 走一遍拼装，产出 live 块与摘要行的交织序列。`assembleContext`（渲染）与
+ * `emittedSummaries`（热区窗口的输入）共用这一份遍历——两处各写一遍的话，
+ * 「窗口数了谁」和「实际渲染了谁」迟早分家
+ */
+function planContext(live: LiveMessage[], summaries: Summary[]): PlanEntry[] {
   const active = summaries.filter((summary) => summary.inContext)
-  if (active.length === 0) return live.map((entry) => entry.message)
-
   const byStep = groupByStep(live)
-  const out: Message[] = []
+  const out: PlanEntry[] = []
   const emitted = new Set<number>()
-
   for (const stepId of stepOrder(byStep, active)) {
     const covering = findCovering(active, stepId)
     if (!covering) {
-      out.push(...(byStep.get(stepId) ?? []))
+      out.push({ live: byStep.get(stepId) ?? [] })
       continue
     }
     // 一条摘要覆盖多个 step 时只发一次，不是每个 step 一遍
     if (emitted.has(covering.id)) continue
     emitted.add(covering.id)
-    out.push(toMessage(covering, bodies.get(covering.id)))
+    out.push({ summary: covering })
   }
   return out
+}
+
+/**
+ * **真正会渲染成消息**的摘要行（按出现顺序、去重）。
+ *
+ * 热区窗口（`hotSummaryIds`）的输入必须是它，不能是「全部在场行」：
+ * 在场但被别的行遮住（同段早位的行先被 `findCovering` 选中）的行不渲染，
+ * 却也计入窗口的话，「看不见的状态变化」就能推动「看得见的渲染」——
+ * 2026-09-23 真机：开库修复 `repairAppliedChains` 在会话重建时把几条被遮住
+ * 的在场行翻成离场，消息一条没变（241→241），在场数却跨过了 `demoteBatch`
+ * 的降级线，热区边界跳了一整批，第 23 条摘要从键变正文，前缀守卫拦下
+ */
+export function emittedSummaries(live: LiveMessage[], summaries: Summary[]): Summary[] {
+  const out: Summary[] = []
+  for (const entry of planContext(live, summaries)) if (entry.summary) out.push(entry.summary)
+  return out
+}
+
+export function assembleContext(
+  live: LiveMessage[],
+  summaries: Summary[],
+  /** 热区摘要的叶子正文，按 summary id。没有的按温区渲染（只给键） */
+  bodies: ReadonlyMap<number, string> = new Map(),
+  /** recall 线索行（cue.ts），turn → 成品行。渲染在此、计算在 send 入口
+   *  （relay 同款：库里消息不动，装配期纯函数贴装——重装配字节一致，
+   *  prefix-guard 不拦）。turn 卸载后 live 块不再出现，cue 随之自然消失 */
+  cues: ReadonlyMap<number, readonly string[]> = new Map(),
+): Message[] {
+  const cuedTurns = new Set<number>()
+  return planContext(live, summaries).flatMap((entry) => {
+    if (entry.summary) return [toMessage(entry.summary, bodies.get(entry.summary.id))]
+    return (entry.live ?? []).map(({ message, turnId }) => {
+      const lines = cues.get(turnId)
+      // 一个 turn 只贴一次（插话轮可能有第二条 user 行）；不复制消息对象
+      if (message.role !== 'user' || !lines || lines.length === 0 || cuedTurns.has(turnId)) return message
+      cuedTurns.add(turnId)
+      return { ...message, parts: [...message.parts, { type: 'text', text: lines.join('\n') }] } satisfies Message
+    })
+  })
 }
 
 /**
@@ -134,7 +181,7 @@ export function hotSummaryIds(
 }
 
 /** step id 升序。live 里已有的，加上摘要覆盖到但一条 live 都不剩的 */
-function stepOrder(byStep: Map<number, Message[]>, active: Summary[]): number[] {
+function stepOrder(byStep: Map<number, LiveMessage[]>, active: Summary[]): number[] {
   const ids = new Set(byStep.keys())
   for (const summary of active) ids.add(summary.coversFrom)
   return [...ids].sort((a, b) => a - b)
@@ -144,12 +191,12 @@ function stepOrder(byStep: Map<number, Message[]>, active: Summary[]): number[] 
  * 按 step 分组。**保持原顺序**——live 按 id 排好序传进来，同一个 step 的消息
  * 在数组里是连续的，push 进去就是对的
  */
-function groupByStep(live: LiveMessage[]): Map<number, Message[]> {
-  const byStep = new Map<number, Message[]>()
+function groupByStep(live: LiveMessage[]): Map<number, LiveMessage[]> {
+  const byStep = new Map<number, LiveMessage[]>()
   for (const entry of live) {
     const bucket = byStep.get(entry.stepId)
-    if (bucket) bucket.push(entry.message)
-    else byStep.set(entry.stepId, [entry.message])
+    if (bucket) bucket.push(entry)
+    else byStep.set(entry.stepId, [entry])
   }
   return byStep
 }

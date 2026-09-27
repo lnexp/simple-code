@@ -29,7 +29,7 @@ export type LessonWriteInput = {
   verified: string
 }
 
-const lessonsDir = (root: string) => join(root, '.simple-code', 'lessons')
+export const lessonsDir = (root: string) => join(root, '.simple-code', 'lessons')
 
 /** name → 合法文件名：小写、空白/下划线折成 -、去非法字符 */
 export function slugifyLessonName(name: string): string {

@@ -213,6 +213,20 @@ describe('openai-chat / buildRequest', () => {
     expect(body()).not.toHaveProperty('system')
   })
 
+  it('历史里的裸串 input 归一后再序列化——arguments 必须能 parse 成对象', () => {
+    // 存量毒：裸串直接 stringify 会发出 '"半截文本"'——合法 JSON 字符串
+    // 但不是对象，提供方按对象取字段直接 500（2026-09-27 test 工作区实案）
+    const wire = wireMessages([
+      {
+        role: 'assistant',
+        parts: [{ type: 'tool_call', id: 't1', name: 'bash', input: '半截文本' }],
+      },
+    ])
+    // wire[0] 是 system（openai 的 system 也是 messages 一员），assistant 在 [1]
+    const fn = (wire[1] as Record<string, any>).tool_calls[0].function
+    expect(JSON.parse(fn.arguments)).toEqual({ _raw: '半截文本' })
+  })
+
   it('必须传 stream_options.include_usage，否则拿不到 usage', () => {
     expect(body().stream_options).toEqual({ include_usage: true })
   })

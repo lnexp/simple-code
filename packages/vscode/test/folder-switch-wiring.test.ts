@@ -2,7 +2,7 @@
 import { act, createElement } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, describe, expect, it } from 'vitest'
-import type { ToWebview } from '../src/protocol.ts'
+import type { ToHost, ToWebview } from '../src/protocol.ts'
 import { App } from '../webview/App.tsx'
 
 /**
@@ -14,12 +14,19 @@ import { App } from '../webview/App.tsx'
  */
 
 let cleanup: (() => void) | null = null
+/** 外发消息的捕获桩（切回恢复要断言 task_open 补基线） */
+const sent: ToHost[] = []
 afterEach(() => {
   cleanup?.()
   cleanup = null
+  sent.length = 0
 })
 
 function mount() {
+  Object.defineProperty(window, 'acquireVsCodeApi', {
+    value: () => ({ postMessage: (msg: unknown) => sent.push(msg as ToHost) }),
+    configurable: true,
+  })
   const host = document.createElement('div')
   document.body.appendChild(host)
   const root = createRoot(host)
@@ -51,6 +58,7 @@ const state = (folder: string, running = false): ToWebview => ({
       presets: [],
   approvalOn: true,
   imagesEnabled: false,
+  contextWindow: 0,
 })
 
 const folders = (active: string): ToWebview => ({
@@ -242,5 +250,109 @@ describe('后台进程条按目录隔离（用户拍板：互不干扰）', () =
       reason: '项目外',
     })
     expect(app.html()).toContain('rm /w/a/y')
+  })
+})
+
+describe('切目录同批消息的守卫（2026-09-23 真机：分支条偶发消失）', () => {
+  it('folders+state+tasks 同一批到达（无渲染间隔）：tasks 用新目录，分支条不丢', () => {
+    const app = mount()
+    app.send(state(A))
+    // 切到 B：宿主 switchTo 的真实时序是 postFolders → attach 的 state →
+    // tasks.rehydrate，三条消息背靠背到达——中间没有 React flush 的机会
+    act(() => {
+      window.dispatchEvent(new MessageEvent('message', { data: folders(B) }))
+      window.dispatchEvent(new MessageEvent('message', { data: state(B) }))
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: {
+            type: 'tasks',
+            folder: B,
+            limit: 3,
+            tasks: [
+              {
+                name: '调研分支',
+                status: 'idle',
+                lastText: '做完了',
+                current: null,
+                effort: null,
+                effortOverridden: false,
+                contextWindow: 0,
+                approvalOn: true,
+              },
+            ],
+          },
+        }),
+      )
+    })
+    // 修复前：tasks 守卫读旧目录 A，快照被丢，分支条只剩「主干」
+    expect(app.html()).toContain('调研分支')
+  })
+})
+
+describe('切目录恢复任务选中（B 方案：lastBranch 按目录记选中）', () => {
+  const taskState = (name: string) => ({
+    name,
+    status: 'idle' as const,
+    lastText: '',
+    current: null,
+    effort: null,
+    effortOverridden: false,
+    contextWindow: 0,
+    approvalOn: true,
+  })
+  const tasksMsg = (folder: string, names: string[]): ToWebview =>
+    ({ type: 'tasks', folder, limit: 3, tasks: names.map(taskState) })
+
+  /** 点分支条选中任务——同真实交互（click → setBranch + task_open 补基线） */
+  const select = (name: string): void => {
+    const btn = document.querySelector('.branch-strip .branch-open')
+    expect(btn).not.toBeNull()
+    act(() => btn!.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+  }
+
+  it('A 里选中的任务，切到 B 落主任务，切回 A 恢复选中并补 task_open 基线', () => {
+    const app = mount()
+    app.send(state(A))
+    app.send(tasksMsg(A, ['调研分支']))
+    app.send(state(A))
+    select('调研分支')
+    expect(app.html()).toContain('调研分支')
+    // 点击本身就该发一次 task_open（选中即补基线）
+    expect(sent.filter((m) => m.type === 'task_open')).toEqual([{ type: 'task_open', task: '调研分支' }])
+
+    // 切到 B：落主任务（B 没记过选中）
+    app.send(folders(B))
+    const tabsB = document.querySelectorAll('.branch-strip .branch-tab')
+    expect(tabsB[0]?.getAttribute('data-active')).toBe('true')
+
+    // 切回 A：选中立即恢复（不等快照），快照到了再补一次基线（幂等）
+    app.send(folders(A))
+    const tabsA = document.querySelectorAll('.branch-strip .branch-tab')
+    expect(tabsA[0]?.getAttribute('data-active')).toBe('false')
+    app.send(state(A))
+    sent.length = 0
+    app.send(tasksMsg(A, ['调研分支']))
+    expect(sent).toContainEqual({ type: 'task_open', task: '调研分支' })
+  })
+
+  it('离开期间任务被关闭——切回不选中、不发 task_open，落主任务', () => {
+    const app = mount()
+    app.send(state(A))
+    app.send(tasksMsg(A, ['调研分支']))
+    app.send(state(A))
+    select('调研分支')
+    expect(app.html()).toContain('调研分支')
+
+    app.send(folders(B))
+    app.send(state(B))
+    // 离开期间「调研分支」被关掉：切回时的快照里没有它
+    app.send(folders(A))
+    app.send(state(A))
+    sent.length = 0
+    app.send(tasksMsg(A, []))
+    expect(sent.filter((m) => m.type === 'task_open')).toEqual([])
+    // 主任务 tab 激活（任务已被关闭，选中作废）
+    const tabs = document.querySelectorAll('.branch-strip .branch-tab')
+    expect(tabs[0]?.getAttribute('data-active')).toBe('true')
   })
 })

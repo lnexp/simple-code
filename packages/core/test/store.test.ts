@@ -5,7 +5,8 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Message } from '../src/llm/types.ts'
 import { listBucketFiles, resolveBucketFile } from '../src/session/buckets.ts'
-import { MEMORY_RELATIVE, openStore, type Store } from '../src/session/store.ts'
+import { forkTask, scopeOf } from '../src/session/task.ts'
+import { lastRegionLine, MEMORY_RELATIVE, openStore, type Store } from '../src/session/store.ts'
 
 const dirs: string[] = []
 afterEach(async () => {
@@ -92,9 +93,11 @@ describe('落盘与读回', () => {
     store.close()
   })
 
-  it('重启兜底：lastRespondedAt 读最后一个 step 的开始时刻', async () => {
+  it('重启兜底：lastRespondedAt 读最后一轮的完成时刻（开始 + 耗时）', async () => {
     // 提案 §12。正常计时走 session 闭包的 lastResponseAt（响应结束时刻），
-    // 只有重启后那份丢了才读这里。空库返回 null——「没有响应过」和
+    // 只有重启后那份丢了才读这里。口径是完成时刻（2026-09-20 从「最后一个
+    // step 的开始」改来：TTL 按模型配、glm-5.3 是 5 分钟，开始口径会把
+    // 间隔算小、倾向误判过期）。空库返回 null——「没有响应过」和
     // 「响应过但时刻未知」要能区分，后者不存在，前者不能是 0（epoch 零点）
     const dir = await workspace()
     const empty = openStore(dir)
@@ -102,14 +105,19 @@ describe('落盘与读回', () => {
     empty.close()
 
     const store = openStore(dir)
+    const turn = store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('一'), assistantSays('二')])
     const at = store.lastRespondedAt()
-    // 口径是 step 开始时刻，只比现在早、且早不了太多（测试里就几毫秒）。
+    // 没落耗时（elapsed null）退回开始时刻，只比现在早、且早不了太多
+    // （测试里就几毫秒）。
     // null 先用 typeof 挡掉：null 参与大小比较会被强转成 0，比较断言挡不住它
     expect(typeof at).toBe('number')
     const when = at as number
     expect(when).toBeLessThanOrEqual(Date.now())
     expect(when).toBeGreaterThan(Date.now() - 60_000)
+    // 落了耗时就得加上：完成时刻 = 开始 + 耗时
+    store.finishTurn(turn, 5 * 60_000)
+    expect(store.lastRespondedAt()).toBe(when + 5 * 60_000)
     store.close()
   })
 
@@ -563,6 +571,7 @@ describe('摘要（3b-1）', () => {
     inContext: true,
     supersededBy: null,
     head: null,
+    owner: null,
     archivePath: null,
     ...over,
   })
@@ -588,6 +597,7 @@ describe('摘要（3b-1）', () => {
       // 这两列卸载时才填
       head: null,
       archivePath: null,
+      owner: null,
     })
     store.close()
   })
@@ -1422,5 +1432,37 @@ describe('regions.jsonl：四个区的诊断记录（提案 §13）', () => {
     expect(first.budget).toBe(238_000) // 比例是拿它当基数算的，缺了这一列没法复算
     expect(typeof first.at).toBe('string') // 唯一能跟 turns/*.jsonl 对上的东西
     store.close()
+  })
+
+  it('行带 owner，lastRegionLine 按会话取尾行——任务视图不串台主任务的数字', async () => {
+    const dir = await workspace()
+    const main = openStore(dir)
+    const m = forkTask(dir, '面板串台')
+    const task = openStore(dir, { task: scopeOf(m) })
+
+    // 主任务和任务交错写（真实时序：两边并发跑，谁装配请求谁追加）
+    main.recordRegions(
+      { overhead: 900, cold: 40, warm: 100, hot: 160, stub: 1_200, floor: 2_000, live: 137_000 },
+      238_000,
+    )
+    task.recordRegions(
+      { overhead: 900, cold: 40, warm: 100, hot: 160, stub: 1_200, floor: 2_000, live: 30_000 },
+      238_000,
+    )
+    main.recordRegions(
+      { overhead: 900, cold: 40, warm: 110, hot: 170, stub: 1_300, floor: 2_000, live: 138_000 },
+      238_000,
+    )
+
+    // 任务视图：跳过主任务的后写行，取到任务自己的
+    expect(lastRegionLine(dir, m.owner)).toMatchObject({ owner: m.owner, live: 30_000 })
+    // 主任务视图：跳过任务的行；无 owner 字段的老行按主任务算
+    expect(lastRegionLine(dir, null)).toMatchObject({ owner: null, live: 138_000 })
+    // 不带 owner 的旧签名 = 主任务（CLI /context 的用法）
+    expect(lastRegionLine(dir)).toMatchObject({ live: 138_000 })
+    // 不存在的会话：null（面板显示暂无，不会拿别人的行凑数）
+    expect(lastRegionLine(dir, 'task-不存在')).toBeNull()
+    main.close()
+    task.close()
   })
 })

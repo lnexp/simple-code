@@ -141,8 +141,12 @@ export function ToolRow({
             </span>
             <span className="approval-reason">{approval.reason}</span>
           </div>
-          {/* 后台文件夹弹的卡：标明来源，不然用户以为当前对话要跑这条 */}
+          {/* 后台文件夹弹的卡：标明来源，不然用户以为当前对话要跑这条。
+              分身任务弹的卡同理——标注任务名（fork-merge.md §3） */}
           {approval.folder && <div className="approval-folder">来自：{approval.folder}</div>}
+          {approval.task && (
+            <div className="approval-folder">来自分身任务「{approval.task}」</div>
+          )}
           <code className="approval-cmd">{approval.command}</code>
           {approval.detail && <div className="approval-detail">触碰：{approval.detail}</div>}
           {countdown && (
@@ -158,7 +162,9 @@ export function ToolRow({
                   ? `${approval.always.lead} *`
                   : approval.always.kind === 'nonpath'
                     ? `${approval.always.lead} 的第 ${approval.always.from} 位参数起不是路径`
-                    : `${approval.always.dir}/*`}
+                    : approval.always.kind === 'paths'
+                      ? approval.always.dirs.map((d) => `${d}/*`).join('、')
+                      : `${approval.always.dir}/*`}
               </code>
             </div>
           )}
@@ -173,12 +179,14 @@ export function ToolRow({
             {approval.always && (
               <button
                 type="button"
-                className="approval-allow"
-                onClick={() => onReply(approval.id, 'always', approval.folder)}
-              >
-                始终允许
-              </button>
-            )}
+              className="approval-allow"
+              onClick={() => onReply(approval.id, 'always', approval.folder)}
+            >
+              {approval.always.kind === 'paths'
+                ? `始终允许这 ${approval.always.dirs.length} 个目录`
+                : '始终允许'}
+            </button>
+          )}
             <button
               type="button"
               className="approval-deny"

@@ -38,6 +38,13 @@ export function openDb(path: string): Db {
   // WAL：崩溃一致性的前提。默认的 rollback journal 在 kill -9 时也能恢复，
   // 但 WAL 下读不阻塞写——第 3 步后台摘要要一边读一边写
   db.exec('PRAGMA journal_mode = WAL')
+  // **刻意不设 busy_timeout**（node:sqlite 默认 0，撞写锁立即抛）：等待是
+  // 同步阻塞，同进程双连接（对话 + 任务 session，task-v3）下锁持有者的
+  // COMMIT 排在同一线程队列里永远轮不到——实测设 5000 会把「立即抛 +
+  // 上层退避重试」变成「冻住 5 秒/次」，三次重试 UI 卡 15 秒（2026-09-23）。
+  // 跨进程竞争在文件锁层就被 LockHeldError 拒了，到不了这里。同进程的
+  // 正解在上层：捕获 database is locked 后让出线程退避重试（tasks.ts
+  // ensureSession）
   // NORMAL 而不是 FULL：FULL 每次 commit 都 fsync，我们每条消息一次事务，
   // 那会把每轮对话变成几十次 fsync。WAL + NORMAL 下丢的最多是最后几次
   // commit，且**不会损坏数据库**——我们能承受丢最后一条消息，不能承受库坏

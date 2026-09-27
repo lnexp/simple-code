@@ -2,7 +2,7 @@
   "name": "SimpleCode",
   "displayName": "SimpleCode",
   "description": "在侧边栏里跑 simple-code agent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "icon": "assets/marketplace-icon.png",
   "type": "module",
   "publisher": "lnexp",
@@ -13,6 +13,9 @@
   "engines": {
     "vscode": "^1.106.0"
   },
+  "extensionKind": [
+    "workspace"
+  ],
   "categories": [
     "AI"
   ],
@@ -55,7 +58,9 @@
     "engines.vscode 1.106 是 secondarySidebar 正式可用的下限（1.97-1.105 藏在",
     "contribSecondarySideBar 提案后面，装老版本会静默回落进 Explorer）。"
   ],
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "viewsContainers": {
       "activitybar": [

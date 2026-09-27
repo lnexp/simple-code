@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { Message } from '../src/llm/types.ts'
 import {
   assembleContext,
+  emittedSummaries,
   hotSummaryIds,
   type LiveMessage,
   type Summary,
@@ -22,6 +23,7 @@ const at = (turnId: number, role: Message['role'], text: string): LiveMessage =>
 const summary = (
   over: Partial<Summary> & Pick<Summary, 'id' | 'coversFrom' | 'coversTo'>,
 ): Summary => ({
+  owner: null,
   level: 0,
   name: '',
   text: `摘要 ${over.id}`,
@@ -190,6 +192,33 @@ describe('分辨率梯度：热区展开正文，其余只给键', () => {
     expect(out[1]).toContain('## 用户要求') // 热的展开了
     expect(out[0]).not.toContain('## 用户要求') // 温的没有
     expect(out[0]).toContain('摘要 1') // 但键还在，不是消失了
+  })
+
+  describe('emittedSummaries：热区窗口只数真正渲染的行', () => {
+    // 2026-09-23 真机回归（ai-legal-advisor，prefix-break 12:54:38）：
+    // 11 条可见 L0 + 1 条被遮住的在场行。开库修复把被遮住的行翻成离场，
+    // 消息一条没变（241→241），旧口径的在场数却从 12 跨到 11、越过
+    // demoteBatch 的降级线——热区边界跳一整批，第 23 条摘要从键变正文
+    const rows = (shadowedInContext: boolean): Summary[] => [
+      ...Array.from({ length: 11 }, (_, i) => summary({ id: i + 1, coversFrom: i + 1, coversTo: i + 1 })),
+      // 与 5 号同段、排在它后面：findCovering 永远选 5 号，这条在场但不渲染
+      summary({ id: 12, coversFrom: 5, coversTo: 5, inContext: shadowedInContext }),
+    ]
+
+    it('被遮住的在场行不进 emittedSummaries', () => {
+      expect(emittedSummaries([], rows(true)).map((s) => s.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+    })
+
+    it('被遮住的行翻转 in_context，热区窗口不动', () => {
+      const opts = { hotLeaves: 2, batch: 10 }
+      const before = hotSummaryIds(emittedSummaries([], rows(true)), opts)
+      const after = hotSummaryIds(emittedSummaries([], rows(false)), opts)
+      expect(after).toEqual(before)
+      // 对照：旧口径（数全部在场行）确实会被这一翻推动——12 条降 10 条留 2，
+      // 11 条全热，边界跳一整批
+      expect(hotSummaryIds(rows(true), opts).size).toBe(2)
+      expect(hotSummaryIds(rows(false), opts).size).toBe(11)
+    })
   })
 
   it('**对照：叶子文件缺失时退回温区渲染，不是空洞**', () => {

@@ -327,6 +327,22 @@ describe('config / 工作区黑名单', () => {
     expect(loaded.warnings).toEqual([])
     expect(loaded.config.loop.maxIterations).toBe(3)
   })
+
+  it('工作区配置路径撞上全局配置路径 → 只按全局读一遍，不剥黑名单', async () => {
+    // 空工作区时面板 folderList 兜底成 home，<home>/.simple-code/settings.json
+    // 就是全局配置本身。修复前：同一文件再按工作区读一遍 → provider/model/
+    // baseUrl/apiKey 被剥 → 「providers.p.baseUrl undefined」校验失败。
+    // Remote-SSH 实测：远端窗口刚连上（还没开文件夹）就是这么炸的
+    const home = join(root, 'home')
+    const cfgPath = join(home, '.simple-code', 'settings.json')
+    await mkdir(join(home, '.simple-code'), { recursive: true })
+    await writeFile(cfgPath, JSON.stringify(MINIMAL))
+    const loaded = await loadConfig(home, { globalPath: cfgPath })
+    expect(loaded.config.provider).toBe('p')
+    expect(loaded.config.providers.p?.baseUrl).toBe('https://api.test')
+    expect(loaded.config.providers.p?.apiKey).toBe('sk-literal')
+    expect(loaded.warnings).toEqual([])
+  })
 })
 
 describe('config / 模型级请求偏好覆盖全局', () => {

@@ -28,6 +28,7 @@ const says = (role: Message['role'], text: string): Message => ({
 })
 
 const summary = (over: Partial<Summary> & Pick<Summary, 'coversFrom' | 'coversTo'>): Summary => ({
+  owner: null,
   id: over.coversFrom,
   level: 0,
   name: '',
@@ -80,8 +81,8 @@ async function sentMessages(options: {
       lastResponseAt: () => null,
       markResponded: () => {},
       stubTokens: 1e9,
-    unloadedSteps: () => new Set<number>(),
-    floorTokens: 1,
+      stubTurns: 1e9,
+        floorTokens: 1,
       safetyMargin: 0,
       clipThresholdChars: 1_000,
       keepHeadChars: 20,
@@ -96,6 +97,7 @@ async function sentMessages(options: {
       recordRegions: () => {},
       pruneMessages: () => {},
       remap: () => {},
+      cues: () => new Map(),
       withTurns: (msgs: Message[]): LiveMessage[] =>
         msgs.map((message, index) => ({
           message,

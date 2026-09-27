@@ -35,3 +35,6 @@ request*.json
 # 构建产物：build.mjs 从仓库根拷进包目录（marketplace 页面/许可用），权威版本在根目录
 packages/vscode/README.md
 packages/vscode/LICENSE
+
+# JetBrains IDE 配置（本机开发环境，不入库）
+.idea/

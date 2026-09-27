@@ -1,5 +1,11 @@
 import { vi } from 'vitest'
 
+// 测试环境剥掉宿主注入的分流变量——vitest 若从 agent 的 bash 子进程启动
+// （$SIMPLE_CODE_MEMORY_DIR 会随 env 传进来），findMemoryRoot 的 env 优先
+// 分支会把 fixture 测试指到真库上（2026-09-22 全套测试 10 红的根因）
+delete process.env.SIMPLE_CODE_MEMORY_DIR
+
+
 /**
  * 全局 setup：跑测试时挡掉运行日志的真写盘。
  *

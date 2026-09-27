@@ -17,8 +17,14 @@ export class LockHeldError extends Error {
   readonly path: string
   readonly holder: number
 
-  constructor(path: string, holder: number) {
-    super(`该目录已被另一个 simple-code 进程占用（pid ${holder}）：${path}`)
+  constructor(path: string, holder: number, holderStartedAt: string | null) {
+    super(
+      `该目录已被另一个 simple-code 进程占用（pid ${holder}` +
+        (holderStartedAt ? `，启动于 ${holderStartedAt}` : '') +
+        `）：${path}\n` +
+        `若是刚 reload 或断线重连过，多半是旧扩展宿主残留——VS Code 回收它最长要 3 小时。` +
+        `确认没有其他窗口在用这个目录后，kill ${holder} 即可释放，再重试打开。`,
+    )
     this.name = 'LockHeldError'
     this.path = path
     this.holder = holder
@@ -52,7 +58,8 @@ export async function acquireLock(folderPath: string, opts: { waitMs?: number } 
     await mkdir(dirname(path), { recursive: true })
     existing = await readLock(path)
     if (!(existing && isAlive(existing))) break
-    if (Date.now() >= deadline) throw new LockHeldError(path, existing.pid)
+    if (Date.now() >= deadline)
+      throw new LockHeldError(path, existing.pid, existing.startedAt)
     await new Promise((resolve) => setTimeout(resolve, POLL_MS))
   } while (true)
 

@@ -98,6 +98,46 @@ export function astSegments(cmd: string): AstSegment[] | null {
   return out.length > 0 ? out : null
 }
 
+/** 沿祖先链找承载本命令重定向的 redirected_statement。
+ *
+ * 直接父节点就是它的情形最简单（`cat x > f`）；但 tree-sitter-bash 会把
+ * 「列表 / 管道 / 复合语句里最右那条命令」的重定向抬到包住整个构造的
+ * redirected_statement 上：
+ *   a && b > f   => (redirected_statement body: (list a b) redirect: f)
+ *   a | b > f    => redirect 挂在 pipeline 上
+ *   { a; } > f   => body 是 compound_statement
+ * 只往上看一层就会漏掉 b 的重定向目标——`cd X && echo x > /etc/passwd`、
+ * `cd X && echo x > .env` 全放行（2026-09-21 修，实测矩阵见 note
+ * approval-redirect-hoisting-hole）。判据：本命令必须是那个 body 里最右
+ * 的命令——shell 语义上重定向只作用于最右一条，`a > f && b` 的 f 归 a，
+ * `a && b > f` 的归 b。
+ *
+ * 找第一个 redirected_statement 祖先就够了：它是最近的，不匹配说明本命令
+ * 不是被重定向的那条。 */
+function redirectHostOf(node: SyntaxNode): SyntaxNode | null {
+  for (let up = node.parent; up; up = up.parent) {
+    if (up.type !== 'redirected_statement') continue
+    const body = up.namedChild(0)
+    return body && lastCommandWithin(body)?.id === node.id ? up : null
+  }
+  return null
+}
+
+/** body 里最右的 command 节点。只沿结构容器下行，不钻进 $() 之类的替换
+ * 内部——`a $(rm x) > f` 的重定向归 a，不归替换里的 rm */
+const CONTAINER_TYPES = new Set(['list', 'pipeline', 'compound_statement', 'subshell', 'command_elements'])
+function lastCommandWithin(node: SyntaxNode): SyntaxNode | null {
+  if (node.type === 'command') return node
+  let last: SyntaxNode | null = null
+  for (let i = 0; i < node.childCount; i++) {
+    const c = node.child(i)
+    if (!c) continue
+    if (c.type === 'command') last = c
+    else if (CONTAINER_TYPES.has(c.type)) last = lastCommandWithin(c) ?? last
+  }
+  return last
+}
+
 /** command 节点 → (lead, items)。跳过的东西各有理由：
  * - variable_assignment（FOO=1 前缀）：不是参数
  * - command_substitution / process_substitution：内部命令已被
@@ -116,16 +156,17 @@ function commandToSegment(node: SyntaxNode): AstSegment | null {
     }
   }
   flatten(node)
-  // file_redirect 是 command 的兄弟节点（redirected_statement 的直接子
-  // 节点），不收进来的话 `cat x > /etc/passwd` 的重定向目标整个漏扫——
-  // 读写分离全靠它标 write。heredoc_redirect 也是这个位置的兄弟
-  const host = node.parent?.type === 'redirected_statement' ? node.parent : null
+  // file_redirect 是 command 的兄弟节点（挂在 redirected_statement 上），
+  // 不收进来的话 `cat x > /etc/passwd` 的重定向目标整个漏扫——读写分离
+  // 全靠它标 write。heredoc_redirect 也是这个位置的兄弟
+  const host = redirectHostOf(node)
   if (host) {
     for (let i = 0; i < host.childCount; i++) {
       const c = host.child(i)
-      // command 自身已在上面 flatten 过，别重复收。注意 child() 每次返回
-      // 新的 JS 包装对象，=== 比不了身份，得用 AST 节点 id
-      if (c && c.id !== node.id) children.push(c)
+      // 只收重定向：host 可能是包住 list / pipeline / 复合语句的节点
+      // （见 redirectHostOf），把结构子节点收进来会把整条命令串当路径判
+      if (c?.type !== 'file_redirect' && c?.type !== 'heredoc_redirect') continue
+      children.push(c)
     }
   }
 
@@ -142,9 +183,13 @@ function commandToSegment(node: SyntaxNode): AstSegment | null {
         // 不带引号 → body 会被展开：$() 子命令虽已被全量枚举（descendants
         // ofType 不分位置），但 tree-sitter 不解析 body 内的反引号替换
         // （纯文本节点），判不全——标记 unparseable 交给 judge 弹
+        //
+        // 展开字符只认 $、反引号、转义反斜杠（\\ 会吃掉一个、\ 换行续行）。
+        // 裸 ( 不展开：原来字符类写成 [$(]，凡 body 里有函数调用的补丁
+        // （几乎全部）都误报 unquoted heredoc（2026-09-21 修）
         const start = c.namedChild(0)?.text ?? ''
-        if (!/^['"]/.test(start) && /[$(`]/.test(c.text)) {
-          unparseable = '不带引号的 heredoc body 含 $/反引号，会被 shell 展开'
+        if (!/^['"]/.test(start) && /(\$|`|\\\n|\\[\\$`])/.test(c.text)) {
+          unparseable = '不带引号的 heredoc body 含 $/反引号/转义反斜杠，会被 shell 展开'
         }
         break
       }

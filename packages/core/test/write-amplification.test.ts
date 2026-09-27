@@ -76,7 +76,7 @@ const CONFIG = {
   // 摘要请求会走 fetch 打到 example.invalid 上添乱
   // 见 merge-e2e 里同一处的说明：夹具太短，用生产默认阈值裁不动
   memory: {
-    unloadTargetRatio: 0.25,
+    unloadTargetRatio: 0.001,
     keepHeadChars: 40,
     idleSummarizeDelayMs: 0,
     clipThresholdChars: 0,

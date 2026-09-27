@@ -1,32 +1,57 @@
 import { join } from 'node:path'
 import * as vscode from 'vscode'
+import { ensureShims, type ShimEntry } from '@simple-code/core'
 import { startLspBridge } from './lsp-bridge.ts'
 import { ChatPanel } from './panel.ts'
 
-export function activate(context: vscode.ExtensionContext): void {
-  // 网络工具的 bash 形态（web-tools §10）：bin 与 extension.cjs 同目录
-  // （build.mjs 拷进 dist），bash 工具经白名单透传给子进程。模型用法：
-  // "$SIMPLE_CODE_WEBFETCH" <url> | head。放 process.env 而不是塞进
-  // bash 配置——core 不认识扩展路径，环境变量是宿主注入的干净通道
-  process.env.SIMPLE_CODE_WEBFETCH = join(__dirname, 'webfetch.js')
-  process.env.SIMPLE_CODE_WEBSEARCH = join(__dirname, 'websearch.js')
-  process.env.SIMPLE_CODE_MCP = join(__dirname, 'mcp.js')
-  // sc —— agent 一次性 CLI（父 agent 派子 agent / 管道件）。
-  // "$SIMPLE_CODE_SC" --root <项目根> -q -t 600 "任务"。headless 审批
-  // 恒拒绝，权限边界=--root 值（写在命令里，过本层审批）
-  process.env.SIMPLE_CODE_SC = join(__dirname, 'sc.js')
-  process.env.SIMPLE_CODE_APPLY_PATCH = join(__dirname, 'apply-patch.js')
-  process.env.SIMPLE_CODE_MEMORY = join(__dirname, 'memory.js')
-  process.env.SIMPLE_CODE_LESSON = join(__dirname, 'lesson.js')
-  process.env.SIMPLE_CODE_NOTE = join(__dirname, 'note.js')
-  process.env.SIMPLE_CODE_EVENT = join(__dirname, 'event.js')
-  process.env.SIMPLE_CODE_SKILL = join(__dirname, 'skill.js')
-  // LSP 桥（lsp-bridge.ts）：bin POST 到本机桥，桥调宿主现成的
-  // execute*Provider。审批侧 "$SIMPLE_CODE_*" 自家 bin 规则 0 天然放行
-  //（LSP 只读、固定语义，非 APPLY_PATCH 那种内容决定路径的例外）
-  process.env.SIMPLE_CODE_LSP = join(__dirname, 'lsp.js')
+/**
+ * 全部 bin 名（→ dist 里同名 .js）。DOC 例外：只读的文档，不是可执行。
+ * LSP（lsp-bridge.ts）：bin POST 到本机桥，桥调宿主现成的
+ * execute*Provider——审批侧 "$SIMPLE_CODE_*" 自家 bin 规则 0 天然放行
+ * （LSP 只读、固定语义，非 APPLY_PATCH 那种内容决定路径的例外）
+ */
+const BINS = [
+  'WEBFETCH', 'WEBSEARCH', 'MCP', 'APPLY_PATCH', 'MEMORY', 'LESSON',
+  'NOTE', 'EVENT', 'SKILL', 'LSP',
+] as const
+
+/**
+ * 工具变量接线（web-tools §10 的同路注入）：bash 工具经白名单透传给
+ * 子进程，模型用法 `"$SIMPLE_CODE_WEBFETCH" <url>`。放 process.env 而
+ * 不是塞进 bash 配置——core 不认识扩展路径，环境变量是宿主注入的干净通道。
+ *
+ * 默认直指 dist 里的 bin（shebang 找系统 node）；shim 写得进
+ * （~/.simple-code/bin/，宿主内置 Node 跑，见 core shims.ts 头注释）
+ * 就改指 shim——没装 node 的机器工具照用。探测约 150ms，一次性启动成本。
+ */
+async function wireBins(): Promise<void> {
+  const kebab = (name: string) => name.toLowerCase().replaceAll('_', '-')
+  const entries: ShimEntry[] = [
+    ...BINS.map((name) => ({
+      name,
+      bin: `sc-${kebab(name)}`,
+      script: join(__dirname, `${kebab(name)}.js`),
+    })),
+    // sc：终端入口（~/.simple-code/bin/sc）+ 父 agent 派子 agent 的一次性
+    // CLI（"$SIMPLE_CODE_SC" --root <项目根> -q "任务"，headless 审批恒拒绝）
+    { name: 'SC', bin: 'sc', script: join(__dirname, 'sc.js') },
+  ]
+  let resolved: Record<string, string>
+  try {
+    resolved = await ensureShims(entries)
+  } catch {
+    // bin 目录写不进（只读 HOME 之类）——回落直指脚本
+    resolved = Object.fromEntries(entries.map(({ name, script }) => [name, script]))
+  }
+  for (const { name } of entries) {
+    process.env[`SIMPLE_CODE_${name}`] = resolved[name]
+  }
   // 教程（self.md）：同 CLI 侧 run.ts injectLocalTools，指向 dist 拷贝
   process.env.SIMPLE_CODE_DOC = join(__dirname, 'self.md')
+}
+
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  await wireBins()
   const lspServer = startLspBridge()
 
   // 双注册互斥的开关，两个条件取或，任一命中走活动栏兜底：

@@ -7,7 +7,8 @@
 //   webview-asset-cache             webview 外链缓存（已用内容 hash 文件名解决）
 // 每步都对人——五步少一步就「装机成功但行为没变」。固化成一条命令。
 //
-// 用法：packages/vscode 下 `pnpm run deploy`。
+// 用法：packages/vscode 下 `pnpm run deploy`；packages/companion 下
+// `pnpm run deploy`（deploy.mjs companion——deploy script 已带参）。
 // 装机目标默认 ~/.vscode/extensions（用户拍板：以后主力环境是 VS Code，
 // Cursor 不再装），可用 SIMPLE_CODE_EXTENSIONS_DIR 覆盖。
 
@@ -18,7 +19,8 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const pkgDir = fileURLToPath(new URL('../packages/vscode', import.meta.url))
+const pkgName = process.argv[2] ?? 'vscode'
+const pkgDir = fileURLToPath(new URL(`../packages/${pkgName}`, import.meta.url))
 const manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'))
 // 扩展目录名规则：publisher.name-version（name 转小写）
 const extDirName = `${manifest.publisher}.${manifest.name.toLowerCase()}-${manifest.version}`
@@ -51,7 +53,8 @@ run('rsync', ['-a', '--delete', `${layer}/`, `${extRoot}/`])
 
 // 5. md5 核对关键产物——装机验证以产物为准（教训 verify-install-via-jsonl-not-self-read）
 const md5 = (p) => createHash('md5').update(readFileSync(p)).digest('hex')
-const checks = ['dist/extension.cjs', 'dist/webview.current']
+// webview 是主扩展独有的（伴生扩展没有 UI），核对清单按包给
+const checks = pkgName === 'vscode' ? ['dist/extension.cjs', 'dist/webview.current'] : ['dist/extension.cjs']
 let ok = true
 for (const rel of checks) {
   const local = join(pkgDir, rel)
@@ -78,26 +81,9 @@ for (const rel of checks) {
 
 rmSync(stage, { recursive: true, force: true })
 
-// 稳定 symlink：~/.simple-code/bin/sc → 扩展目录 dist 下的
-// 对应 bin。扩展目录名带版本号，人的 PATH 不该跟着版本改——deploy 每次
-// 重指。终端裸用还需 export SIMPLE_CODE_API_KEY（key 是 ${ENV} 引用）
-{
-  const binDir = join(homedir(), '.simple-code/bin')
-  for (const [name, file] of [['sc', 'sc.js']]) {
-    const target = join(extRoot, `dist/${file}`)
-    const link = join(binDir, name)
-    if (!existsSync(target)) {
-      console.error(`[deploy] ✗ ${target} 不存在——查 build.mjs 的 bin 清单`)
-      ok = false
-      continue
-    }
-    mkdirSync(binDir, { recursive: true })
-    try { unlinkSync(link) } catch { /* 不存在最好 */ }
-    symlinkSync(target, link)
-    console.log(`[deploy] ✓ ${link} → ${target}`)
-  }
-  console.log(`[deploy] PATH 加 ${join(homedir(), '.simple-code/bin')} 即可裸用`)
-}
+// ~/.simple-code/bin/ 的 sc 不再由 deploy 建软链——扩展激活时的 shim
+// 接管（core src/shims.ts：宿主内置 Node 优先、系统 node 兜底，激活
+// 每次重写，路径永远新鲜）。deploy 建的软链会和 shim 互相覆盖打架
 if (!ok) { console.error('[deploy] 核对失败——上面的差异要处理，别 reload'); process.exit(1) }
 console.log(`[deploy] 完成。Cmd+Shift+P → Reload Window 生效`)
 console.log(`[deploy] 注：reload 后行为仍没变，先跑 verify-install 教训那套（jsonl 仲裁），再怀疑缓存`)

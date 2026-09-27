@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { AgentEvent } from '../src/events.ts'
 import type { LLMEvent } from '../src/llm/events.ts'
 import { LLMStreamError } from '../src/llm/protocol.ts'
@@ -7,6 +10,7 @@ import type { Summary } from '../src/loop/assemble.ts'
 import type { RegionSizes } from '../src/loop/regions.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
 import { type LoopContext, type LoopDeps, run } from '../src/loop/run.ts'
+import { relayHit, relaySave } from '../src/loop/relay-cache.ts'
 import { estimateMessageTokens } from '../src/loop/tokens.ts'
 import type { Tool, ToolContext, ToolOutput } from '../src/tools/types.ts'
 import { makePng, mulberry32 } from './make-png'
@@ -20,7 +24,6 @@ const usage = (): Usage => ({
   cacheReadInputTokens: 0,
   reasoningTokens: 0,
 })
-
 /** 说一句话就结束 */
 const says = (text: string): StreamEvent[] => [
   { type: 'text_start' },
@@ -36,22 +39,6 @@ const calls = (id: string, name = 'bash', input: unknown = { command: 'ls' }): S
   { type: 'tool_input_end', id, name, input },
   { type: 'finish', reason: 'tool-calls', usage: usage() },
 ]
-
-/**
- * 按脚本逐轮出流。**记录每轮收到的 request**——「中断后不空转」这类断言
- * 靠的就是请求次数，不是事件内容
- */
-function scriptedStream(rounds: StreamEvent[][]) {
-  const seen: Request[] = []
-  const stream = (request: Request): AsyncIterable<StreamEvent> => {
-    const round = rounds[seen.length] ?? []
-    seen.push(structuredClone(request))
-    return (async function* () {
-      for (const ev of round) yield ev
-    })()
-  }
-  return { stream, seen, requests: () => seen.length }
-}
 
 const fakeTool = (name: string, run?: (ctx: ToolContext) => Promise<ToolOutput>): Tool => ({
   name,
@@ -74,6 +61,8 @@ async function drive(options: {
   messages?: Message[]
   tools?: Tool[]
   signal?: AbortSignal
+  /** 插话软中断持有者（LoopContext.interject）——插话转后台用 */
+  interject?: LoopContext['interject']
   maxIterations?: number
   lastFinish?: LoopContext['lastFinish']
   onEvent?: (ev: AgentEvent, ctx: LoopContext) => void
@@ -86,6 +75,8 @@ async function drive(options: {
   reloadSystem?: LoopDeps['reloadSystem']
   /** 注入 deps.kickSummary，观测水位检查催没催摘要 */
   kickSummary?: LoopDeps['kickSummary']
+  /** 注入 deps.taskOverflow（分支跑超）——观测 loop 顶的闸 */
+  taskOverflow?: LoopDeps['taskOverflow']
 }): Promise<Harness> {
   const scripted = scriptedStream(options.rounds ?? [])
   const tools = options.tools ?? [fakeTool('bash')]
@@ -106,6 +97,7 @@ async function drive(options: {
     },
     maxIterations: options.maxIterations ?? 10,
     ...(options.reloadSystem ? { reloadSystem: options.reloadSystem } : {}),
+    ...(options.taskOverflow ? { taskOverflow: options.taskOverflow } : {}),
     ...(options.kickSummary ? { kickSummary: options.kickSummary } : {}),
     ...(options.memory ? { memory: options.memory } : {}),
   }
@@ -114,6 +106,7 @@ async function drive(options: {
     tasks: [],
     deps,
     signal: options.signal ?? new AbortController().signal,
+    ...(options.interject ? { interject: options.interject } : {}),
     ...(options.lastFinish ? { lastFinish: options.lastFinish } : {}),
     ...(options.lastUsage ? { lastUsage: options.lastUsage } : {}),
   }
@@ -182,12 +175,84 @@ describe('基本回合', () => {
     expect(h.ctx.messages[2]?.parts).toHaveLength(2)
   })
 
+  it('插话软中断：fire 命中正在执行的工具，同批后续工具拿到换新后的信号', async () => {
+    // session 排队路径的语义（session.ts）：fire 当前这把 + 立刻换新。
+    // 这里验证 loop 侧的关节——执行时取 .current.signal，且只有当时
+    // 正在跑的那个工具收到已开火的信号
+    const holder: NonNullable<LoopContext['interject']> = { current: new AbortController() }
+    const seen: (AbortSignal | undefined)[] = []
+    const tool = fakeTool('bash', async (tctx) => {
+      seen.push(tctx.interjectSignal)
+      await new Promise((r) => setTimeout(r, 250)) // 模拟长命令
+      return { output: 'ok', exitCode: 0, isError: false }
+    })
+    setTimeout(() => {
+      const fired = holder.current
+      holder.current = new AbortController()
+      fired.abort()
+    }, 100) // 第一个工具执行中开火
+    await drive({
+      rounds: [
+        [
+          ...calls('t1').slice(0, 3),
+          ...calls('t2').slice(0, 3),
+          { type: 'finish', reason: 'tool-calls', usage: usage() },
+        ],
+        says('好'),
+      ],
+      tools: [tool],
+      interject: holder,
+    })
+    expect(seen).toHaveLength(2)
+    expect(seen[0]?.aborted).toBe(true) // 正在执行的：收到开火
+    expect(seen[1]?.aborted).toBe(false) // 换新后：干净信号
+  })
+
   it('未知工具名变成 isError 结果，不打断 loop', async () => {
     const h = await drive({ rounds: [calls('t1', 'nosuch'), says('那我换个方式')] })
 
     expect(h.requests()).toBe(2) // loop 没被打断
     expect(h.ctx.messages[2]?.parts[0]).toMatchObject({ isError: true })
     expect(kinds(h.events)).toContain('tool_error')
+  })
+
+  /**
+   * 大小写兜底。**不是为模型能力不足做防御，是外部输入不可靠**：
+   * 2026-09-20 实测某渠道一段时间内把 `bash` 采样成 `Bash`（同一轮里
+   * 两种写法混用），整轮工具调用全部 unknown tool，还撞上死循环熔断
+   */
+  it('**工具名大小写不匹配时回退命中**（渠道把 bash 写成 Bash）', async () => {
+    let ran = 0
+    const tool = fakeTool('bash', async () => {
+      ran++
+      return { output: 'ok', exitCode: 0, isError: false }
+    })
+    const h = await drive({
+      rounds: [calls('t1', 'Bash'), says('好了')],
+      tools: [tool],
+    })
+
+    expect(ran).toBe(1) // 真跑了，不是报「没有这个工具」
+    expect(h.ctx.messages[2]?.parts[0]).toMatchObject({ isError: false })
+    expect(kinds(h.events)).not.toContain('tool_error')
+  })
+
+  it('大小写兜底只在精确匹配失败后生效，不影响同名精确命中', async () => {
+    const hits: string[] = []
+    const lower = fakeTool('bash', async () => {
+      hits.push('lower')
+      return { output: 'lower', exitCode: 0, isError: false }
+    })
+    const upper = fakeTool('Bash', async () => {
+      hits.push('upper')
+      return { output: 'upper', exitCode: 0, isError: false }
+    })
+    await drive({
+      rounds: [calls('t1', 'Bash'), says('好了')],
+      tools: [lower, upper],
+    })
+
+    expect(hits).toEqual(['upper'])
   })
 })
 
@@ -538,6 +603,17 @@ const truncated = (text: string): StreamEvent[] => [
   { type: 'finish', reason: 'length', usage: usage() },
 ]
 
+describe('任务跑超（task-v3 配额闸）', () => {
+  it('命中即收口：一个 error 事件、不发请求、排队输入不消费', async () => {
+    const h = await drive({
+      rounds: [says('做完了')],
+      taskOverflow: () => '分支跑超预留编号段（turns 的 id 已到 10000，段上限 10000），已自动停止——只能合并或丢弃，不能继续',
+    })
+    expect(h.events.filter((e) => e.type === 'error')).toHaveLength(1)
+    expect(h.requests()).toBe(0)
+  })
+})
+
 describe('输出被 max_tokens 截断', () => {
   it('续写而不是当成正常结束', async () => {
     // 当成正常结束的话用户看到话说一半就没了；这里选择续写
@@ -667,6 +743,13 @@ const stubby = (seq: number): Message => ({
 })
 
 /** 记下每次卸载请求和摘要启用请求，并返回假的归档路径 */
+/**
+ * 压缩点（缓存过期触发）。前缀不变式（2026-09-23）之后摘要进场、合并生效
+ * 只在压缩点发生——测它们的用例要先让这一步成为压缩点
+ */
+const COMPACTION_POINT = { lastResponseAt: () => 0, now: () => 1e12 } as const
+
+
 function spyMemory(over: Partial<NonNullable<LoopDeps['memory']>> = {}) {
   const calls: number[][] = []
   const activated: number[] = []
@@ -674,8 +757,12 @@ function spyMemory(over: Partial<NonNullable<LoopDeps['memory']>> = {}) {
   const cold: number[][] = []
   const regions: { sizes: RegionSizes; budget: number }[] = []
   const memory: LoopDeps['memory'] = {
+    cues: () => new Map(),
     contextWindow: 1000,
-    targetRatio: 0.4,
+    // compaction-v2：targetRatio 是保底区的比例下限（max(floorTokens, 预算×比例)
+    // 再夹 20% 上限）。0.001 让 floor ≈ floorTokens=1（预算 900 下 0.9 取整到 1）
+    // ——保持「只圈住最后一个 step」的旧口径，保底语义的用例自己覆盖
+    targetRatio: 0.001,
     // 时间维度的默认值＝「不触发」：lastResponseAt 为 null 时 isCacheStale
     // 恒 false，既有用例（预算触发那些）不受影响。要测 stale 的自己覆盖
     cacheTtlMs: 3 * 60 * 60 * 1000,
@@ -685,8 +772,8 @@ function spyMemory(over: Partial<NonNullable<LoopDeps['memory']>> = {}) {
     floorTokens: 1,
     // 默认大值=水位检查不触发；要测三级递进第二级的用例自己覆盖成小值
     stubTokens: 1e9,
-    unloadedSteps: () => new Set<number>(),
-    // 测试里关掉余量，让预算就是 contextWindow - maxTokens，好算
+    stubTurns: 1e9,
+        // 测试里关掉余量，让预算就是 contextWindow - maxTokens，好算
     safetyMargin: 0,
     keepHeadChars: 20,
     // 阈值压到 0：这些用例造的夹具是几十到几百字符的合成消息，
@@ -763,42 +850,30 @@ describe('上下文卸载', () => {
     expect(estimated).toBeLessThan(1500 * 0.5) // 且确实是大幅下降，不是蹭过线
   })
 
-  it('target 的基数是预算，不是窗口', async () => {
-    // 提案 §10.5。实现一度写成 `contextWindow * targetRatio`；改成预算之后
-    // 全量 730 条一条没红——**这个基数当时是零覆盖的**，所以补这条。
+  it('保底区 = max(floorTokens, 预算 × targetRatio)，再夹 20% 上限（compaction-v2 §0.2）', async () => {
+    // 原来这个位置测的是「卸载 target 的基数是预算」（35% 时代）——v2 没有
+    // target 了（保底区外全卸），基数问题换到保底区上：比例参与的是 floor。
+    // 预算 600（窗口 1000 − maxTokens 400），四条 300 + 短 user：
     //
-    // 两个基数只有 maxTokens 能分开（窗口 1000、margin 0）：
-    //   maxTokens 400 → 预算 600 → target 300   （窗口基数会得 500）
-    // 四条 300 的消息，卸一条省 ~250（存根还剩头部+归档提示）。从 ~1205 起：
-    //   → 955 → 705 → 455 → 205
-    // target 500 在第 3 条之后就停（455 ≤ 500），target 300 要卸满第 4 条。
-    // **差的就是下标 3 那条。**
-    const m = spyMemory({ targetRatio: 0.5 })
+    // ratio 0.001 → floor = max(1, 0.6) = 1 → 只圈住短消息，四条全卸
+    const m1 = spyMemory({ targetRatio: 0.001 })
     await drive({
       messages: [
         bulky('user', 300),
         bulky('assistant', 300),
         bulky('user', 300),
         bulky('assistant', 300),
-        // 保底区：floorTokens 为 1，只圈得住最后一个 step，上面四条都可卸
         { role: 'user', parts: [{ type: 'text', text: '短' }] },
       ],
-      memory: m.memory,
+      memory: m1.memory,
       rounds: [says('好的')],
       maxTokens: 400,
     })
-
-    expect(m.calls.flat()).toContain(3)
-  })
-
-  it('对照组：同一批消息，预算大了就少卸一条', async () => {
-    // 只改 maxTokens（400 → 20），夹具一个字不动：预算 980 → target 490，
-    // 第 3 条不该再被卸。
-    //
-    // **这条对照组才是证明基数的那一半。** 上面那条单独看，一个「无脑卸光」
-    // 的实现也能过；两条一起才说明卸几条真的随预算走。而窗口基数下两条的
-    // target 都是 500、都卸 3 条——所以变异时上面红、这条绿
-    const m = spyMemory({ targetRatio: 0.5 })
+    expect(m1.calls.flat()).toContain(3)
+    // ratio 0.5 → max(1, 300) = 300，被 20% 上限（600×0.2=120）夹住 →
+    // floor 圈住短消息 + 最后一条 bulky（一条 300 就把 120 撑破，对齐 step
+    // 起点整条保下）→ 卸 0..2，下标 3 保住
+    const m2 = spyMemory({ targetRatio: 0.5 })
     await drive({
       messages: [
         bulky('user', 300),
@@ -807,13 +882,28 @@ describe('上下文卸载', () => {
         bulky('assistant', 300),
         { role: 'user', parts: [{ type: 'text', text: '短' }] },
       ],
-      memory: m.memory,
+      memory: m2.memory,
       rounds: [says('好的')],
-      maxTokens: 20,
+      maxTokens: 400,
     })
-
-    expect(m.calls.flat()).not.toContain(3)
-    expect(m.calls.flat()).toContain(2) // 前提：确实卸了东西，不是空集
+    expect(m2.calls.flat()).not.toContain(3)
+    expect(m2.calls.flat()).toContain(2) // 前提：确实卸了东西，不是空集
+    // ratio 1（想要整个预算 600 当保底）→ 同样被 120 夹住：保底区不许
+    // 吞掉预算——不夹的话一条都卸不动，summary-e2e（窗口 3000）当场红过
+    const m3 = spyMemory({ targetRatio: 1 })
+    await drive({
+      messages: [
+        bulky('user', 300),
+        bulky('assistant', 300),
+        bulky('user', 300),
+        bulky('assistant', 300),
+        { role: 'user', parts: [{ type: 'text', text: '短' }] },
+      ],
+      memory: m3.memory,
+      rounds: [says('好的')],
+      maxTokens: 400,
+    })
+    expect(m3.calls.flat()).not.toContain(3)
   })
 
   it('对照组：没到阈值时一条都不卸', async () => {
@@ -878,10 +968,9 @@ describe('上下文卸载', () => {
     expect(JSON.stringify(h.sent[0]?.messages)).toContain('.simple-code/memory/turns/')
   })
 
-  it('**卸载只判冷不激活摘要**——三级递进的一二级解绑（2026-09-12）', async () => {
-    // 原行为：卸载循环里 ready 摘要当场顶替（activated=[7]）。
-    // 改为：卸载只把原文降级成存根（第一级），摘要进场由存根段水位驱动
-    // （activateByStubLevel，第二级）。存根段没超线时 activated 必须是空
+  it('**卸载只判冷不激活摘要**——卸载和进场两个开关解绑', async () => {
+    // 卸载只把原文降级成存根，摘要进场由位置制判定（activateByZone）。
+    // 这里没有 ready 摘要、段也没出存根区，activated 必须是空
     const calls: number[][] = []
     const m = spyMemory({
       unload: (indices) => {
@@ -910,29 +999,53 @@ describe('上下文卸载', () => {
     expect(m.activated).toEqual([]) // 但一二级解绑后不再当场激活
   })
 
-  it('**存根段超线才让摘要进场，最老优先，水位回落即停**', async () => {
-    // 三级递进第二级：原文→存根（第一级，这里直接给存根化消息）→
-    // 水位 >stubTokens → activateSummary 按最老 coversFrom 激活 →
-    // 装配顶替 → 水位回落 → 停手。两条 ready 摘要只该激活第一条
-    let activatedId: number | null = null
+  it('**存根区外的段摘要才进场，区内的不动**（compaction-v2 位置制）', async () => {
+    // 三条存根消息各占一轮（turn 0/1/2）+ user（turn 3，floor 只圈它）。
+    // stubTurns=2：区里装 turn 2、turn 1，turn 0 在区外——coversFrom 0 的
+    // 摘要进场，1、2 的不进。跨界的（covers 1..2）也不进——半存根半摘要
+    // 没有意义
     const summaries = [
       { id: 11, level: 0, coversFrom: 0, coversTo: 0, status: 'ready', inContext: false, supersededBy: null },
       { id: 12, level: 0, coversFrom: 1, coversTo: 1, status: 'ready', inContext: false, supersededBy: null },
+      { id: 13, level: 0, coversFrom: 1, coversTo: 2, status: 'ready', inContext: false, supersededBy: null },
     ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>
     const m = spyMemory({
-      // 两条存根 ~83：激活第一条顶替掉 ~40 后剩 ~43 < 50 停手——
-      // 设 1 的话只有全顶替完才满足，测不出「回落即停」
-      stubTokens: 50,
-      // 滞留口径=已卸未顶替；spy 不落库，这里声明两条存根的 step 都已卸
-      unloadedSteps: () => new Set([0, 1]),
-      summaries: () => (activatedId === null ? summaries : summaries.map((s) => ({ ...s, inContext: s.id === activatedId }))),
+      ...COMPACTION_POINT,
+      stubTokens: 1e9, // token 界不设限，只让轮数界起作用
+      stubTurns: 2,
+      summaries: () => summaries,
       activateSummary: (stepId) => {
         m.activated.push(stepId) // override 掉 spy 默认实现后得自己记
-        if (stepId !== 0) return false
-        activatedId = 11
         return true
       },
-      withTurns: (messages) => messages.map((message, i) => ({ message, turnId: i, stepId: i })),
+      withTurns: (messages) =>
+        messages.map((message, i) => ({
+          message,
+          turnId: i < 3 ? i : 3, // 存根各一轮，user 一轮
+          stepId: i,
+        })),
+    })
+    const kicks: number[] = []
+    await drive({
+      messages: [stubby(0), stubby(1), stubby(2), bulky('user', 10)],
+      memory: m.memory,
+      rounds: [says('好的')],
+      kickSummary: () => kicks.push(1),
+    })
+    // 区外的（turn 0）进场；区内的（turn 1）和跨界的（covers 1..2）不动
+    expect(m.activated).toEqual([0])
+    expect(kicks).toEqual([]) // 区内段不需要自己的 L0，不催
+  })
+
+  it('**区外段没有摘要盖住时催摘要（kickSummary）**', async () => {
+    // 存根区外的段在等自己的 L0——连续使用中 idle 摘要跟不上，
+    // 主动催一次（不阻塞本轮）
+    const m = spyMemory({
+      ...COMPACTION_POINT,
+      stubTokens: 1e9,
+      // 区里只装得下 1 轮（默认 withTurns：一条消息一轮）：stubby(0) 在区外
+      stubTurns: 1,
+      summaries: () => [],
     })
     const kicks: number[] = []
     await drive({
@@ -941,40 +1054,84 @@ describe('上下文卸载', () => {
       rounds: [says('好的')],
       kickSummary: () => kicks.push(1),
     })
-    // 激活了最老那条（coversFrom=0），顶替掉它的存根后水位回落，第二条不动
-    expect(m.activated).toEqual([0])
-    expect(kicks).toEqual([]) // 回落了就不催
-  })
-
-  it('**超线但无 ready 摘要可顶替时催摘要（kickSummary）**', async () => {
-    // 存根段超线、ready 摘要一条都没有：剩下的存根在等自己的 L0——
-    // 连续使用中 idle 摘要跟不上，主动催一次（不阻塞本轮）
-    const m = spyMemory({
-      stubTokens: 1,
-      summaries: () => [],
-      unloadedSteps: () => new Set([0]),
-    })
-    const kicks: number[] = []
-    await drive({
-      messages: [stubby(0), bulky('user', 10)],
-      memory: m.memory,
-      rounds: [says('好的')],
-      kickSummary: () => kicks.push(1),
-    })
     expect(kicks.length).toBeGreaterThan(0)
   })
 
-  it('**纯文本段（裁不动、无存根）也计滞留**——否则触发卸载后 token 一点不降', async () => {
-    // 水位旧口径只算存根，纯文本段没有存根形态 → 永不进场 → 原文继续
-    // 全文在场。新口径：已卸（unloadedSteps）未顶替的内容都是滞留，纯
-    // 文本的滞留形态就是原文本身，照样驱动摘要进场
+  it('**token 界先到也收口**（两界先到先停的另一条腿）', async () => {
+    // stubTurns 放开，只让 token 界起作用：界 = 一条存根的 1.5 倍——
+    // 区里装得下一条、装不下两条。stubby(2) 在区里，stubby(0)/stubby(1) 在区外
+    const oneStub = estimateMessageTokens(stubby(0).parts)
+    const summaries = [
+      { id: 11, level: 0, coversFrom: 0, coversTo: 0, status: 'ready', inContext: false, supersededBy: null },
+      { id: 12, level: 0, coversFrom: 1, coversTo: 1, status: 'ready', inContext: false, supersededBy: null },
+      { id: 13, level: 0, coversFrom: 2, coversTo: 2, status: 'ready', inContext: false, supersededBy: null },
+    ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>
+    const m = spyMemory({
+      ...COMPACTION_POINT,
+      stubTokens: Math.ceil(oneStub * 1.5),
+      stubTurns: 1e9,
+      summaries: () => summaries,
+      activateSummary: (stepId) => {
+        m.activated.push(stepId)
+        return true
+      },
+    })
+    await drive({
+      messages: [stubby(0), stubby(1), stubby(2), bulky('user', 10)],
+      memory: m.memory,
+      rounds: [says('好的')],
+    })
+    // 越界那条（stubby(1)）自己算区外——off-by-one 会把它留在区里
+    expect(m.activated).toEqual([0, 1])
+  })
+
+  it('**前缀不变式：没触发压缩点，存根超线也不进场**（进场只搭压缩点的车）', async () => {
+    const m = spyMemory({
+      stubTokens: 1,
+      stubTurns: 1e9,
+      summaries: () => [
+        { id: 31, level: 0, coversFrom: 0, coversTo: 0, status: 'ready', inContext: false, supersededBy: null },
+      ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>,
+    })
+    await drive({ messages: [stubby(0), bulky('user', 10)], memory: m.memory, rounds: [says('好的')] })
+    expect(m.activated).toEqual([])
+  })
+
+  it('**前缀不变式：没触发压缩点，待生效的合并不应用**（2026-09-23 request1/2 实测的病）', async () => {
+    let applied = 0
+    const m = spyMemory({
+      applyMerges: () => {
+        applied += 1
+        return new Set<number>()
+      },
+    })
+    await drive({ messages: [bulky('user', 10)], memory: m.memory, rounds: [says('好的')] })
+    expect(applied).toBe(0)
+    // 对照：压缩点上照常应用
+    const m2 = spyMemory({
+      ...COMPACTION_POINT,
+      applyMerges: () => {
+        applied += 1
+        return new Set<number>()
+      },
+    })
+    await drive({ messages: [bulky('user', 10)], memory: m2.memory, rounds: [says('好的')] })
+    expect(applied).toBe(1)
+  })
+
+  it('**纯文本段（裁不动、无存根）出存根区也进场**——否则原文一直全文在场', async () => {
+    // 位置制判据只看「段在哪」，不看「有没有存根形态」：纯文本段裁不动，
+    // 出了存根区照样该被摘要顶替——否则它的原文永远全文在场，token 一点
+    // 不降。stubTurns=1 + 默认 withTurns（一条消息一轮）：text(0) 出区，
+    // text(1) 是区里那一轮
     const text = (i: number): Message => ({
       role: i % 2 ? 'assistant' : 'user',
       parts: [{ type: 'text', text: `第${i}段较长的纯文本内容。${'补'.repeat(200)}` }],
     })
     const m = spyMemory({
-      stubTokens: 50,
-      unloadedSteps: () => new Set([0, 1]),
+      ...COMPACTION_POINT,
+      stubTokens: 1e9,
+      stubTurns: 1,
       summaries: () => [
         { id: 21, level: 0, coversFrom: 0, coversTo: 0, status: 'ready', inContext: false, supersededBy: null },
       ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>,
@@ -984,7 +1141,7 @@ describe('上下文卸载', () => {
       memory: m.memory,
       rounds: [says('好的')],
     })
-    // 纯文本 400 字 ≈ 100+ token > 50：水位超线，最老的 L0 该进场顶替
+    // text(0) 在存根区外，它 的 L0 该进场顶替
     expect(m.activated).toEqual([0])
   })
 
@@ -1037,16 +1194,12 @@ describe('上下文卸载', () => {
     // 和 output 的值），所以一条被卸一条没被卸也是合法的。
     //
     // 这条是防御性的——将来若有人"优化"成把整个 input 换成字符串，
-    // 或者顺手删掉 id，这里会红。构造让 target 恰好在 call 之后、
-    // result 之前达成：前两条大（卸掉省很多），result 小（卸不卸无所谓）。
-    //
-    // **量要按 estimateTokens 的口径算，不能拍脑袋**：tool_call 的 input 走
-    // JSON 口径（1 token/2 字符），文本走 4 字符/token，两者差一倍。原来那组
-    // 数字是按统一 3.5 定的，改口径后 target 落在了 result 之后，第 3 条也被卸
-    // target 200：卸完第 0、1 条就降到约 104，**必须高于"全卸光后的残留量"**
-    // （每条卸完还剩头部+归档提示约 18 token，四条约 104）。target 定在残留量
-    // 以下的话循环永远够不着，会一路卸到底，第 3 条也被卸——那正是原来红的原因
-    const m = spyMemory({ targetRatio: 0.2 })
+    // 或者顺手删掉 id，这里会红。构造让保底区边界恰好在 call 之后、result
+    // 之前：result 够大（2000 字符 ≈ 500 token，加上 user 一起 ≥ floor），
+    // 单独的 user 撑不满 floor——floorStartIndex 在 result 上收口，call 落在
+    // 区外被卸。v2 的保底区从后往前**加到哪条哪条进来**，所以 crossing 必须由
+    // result 自己完成，不能指望「下一条太大就停」——那会把 call 也保进来
+    const m = spyMemory({ floorTokens: 300, targetRatio: 0.001 })
     const h = await drive({
       messages: [
         // **这条用纯文本撑体积，不用 bulky。** bulky 现在自带 tool_call /
@@ -1062,7 +1215,7 @@ describe('上下文卸载', () => {
         {
           role: 'tool',
           parts: [
-            { type: 'tool_result', toolCallId: 'pair', output: 'y'.repeat(70), isError: false },
+            { type: 'tool_result', toolCallId: 'pair', output: 'y'.repeat(2_000), isError: false },
           ],
         },
         { role: 'user', parts: [{ type: 'text', text: '短' }] },
@@ -1568,6 +1721,7 @@ describe('上下文预算：真实 usage + 新增估算', () => {
   describe('基线下标以 ctx.messages 为准', () => {
     const summary = (coversFrom: number, coversTo: number): Summary => ({
       id: 1,
+      owner: null,
       level: 0,
       name: '',
       text: '早几轮的摘要',
@@ -1676,14 +1830,15 @@ describe('窗口分区（§11）', () => {
     expect(roomy.cold).toEqual([])
   })
 
-  it('**纯 reasoning 的 step 也能出局**——出局是位置决定的，不是收益决定的', async () => {
+  it('**纯 reasoning 的 step 出局时 reasoning 整块丢弃**（compaction-v2 §0.3）', async () => {
     // **这条在 §11.5 之前必红。** 旧的 `pickOldest` 有一句 `if (saved <= 0)
     // continue`：卸载省不到量的 step 直接跳过，于是它永远不进 picked、永远
     // 不标 unloaded、它所在的段永远凑不齐「整段卸空」，**那个 turn 的摘要
     // 永远不生效**。纯问答和纯思考的 turn 就这么卡在 live 里出不去。
     //
-    // 换成按位置挑之后，这个 step 照样出局、照样判冷，只是 `indices` 里没有
-    // 它（`savingOf > 0` 过滤掉了）——不写库，但摘要能生效
+    // 位置制让它照样出局、照样判冷；v2 再进一步：出局即丢 reasoning
+    // （-76% 的那个大头），纯 reasoning 的消息丢完剩空壳，normalize 删掉。
+    // 它的正文/推理原文都在 turns 归档里，cat 得回来
     const thinker = (n: number): Message => ({
       role: 'assistant',
       parts: [
@@ -1692,7 +1847,6 @@ describe('窗口分区（§11）', () => {
       ],
     })
     const messages = [thinker(1), thinker(2), bulky('user', 300)]
-    const before = structuredClone(messages)
     const m = spyMemory({ withTurns: oneTurn })
     const h = await drive({
       messages,
@@ -1702,9 +1856,11 @@ describe('窗口分区（§11）', () => {
     })
 
     expect(m.cold.flat()).toContain(0) // 出局了
-    expect(m.calls.flat()).not.toContain(0) // 但没写库——卸它一个字都不省
-    // **而且逐字没动**：reasoning 连 signature 都在，text 也在
-    expect(h.ctx.messages[0]).toEqual(before[0])
+    expect(m.calls.flat()).toContain(0) // reasoning 丢了，真省得下——写库存原文
+    // reasoning 整块没了，正文保留
+    const after0 = h.ctx.messages[0]
+    expect(after0?.parts.some((p) => p.type === 'reasoning')).toBe(false)
+    expect(after0?.parts.some((p) => p.type === 'text')).toBe(true)
   })
 
   it('**保底区逐字不变**——最近那段是模型判断「我在干什么」的全部依据', async () => {
@@ -2019,3 +2175,176 @@ describe('图片缩放（发送侧，web-tools §2）', () => {
     expect(h.ctx.messages[0]?.parts[0]).toMatchObject({ data: bigPng })
   })
 })
+
+describe('视觉转述中断', () => {
+  it('停止能打断挂住的转述——孤儿 signal 回归（2026-09-24 gemini 挂 120s 实测）', async () => {
+    // 转述模型挂住、不产 token：只有收到 abort 才 reject。修复前 relay
+    // 拿的是没人能 abort 的孤儿 signal，这个 promise 永远不落——整个
+    // run 挂在 relayPendingImages 上，「停止」打不到它（vitest 超时兜底）
+    let started = false
+    const relay = vi.fn(
+      async (_img: { data: string; mimeType: string }, _focus: string, signal?: AbortSignal) => {
+        started = true
+        return await new Promise<string>((_, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('aborted')))
+        })
+      },
+    )
+    const controller = new AbortController()
+    const deps: LoopDeps = {
+      stream: (request: Request): AsyncIterable<StreamEvent> =>
+        (async function* () {
+          yield* says('好的')
+        })(),
+      now: () => 0,
+      tools: new Map([fakeTool('bash')].map((t) => [t.name, t])),
+      root: '/tmp',
+      caps: { images: false },
+      request: {
+        model: 'm',
+        maxTokens: 100,
+        thinking: 'disabled',
+        effort: 'high',
+        reasoningDisplay: 'omitted',
+        system: 'S',
+        tools: [],
+      },
+      maxIterations: 10,
+      visionRelay: relay,
+    }
+    const ctx: LoopContext = {
+      messages: [
+        {
+          role: 'user',
+          parts: [
+            { type: 'text', text: '看图' },
+            { type: 'image', data: 'aGk=', mimeType: 'image/png' },
+          ],
+        },
+      ],
+      tasks: [],
+      deps,
+      signal: controller.signal,
+    }
+
+    const events: AgentEvent[] = []
+    const consuming = (async () => {
+      for await (const ev of run(ctx)) events.push(ev)
+    })()
+    // 转述已发出再停——停早了循环顶的 aborted 检查会直接跳过转述
+    await vi.waitFor(() => expect(started).toBe(true))
+    controller.abort()
+    await consuming
+    // 中断的转述存 ''：一次了结，图降级成占位符而不是每轮重撞
+    expect(ctx.relayCache?.get('aGk=')).toBe('')
+  })
+})
+
+/**
+ * 按脚本逐轮出流。**记录每轮收到的 request**——「中断后不空转」这类断言
+ * 靠的就是请求次数，不是事件内容
+ */
+function scriptedStream(rounds: StreamEvent[][]) {
+  const seen: Request[] = []
+  const stream = (request: Request): AsyncIterable<StreamEvent> => {
+    const round = rounds[seen.length] ?? []
+    seen.push(structuredClone(request))
+    return (async function* () {
+      for (const ev of round) yield ev
+    })()
+  }
+  return { stream, seen, requests: () => seen.length }
+}
+
+
+describe('relay 转述缓存盘上层（relay-cache.ts，方案 B 2026-09-24）', () => {
+  const image = { type: 'image' as const, data: 'aGk=', mimeType: 'image/png' }
+
+  /** 一轮就结束的最小 deps；relay 是可替换的转述副模型桩 */
+  const makeDeps = (root: string, relay: (img: { data: string }) => Promise<string>): LoopDeps => ({
+    stream: (request: Request): AsyncIterable<StreamEvent> =>
+      (async function* () {
+        yield* says('好的')
+      })(),
+    now: () => 0,
+    tools: new Map(),
+    root,
+    caps: { images: false },
+    request: {
+      model: 'm',
+      maxTokens: 100,
+      thinking: 'disabled',
+      effort: 'high',
+      reasoningDisplay: 'omitted',
+      system: 'S',
+      tools: [],
+    },
+    maxIterations: 10,
+    visionRelay: async (img) => relay(img),
+  })
+
+  const makeCtx = (deps: LoopDeps): LoopContext => ({
+    messages: [{ role: 'user', parts: [{ type: 'text', text: '看图' }, image] }],
+    tasks: [],
+    deps,
+    signal: new AbortController().signal,
+  })
+
+  const drive = async (ctx: LoopContext): Promise<void> => {
+    for await (const _ev of run(ctx)) void _ev
+  }
+
+  it('save 后 hit、roundtrip；追加写不互吞', () => {
+    const root = mkdtempSync(join(tmpdir(), 'relay-'))
+    relaySave(root, 'aaa', '[视觉转述] 甲')
+    relaySave(root, 'bbb', '[视觉转述] 乙')
+    expect(relayHit(root, 'aaa')).toBe('[视觉转述] 甲')
+    expect(relayHit(root, 'bbb')).toBe('[视觉转述] 乙')
+    // 两个内容不同的图键不撞
+    expect(relayHit(root, 'ccc')).toBeUndefined()
+    // 同图重写取新值
+    relaySave(root, 'aaa', '[视觉转述] 甲2')
+    expect(relayHit(root, 'aaa')).toBe('[视觉转述] 甲2')
+  })
+
+  it('session 重建后旧图不再重述：新 ctx 命中盘缓存，副模型零调用', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'relay-'))
+    const relay1 = vi.fn(async () => '这张图里有只猫')
+    await drive(makeCtx(makeDeps(root, relay1)))
+    expect(relay1).toHaveBeenCalledTimes(1)
+    expect(ctxRelayText(root, image.data)).toContain('猫')
+
+    // session 重建 = 全新 ctx（relayCache 清零），盘上还在
+    const relay2 = vi.fn(async () => '不该被调用')
+    const ctx2 = makeCtx(makeDeps(root, relay2))
+    await drive(ctx2)
+    expect(relay2).not.toHaveBeenCalled()
+    // 命中的是盘上那份转述，出口拿到的是同一段成品文本
+    expect(ctx2.relayCache?.get(image.data)).toBe(`[视觉转述] ${ctxRelayText(root, image.data)}`)
+  })
+
+  it("失败（''）不落盘：只留内存层，下个 session 重试再述", async () => {
+    const root = mkdtempSync(join(tmpdir(), 'relay-'))
+    const fail = async () => {
+      throw new Error('gemini 挂了')
+    }
+    const ctx1 = makeCtx(makeDeps(root, fail))
+    await drive(ctx1)
+    // 内存层存 ''：本 session 内一次了结
+    expect(ctx1.relayCache?.get(image.data)).toBe('')
+    // 盘上没有这张图——失败不落盘（瞬时超时不能变永久占位符）
+    expect(relayHit(root, image.data)).toBeUndefined()
+
+    const ok = vi.fn(async () => '重试成功了')
+    await drive(makeCtx(makeDeps(root, ok)))
+    expect(ok).toHaveBeenCalledTimes(1)
+    expect(relayHit(root, image.data)).toBe('[视觉转述] 重试成功了')
+  })
+})
+
+/** 从盘缓存文件里读出这张图的转述原文（去掉 `[视觉转述] ` 前缀用的反查） */
+function ctxRelayText(root: string, data: string): string {
+  const text = relayHit(root, data)
+  expect(text).toBeDefined()
+  return text!.replace(/^\[视觉转述\] /, '')
+}

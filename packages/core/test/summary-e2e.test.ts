@@ -68,7 +68,8 @@ const CONFIG = {
   // 这类断言直接冲垮。自动触发本身在 summarize-idle.test.ts 里测
   // 见 merge-e2e 里同一处的说明：夹具太短，用生产默认阈值裁不动
   memory: {
-    unloadTargetRatio: 0.25,
+    unloadTargetRatio: 0.001,
+        stubTurns: 1,
     keepHeadChars: 40,
     idleSummarizeDelayMs: 0,
     clipThresholdChars: 0,

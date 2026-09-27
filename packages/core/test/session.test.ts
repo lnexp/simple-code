@@ -372,6 +372,11 @@ describe('AGENTS.md', () => {
     expect(withBoth).toContain('代价可恢复的问题不加机制')
     expect(none).toContain('代价可恢复的问题不加机制')
     expect(none).toContain('别拿印象当事实')
+    // 求证降级链（2026-09-23）：core 行为，无条件在场，顺序记忆→代码→问用户
+    expect(withBoth).toContain('先查记忆（memory 的 turns、note、event、lesson')
+    expect(withBoth).toContain('与 skill（该怎么做）')
+    expect(none).toContain('两步都过仍无法确定的，停下来问用户')
+    expect(none).toContain('或不确定该怎么做时查用（求证链的第一步）')
     // t885 常驻清单：同为 core 行为，无条件在场
     expect(none).toContain('常驻上下文（每轮全价重发）')
     expect(none).toContain('各类正文只在你主动 read 时才进上下文')

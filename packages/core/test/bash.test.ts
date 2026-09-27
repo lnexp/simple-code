@@ -1,5 +1,5 @@
 import { execFile, spawn as spawnRaw } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -157,6 +157,48 @@ describe('bash / 超时与中断', () => {
     expect(tail).toContain('before')
     expect(tail).toContain('after')
     process.kill(pid, 'SIGKILL') // 收尾
+  })
+
+  it('插话软中断：不等超时，命令立刻转后台、进程不死、问题不被扣住', async () => {
+    // 排队插话在 runLoop 迭代顶投递，但工具执行中（这里 sleep 30）用户的
+    // 问题原本要等它跑完——插话信号让 bash 立刻走转后台路径（2026-09-21）
+    const c = new AbortController()
+    const start = Date.now()
+    const p = run({ command: 'echo before; sleep 30', timeout: 60 }, { interjectSignal: c.signal })
+    await new Promise((r) => setTimeout(r, 300)) // 让它真正进入执行中
+    c.abort()
+    const r = await p
+    // 立刻返回（不是等 60 秒超时），走的是转后台文案
+    expect(Date.now() - start).toBeLessThan(5_000)
+    expect(r.output).toContain('插话')
+    expect(r.output).toContain('转入后台')
+    expect(r.output).toContain('before') // 转后台前的输出要保留
+    const pid = Number(r.output.match(/pid\s+(\d+)/)?.[1])
+    const logPath = r.output.match(/日志\s+(\S+)/)?.[1]
+    expect(pid).toBeGreaterThan(1)
+    expect(logPath).toMatch(/sc-bg-\d+\.log$/)
+    // 进程还活着；登记簿里有它
+    expect(() => process.kill(pid, 0)).not.toThrow()
+    expect(bgRegistry.snapshot().some((x) => x.pid === pid)).toBe(true)
+    process.kill(pid, 'SIGKILL') // 收尾
+  })
+
+  it('插话转后台后再中断（stop）不杀它——后台进程不随会话中断而死', async () => {
+    const c = new AbortController()
+    const stop = new AbortController()
+    const p = run(
+      { command: 'echo before; sleep 30', timeout: 60 },
+      { interjectSignal: c.signal, signal: stop.signal },
+    )
+    await new Promise((r) => setTimeout(r, 300))
+    c.abort() // 先插话转后台
+    await p
+    stop.abort() // 再模拟用户 stop：detached 后不应杀组
+    await new Promise((r) => setTimeout(r, 300))
+    // 上一个用例的进程已杀，这里从登记簿找本条的 pid
+    const alive = bgRegistry.snapshot().filter((x) => /sleep/.test(x.command))
+    expect(alive.length).toBeGreaterThan(0)
+    for (const x of alive) process.kill(x.pid, 'SIGKILL') // 收尾
   })
 
   // t886 真机 bug：`... mvn ... & echo; sleep 55; curl` 转后台后，外层 bash
@@ -489,6 +531,37 @@ describe('审批 always 白名单（approval.json）', () => {
     } finally {
       rmSync(join(root, '.simple-code', 'approval.json'), { force: true })
       rmSync(outsideDir, { recursive: true, force: true })
+    }
+  })
+
+  it('multi 卡的批量 always：一次记多个目录（2026-09-21 方案 1）', async () => {
+    const d1 = join(root, '..', 'sc-multi-1')
+    const d2 = join(root, '..', 'sc-multi-2')
+    mkdirSync(d1, { recursive: true })
+    mkdirSync(d2, { recursive: true })
+    try {
+      const seen: Array<Parameters<NonNullable<ToolContext['requestApproval']>>[0]> = []
+      const ra = (q: Parameters<NonNullable<ToolContext['requestApproval']>>[0]) => {
+        seen.push(q)
+        return Promise.resolve<'allow' | 'always' | 'deny'>('always')
+      }
+      const r = await run({ command: `ls ${d1}; ls ${d2}` }, { requestApproval: ra })
+      expect(r.isError).toBe(false)
+      // 卡上带批量预览——UI 靠它出「始终允许这 N 个目录」。dirs 是链接
+      // 解析后的真实形态（/var→/private/var，detail 侧同款），断言对齐它
+      const real = (p: string) => realpathSync(p)
+      expect(seen[0]!.always).toEqual({ kind: 'paths', dirs: [real(d1), real(d2)] })
+      // 两个目录都落进白名单
+      const data = JSON.parse(readFileSync(join(root, '.simple-code', 'approval.json'), 'utf8'))
+      expect(data.paths).toContain(real(d1))
+      expect(data.paths).toContain(real(d2))
+      // 白名单生效：同两条命令不再问
+      const r2 = await run({ command: `ls ${d1}; ls ${d2}` }, { requestApproval: () => Promise.resolve('deny') })
+      expect(r2.isError).toBe(false)
+    } finally {
+      rmSync(join(root, '.simple-code', 'approval.json'), { force: true })
+      rmSync(d1, { recursive: true, force: true })
+      rmSync(d2, { recursive: true, force: true })
     }
   })
 

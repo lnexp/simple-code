@@ -8,7 +8,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import { dirname, isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 const BEGIN = '*** Begin Patch'
 const END = '*** End Patch'
@@ -218,6 +218,38 @@ export async function applyPatch(cwd: string, raw: string): Promise<string> {
   }
   for (const j of jobs) writeJob(j)
   return summary.join('\n')
+}
+
+/** 通道版补丁内核（note/lesson/skill 的 patch 子命令共用，2026-09-24）。
+ *  与裸 apply_patch 的本质差异：**目标由通道的 <name> 锁死**，不由补丁
+ *  内容决定——单 hunk、Update、路径与目标一致才落盘。applyPatch 落盘后
+ *  调 validate 做通道不变式校验（note 的 front matter / lesson 的五段 /
+ *  skill 的非空），抛错即回滚原文件——补丁永远留不下一条破不变式的文件。
+ *  这样审批面也不用为通道开口子：自家 bin 固定语义照放（approval 规则 0），
+ *  不变式由这里守。 */
+export async function patchFile(
+  root: string,
+  absTarget: string,
+  raw: string,
+  validate: (patched: string) => void,
+): Promise<string> {
+  const hunks = parsePatch(raw)
+  const h = hunks[0]
+  if (hunks.length !== 1 || h?.kind !== 'update') {
+    throw new Error('patch 通道只接受单个 Update File（新建走各通道的 write，多文件走 $SIMPLE_CODE_APPLY_PATCH）')
+  }
+  if (resolve(root, h.path) !== resolve(absTarget)) {
+    throw new Error(`补丁目标是 ${h.path}，与要改的文件（${absTarget}）不一致——要改别的文件走 $SIMPLE_CODE_APPLY_PATCH`)
+  }
+  const original = readFileSync(absTarget, 'utf8')
+  const summary = await applyPatch(root, raw)
+  try {
+    validate(readFileSync(absTarget, 'utf8'))
+  } catch (e) {
+    writeFileSync(absTarget, original, 'utf8') // 不变式破了不留盘
+    throw e
+  }
+  return summary
 }
 
 /** update（含 Move to）的规划：读原文件、逐 chunk 匹配替换、产出写任务 */

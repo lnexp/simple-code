@@ -21,6 +21,9 @@
  *
  * write 的五段用单引号包多行文本（内容里有单引号就先把段文本存临时文件
  * 再 cat 拼，别跟引号搏斗）。
+ *
+ * patch 子命令 2026-09-27 退役：局部改走 "$SIMPLE_CODE_APPLY_PATCH"
+ * （目标 .simple-code/lessons/<name>.md，免审批）。
  */
 import { readFileSync } from 'node:fs'
 import { type LessonWriteInput, listLessons, parseStdinLessonInput, readLesson, searchLessons, writeLesson } from '@simple-code/core/src/tools/lesson.ts'

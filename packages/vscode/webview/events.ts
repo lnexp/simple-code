@@ -1,5 +1,12 @@
 import type { AgentEvent, HydratePart, Message } from '@simple-code/core'
 
+/** 毫秒 → 「X 分钟」/「X 秒」，unloaded 的 stale 文案自证用 */
+const fmtInterval = (ms: number | null): string => {
+  if (ms === null) return '?'
+  const min = Math.round(ms / 60_000)
+  return min >= 1 ? `${min} 分钟` : `${Math.round(ms / 1000)} 秒`
+}
+
 /**
  * `AgentEvent` 流折叠成界面要渲染的东西。**纯函数，不碰 DOM。**
  *
@@ -163,9 +170,11 @@ export function reduce(view: ChatView, agentEv: AgentEvent, now: number): ChatVi
       // 文案按触发原因分开（方案 A）：budget 才真的是「接近上限」；
       // stale 是缓存过期搭车压缩，预算没超也说「接近上限」是误导
       // （实测 raw 14% 也这么喊过）；force 是超限自救、连保底区一起卸
+      // stale 文案带实际间隔（sinceMs）：触发的判断依据就是它，写出来
+      // 文案自己就能自证到没到 TTL，不用翻 runlog
       const text =
         agentEv.reason === 'stale'
-          ? `刚才这发缓存已过期、横竖全价，顺手把最早的 ${agentEv.count} 条归档了，之后基数更小`
+          ? `距上次响应 ${fmtInterval(agentEv.sinceMs)}，缓存已过期、横竖全价，顺手把最早的 ${agentEv.count} 条归档了，之后基数更小`
           : agentEv.reason === 'force'
             ? `超出模型上限，紧急归档 ${agentEv.count} 条（含最近上下文）`
             : `上下文接近上限，最早的 ${agentEv.count} 条已归档到磁盘，模型需要时会自己读回来`

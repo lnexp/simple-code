@@ -80,7 +80,8 @@ const CONFIG = {
   // 消息，用生产默认的 1000 一条都裁不动，测的就成了空集。阈值本身在
   // unload.test.ts 里测
   memory: {
-    unloadTargetRatio: 0.25,
+    unloadTargetRatio: 0.001,
+        stubTurns: 1,
     keepHeadChars: 40,
     mergeFactor: 2,
     idleSummarizeDelayMs: 0,
@@ -202,6 +203,7 @@ describe('合并端到端', () => {
       says(reply('答二')),
       says(reply('答三')),
       says(reply('答四')),
+      says(reply('答五')),
     ])
     const session = await getSession(dir, {
       globalPath,
@@ -219,13 +221,16 @@ describe('合并端到端', () => {
     await drain(session.send(long('第二个问题')))
     await drain(session.send(long('第三个问题'))) // 撞阈值：卸最老的消息
 
-    // 空闲期逐个补摘（一次 tick 一个 step），攒出 ≥2 个生效 L0
+    // 空闲期逐个补摘（一次 tick 一个 step）。前缀不变式（2026-09-23）：摘要
+    // 只落 ready，进场要等下一个压缩点——再发一轮（超预算）把积压的放进来
     for (let i = 0; i < 6; i++) await session.summarizeIdle()
+    await drain(session.send(long('第四个问题')))
     const active = rowsOf(dir).filter((r) => r.level === 0 && r.inContext)
     expect(active.length).toBeGreaterThanOrEqual(2) // 前提：合并的原料够了
 
-    // 债还清后的空闲 tick：合并（mergeFactor=2）只写库
-    await session.summarizeIdle()
+    // 债还清后的空闲 tick：合并（mergeFactor=2）只写库。第四问那一轮也要
+    // 先还 L0 债，所以 tick 到出现 L1 为止
+    for (let i = 0; i < 8 && !rowsOf(dir).some((r) => r.level === 1); i++) await session.summarizeIdle()
     const rows = rowsOf(dir)
     const l1 = rows.find((r) => r.level === 1)
     expect(l1?.text).toContain('L1【索引】')
@@ -237,7 +242,7 @@ describe('合并端到端', () => {
     }
 
     // **合并写入后、生效前** kill -9（不走 close）。重启后待生效的合并还在，
-    // 下一次请求把它换进来（apply 在 unloadIfNeeded 开头，不依赖预算）
+    // 下一个压缩点把它换进来（重启后第一问就超预算——压缩点）
     void session
     const rec2 = recordingStream([says(reply('答四'))])
     const session2 = await getSession(dir, {
@@ -265,7 +270,8 @@ describe('合并端到端', () => {
   it('**级联：分批生效的 L0 先合成 L1a，下一批合成 L1b 时级联出 L2**', async () => {
     const { dir, globalPath } = await workspace({
       memory: {
-        unloadTargetRatio: 0.25,
+        unloadTargetRatio: 0.001,
+        stubTurns: 1,
         keepHeadChars: 10,
         clipThresholdChars: 0,
         // 三级递进（2026-09-12）：L0 进场由存根段水位驱动。夹具消息小，
@@ -318,8 +324,11 @@ describe('合并端到端', () => {
 
     // idle 逐个还 L0 债；债清那次调用里 mergeWhileDue 把当时 active 的
     // 前缀 run 收成 L1a（待生效，in_context=0）
+    // 前缀不变式：L0 只在压缩点进场，合并的原料（in_context 的 L0）要靠
+    // 请求来放进来——空闲几次就插一问
     for (let i = 0; i < 40 && rowsOf(dir).filter((r) => r.level === 1).length === 0; i++) {
       await session.summarizeIdle()
+      if (i % 4 === 3) await drain2(session.send(long2(`第${++sent}个问题`)))
     }
     const l1a = rowsOf(dir).find((r) => r.level === 1)
     expect(l1a).toBeDefined()
@@ -337,6 +346,7 @@ describe('合并端到端', () => {
     }
     for (let i = 0; i < 60 && rowsOf(dir).filter((r) => r.level === 2).length === 0; i++) {
       await session.summarizeIdle()
+      if (i % 4 === 3) await drain2(session.send(long2(`第${++sent}个问题`)))
     }
 
     const rows = rowsOf(dir)
@@ -358,7 +368,8 @@ describe('合并端到端', () => {
   it('**对照：mergeFactor 没攒够就不合**——合并是攒够才做，不是到点就做', async () => {
     const { dir, globalPath } = await workspace({
       memory: {
-        unloadTargetRatio: 0.25,
+        unloadTargetRatio: 0.001,
+        stubTurns: 1,
         keepHeadChars: 40,
         clipThresholdChars: 0,
         stubTokens: 1, // 同上：水位不超线摘要不进场，对照组测不到「没合」
@@ -409,7 +420,8 @@ describe('合并端到端', () => {
   const sixTurnsThen = async (indexRatio: number) => {
     const { dir, globalPath } = await workspace({
       memory: {
-        unloadTargetRatio: 0.25,
+        unloadTargetRatio: 0.001,
+        stubTurns: 1,
         keepHeadChars: 40,
         clipThresholdChars: 0,
         mergeFactor: 2, // **攒得够**：老条件下这里必合
@@ -417,7 +429,7 @@ describe('合并端到端', () => {
         indexRatio,
       },
     })
-    const rec = recordingStream(Array.from({ length: 6 }, (_, i) => says(bigReply(String(i)))))
+    const rec = recordingStream(Array.from({ length: 7 }, (_, i) => says(bigReply(String(i)))))
     const session = await getSession(dir, {
       globalPath,
       env: { TEST_KEY: KEY },
@@ -429,6 +441,10 @@ describe('合并端到端', () => {
     for (let n = 1; n <= 6; n++) await drain(session.send(`q${n}问题很短`))
     // 一次 tick 补一个 step 的 L0，先把债还清，最后几 tick 才轮得到合并
     for (let i = 0; i < 14; i++) await session.summarizeIdle()
+    // 前缀不变式：L0 只落 ready，再问一句（超预算 = 压缩点）放进场，之后
+    // 的空闲 tick 才轮得到合并判断
+    await drain(session.send('q7问题很短'))
+    for (let i = 0; i < 4; i++) await session.summarizeIdle()
     const rows = rowsOf(dir)
     await session.close()
     return rows

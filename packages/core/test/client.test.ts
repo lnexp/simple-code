@@ -257,6 +257,59 @@ describe('流空闲超时', () => {
     expect(events.filter((e) => e.type === 'text_delta')).toHaveLength(3)
   })
 
+  it('SSE 注释行（网关心跳）不再给空闲钟续命 —— 按内容不按字节', async () => {
+    // 2026-09-21 实锤：watch 按字节重置，而本网关的心跳是注释行
+    // （: gateway-keepalive）——字节在流、内容不来，空闲钟永远不开火
+    const { body, push } = controllableBody()
+    const stream = sendWithIdle(body, 60)
+    push(MESSAGE_START)
+    // 心跳持续跳（30ms 一条，跳 900ms）：修复前注释行也是字节，钟被无限
+    // 续命；修复后 60ms 无内容就该开火
+    const heartbeats = (async () => {
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 30))
+        try {
+          push(': gateway-keepalive\n\n')
+        } catch {
+          return // 流已被超时中止：再 enqueue 会抛 ERR_INVALID_STATE
+        }
+      }
+    })()
+    let rejected = false
+    drain(stream).catch(() => {
+      rejected = true
+    })
+    await new Promise((r) => setTimeout(r, 200))
+    // 200ms 时心跳仍在跳（还剩 700ms）：60ms 空闲必须早已开火
+    expect(rejected).toBe(true)
+    void heartbeats
+  })
+
+  it('Anthropic 的 ping 事件不是内容 —— 也不续命', async () => {
+    // 心跳的第二种形态：协议层的事件（event: ping），anthropic-messages
+    // 把它丢了不产 LLMEvent——touch 放在 LLMEvent 层就不会被它续命
+    const { body, push } = controllableBody()
+    const stream = sendWithIdle(body, 60)
+    push(MESSAGE_START)
+    const pings = (async () => {
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 30))
+        try {
+          push('event: ping\ndata: {"type":"ping"}\n\n')
+        } catch {
+          return // 流已被超时中止：再 enqueue 会抛 ERR_INVALID_STATE
+        }
+      }
+    })()
+    let rejected = false
+    drain(stream).catch(() => {
+      rejected = true
+    })
+    await new Promise((r) => setTimeout(r, 200))
+    expect(rejected).toBe(true)
+    void pings
+  })
+
   it('响应头一直不来也算挂 —— 计时器要盖住 fetch 那段', async () => {
     // 只包读流的话，「连上了但响应头不来」这种挂法漏网，现象一模一样
     const hangingFetch = ((_url: string, init?: RequestInit) =>

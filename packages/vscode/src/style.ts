@@ -565,13 +565,33 @@ body {
   margin-left: auto; font-size: 13px; visibility: hidden;
 }
 .menu-item[aria-checked='true'] .codicon-check { visibility: visible; }
-.usage { color: var(--vscode-descriptionForeground); font-size: 0.85em; }
-/* 「上下文 X」在 usage 行里保持内联观感，但可点击开分区面板 */
-.usage-ctx {
-  background: none; border: none; padding: 0;
-  color: inherit; font: inherit; cursor: pointer;
+/* 耗时统计：空间不够时**它让路**（收缩 + 省略号），把位置留给上下文按钮
+   和右侧控件——「还剩多少上下文」比「上一轮花了多久」更需要一直看见 */
+.usage {
+  color: var(--vscode-descriptionForeground); font-size: 0.85em;
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.usage-ctx:hover { color: var(--vscode-foreground); text-decoration: underline; }
+/* 「上下文 X」：环形水位 + 文字的胶囊钮。**必须压过 .bar button 的实色
+   兜底**——只写 background:none 会被那条规则的蓝底盖掉，底栏上就多出
+   一个蓝方框（2026-09-18 真栽过，见 simple-code-statusbar-shape 档案）。
+   形状语言跟右侧控件一致：扁平、无边框、hover 给底色；实色块只留给发送键 */
+.bar button.usage-ctx {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: none; border: none;
+  padding: 2px 7px 2px 3px;
+  border-radius: 11px;
+  color: var(--vscode-descriptionForeground);
+  font: inherit; font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+/* 不参与收缩：环 + 数字是个整体，压扁就成了半个环加半个数 */
+.bar button.usage-ctx { flex: none; font-size: 0.85em; }
+.bar button.usage-ctx:hover {
+  color: var(--vscode-foreground);
+  background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+}
+/* svg 的 block 去掉行内基线下沉，不然 flex 居中会偏几 px（同 send-btn） */
+.usage-ring { display: block; flex: none; }
 /* 上下文分析面板（方案 A）：底部锚定的小浮层，遮罩轻——它不是模态对话框 */
 .ctx-mask {
   position: fixed; inset: 0; z-index: 90;
@@ -580,7 +600,9 @@ body {
   background: transparent; /* 只做点外关闭的命中区，不压暗 */
 }
 .ctx-panel {
-  min-width: 340px; max-width: 480px;
+  /* **不设 min-width**：侧栏能拖到 300px 以下，固定宽度会横向溢出被裁掉
+     右半边（时间戳和占比列首当其冲）。宽度跟着遮罩走、上限 480 */
+  width: 100%; max-width: 480px; min-width: 0;
   padding: 10px 14px;
   border: 1px solid var(--vscode-panel-border);
   border-radius: ${RADIUS.md};
@@ -588,32 +610,61 @@ body {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
   cursor: default;
 }
-.ctx-head { font-size: 0.9em; margin-bottom: 6px; }
-.ctx-at { color: var(--vscode-descriptionForeground); font-size: 0.85em; margin-left: 8px; }
-.ctx-table { border-collapse: collapse; width: 100%; font-size: 0.88em; }
-.ctx-table td { padding: 2px 6px 2px 0; vertical-align: middle; }
-.ctx-label { white-space: nowrap; }
+.ctx-panel {
+  /* 空闲区的灰：堆叠条的轨道底色，也是列表里「空闲」那行的色点 */
+  --ctx-idle: color-mix(in srgb, var(--vscode-foreground) 22%, transparent);
+  /* charts 变量只有 6 个彩色（红蓝黄橙绿紫），而分区有 8 个。缺的两个
+     由混色补：青 = 绿+蓝（和「未卸载」同族，表示都是原文），
+     粉 = 紫+红（避开正红的「报警」语义） */
+  --ctx-teal: color-mix(in srgb, var(--vscode-charts-green, #89d185) 55%, var(--vscode-charts-blue, #3794ff));
+  --ctx-pink: color-mix(in srgb, var(--vscode-charts-purple, #b180d7) 55%, var(--vscode-charts-red, #f14c4c));
+}
+.ctx-head { margin-bottom: 12px; }
+.ctx-title { font-size: 0.95em; font-weight: 600; letter-spacing: 0.02em; }
+.ctx-sub {
+  font-size: 0.82em; margin-top: 3px;
+  color: var(--vscode-descriptionForeground);
+}
+.ctx-sub b {
+  color: var(--vscode-foreground); font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.ctx-at { float: right; opacity: 0.75; }
+/* 总览堆叠条：各段按真实百分比，剩余露出轨道底色即空闲。gap 会让
+   宽度和不等于 100%，所以段之间不留缝——靠颜色本身分隔 */
+.ctx-stack {
+  display: flex; height: 8px;
+  border-radius: 4px; overflow: hidden;
+  background: var(--ctx-idle);
+  margin-bottom: 12px;
+}
+.ctx-stack span { display: block; min-width: 1px; }
+.ctx-list { display: flex; flex-direction: column; }
+/* 行高 25px + hover 底色：和底栏控件同一套反馈语言（扁平 + hover） */
+.ctx-row {
+  display: flex; align-items: center; gap: 8px;
+  height: 25px; padding: 0 4px;
+  border-radius: ${RADIUS.sm};
+  font-size: 0.86em;
+}
+.ctx-row:hover { background: color-mix(in srgb, var(--vscode-foreground) 6%, transparent); }
+.ctx-dot { width: 7px; height: 7px; border-radius: 2px; flex: none; }
+.ctx-label { width: 5.6em; flex: none; white-space: nowrap; }
+/* 范围（step 闭区间）：占住中间的伸缩位、右贴，弱化成最浅的一档 */
+.ctx-range {
+  flex: 1; text-align: right; white-space: nowrap;
+  font-size: 0.92em; opacity: 0.6;
+  color: var(--vscode-descriptionForeground);
+  font-variant-numeric: tabular-nums;
+}
 .ctx-num {
-  text-align: right; white-space: nowrap;
-  font-variant-numeric: tabular-nums; min-width: 5.5em;
+  width: 4.2em; text-align: right; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 .ctx-pct {
-  text-align: right; min-width: 4em;
+  width: 3.4em; text-align: right;
   color: var(--vscode-descriptionForeground);
   font-variant-numeric: tabular-nums;
-}
-/* 范围列（step 闭区间）：弱化右对齐，和占比同灰阶 */
-.ctx-range {
-  text-align: right; min-width: 6em; white-space: nowrap;
-  color: var(--vscode-descriptionForeground);
-  font-variant-numeric: tabular-nums;
-}
-/* 迷你条形图：上限 32% 宽（8% × 4），空闲那种大数不把行撑爆 */
-.ctx-bar { width: 32%; }
-.ctx-bar span {
-  display: block; height: 8px;
-  border-radius: 2px;
-  background: var(--vscode-focusBorder);
 }
 .ctx-empty { color: var(--vscode-descriptionForeground); font-size: 0.9em; padding: 6px 0; }
 /* 点开的原图。data URL 本来就带 mime，浏览器自己渲染；这里只管居中和关闭 */
@@ -775,6 +826,69 @@ code a[data-open-path]:hover {
   padding: 0 2px;
 }
 .bg-kill:hover { color: var(--vscode-errorForeground); }
+
+/* 任务条（task-v3，2026-09-23）：切任务 = 切目录同款体感，
+   点谁 = 看谁 + 输入给谁。常驻渲染（+ 是开第一个分支的唯一入口），
+   紧贴控件区上方。样式 = 目录 tab 同款下划线语言（用户拍板 2026-09-24：
+   原来的实心药丸和整个插件的设计风格不一样）——tab 踞在下方 composer
+   自带的 border-top 上（margin-bottom:-1px 重叠）。条自己**不加**
+   border-bottom：composer 已有边线，再加一条就是紧贴的两条线（真机
+   实测「两个下划线」，2026-09-24 修），机制与 folder-tab 踞
+   folder-head 底线一字不差 */
+.branch-strip {
+  display: flex; align-items: stretch; gap: 2px; flex: none;
+  padding: 0 6px;
+  font-size: 11px;
+}
+.branch-tab {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 5px 8px; min-width: 0; margin-bottom: -1px;
+  background: none; border: none;
+  border-bottom: 1px solid transparent;
+  color: var(--vscode-descriptionForeground);
+  white-space: nowrap;
+}
+.branch-tab:hover { color: var(--vscode-foreground); }
+.branch-tab[data-active] {
+  color: var(--vscode-foreground);
+  border-bottom-color: var(--vscode-focusBorder);
+}
+.branch-open {
+  flex: none; border: none; background: none; cursor: pointer; padding: 0;
+  color: inherit; font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 14em;
+}
+.branch-open:hover { text-decoration: underline; }
+.branch-add {
+  flex: none; border: none; background: none; cursor: pointer; padding: 2px 8px;
+  color: var(--vscode-descriptionForeground); font-size: 11px;
+}
+.branch-add:hover:not(:disabled) { color: var(--vscode-foreground); }
+.branch-add:disabled { opacity: 0.4; cursor: default; }
+.branch-draft-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 3px 10px; margin: 2px 8px; border-radius: 4px;
+  background: color-mix(in srgb, var(--vscode-charts-blue, #75beff) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--vscode-charts-blue, #75beff) 45%, transparent);
+  color: var(--vscode-foreground); font-size: 11px;
+}
+.branch-draft-bar button {
+  border: none; background: none; cursor: pointer; padding: 0 4px;
+  color: var(--vscode-descriptionForeground); font-size: 11px;
+}
+.branch-draft-bar button:hover { color: var(--vscode-foreground); text-decoration: underline; }
+.task-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+.task-dot[data-status='running'] { background: var(--vscode-charts-green, #89d185); }
+.task-dot[data-status='idle'] { background: var(--vscode-charts-blue, #75beff); }
+.task-dot[data-status='error'] { background: var(--vscode-errorForeground, #f48771); }
+.task-dot[data-status='closing'] { background: var(--vscode-descriptionForeground, #8b8b8b); }
+.task-btn {
+  flex: none; border: none; background: none; cursor: pointer; padding: 0 2px;
+  color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.4;
+}
+.task-btn:hover { color: var(--vscode-foreground); }
+.task-close:hover { color: var(--vscode-errorForeground, #f48771); }
+.branch-tab[data-status='closing'] { opacity: 0.55; }
 
 /* 多根工作区的对话头（design.md §7）：消息列表顶上、fatal 条之下。
    单根不渲染，不占空间 */

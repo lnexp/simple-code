@@ -233,26 +233,20 @@ const memoryConfig = strictObject({
   // 比例形式的问题是它把「给输出留多少」藏在一个数字里——0.7 碰巧盖住了
   // 默认 maxTokens，配成 0.95 就直接撞窗口，而那时配置看起来完全合理
   /**
-   * 卸载卸到**预算**的这个比例为止，也就是提案 §4.5 ④「最近原始消息」这一块的容量。
+   * 保底区的**比例下限**（compaction-v2 §0.2，2026-09-24 拍板）：
+   * 保底区 = max(`floorTokens`, 预算 × 这个比例)。预算 238,000 时
+   * max(16k, 23.8k) = 23.8k——比 35% 时代保得更多，靠「保底外 reasoning
+   * 整块丢弃」把存根压回来（实测每轮 4.36k → 1.05k）。
    *
-   * **基数是预算（`contextWindow - maxTokens - reservedTokens`），不是窗口**
-   * ——写成窗口的话这个比例的含义会随 maxTokens 漂移，见提案 §10.5。
+   * **键名沿用、语义换了**：原来（proposal §8.3）是「卸载目标压回预算的
+   * 这个比例」，默认 0.35——v2 推翻：四趟车（stale/预算/force/任务关闭）
+   * 触发即「保底区外全卸」，没有「压回某个比例」的目标，比例改作保底区
+   * 的下限，默认 0.10。旧值 0.35 在新语义下 = 保底 83k，偏大但合法。
    *
-   * 0.35 有实测依据（§8.3）：预算 238,000 的 35% ≈ 83,000 token。稳态实例里
-   * ①②③ 加起来只占 0.7%+2.1%，所以这个数基本就是整个 context 的上界——
-   * 撞满时合计 36%。
-   *
-   * **没有「保 N 个 turn」这个参数，故意的**（§4.5）：turn 不是尺寸稳定的
-   * 单位，实测 p90/p50 = 11 倍，同一个「保 1 个 turn」在中位数时占窗口 1.9%、
-   * 撞上最大那个 turn 时占 64%。一个配置值在分布两端差 30 倍就不是配置值。
-   *
-   * turn 不是尺寸稳定的单位，所以**不按条数收**，按 token 预算。
-   *
-   * 保底区不在这个参数里，是独立的 `floorTokens`（见下）。原来那条硬约束是
-   * 「至少保 1 个 turn，哪怕它自己就超」——§11.5 推翻了，理由是 turn 不是
-   * 尺寸稳定的单位，「保 1 个 turn」等于没有上限。
+   * 基数是预算（`contextWindow - maxTokens - reservedTokens`）不是窗口，
+   * 见提案 §10.5；另有 FLOOR_MAX_RATIO 上限夹住小窗口，见 run.ts。
    */
-  unloadTargetRatio: z.number().gt(0).lte(1).default(0.35),
+  unloadTargetRatio: z.number().gt(0).lte(1).default(0.10),
   /**
    * 保底区：最近这么多 token 的原文一个字不动（提案 §11.5 的 ⑤ 区）。
    *
@@ -273,12 +267,24 @@ const memoryConfig = strictObject({
    */
   floorTokens: z.number().int().positive().default(16_000),
   /**
-   * 存根段上限（token）——三级递进的第二级水位线（2026-09-12 拍板）。
-   * 卸载把原文裁成 300 字符存根后，摘要在手也不急着顶替；存根段超过这条
-   * 线才让最老的 ready 摘要进场。默认与 `floorTokens` 同量级：floor 管
-   * 「最近的保多少」，这条管「中间态最多驻留多少」，两把尺子一个刻度。
+   * 存根区的 token 上界（compaction-v2 §0.4）。存根区 = 保底区上方
+   * 「已卸成存根、摘要还没进场」的缓冲带，两个上界（这条 + `stubTurns`）
+   * **先到先停**：重会话（排查轮 ~1k/轮）16k 先到、实际管 ~15 轮，
+   * 轻会话（纯问答 ~0.5k/轮）30 轮先到——两个界各管一头，不冗余。
+   *
+   * 语义变更（v2）：原来（2026-09-12 水位闸）是「存根段超过这条线才让
+   * 摘要进场」，v2 改成位置制（存根区从保底往上数），这条只剩「缓冲带
+   * 最多多大」一个意思。默认与 `floorTokens` 同量级。
    */
   stubTokens: z.number().int().positive().default(16_000),
+  /**
+   * 存根区的轮数上界（compaction-v2 §0.4）。与 `stubTokens` 先到先停。
+   *
+   * **位置制，不是年龄制**：从保底往上数实际存在的轮行——fork 的预留
+   * 号段缝（turn 号 +10000 的空洞）数不进去。按「段尾之后又过几轮」做
+   * 减法的话，fork 缝会把 6 轮虚报成 1020 轮，这正是弃年龄改位置的原因。
+   */
+  stubTurns: z.number().int().positive().default(30),
   /**
    * 预算之外再留的 token 数：`预算 = contextWindow - maxTokens - 这个值`。
    *
@@ -390,6 +396,23 @@ const memoryConfig = strictObject({
   demoteBatch: z.number().int().positive().default(10),
 })
 
+const recallConfig = strictObject({
+  /**
+   * off：不算（零开销）。shadow：算 + 落 cues 表但不渲染——上线前的观察
+   * 日志，直接查 cues 表看「当时撞出了什么」。on：落库 + 装配渲染。
+   * 默认 shadow（proposal §9：精度无 ground truth，先影子跑体感）
+   */
+  mode: z.enum(['off', 'shadow', 'on']).default('shadow'),
+  /** 半衰期（轮）：N 轮前碰过的词剩 2^(-N/halfLife)。记性长短的唯一旋钮 */
+  halfLife: z.number().positive().default(10),
+  /** 信号窗口：回看最近多少轮的文本切词 */
+  window: z.number().int().positive().default(30),
+  /** 每轮线索行上限（噪声预算） */
+  topK: z.number().int().positive().default(2),
+  /** 同一候选多少轮内不重撞（狼来了防放大） */
+  dedupTurns: z.number().int().positive().default(5),
+})
+
 export const configSchema = strictObject({
   // JSON 没有注释语法，但配置文件本来就该能写说明。放行这两个约定键——
   // 它们不削弱拼错检测：写错的字段名不会正好是 $comment
@@ -408,6 +431,10 @@ export const configSchema = strictObject({
   visionModel: visionModelRef.nullable().default(null),
   loop: loopConfig.prefault({}),
   memory: memoryConfig.prefault({}),
+  // recall 线索层（docs/proposals/recall.md）：send 入口算一次 TF-IDF×
+  // 半衰期命中，落 cues 表冻结。mode 三档——off 不算；shadow 算+落库但不
+  // 渲染（上线前的观察日志，直接查 cues 表）；on 落库+装配渲染
+  recall: recallConfig.prefault({}),
 })
 
 export type Config = z.infer<typeof configSchema>

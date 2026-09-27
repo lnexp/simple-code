@@ -72,6 +72,7 @@ const state: ToWebview = {
       presets: [],
   approvalOn: true,
   imagesEnabled: false,
+  contextWindow: 0,
 }
 
 describe('历史回放接线', () => {

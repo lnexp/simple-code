@@ -349,7 +349,7 @@ describe('切换时机', () => {
 
 /**
  * 跨模型的 reasoning 签名。**留着错签名是 400，剥掉只是少发一块思考**——
- * 不对称，往剥掉那边倒。见 session.ts 的 dropSignatures 注释。
+ * 不对称，往剥掉那边倒。见 session.ts 的 dropForeignSignatures 注释。
  */
 describe('换模型剥掉 reasoning 签名', () => {
   const withThinking: StreamEvent[] = [
@@ -365,33 +365,85 @@ describe('换模型剥掉 reasoning 签名', () => {
   const signatures = (messages: readonly Message[]): (string | undefined)[] =>
     messages.flatMap((m) => m.parts.filter((p) => p.type === 'reasoning').map((p) => p.encrypted))
 
-  it('切到别的模型，历史里的签名没了（思考文本还在）', async () => {
-    const { session } = await open([withThinking])
+  /** 某次请求里 assistant 消息带的签名 */
+  const sentSignatures = (request: Request | undefined): (string | undefined)[] =>
+    (request?.messages ?? []).flatMap((m) =>
+      m.parts.filter((p) => p.type === 'reasoning').map((p) => p.encrypted),
+    )
+
+  it('切到别的模型后发消息：发出去的请求里没有旧模型的签名（思考文本还在）', async () => {
+    const { session, seen } = await open([withThinking, says('b 答')])
     await drain(session.send('想一下'))
     // 前提断言（§6.1）：确实存下了签名，否则「剥掉了」是在剥空集合
     expect(signatures(session.messages())).toEqual(['sig-ALPHA-xyz'])
 
     session.setModel({ provider: 'beta', model: 'b-one' })
+    await drain(session.send('换了'))
 
+    expect(seen[1]?.model).toBe('b-one')
+    expect(sentSignatures(seen[1])).toEqual([undefined])
     expect(signatures(session.messages())).toEqual([undefined])
     // 文本没被连坐删掉——界面上那块思考还要显示
-    const text = JSON.stringify(session.messages())
-    expect(text).toContain('让我想想')
+    expect(JSON.stringify(session.messages())).toContain('让我想想')
+    await session.close()
+  })
+
+  it('setModel 本身不改历史——剥签名推迟到真发给别的模型时', async () => {
+    // 在 setModel 里剥的话，重建会话时「恢复上次选择」也算换模型，每次
+    // reload 剥一遍、改写请求前缀（2026-09-23 前缀守卫抓到）
+    const { session } = await open([withThinking])
+    await drain(session.send('想一下'))
+    session.setModel({ provider: 'beta', model: 'b-one' })
+    expect(signatures(session.messages())).toEqual(['sig-ALPHA-xyz'])
+    await session.close()
+  })
+
+  it('A→B→A 中间没发消息：签名留着，回到 A 照常发出去', async () => {
+    const { session, seen } = await open([withThinking, says('又是 a')])
+    await drain(session.send('想一下'))
+    session.setModel({ provider: 'beta', model: 'b-one' })
+    session.setModel({ provider: 'alpha', model: 'a-small' })
+    await drain(session.send('回来了'))
+    expect(sentSignatures(seen[1])).toEqual(['sig-ALPHA-xyz'])
     await session.close()
   })
 
   it('**对照组：切成当前正在用的那个，签名必须留着**', async () => {
     // 没有这条的话，「无条件剥掉」也能让上面那条通过。而无条件剥掉的代价是
     // 每次 UI 重发一遍相同选择就把签名清一次，thinking 白思考
-    const { session } = await open([withThinking])
+    const { session, seen } = await open([withThinking, says('还是 a')])
     await drain(session.send('想一下'))
     session.setModel({ provider: 'alpha', model: 'a-small' })
-    expect(signatures(session.messages())).toEqual(['sig-ALPHA-xyz'])
+    await drain(session.send('再来'))
+    expect(sentSignatures(seen[1])).toEqual(['sig-ALPHA-xyz'])
     await session.close()
   })
 
+  it('重建会话恢复上次选择（配置默认 → 上次模型）：签名不剥、前缀守卫不响', async () => {
+    // 真机 2026-09-23：面板重建会话 → onSessionReady 从配置默认 setModel 回
+    // 上次的模型 → 旧代码当成换模型剥光签名 → 下一次请求 messages 第 91 条
+    // 起与上次不同，PrefixBrokenError
+    const { dir, globalPath } = await workspace()
+    const big = { provider: 'alpha', model: 'a-big' }
+    const first = scripted([withThinking])
+    const s1 = await getSession(dir, { globalPath, env: ENV, tools: [fakeTool()], stream: first.stream, skipLock: true })
+    s1.setModel(big)
+    await drain(s1.send('想一下'))
+    await s1.close()
+
+    const second = scripted([says('接着')])
+    const s2 = await getSession(dir, { globalPath, env: ENV, tools: [fakeTool()], stream: second.stream, skipLock: true })
+    s2.setModel(big) // 恢复上次选择
+    const events: { type: string; message?: string }[] = []
+    for await (const ev of s2.send('重启后')) events.push(ev as { type: string; message?: string })
+    await s2.close()
+
+    expect(events.filter((e) => e.type === 'error')).toEqual([])
+    expect(sentSignatures(second.seen[0])).toEqual(['sig-ALPHA-xyz'])
+  })
+
   it('前提：协议层确实会把没签名的 reasoning 整块丢掉', async () => {
-    // dropSignatures 的全部依据。协议层哪天改成「没签名就伪造一个」或者
+    // dropForeignSignatures 的全部依据。协议层哪天改成「没签名就伪造一个」或者
     // 「原样发空 signature」，剥签名就从「少发一块」变成「照样 400」，
     // 而这个文件里其他测试全都还是绿的
     const reasoning = (encrypted?: string): Message => ({

@@ -12,3 +12,4 @@ tsconfig.webview.json
 # **没有 `!dist/**`**：我们前面没有排除过 dist，不需要找回；加上去只会覆盖掉
 # 这条 map 规则——实测加了它 map 就会进包，而且不报任何错
 **/*.map
+*.tsbuildinfo

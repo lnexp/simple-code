@@ -88,7 +88,10 @@ export function syncSearchIndex(db: Db): void {
   )
   for (const s of steps) {
     const msgs = db.all<{ content_json: string }>(
-      `SELECT content_json FROM messages WHERE step_id = ? ORDER BY id`,
+      // 排除任务的复制行（同 store.ts NOT_COPY；这里不 import 是为了不跟
+      // store 成环）——否则 fork 前的 step 在任务存活期间全量重灌时读成双份
+      `SELECT content_json FROM messages WHERE step_id = ?
+         AND messages.owner IS (SELECT t.owner FROM turns t WHERE t.id = messages.turn_id) ORDER BY id`,
       s.id,
     )
     if (msgs.length === 0) continue

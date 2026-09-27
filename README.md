@@ -36,17 +36,19 @@ SimpleCode（以下简称 SC）是一个编码 agent：接收需求，读取代�
 
 ## 安装
 
+支持 macOS 与 Linux；Windows 建议在 WSL 内使用（工具链按 POSIX 设计，原生 Windows 未支持）。
+
 **VS Code 扩展**：在扩展面板中搜索 `SimpleCode` 安装。首次使用需先完成模型配置（见下节）。
 
-**终端命令 `sc`**（可选）：扩展本身不会改动 `PATH`，也不会向用户目录写入任何内容。需要在终端使用时自行建立一个链接——`sc.js` 随扩展一同安装，位于扩展目录的 `dist/` 下：
+无需单独安装 Node.js：apply_patch、网络检索、记忆等工具脚本优先使用宿主编辑器（VS Code / Cursor）内置的 Node 运行，系统未安装 Node 亦可正常使用；装有 Node 时作为兜底。
+
+**终端命令 `sc`**（可选）：扩展激活时会在 `~/.simple-code/bin/` 下建立命令入口（含 `sc`），把该目录加入 `PATH` 即可：
 
 ```bash
-mkdir -p ~/.simple-code/bin
-ln -sf "$(ls -d ~/.vscode/extensions/lnexp.simplecode-*/dist/sc.js | tail -1)" ~/.simple-code/bin/sc
 export PATH="$HOME/.simple-code/bin:$PATH"   # 写进 ~/.zshrc 持久生效
 ```
 
-扩展目录名包含版本号，升级后需重新执行上述 `ln` 命令。从源码安装则无需手动处理，`node scripts/deploy.mjs` 会自动建立并在每次部署时重新指向。
+入口是几个由扩展在每次激活时重写的小脚本（同样以内置 Node 运行），扩展目录随版本变化，无需手动维护。
 
 终端环境不继承 VS Code 的设置，因此配置中以 `${ENV_VAR}` 形式引用的密钥需要在 shell 中导出，否则首次执行即报错：
 

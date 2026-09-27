@@ -62,7 +62,19 @@ export type AgentEvent =
    * UI 拿它提示用户「早期对话已归档」——不提示的话，用户翻上去会看到
    * 自己的消息变成了半截，像是数据被弄坏了。
    */
-  | { type: 'unloaded'; count: number; estimated: number; reason: 'budget' | 'stale' | 'force' }
+  /**
+   * sinceMs = 距上次响应的毫秒（null = 本进程还没响应过，只有 budget/force
+   * 可能带 null——stale 的判断依据就是它，必非 null）。渲染层把它写进
+   * stale 文案「距上次响应 X 分钟」，文案自己就能自证有没有到 TTL，
+   * 不用翻 runlog（2026-09-20，起因是「感觉没到 5 分钟却触发了」查无数据）
+   */
+  | {
+      type: 'unloaded'
+      count: number
+      estimated: number
+      reason: 'budget' | 'stale' | 'force' | 'merge'
+      sinceMs: number | null
+    }
   /**
    * 一步结束。**这是「一步」不是「一轮」**——一轮里模型每被调用一次就有
    * 一个，调工具之后还会继续。

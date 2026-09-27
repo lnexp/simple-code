@@ -1,6 +1,9 @@
 import { beforeAll, describe, expect, it } from 'vitest'
 import { DEFAULT_HIDDEN_ALLOW, DEFAULT_NETWORK_ALLOW, classify } from '../src/tools/approval.ts'
 import { warmupShellParser } from '../src/tools/shell-ast.ts'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 /**
  * AST 路径（tree-sitter）的判定回归。approval.test.ts 不调 warmup、
@@ -99,5 +102,169 @@ describe('AST 路径：正则做不到的结构性判定（本次升级的目的
     blocked(`cat > ${ROOT}/.simple-code/x.txt`, '要写入 .simple-code')
     allow(`cat ${ROOT}/.simple-code/settings.json`) // 读放行（2026-09-14 拍板）
     blocked('cat /etc/passwd', '项目外') // 前缀外照旧
+  })
+})
+
+describe('AST 路径：重定向在 && / 管道 / 复合语句里不再漏扫（2026-09-21 修）', () => {
+  it('外层构造不影响重定向目标的判定', () => {
+    // 修前：以下全放行——tree-sitter 把重定向抬到包住整个 list/管道/复合
+    // 语句的 redirected_statement 上，commandToSegment 只往上看一层而漏扫
+    blocked(`cd ${ROOT} && echo x > /etc/passwd`, '项目外')
+    blocked('true && echo x > /etc/passwd', '项目外')
+    blocked(`cd ${ROOT} && echo x >> /etc/passwd`, '项目外')
+    blocked(`cd ${ROOT} || echo x > /etc/passwd`, '项目外')
+    blocked(`cd ${ROOT} && echo x > .env`, '隐藏')
+    blocked(`cd ${ROOT} && cat src/a.ts > ../outside.txt`, '项目外')
+    blocked('echo x | cat > /etc/passwd', '项目外')
+    blocked(`cd ${ROOT} && { echo x; } > /etc/passwd`, '项目外')
+    // 项目内照旧放行——收紧不能变成见重定向就问
+    allow(`cd ${ROOT} && echo x > out.txt`)
+    allow('echo x | cat > out.txt')
+    allow(`cd ${ROOT} && echo x > ${ROOT}/out.txt`)
+  })
+  it('重定向只归最右那条命令——不牵连左命令，也不漏右命令', () => {
+    // `a > f && b`：重定向归 a（a 的直接父就是 redirected_statement，回归）
+    blocked('echo x > /etc/passwd && true', '项目外')
+    // `a && b > f`：b 的实参照样判——左命令不受牵连
+    blocked(`cd ${ROOT} && cat /etc/shadow`, '项目外')
+  })
+  it('不带引号的 heredoc 在 && 形状下同样拦（body 会被 shell 展开）', () => {
+    blocked(`cd ${ROOT} && cat <<EOF\n\`evil\`\nEOF`, '反引号')
+    blocked(
+      `cd ${ROOT} && "$SIMPLE_CODE_APPLY_PATCH" <<PATCH\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x\n+\`rm -rf /tmp/x\`\n*** End Patch\nPATCH`,
+      '反引号',
+    )
+    // 带引号的分隔符：body 是字面量，照旧放行
+    allow(`cd ${ROOT} && "$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x\n+\`ls\` 与 $(ls) 的文档段落\n*** End Patch\nPATCH`)
+  })
+  it('不带引号 heredoc 的字符判定：裸括号不再误报，转义反斜杠不再漏', () => {
+    // 修前：body 里只有 foo() 也弹「unquoted heredoc」——凡带函数调用的
+    // 补丁全中；(` 在无引号 heredoc 里不展开，纯误报）
+    allow(`cd ${ROOT} && "$SIMPLE_CODE_APPLY_PATCH" <<PATCH\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x = foo()\n+y = bar()\n*** End Patch\nPATCH`)
+    // 修前：\\ 会被 shell 吃掉一个（补丁内容静默变形）却放行
+    blocked(`cd ${ROOT} && cat <<EOF\nx = "a\\\\b"\nEOF`, '反斜杠')
+  })
+  it('规则 0（裸 apply_patch 开头）也查不带引号的 heredoc', () => {
+    blocked('"$SIMPLE_CODE_APPLY_PATCH" <<PATCH\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x\n+`rm -rf /tmp/x`\n*** End Patch\nPATCH', '反引号')
+    allow('"$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x\n+`ls` 与 $(ls) 的文档段落\n*** End Patch\nPATCH')
+  })
+})
+
+describe('AST 路径：自家 bin 的不带引号 heredoc 弹卡（stdin 展开旁路，2026-09-24 收口）', () => {
+  // NOTE/LESSON 的 write 吃 heredoc stdin——不带引号的分隔符 body 会被
+  // shell 展开（$( ) 任意命令）。SKILL 的 patch 2026-09-27 退役，但规则
+  // 对任意自家 bin 的不带引号 heredoc 通用，保留一个虚构形态测机制。
+  // 必须挂 wasm 测——正则回退路径看不见 heredoc 结构
+  it('不带引号的分隔符 + body 含 $/反引号 → 弹卡（unparseable）', () => {
+    for (const cmd of [
+      `"$SIMPLE_CODE_NOTE" write <<MD\nname: $(rm -rf /)\nMD`,
+      `"$SIMPLE_CODE_LESSON" write <<JSON\n{"name":"x $y"}\nJSON`,
+      `"$SIMPLE_CODE_SKILL" read <<PATCH\nbody $x\nPATCH`,
+      `"$SIMPLE_CODE_APPLY_PATCH" <<PATCH\nbody $x\nPATCH`,
+    ]) {
+      const v = ask(cmd)
+      if (v.kind !== 'ask') throw new Error(`应弹卡：${cmd}`)
+      if (v.category !== 'unparseable') throw new Error(`category 应为 unparseable：${cmd}`)
+    }
+  })
+  it('采集键=bin 本体：批「始终允许」后同形态免审', () => {
+    const v = ask(`"$SIMPLE_CODE_NOTE" write <<MD\n$x\nMD`)
+    if (v.kind === 'ask') expect(v.alwaysLead).toBe('$SIMPLE_CODE_NOTE')
+    else throw new Error('未批白名单时应弹卡')
+    const cfgN = { ...cfg, alwaysLeads: ['$SIMPLE_CODE_NOTE'] }
+    expect(classify(`"$SIMPLE_CODE_NOTE" write <<MD\n$x\nMD`, ROOT, cfgN)).toEqual({ kind: 'allow' })
+  })
+  it('带引号的分隔符（通道用法样例的形态）照放', () => {
+    allow(`"$SIMPLE_CODE_NOTE" write <<'MD'\nname: foo\ntitle: t\ndescription: d\n---\n正文\nMD`)
+    allow(`"$SIMPLE_CODE_LESSON" write <<'JSON'\n{"name":"x"}\nJSON`)
+  })
+})
+
+describe('multi 同质 external_dir 的批量 always（2026-09-21 方案 1）', () => {
+  // 真目录（mkdtemp）：dirHint 对存在的目录记本身——非存在路径会记父
+  // 目录，断言就测不准「记各目录」了。转成真实形态（/var→/private/var）：
+  // classify 的 detail 走链接解析，alwaysPaths 记的是真实路径
+  const mk = () => realpathSync(mkdtempSync(join(tmpdir(), 'sc-multi-always-')))
+  const rm = (d: string) => rmSync(d, { recursive: true, force: true })
+
+  it('触发点全是项目外目录：alwaysPaths 记各目录', () => {
+    const a = mk()
+    const b = mk()
+    try {
+      const v = ask(`ls ${a}; ls ${b}`)
+      expect(v.kind).toBe('ask')
+      if (v.kind === 'ask') {
+        expect(v.category).toBe('multi')
+        expect(v.alwaysPaths).toEqual([a, b])
+      }
+    } finally {
+      rm(a)
+      rm(b)
+    }
+  })
+
+  it('同一目录两处触发：去重成一条', () => {
+    const a = mk()
+    try {
+      const v = ask(`ls ${a}; cat ${a}/f.md`)
+      expect(v.kind).toBe('ask')
+      if (v.kind === 'ask') expect(v.alwaysPaths).toEqual([a])
+    } finally {
+      rm(a)
+    }
+  })
+
+  it('掺了解释器：维持两键（无 alwaysPaths）', () => {
+    const v = ask('cd /Users/dev && python3 -c "print(1)"')
+    expect(v.kind).toBe('ask')
+    if (v.kind === 'ask') {
+      expect(v.category).toBe('multi')
+      expect(v.alwaysPaths).toBeUndefined()
+      expect(v.alwaysLead).toBeUndefined()
+    }
+  })
+
+  it('含过宽目录（家目录直下的文件）：不给批量 always', () => {
+    // ~/.zshrc 的 dirHint 是家目录本身——过宽防线返回 null，这张卡里
+    // 混进了一个不能记的触发点，一键全记就成了谎话
+    const a = mk()
+    try {
+      const v = ask(`ls ${a}; cat ~/.zshrc`)
+      expect(v.kind).toBe('ask')
+      if (v.kind === 'ask') expect(v.alwaysPaths).toBeUndefined()
+    } finally {
+      rm(a)
+    }
+  })
+
+  it('去重后超过 5 个目录：不给（一笔大账逼你分开看）', () => {
+    const base = mk()
+    const dirs = [1, 2, 3, 4, 5, 6].map((i) => join(base, `d${i}`))
+    try {
+      for (const d of dirs) mkdirSync(d)
+      const v = ask(dirs.map((d) => `ls ${d}`).join(';'))
+      expect(v.kind).toBe('ask')
+      if (v.kind === 'ask') expect(v.alwaysPaths).toBeUndefined()
+      // 恰好 5 个：给
+      const v5 = ask(dirs.slice(0, 5).map((d) => `ls ${d}`).join(';'))
+      expect(v5.kind).toBe('ask')
+      if (v5.kind === 'ask') expect(v5.alwaysPaths).toHaveLength(5)
+    } finally {
+      rm(base)
+    }
+  })
+
+  it('单触发 external_dir 不带 alwaysPaths（走原有的单目录卡）', () => {
+    const a = mk()
+    try {
+      const v = ask(`ls ${a}`)
+      expect(v.kind).toBe('ask')
+      if (v.kind === 'ask') {
+        expect(v.category).toBe('external_dir')
+        expect(v.alwaysPaths).toBeUndefined()
+      }
+    } finally {
+      rm(a)
+    }
   })
 })

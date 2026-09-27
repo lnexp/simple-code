@@ -15,7 +15,7 @@ import {
   startTool,
   type ToolStream,
 } from './utils/tool-stream.ts'
-import { asArray, asNumber, asObject, asString, readRetryAfter } from './utils/wire.ts'
+import { asArray, asNumber, asObject, asString, asToolInput, readRetryAfter } from './utils/wire.ts'
 
 type WireMessage = Record<string, unknown>
 
@@ -130,7 +130,10 @@ function toWireMessages(msg: Message): WireMessage[] {
             tool_calls: toolCalls.map((t) => ({
               id: t.id,
               type: 'function',
-              function: { name: t.name, arguments: JSON.stringify(t.input) },
+              // asToolInput：存量毒（历史里的裸串 input）归一后再序列化，
+              // 否则 arguments 是 '"半截文本"'——合法 JSON 字符串但不是
+              // 对象，提供方 parse 后按对象取字段直接 500
+              function: { name: t.name, arguments: JSON.stringify(asToolInput(t.input)) },
             })),
           }
         : {}),

@@ -29,7 +29,12 @@ describe('acquireLock', () => {
     const first = await acquireLock(dir)
 
     // waitMs 0：持锁者活着就直接拒。默认值会先等 5s，那是下面两条用例的事
-    await expect(acquireLock(dir, { waitMs: 0 })).rejects.toBeInstanceOf(LockHeldError)
+    // 报错要教用户怎么办：Remote-SSH 断线重连后旧扩展宿主残留握锁最长 3 小时
+    // （2026-09-26 实测：reload 后撞上，用户只知道 pid 不知道下一步）
+    const err = await acquireLock(dir, { waitMs: 0 }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(LockHeldError)
+    expect((err as Error).message).toContain('kill')
+    expect((err as Error).message).toContain('3 小时')
 
     await first.release()
     // 释放后能再拿——否则一次崩溃就要用户手工删文件

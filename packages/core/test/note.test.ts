@@ -8,7 +8,7 @@ import {
   NOTES_INDEX_LIMIT,
   parseNoteMeta,
   readNote,
-  updateNote,
+  searchNotes,
   writeNote,
 } from '../src/tools/note.ts'
 
@@ -73,28 +73,24 @@ describe('note 库', () => {
     expect(listNotes(dir())).toContain('还没有 note')
   })
 
-  it('update 给哪段改哪段：只改 description，title/正文/created 保留', () => {
-    const root = dir()
-    writeNote(root, { name: 'mcp', title: 'MCP 状态', description: 'ESM 崩溃未解决', body: '旧正文' })
-    const before = parseNoteMeta(readNote(root, 'mcp'))
-    const out = updateNote(root, 'mcp', { description: '已修好，SDK 兼容层落地' })
-    expect(out).toContain('已更新')
-    const after = parseNoteMeta(readNote(root, 'mcp'))
-    expect(after.description).toBe('已修好，SDK 兼容层落地')
-    expect(after.created).toBe(before.created) // 首次创建时间不因改写丢失
-    expect(readNote(root, 'mcp')).toContain('# MCP 状态') // title 没给就保留
-    expect(readNote(root, 'mcp')).toContain('旧正文') // 正文没给就保留
-  })
-
-  it('update 不存在的 note 报错指路', () => {
-    expect(() => updateNote(dir(), 'nope', { description: 'x' })).toThrow('没有这条 note')
-  })
-
-  it('write 撞同名报错指路 update——静默覆盖会丢旧结论', () => {
+  it('write 撞同名报错——改内容走 APPLY_PATCH 或显式删（静默覆盖会丢旧结论）', () => {
     const root = dir()
     writeNote(root, { name: 'dup', title: 'T', description: 'd', body: 'b' })
     expect(() => writeNote(root, { name: 'dup', title: 'T2', description: 'd2', body: 'b2' })).toThrow(
       '已存在',
     )
+  })
+
+  it('search：全文命中（含暗区），格式对齐 lesson search', () => {
+    const root = dir()
+    writeNote(root, { name: 'panel-fix', title: '面板', description: '面板串台修法', body: '正文里写了 regions 过滤' })
+    writeNote(root, { name: 'other', title: '无关', description: '别的', body: '别的正文' })
+    // 命中描述行
+    expect(searchNotes(root, '串台')).toContain('panel-fix')
+    // 命中正文（list 看不到正文——search 补的就是这个盲区）
+    expect(searchNotes(root, 'regions')).toContain('panel-fix')
+    // 不命中给明确文案
+    expect(searchNotes(root, '不存在词')).toContain('没有 note 命中')
+    expect(() => searchNotes(root, '')).toThrow('search 需要 query')
   })
 })

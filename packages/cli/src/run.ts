@@ -4,24 +4,45 @@ import { constants as fsConstants } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Effort, ModelRef, SessionOptions } from '@simple-code/core'
-import { GLOBAL_CONFIG_PATH, getSession } from '@simple-code/core'
+import { GLOBAL_CONFIG_PATH, ensureShims, getSession, type ShimEntry } from '@simple-code/core'
 import { createRenderer, type Sink } from './render.ts'
 import { type ReplOptions, runRepl } from './repl.ts'
 
-/** CLI 宿主自注入工具路径。这批变量本来由 VS Code 扩展 activate() 注入
+/**
+ * CLI 宿主自注入工具路径。这批变量本来由 VS Code 扩展 activate() 注入
  * （extension.ts），终端裸跑 CLI 时没有宿主——不补的话 system prompt 里
- * 承诺的 `"$SIMPLE_CODE_WEBFETCH" <url>` 等九个工具全是空变量，模型一调
- * 就是空命令。bin 与本文件同目录（dist），存在才设、不覆盖已有注入 */
-export async function injectLocalTools(dir = dirname(fileURLToPath(import.meta.url))): Promise<void> {
+ * 承诺的 `"$SIMPLE_CODE_WEBFETCH" <url>` 等工具全是空变量，模型一调
+ * 就是空命令。bin 与本文件同目录（dist），存在才设、不覆盖已有注入。
+ *
+ * 指向 shim 而不是脚本本体（core shims.ts 头注释）：node 用跑着 sc 的
+ * 这个（process.execPath——能跑 sc 就能跑兄弟 bin，不用探测），PATH 里
+ * 没有 node 的机器上全部工具照用。binDir 参数只给测试换目录。
+ */
+export async function injectLocalTools(
+  dir = dirname(fileURLToPath(import.meta.url)),
+  binDir?: string,
+): Promise<void> {
+  const kebab = (name: string) => name.toLowerCase().replaceAll('_', '-')
+  const entries: ShimEntry[] = []
   for (const name of ['WEBFETCH', 'WEBSEARCH', 'MCP', 'APPLY_PATCH', 'MEMORY', 'LESSON', 'NOTE', 'EVENT', 'SKILL', 'SC']) {
     const key = `SIMPLE_CODE_${name}`
     if (process.env[key]) continue
-    const path = join(dir, `${name.toLowerCase() === 'apply_patch' ? 'apply-patch' : name.toLowerCase()}.js`)
+    const script = join(dir, `${name === 'SC' ? 'sc' : kebab(name)}.js`)
     try {
-      await access(path, fsConstants.X_OK)
-      process.env[key] = path
+      await access(script, fsConstants.X_OK)
     } catch {
       // 该 bin 没构建（如裁剪版 dist）——跳过，prompt 层自会看到变量缺失
+      continue
+    }
+    entries.push({ name, bin: name === 'SC' ? 'sc' : `sc-${kebab(name)}`, script })
+  }
+  if (entries.length > 0) {
+    try {
+      const shims = await ensureShims(entries, binDir === undefined ? { nodeBin: process.execPath } : { nodeBin: process.execPath, binDir })
+      for (const { name } of entries) process.env[`SIMPLE_CODE_${name}`] = shims[name]
+    } catch {
+      // shim 写不进——回落直指脚本（shebang 找系统 node）
+      for (const { name, script } of entries) process.env[`SIMPLE_CODE_${name}`] = script
     }
   }
   // 教程（self.md）：agent 在任何目录下查自己怎么运作。不是可执行
@@ -93,7 +114,9 @@ export const createApproval = (sink: Sink): ApprovalShared => {
             ? `[a]始终允许（${q.always.lead} * 今后免审）`
             : q.always.kind === 'nonpath'
               ? `[a]始终允许（${q.always.lead} 的第 ${q.always.from} 位参数起不是路径，今后免审）`
-              : `[a]始终允许（${q.always.dir}/ 今后免审）`
+              : q.always.kind === 'paths'
+                ? `[a]始终允许（这 ${q.always.dirs.length} 个目录今后免审）`
+                : `[a]始终允许（${q.always.dir}/ 今后免审）`
           : ''
         sink.err(
           `\n[需要审批·${APPROVAL_LABEL[q.category] ?? q.category}] ${q.reason}\n  ${q.command}\n` +

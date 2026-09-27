@@ -2,6 +2,7 @@ import type { AgentEvent } from '../events.ts'
 import { LLMStreamError } from '../llm/protocol.ts'
 import { resizeImageParts, stripImagesWhenUnsupported, thumbnailDataUrl } from '../llm/resizer.ts'
 import { logRun } from '../runlog.ts'
+import { relayHit, relaySave } from './relay-cache.ts'
 import type {
   Capabilities,
   FinishReason,
@@ -23,6 +24,7 @@ import {
 } from './accumulate.ts'
 import {
   assembleContext,
+  emittedSummaries,
   hotSummaryIds,
   type LiveMessage,
   type Summary,
@@ -30,10 +32,11 @@ import {
 } from './assemble.ts'
 import { hasPendingToolCalls, hasUnansweredUserInput, normalizeWithOrigin } from './normalize.ts'
 import { type RegionSizes, regionSizes } from './regions.ts'
-import { drainStubWater } from './summarize.ts'
+import { activateBeyondStubZone } from './summarize.ts'
 import type { StreamEvent } from './retry.ts'
 import { inputBudget as budgetOf, contextUsage, estimateMessageTokens } from './tokens.ts'
 import { unloadMessage } from './unload.ts'
+import type { PrefixGuard } from './prefix-guard.ts'
 
 /**
  * 排队的任务，**FIFO**（core-modules.md §7）。
@@ -60,6 +63,30 @@ export type LoopDeps = {
   stream(request: Request, signal: AbortSignal): AsyncIterable<StreamEvent>
   tools: Map<string, Tool>
   root: string
+  /** 记忆库根（分身任务 = 任务目录；缺省 = root）。bash 注入
+   *  SIMPLE_CODE_MEMORY_DIR 给 $SIMPLE_CODE_MEMORY 分流用（memory.ts） */
+  memoryRoot?: string
+  /**
+   * 任务跑超检查（task-v3 配额闸，2026-09-23 用户拍板）。
+   * 只在分身 session 存在（memoryRoot 旁有 task.json，session 层装配）；
+   * 返回 null = 没超，字符串 = 停止原因（发给用户看）。loop 每轮迭代顶查
+   * 一次——拦「轮中长个儿」的 steps/messages；turn 起头的拦在 session.send
+   * 入口（beginTurn 在 loop 之前就写 turns 表）
+   */
+  taskOverflow?: () => string | null
+  /**
+   * 前缀不变式守卫（prefix-guard.ts）：发请求前核对「这次以上次为前缀」，
+   * 压缩点放行一次。不传 = 不守（单测、ephemeral）
+   */
+  prefixGuard?: PrefixGuard
+  /**
+   * 发请求前落盘当前历史。step_finish 才落盘的话，工具结果/插话在「已经
+   * 发出去、回答还没回来」这段窗口里只在内存——此时 reload/崩溃，重启后
+   * 这几条丢了（工具调用被补成「中断」占位），下一次请求与上一次发出的
+   * 前缀对不上（2026-09-23 ai-legal-advisor 真机，前缀守卫抓到）。
+   * 规则：**发出去的必须先在库里**。不传 = 不落（单测、ephemeral）
+   */
+  checkpoint?: (messages: Message[]) => void
   caps: Capabilities
   /** buildRequest 需要、但 loop 不解释的部分 */
   request: Omit<Request, 'messages'>
@@ -101,7 +128,12 @@ export type LoopDeps = {
 
 export type MemoryDeps = {
   contextWindow: number
-  /** 卸到**预算**的这个比例为止（不是窗口的，见 unloadIfNeeded） */
+  /**
+   * 保底区的比例下限（compaction-v2 §0.2）：保底 = max(floorTokens,
+   * 预算 × 这个比例)。键名沿用旧值（schema 的 unloadTargetRatio），
+   * 语义从「卸载目标压回预算的这个比例」换成保底下限——四趟车触发即
+   * 保底区外全卸，没有「压回某个比例」的目标了
+   */
   targetRatio: number
   /**
    * 距上次响应超过它就视缓存已死，预算没超也压到 target（提案 §12）。
@@ -128,17 +160,10 @@ export type MemoryDeps = {
    * 的单位**（p90/p50 = 11 倍）。
    */
   floorTokens: number
-  /**
-   * 存根段上限（token）。三级递进的第二级水位线（2026-09-12 拍板）：
-   * 卸载把原文裁成存根后，摘要在手也不急着顶替——存根便宜地保留真实头部
-   * 文本，存根段超过这条线才让摘要进场。装配口径算水位（顶替的判断和发
-   * 出去的那份必须是同一把尺子）
-   */
+  /** 存根区 token 上界（compaction-v2 §0.4，与 stubTurns 先到先停） */
   stubTokens: number
-  /** 已卸载（推进线过）的 step 集合。水位口径：已卸未顶替的内容——存根和
-   * 裁不动的原文——都是「等摘要收的滞留」。纯文本段没有存根形态，不把它
-   * 算上的话触发卸载后 token 一点不降（原文继续全文在场） */
-  unloadedSteps: () => Set<number>
+  /** 存根区轮数上界（compaction-v2 §0.4，位置制：数实际存在的轮行） */
+  stubTurns: number
   /**
    * 预算之外再留的余量，见 inputBudget。
    *
@@ -179,12 +204,19 @@ export type MemoryDeps = {
   activateSummary: (stepId: number) => boolean
   /** 已生效（`inContext`）的摘要。发请求前拼装要用 */
   summaries: () => Summary[]
+  /** recall 线索行（cue.ts）：turn → 成品行。装配渲染的唯一数据源，
+   *  落库在 send 入口、算一次冻结——在这里现算会破前缀（重装配字节要一致） */
+  cues: () => ReadonlyMap<number, readonly string[]>
   /** 这几条摘要的叶子正文，按 summary id。查不到的不在返回值里（走温区渲染） */
   leafBodies: (summaries: Summary[]) => Map<number, string>
   /** 热区留几条展开正文（§4.4）。实测取 8，账见 schema.ts 的 hotLeaves */
   hotLeaves: number
   /** 热区降级一次降几条。**必须成批**，否则每轮破 ③ 的缓存（§4.7 硬约束一） */
   demoteBatch: number
+  /** 取走「合并待压缩」标记（一次性）。true = 这次请求按压缩点处理（见
+   *  unloadIfNeeded 的触发条件）——任务合并还俗改写了前缀，改写合法性由
+   *  这一趟压缩的车票背书 */
+  consumeMergePending?: () => boolean
   /**
    * 给内存历史配上 turn 归属。
    *
@@ -215,6 +247,13 @@ export type LoopContext = {
   tasks: Task[]
   deps: LoopDeps
   signal: AbortSignal
+  /**
+   * 插话软中断的持有者（可变）。session 在排队路径 fire 当前这把并换新，
+   * 每次工具执行取 `.current.signal`——fire 只命中当时正在跑的那一个工具，
+   * 批次里后续工具拿到的是换新后的。bash 用它把执行中的命令转后台
+   * （不杀），详见 ToolContext.interjectSignal
+   */
+  interject?: { current: AbortController }
   /**
    * 模型上一轮为什么停。四条件退出要看它，第一轮是 undefined。
    *
@@ -255,10 +294,12 @@ export type LoopContext = {
   doomed?: boolean
   /**
    * visionRelay 的转述缓存（图 data → `[视觉转述] …` 成品文本，'' = 失败）。
-   * 可变状态和 lastUsage 一个模式：loop 内逐轮累积，不落库。缓存住的意义
+   * 可变状态和 lastUsage 一个模式：loop 内逐轮累积。缓存住的意义
    * 是发送出口（assembleForRequest → stripImagesWhenUnsupported）是同步的，
    * 转述这种异步活只能提前一步在这里做完；'' 也算命中——失败不重试，
-   * 出口兜底占位符
+   * 出口兜底占位符。
+   * 这层随 session 重建清零；跨重建的持久命中走盘上层（relay-cache.ts，
+   * relayPendingImages 里查）——旧图不再每次重建后重述一遍
    */
   relayCache?: Map<string, string>
 }
@@ -310,6 +351,13 @@ export async function* run(ctx: LoopContext): AsyncIterable<AgentEvent> {
 /** 外层：一直跑到真的没事做了 */
 async function* runLoop(ctx: LoopContext): AsyncIterable<AgentEvent> {
   for (let iteration = 0; iteration < ctx.deps.maxIterations; iteration++) {
+    // 分支跑超（§10.2 运行时版）：任何一轴的预留段用满即停，排队的输入
+    // 也不收——继续写会侵入段间缓冲、撞兄弟任务的 marker，停下后只能合并
+    const overflow = ctx.deps.taskOverflow?.()
+    if (overflow !== undefined && overflow !== null) {
+      yield { type: 'error', message: overflow, retryable: false }
+      return
+    }
     // 排队的任务优先于生成新回复。不需要单独的调度器——每轮结束检查一遍即可。
     //
     // **shift 不是 pop。** core-modules.md §7 写的是「栈」，但用户在 agent
@@ -354,12 +402,21 @@ async function* runLoop(ctx: LoopContext): AsyncIterable<AgentEvent> {
  */
 async function relayPendingImages(ctx: LoopContext): Promise<void> {
   if (ctx.deps.caps.images || !ctx.deps.visionRelay) return
+  // 盘上缓存层（relay-cache.ts）：内存 Map 随 session 重建清零，盘上的不清
+  // ——live 窗口里的旧图命中即免述（2026-09-24 实测：每张 24s，gemini 不稳
+  // 时挂满 120s idle 超时，压缩/切目录后每回重述就是每回白等）
+  const cacheRoot = ctx.deps.memoryRoot ?? ctx.deps.root
+  ctx.relayCache ??= new Map()
   const pending: { data: string; mimeType: string }[] = []
   for (const msg of ctx.messages) {
     for (const part of msg.parts) {
-      if (part.type === 'image' && !ctx.relayCache?.has(part.data)) {
-        if (pending.every((img) => img.data !== part.data)) pending.push(part)
+      if (part.type !== 'image' || ctx.relayCache.has(part.data)) continue
+      const hit = relayHit(cacheRoot, part.data)
+      if (hit !== undefined) {
+        ctx.relayCache.set(part.data, hit)
+        continue
       }
+      if (pending.every((img) => img.data !== part.data)) pending.push(part)
     }
   }
   if (pending.length === 0) return
@@ -367,14 +424,19 @@ async function relayPendingImages(ctx: LoopContext): Promise<void> {
   const texts = await Promise.all(
     pending.map(async (img) => {
       try {
-        return `[视觉转述] ${await relay(img, '')}`.trim()
+        // ctx.signal 传下去：用户点停止要能打断挂住的转述（曾经的孤儿
+        // signal 打不断，见 makeVisionRelay 注释）；catch 存 '' 一次了结
+        return `[视觉转述] ${await relay(img, '', ctx.signal)}`.trim()
       } catch {
         return ''
       }
     }),
   )
-  ctx.relayCache ??= new Map()
-  pending.forEach((img, i) => ctx.relayCache!.set(img.data, texts[i] ?? ''))
+  pending.forEach((img, i) => {
+    ctx.relayCache!.set(img.data, texts[i] ?? '')
+    // '' 内部跳过：失败只留内存层，下个 session 还能重试（见 relay-cache.ts）
+    relaySave(cacheRoot, img.data, texts[i] ?? '')
+  })
 }
 
 /**
@@ -494,12 +556,13 @@ async function* runStep(ctx: LoopContext): AsyncIterable<AgentEvent> {
 
   // 卸载排在 normalize 之后、发请求之前：估算要基于干净的历史（孤儿
   // tool_call 会让它偏），而卸载完还要重新组装 request
+  //
+  // 前缀的一切改写（合并生效、卸载、摘要进场、system 重读）都只在这里面的
+  // 压缩点发生——前缀不变式（prefix-guard.ts）。原来摘要进场
+  // （activateByStubLevel）在这里无条件跑、合并在触发判断之前无条件应用，
+  // 摘要器每产出一条，下一个请求的前缀就在中段变一次（2026-09-23
+  // request1/request2 实测：113 条只命中前 18 条）
   yield* unloadIfNeeded(ctx)
-  // 三级递进的第二级（2026-09-12 拍板）：存根段水位检查。卸载把原文降级
-  // 成存根后，摘要在手也不急——存根段超线才让摘要进场顶替。放在这里
-  // 而不是卸载循环里：水位是**装配口径**（顶替过的不再计入），和发出去
-  // 的那份同一把尺子；force 自救后同样受益（有摘要可顶就顶，窗口省更多）
-  activateByStubLevel(ctx)
 
   const acc = yield* streamWithOverflowRecovery(ctx)
 
@@ -509,6 +572,18 @@ async function* runStep(ctx: LoopContext): AsyncIterable<AgentEvent> {
   ctx.messages.push(finishAccumulator(acc))
   ctx.lastFinish = acc.finish
   ctx.lastUsage = acc.usage
+  // 拒答是 HTTP 200、内容为空：不透传的话用户只看到模型「什么都没说」，
+  // 为什么被拒全在被丢掉的 explanation 里（Accumulator.refusal 的注释）。
+  // 不算错误流：这轮正常结束（无 tool call），只是补一条说明
+  if (acc.finish === 'content-filter' && acc.refusal) {
+    const { category, explanation } = acc.refusal
+    const detail = [category, explanation].filter(Boolean).join('：')
+    yield {
+      type: 'error',
+      message: `模型侧安全拒答——${detail}。同样的请求换个模型重发通常可行。`,
+      retryable: false,
+    }
+  }
   // 缓存寿命的计时起点（提案 §12）。记在流结束而不是发请求前：stale 判断
   // 要量的是「服务端最后一次见到我们是什么时候」，请求发出去服务端还没回话
   // 时缓存状态未定，以响应到达为准
@@ -553,7 +628,7 @@ async function* streamWithOverflowRecovery(
     // 保底区，重算出的边界偏乐观——观测误差，force 本来就是异常路径
     const live = ctx.deps.memory?.withTurns(ctx.messages) ?? []
     const floorStart = ctx.deps.memory
-      ? floorStartIndex(live, ctx.deps.memory.floorTokens, inputBudget(ctx))
+      ? floorStartIndex(live, ctx.deps.memory.floorTokens, inputBudget(ctx), ctx.deps.memory.targetRatio)
       : live.length
     const floorSet = new Set(live.slice(floorStart).map((entry) => entry.message))
     const stepIds = new Map(live.map((entry) => [entry.message, entry.stepId] as const))
@@ -562,6 +637,12 @@ async function* streamWithOverflowRecovery(
     // 记在这里而不是外面：overflow 自救会重新拼装、重新卸载，最后一次尝试
     // 发出去多少条才是 usage 描述的那份，在外面拼第二次会拼出不同的长度
     ctx.usageCoversUpTo = request.messages.length
+    // 先落盘再发（见 LoopDeps.checkpoint）。在守卫之前：守卫拦下也无妨，
+    // 落的是合法的 live 历史
+    ctx.deps.checkpoint?.(ctx.messages)
+    // 前缀不变式：违规抛 PrefixBrokenError，由 run 的顶层 catch 变成
+    // error 事件结束本轮（不发出去——发了就是一次全价请求）
+    ctx.deps.prefixGuard?.check(request)
     let acc = emptyAccumulator()
     const startedAt = ctx.deps.now()
     let firstAt: number | null = null
@@ -646,17 +727,28 @@ function assembleForRequest(ctx: LoopContext): Message[] {
   if (!memory) return stripImagesWhenUnsupported(ctx.messages, ctx.deps.caps, ctx.relayCache)
 
   const summaries = memory.summaries()
-  if (summaries.length === 0) return stripImagesWhenUnsupported(ctx.messages, ctx.deps.caps, ctx.relayCache)
+  // 空 summaries 也走 assembleContext（传空摘要）：planContext 在无摘要时
+  // 是恒等映射，但 cue 贴装只有它做——提前 return 原样消息的话，新会话
+  // （还没有任何摘要、cue 最该工作的时刻）永远看不到线索行
+  if (summaries.length === 0)
+    return stripImagesWhenUnsupported(
+      assembleContext(memory.withTurns(ctx.messages), [], new Map(), memory.cues()),
+      ctx.deps.caps,
+      ctx.relayCache,
+    )
+  // 热区窗口只数**真正渲染出来**的 L0（emittedSummaries，见其注释）——
+  // 全部在场行都数的话，被遮住的行的进出会推动看得见的降级点
+  const emitted = emittedSummaries(memory.withTurns(ctx.messages), summaries)
   // 热区那几条展开叶子正文，其余只给键（§4.4 的分辨率梯度）。**只读热区的
   // 文件**——全读一遍是每轮请求都要付的 IO，而热区是十几个（`hotLeaves` 8，
   // 加降级批次的摆动上限 17），索引区整体上百条
-  const hot = hotSummaryIds(summaries, {
+  const hot = hotSummaryIds(emitted, {
     hotLeaves: memory.hotLeaves,
     batch: memory.demoteBatch,
   })
-  const bodies = memory.leafBodies(summaries.filter((summary) => hot.has(summary.id)))
+  const bodies = memory.leafBodies(emitted.filter((summary) => hot.has(summary.id)))
   return stripImagesWhenUnsupported(
-    assembleContext(memory.withTurns(ctx.messages), summaries, bodies),
+    assembleContext(memory.withTurns(ctx.messages), summaries, bodies, memory.cues()),
     ctx.deps.caps,
     ctx.relayCache,
   )
@@ -683,43 +775,81 @@ async function* unloadIfNeeded(ctx: LoopContext, force = false): AsyncIterable<A
   const memory = ctx.deps.memory
   if (!memory) return
 
-  // **先应用待生效的合并，再看要不要卸、卸多少**（§9.1「生效必须先于卸载」）。
-  // 放在预算判断之前：塌缩本身就能释放一大块（10 条 L0 变 1 条 L1），
-  // 很多时候应用完已经在预算内，一条都不用卸——顺序反了会按「还没释放」
-  // 的状态多卸一批近期上下文
-  yield* applyPendingMerges(ctx)
-
-  // 缓存过期是第二个触发条件（提案 §12）：one session 隔夜回来，预算没超但
-  // prompt cache 已经过期，这一发横竖全价，基数越小越好——把「该做的压缩」
-  // 搭上这趟本来就要破的前缀。判据只能用时间推断：cache_read 只出现在响应的
-  // usage 里，发请求前看不见
+  // **压缩点 = 前缀唯一合法的改写时机**（前缀不变式，prefix-guard.ts）。
+  // 触发判断必须排在一切改写之前：原来合并生效（applyPendingMerges）排在
+  // 判断之前、每个 step 都跑，摘要器每合出一条 L1，下一个请求的前缀就在
+  // 中段变一次——design.md §9.1 写的是「等下一次卸载才换进来」，实现从
+  // 4575614 起就没守住（2026-09-23 request1/request2：113 条只命中前 18 条）
+  //
+  // 四趟车（stale/预算/force/任务关闭）**都卸都换**（compaction-v2 §0.1，
+  // 2026-09-24 拍板）：原来「任务关闭只放行改写、卸多少由 stale/over 决定」
+  // 被推翻——四趟车都断缓存，捎带卸载边际成本为零；反过来「stale/任务关闭
+  // 不卸」会让低用量会话的保底外原文/存根永远堆着，没人收
+  const mergePending = memory.consumeMergePending?.() ?? false
   const stale = isCacheStale(memory)
   const over = currentUsage(ctx) > inputBudget(ctx)
-  if (!force && !stale && !over) return
+  if (!force && !mergePending && !stale && !over) return
+  ctx.deps.prefixGuard?.allowRewrite()
+
+  // 触发了：**先应用待生效的合并，再看还要卸多少**（§9.1「生效必须先于
+  // 卸载」）。塌缩本身就能释放一大块（10 条 L0 变 1 条 L1），很多时候应用完
+  // 已经在预算内，一条都不用卸——顺序反了会按「还没释放」的状态多卸一批
+  yield* applyPendingMerges(ctx)
+  try {
+    yield* unloadOldest(ctx, { force, stale, over, mergePending })
+  } finally {
+    // 摘要进场（compaction-v2 §0.4 位置制：存根区天花板之外的段）。
+    // 放 finally：卸载提前返回（挑不出可卸的）时这趟车照样要搭——原来
+    // activateBacklog 管的「上次压缩前已就绪的积压」也被位置制判定收编
+    // （段在哪比段头什么时候卸的重要），单独入口删掉
+    activateByZone(ctx)
+  }
+}
+
+/** 卸载本体：压缩点已确认（unloadIfNeeded），合并已应用 */
+async function* unloadOldest(
+  ctx: LoopContext,
+  t: { force: boolean; stale: boolean; over: boolean; mergePending: boolean },
+): AsyncIterable<AgentEvent> {
+  const memory = ctx.deps.memory
+  if (!memory) return
+
+  // 四趟车都到这（compaction-v2 §0.1）：stale / 预算 / force / 任务关闭
+  // 触发即卸，卸多少由保底区决定、与哪趟车无关。stale 的理由（提案 §12）
+  // 不变：隔夜回来 prompt cache 已死，这一发横竖全价，基数越小越好
   // 诊断（2026-09-18）：真机上出现过「距上次成功响应 2-6 秒、上下文才占 5%」
   // 却报 stale 归档的现象，四个数都落盘才能判是 last 没更新还是 ttl 读错。
   // 时间一律记 epoch ms + ISO(带 Z)，别只记可读串——跨时区读日志会把 UTC
   // 当本地看，这次定位就先被带偏过一轮
-  if (stale || force || over) {
-    const last = memory.lastResponseAt()
-    logRun({
-      ev: 'unload_trigger',
-      folder: ctx.deps.root,
-      reason: force ? 'force' : over ? 'budget' : 'stale',
-      nowMs: memory.now(),
-      nowIso: new Date(memory.now()).toISOString(),
-      lastMs: last,
-      lastIso: last === null ? null : new Date(last).toISOString(),
-      sinceMs: last === null ? null : memory.now() - last,
-      ttlMs: memory.cacheTtlMs,
-      usage: currentUsage(ctx),
-      budget: inputBudget(ctx),
-    })
-  }
-  // 归档原因主因优先（force > 预算 > 缓存过期）。只看「有没有触发」不区分的话，
-  // 三个场景共用一条「上下文接近上限」文案：缓存过期时是假的（实测 raw 14%
-  // 也这么喊）、force 时是说反了（不是「接近」，是已经超了、连保底区都卸了）
-  const reason: 'budget' | 'stale' | 'force' = force ? 'force' : over ? 'budget' : 'stale'
+  const last = memory.lastResponseAt()
+  logRun({
+    ev: 'unload_trigger',
+    folder: ctx.deps.root,
+    reason: t.force ? 'force' : t.over ? 'budget' : t.stale ? 'stale' : 'merge',
+    nowMs: memory.now(),
+    nowIso: new Date(memory.now()).toISOString(),
+    lastMs: last,
+    lastIso: last === null ? null : new Date(last).toISOString(),
+    sinceMs: last === null ? null : memory.now() - last,
+    ttlMs: memory.cacheTtlMs,
+    usage: currentUsage(ctx),
+    budget: inputBudget(ctx),
+  })
+  // 归档原因主因优先（force > 预算 > 缓存过期 > 任务关闭）。只看「有没有触发」
+  // 不区分的话，场景间共用一条「上下文接近上限」文案：缓存过期时是假的
+  // （实测 raw 14% 也这么喊）、force 时是说反了（不是「接近」，是已经超了、
+  // 连保底区都卸了）
+  const reason: 'budget' | 'stale' | 'force' | 'merge' = t.force
+    ? 'force'
+    : t.over
+      ? 'budget'
+      : t.stale
+        ? 'stale'
+        : 'merge'
+  // 压缩路径逐段检查点（2026-09-22 第三次卡死断口在这条路径里：unload_trigger
+  // 之后连 llm_req 都没写出来）。写法同 tool_run：写在「即将进入的阶段」之前，
+  // 冻住的进程写不了日志——runlog 最后一条 step 就是卡住的段
+  logRun({ ev: 'unload_step', folder: ctx.deps.root, step: 'reload_system', reason })
   // 搭这趟本来就要破缓存的车刷新 system prompt（AGENTS.md / notes 有没有
   // 改过、改了什么，都无所谓——重读一遍几 ms，横竖前缀已作废）
   const reload = await ctx.deps.reloadSystem?.()
@@ -732,42 +862,45 @@ async function* unloadIfNeeded(ctx: LoopContext, force = false): AsyncIterable<A
     }
   }
 
-  // **基数是预算，不是窗口**（提案 §10.5）。一度写成 `contextWindow * ratio`，
-  // 那样这个比例的含义会随 maxTokens 漂移：窗口 256k、maxTokens 16k 时
-  // 「窗口的 35%」是预算的 37.6%，maxTokens 配到 64k 就变成 47%——同一个配置值
-  // 在两处配置下差 12 个百分点，而配置看起来完全合理。
+  // **保底区外全卸**（compaction-v2 §0.2）：没有「压回预算某个比例」的
+  // 目标了——四趟车触发即把 floorStart 之外的全部挑走，压到多低由保底区
+  // 决定，与哪趟车、当前用量都无关。原来按 target 停手的话，低用量会话
+  // （用量 < 35% 预算）的 stale 车一条都挑不出来，保底外原文永远全文在场
+  // ——「stale 只换不卸」正是 v2 推翻的第一条
   //
-  // 这里原来还夹了一道 `Math.min(target, budget)`，防的是「target 比 budget
-  // 还大 → 每轮判定超了却一条都挑不出来 → 卸载静默失效」。基数改成预算之后
-  // 那个洞的根没了（schema 保证 targetRatio ≤ 1），夹子结构上不可能触发，删掉。
-  // **要加回来的话先想清楚什么配置能让它触发**，想不出来就是又在防一个不存在的情况
-  const target = inputBudget(ctx) * memory.targetRatio
-  // **卸载的单位是 step**（提案 §11.5）。原来是 turn 整组，那样切不进一个
-  // 大 turn 的内部——保底区改成按 token 收口之后边界会落在 turn 中间，
-  // 按 turn 挑就又回到「100 个 step 的 turn 一条都卸不掉」
+  // **卸载的单位是 step**（提案 §11.5），理由不变：保底线会落在一个 turn
+  // 中间，按 turn 挑就切不进去，「100 个 step 的 turn 一条都卸不掉」
   const live = memory.withTurns(ctx.messages)
-  const picked = pickOldestSteps({
-    live,
-    target,
-    // **force 路径放弃保底区。** 一度以为不需要——「保底区有 floorTokens
-    // 夹着，撑不爆窗口」。错了：夹的是**门限**，不是保底区的实际大小。
-    // `floorStartIndex` 无论如何要整个圈住最后一个 step，而一个 step 能有
-    // 「maxTokens 的助手输出 + N 条各 maxOutputChars 的工具结果」那么大，
-    // 窗口小、一个 step 里工具调用又多的时候，它自己就超窗口。
-    //
-    // 那正是 §4.8 第 1 级降级当年要救的情况。这里不是把「裁剪」请回来——
-    // 动作还是同一个 `unloadMessage`，只是紧急时连保底区一起卸。代价（模型
-    // 看不清自己这一轮干了什么）比熔断后让用户「开个新会话」小
-    floorStart: force ? live.length : floorStartIndex(live, memory.floorTokens, inputBudget(ctx)),
-    keepHeadChars: memory.keepHeadChars,
-    clipThresholdChars: memory.clipThresholdChars,
-    // 起点用和触发判断同一个口径。用纯估算起算的话，触发说"超了"而挑选说
-    // "已经在 target 以下"，一条都挑不出来——不报错，卸载静默失效
-    from: currentUsage(ctx),
+  const budget = inputBudget(ctx)
+  // **force 路径放弃保底区。** 一度以为不需要——「保底区有 floorTokens
+  // 夹着，撑不爆窗口」。错了：夹的是**门限**，不是保底区的实际大小。
+  // `floorStartIndex` 无论如何要整个圈住最后一个 step，而一个 step 能有
+  // 「maxTokens 的助手输出 + N 条各 maxOutputChars 的工具结果」那么大，
+  // 窗口小、一个 step 里工具调用又多的时候，它自己就超窗口——紧急时连
+  // 保底区一起卸（§4.8 第 1 级降级当年的情况），代价（模型看不清自己
+  // 这一轮干了什么）比熔断后让用户「开个新会话」小
+  const floorStart = t.force
+    ? live.length
+    : floorStartIndex(live, memory.floorTokens, budget, memory.targetRatio)
+  logRun({
+    ev: 'unload_step',
+    folder: ctx.deps.root,
+    step: 'pick',
+    reason,
+    messages: live.length,
+    floorStart,
+    usage: currentUsage(ctx),
   })
+  const picked = pickOutsideFloor(live, floorStart)
   // 真的一条都挑不出来了（force 路径下意味着连保底区都卸过一遍）。
   // 往上报 count=0 由 forceUnload 判熔断，别在这里抛
   if (picked.length === 0) return
+
+  // **当前工具轮（pending tool loop）的 thinking 不丢**（compaction-v2 §0.3
+  // 例外）：anthropic 续发 tool result 时要求带 thinking 的 assistant 消息
+  // 原样在场。界线划在最后一条 user 消息——force 路径会卸进当前轮，靠这条
+  // 保住配对；正常路径当前轮全在保底区内，这条界线不生效
+  const roundStart = live.findLastIndex((entry) => entry.message.role === 'user')
 
   // **挑中的 step 全判冷，但只有真卸得动的才往库里另存一份原文。**
   //
@@ -776,10 +909,19 @@ async function* unloadIfNeeded(ctx: LoopContext, force = false): AsyncIterable<A
   // 的话，库里就是内容完全相同的两行——写放大的另一种形态，
   // `write-amplification` 盯着这个。但它们照样该判冷：**出局是位置决定的，
   // 卸不卸得动是另一回事**（§11.5），判冷了摘要才能顶替它们
-  const indices = picked.filter((index) => savingOf(live, index, memory) > 0)
+  const indices = picked.filter((index) => savingOf(live, index, memory, index < roundStart) > 0)
   const cold = [...new Set(picked.flatMap((index) => live[index]?.stepId ?? []))]
 
+  logRun({
+    ev: 'unload_step',
+    folder: ctx.deps.root,
+    step: 'mark_cold',
+    reason,
+    picked: picked.length,
+    cold: cold.length,
+  })
   memory.markCold(cold)
+  logRun({ ev: 'unload_step', folder: ctx.deps.root, step: 'store_unload', reason, indices: indices.length })
   const refs = memory.unload(indices)
   let unloaded = 0
   for (const [nth, index] of indices.entries()) {
@@ -790,14 +932,15 @@ async function* unloadIfNeeded(ctx: LoopContext, force = false): AsyncIterable<A
         threshold: memory.clipThresholdChars,
         keepHeadChars: memory.keepHeadChars,
         archive: ref.archivePath,
+        dropReasoning: index < roundStart,
       })
       unloaded++
     }
   }
-  // 摘要不再在这里激活（2026-09-12 三级递进）：卸载只管把原文降级成存根
-  // （第一级），摘要进场由存根段水位驱动（activateByStubLevel，第二级）——
-  // 两个开关解绑后，摘要在手也可以先不用，上下文按压力逐级压缩。
-  // markCold 照旧：判冷是摘要顶替的资格，水位检查只激活判过冷的段
+  // 摘要不在这里激活：卸载只管把原文降级成存根，进场由位置制判定
+  // （activateByZone → activateBeyondStubZone，finally 里）——摘要在手
+  // 也可以先不用，存根区里先驻留。markCold 照旧：判冷是摘要顶替的资格
+  logRun({ ev: 'unload_step', folder: ctx.deps.root, step: 'normalize', reason, unloaded })
   normalize(ctx)
   // count 是**真的改写了几条**，不是打算卸几条。store 少还一个 ref（下标越界、
   // 行已经是 unloaded）时两者会不一样，报"打算卸的"会让上层以为卸成功了——
@@ -805,11 +948,14 @@ async function* unloadIfNeeded(ctx: LoopContext, force = false): AsyncIterable<A
   // estimated 报卸完之后**发出去那份**有多大，和触发判断同一个口径。报
   // `ctx.messages` 的话，被摘要顶替的那些也算进去——数字比真实大好几倍，
   // 而这个字段唯一的用途就是让人判断「卸载到底管不管用」
+  const lastAt = memory.lastResponseAt()
+  logRun({ ev: 'unload_step', folder: ctx.deps.root, step: 'estimate', reason })
   yield {
     type: 'unloaded',
     count: unloaded,
     estimated: estimateAll(assembleForRequest(ctx)),
     reason,
+    sinceMs: lastAt === null ? null : memory.now() - lastAt,
   }
 }
 
@@ -836,6 +982,8 @@ function* applyPendingMerges(ctx: LoopContext): IterableIterator<AgentEvent> {
   const memory = ctx.deps.memory
   if (!memory) return
 
+  // 压缩路径检查点（同上）——apply 在 unload_trigger 日志之前跑，是路径第一步
+  logRun({ ev: 'unload_step', folder: ctx.deps.root, step: 'apply_merges' })
   const dropped = memory.applyMerges()
   if (dropped.size === 0) return
 
@@ -878,7 +1026,7 @@ export function headOf(message: Message, limit: number): string {
 }
 
 /**
- * 从最老的开始挑，挑到估算值降到 target 以下为止。
+ * 保底区外全挑（compaction-v2 §0.2）——没有「挑到某个 target 为止」了。
  *
  * **单位是 step，不是 turn**（提案 §11.5）。改单位是因为保底区改成了按 token
  * 收口——16,000 token 的边界会落在一个 turn 中间，按 turn 挑就切不进去，
@@ -891,57 +1039,33 @@ export function headOf(message: Message, limit: number): string {
  * 推进线真的到过这段。挑中间的会出现段尾卸了、段头没卸：判头退回不上岗
  * （存根滞留），判任一则把没退场的历史顶掉（§11.6 坑三）。
  *
- * **没有 `saved <= 0 就跳过`。** 上一版按 turn 挑时有这一条，防的是「已经
- * 全卸空的 turn 汇总为 0、`estimated` 一点不降、循环不 break、把保底线以内
- * 的也挑上」——真实库 66545 行里 80% 的重复行是这么来的，6 天 74 MB。
- * 现在不需要了，两个原因：
- *
- * ① 出局判据换成了位置（在不在保底区外），不是收益。裁不动的短消息照样
- *    出局——**这正是 §11.4 敢让对话文本免裁的前提**
- * ② 保底区有了硬边界，越过它就 break，挑不到「保底线以内」去
- *
+ * 裁不动的短消息照样出局（出局是位置决定的，不是收益——§11.4 敢让
+ * 对话文本免裁的前提）。
  * 写放大的防线**下沉到消息层**（调用方的 `indices = picked.filter(saved > 0)`）：
  * 内容相同的两行才是写放大，那条判断在那里做更准。
  */
-function pickOldestSteps(opts: {
-  live: LiveMessage[]
-  target: number
-  /** 保底区第一条消息的下标。它和它之后的一律不碰 */
-  floorStart: number
-  keepHeadChars: number
-  clipThresholdChars: number
-  /** 当前用量的起算值。由调用方按真实口径算好传进来，见 contextUsage */
-  from: number
-}): number[] {
-  const { live, target, floorStart } = opts
+function pickOutsideFloor(live: LiveMessage[], floorStart: number): number[] {
   const picked: number[] = []
-  let estimated = opts.from
-
   for (const step of groupByStep(live)) {
-    if (estimated <= target) break
     // **整个 step 都得在保底区之外。** step 是按顺序排的，一旦有一个碰到保底
     // 区，后面的全在里面，所以是 break 不是 continue。
     // 不切开 step 是因为摘要的 covers 是 step 区间——切开会让一个段永远
     // 凑不齐「整段卸空」
     if (step.some((index) => index >= floorStart)) break
-
-    // **减去的是「省下来的量」，不是整条。** 卸载后每条还剩头部和归档提示，
-    // 按整条减的话会以为已经降到 target 了，实际还差一截——现象是卸完仍然
-    // 超预算，而且不报错。用真的卸载结果来算，不另写一套估算。
-    //
-    // 省不到（纯文本 step、已经是存根的 step）也照样入选，只是 `estimated`
-    // 不降、循环继续往前走。它们出局的收益不在裁剪，在于**摘要能顶替它们**
     picked.push(...step)
-    estimated -= step.reduce((sum, index) => sum + savingOf(live, index, opts), 0)
   }
   return picked
 }
 
-/** 一条消息卸载后能省下的 token。负数表示卸完反而更大（短消息加了归档提示） */
+/** 一条消息卸载后能省下的 token（含 reasoning 丢弃）。负数表示卸完反而
+ * 更大（短消息加了归档提示）。dropReasoning 与调用方（unloadOldest 的
+ * 转换循环）必须同一个判定——两边不一致的话，「存不存原文」和「真卸出
+ * 什么」各说各话 */
 function savingOf(
   live: LiveMessage[],
   index: number,
   opts: { keepHeadChars: number; clipThresholdChars: number },
+  dropReasoning: boolean,
 ): number {
   const message = live[index]?.message
   if (!message) return 0
@@ -949,6 +1073,7 @@ function savingOf(
     threshold: opts.clipThresholdChars,
     keepHeadChars: opts.keepHeadChars,
     archive: PATH_PLACEHOLDER,
+    dropReasoning,
   })
   return estimateMessageTokens(message.parts) - estimateMessageTokens(after.parts)
 }
@@ -1000,47 +1125,35 @@ const PATH_PLACEHOLDER = '.simple-code/memory/turns/000/turn-000000.jsonl' // �
  * 这不是假想，本次实施时 `summary-e2e`/`merge-e2e`（窗口 3,000）当场全红，
  * 是它们把这个缺口照出来的。
  */
-/**
- * 存根段水位检查——三级递进的第二级（2026-09-12 拍板）。
- *
- * 原文 →（触发线）存根 →（本函数）摘要顶替。摘要在手也不急着用：存根
- * 比摘要便宜地保留真实头部文本，只有存根段超过 `stubTokens`（默认 16k，
- * 与 floorTokens 同量级）才让最老的 ready 摘要进场。这条线之前的行为是
- * 「卸载时 ready 的当场顶替」（两级绑死），连续使用中 idle 摘要跟不上时
- * floor 外原文全文堆积（实测 121k）——解绑后触发线一到
- * 原文就塌缩成存根，窗口控制不再依赖摘要进度。
- *
- * 激活顺序最老优先；`activateSummary` 只认段头已卸的段（段头没卸说明
- * 推进线没到过，顶了就抢跑）。全激活完仍超线 = 摘要没跟上 → kickSummary
- * 主动催一次（不阻塞本轮，summarizeIdle 自己有并发闸）。
- *
- * 每激活一条重新装配算水位：激活一条顶替掉的是它 covers 的整个 step
- * 区间的存根，增量算容易和 covers 的边界口径漂，装配口径是唯一不会错的。
- * ready 摘要十几条的量级，这个循环的成本可忽略
- */
-function activateByStubLevel(ctx: LoopContext): void {
+/** 摘要进场的压缩点包装：画好保底线，其余判定见 activateBeyondStubZone */
+function activateByZone(ctx: LoopContext): void {
   const memory = ctx.deps.memory
   if (!memory) return
-  drainStubWater({
-    assemble: () => {
-      const messages = assembleForRequest(ctx)
-      // 装配数组里的消息引用与 withTurns 同源（assembleContext 不克隆），
-      // 用引用建 step 映射
-      const stepOf = new Map<Message, number>()
-      for (const entry of memory.withTurns(ctx.messages)) stepOf.set(entry.message, entry.stepId)
-      return { messages, stepOf }
-    },
+  const live = memory.withTurns(ctx.messages)
+  activateBeyondStubZone({
+    live,
+    // 与卸载同一把尺子：进场判定画的存根区必须和卸载保住的保底区同一条
+    // floorStart——两边各算各的话，刚卸完的段可能被判进不了场
+    floorStart: floorStartIndex(live, memory.floorTokens, inputBudget(ctx), memory.targetRatio),
+    stubTurns: memory.stubTurns,
     stubTokens: memory.stubTokens,
     summaries: () => memory.summaries(),
     activateSummary: (stepId) => memory.activateSummary(stepId),
-    unloadedSteps: () => memory.unloadedSteps(),
     kick: () => ctx.deps.kickSummary?.(),
   })
 }
 
 
-function floorStartIndex(live: LiveMessage[], floorTokens: number, budget: number): number {
-  const limit = Math.min(floorTokens, budget * FLOOR_MAX_RATIO)
+function floorStartIndex(
+  live: LiveMessage[],
+  floorTokens: number,
+  budget: number,
+  floorRatio: number,
+): number {
+  // compaction-v2 §0.2：保底 = max(floorTokens, 预算 × floorRatio)——
+  // 预算 238k 时 max(16k, 23.8k) = 23.8k，保得比 35% 时代多，靠保底外
+  // reasoning 整块丢弃（§0.3）把存根压回来
+  const limit = Math.min(Math.max(floorTokens, budget * floorRatio), budget * FLOOR_MAX_RATIO)
   let tokens = 0
   let index = live.length
   for (let i = live.length - 1; i >= 0; i--) {
@@ -1059,10 +1172,12 @@ function floorStartIndex(live: LiveMessage[], floorTokens: number, budget: numbe
 /**
  * 保底区最多占预算的多少。
  *
- * 0.2 是本项目自行推断：`target` 是预算的 35%（§8.3），保底区必须**明显小于**
- * 它，否则卸载刚做完就又超 target。20% 留出 15 个百分点给 ②③④，够了。
- * 真正重要的不是这个数的精确值，而是**有这道夹子**——没有它，
- * 「floorTokens 比预算大」这种配置会静默退化成不卸载。
+ * 0.2 是本项目自行推断，钉的是**小窗口下限**：`floorTokens` 的默认
+ * 16,000 是按 238,000 的预算定的，配一个 8k 窗口的模型时 max(16k, 10%)
+ * 比整个预算还大，保底区吞掉全部历史——**又变成一条都卸不动，和改动前
+ * 一模一样的病**。`summary-e2e`/`merge-e2e`（窗口 3,000）当场全红过，
+ * 是它们把这个缺口照出来的。proposal 的 max() 公式没写这道夹子，
+ * 是按 238k 预算推演时的盲区——大预算下它永远不触发（23.8k < 47.6k）。
  */
 const FLOOR_MAX_RATIO = 0.2
 
@@ -1241,13 +1356,32 @@ function doomLoopGuard(
 }
 
 /**
+ * 按名字取工具，**精确匹配失败时回退一次大小写不敏感匹配**。
+ *
+ * 这不是为模型能力不足做防御，是外部输入不可靠：2026-09-20 实测某渠道
+ * 在一段时间内把 `bash` 采样成了 `Bash`（同一轮里两种写法混用，日志
+ * `tool_fail/unknown tool` 17 次），整轮因此瘫掉并撞上死循环熔断。
+ * 工具名是模型生成的 token，渠道换节点/改写工具定义都会带偏它。
+ *
+ * 只在精确匹配失败后才回退，正常路径零开销、零行为变化。同名不同壳
+ * （真有 `bash` 和 `Bash` 两个工具）时精确匹配已经命中，轮不到这里。
+ */
+function resolveTool(tools: LoopContext['deps']['tools'], name: string): Tool | undefined {
+  const exact = tools.get(name)
+  if (exact) return exact
+  const lowered = name.toLowerCase()
+  for (const [key, tool] of tools) if (key.toLowerCase() === lowered) return tool
+  return undefined
+}
+
+/**
  * 工具执行的唯一出口。
  *
  * 未知工具名不抛异常，跟工具自身失败一样变成 isError 的结果——模型看到
  * 「没有这个工具」会自己改用别的，抛出去则整个 turn 结束（CLAUDE.md §4.1）
  */
 async function runOne(ctx: LoopContext, call: ToolCallPart): Promise<[ToolResultPart, AgentEvent]> {
-  const tool = ctx.deps.tools.get(call.name)
+  const tool = resolveTool(ctx.deps.tools, call.name)
   if (!tool) {
     const available = [...ctx.deps.tools.keys()].join(' / ')
     const message = `没有名为 ${call.name} 的工具。可用的是：${available}`
@@ -1263,9 +1397,14 @@ async function runOne(ctx: LoopContext, call: ToolCallPart): Promise<[ToolResult
   const sink = ctx.deps.rawSink?.(call.id)
   let out: ToolOutput
   try {
+    // 卡点日志（定位宿主同步卡死，2026-09-21）：检查点写在「即将进入的
+    // 阶段」之前，冻住的进程写不了日志——runlog 最后一条 ev 就是卡住的段
+    logRun({ ev: 'tool_run', folder: ctx.deps.root, tool: call.name })
     out = await tool.execute(call.input, {
       root: ctx.deps.root,
+      ...(ctx.deps.memoryRoot ? { memoryRoot: ctx.deps.memoryRoot } : {}),
       signal: ctx.signal,
+      ...(ctx.interject ? { interjectSignal: ctx.interject.current.signal } : {}),
       toolCallId: call.id,
       ...(sink ? { onRawOutput: (chunk: string) => sink.write(chunk), rawPath: sink.path } : {}),
       ...(ctx.deps.requestApproval ? { requestApproval: ctx.deps.requestApproval } : {}),
@@ -1288,6 +1427,9 @@ async function runOne(ctx: LoopContext, call: ToolCallPart): Promise<[ToolResult
   const images = out.images?.map((img) => ({ type: 'image' as const, ...img }))
   // webview 只拿 256px 缩略图，原图在库里（消息 JSON 整存），要看大的
   // 从历史渲染那条路走（阶段 3 的 webview 部分）
+  if (out.images && out.images.length > 0) {
+    logRun({ ev: 'tool_img', folder: ctx.deps.root, tool: call.name })
+  }
   const thumbnails =
     out.images && out.images.length > 0
       ? (

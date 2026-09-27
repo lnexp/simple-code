@@ -54,20 +54,28 @@ export function createRouter(deps: RouterDeps): Router {
       type: 'folders',
       folders: deps.folders().map((p) => ({
         path: p,
-        running: bridges.get(p)?.isRunning() ?? false,
+        // 主干或任一分身在跑都算这个目录在忙（2026-09-22 真机反馈：
+        // 分支干活时目录名前的绿点不亮）
+        running: (bridges.get(p)?.isRunning() ?? false) || (bridges.get(p)?.anyRunning() ?? false),
         pendingApprovals: bridges.get(p)?.pendingApprovals() ?? 0,
       })),
       active,
     })
   }
 
-  /** 该文件夹 bridge 的 post：非 active 只放行审批消息（带 folder 标注），
-   * 其余丢弃——历史在盘上，切回时 hydrate 接上，中间的 UI 增量没人看 */
+  /** 该文件夹 bridge 的 post：非 active 只放行状态类消息（带 folder 标注），
+   * 其余丢弃——历史在盘上，切回时 hydrate 接上，中间的 UI 增量没人看。
+   * 任务的 task_agent 是高频流（跟 agent 同级），只走 active；任务快照和
+   * 面板基线是状态类（跟 bg_processes 同级），带 folder 常发 */
   const bridgePost = (folder: string) => (msg: ToWebview) => {
+    // tasks 快照意味着分身状态变了（跑起来/停了）——folder tab 绿点跟着刷
+    if (msg.type === 'tasks') postFolders()
     if (
       msg.type === 'approval_request' ||
       msg.type === 'approval_closed' ||
-      msg.type === 'bg_processes'
+      msg.type === 'bg_processes' ||
+      msg.type === 'tasks' ||
+      msg.type === 'task_hydrate'
     ) {
       deps.post({ ...msg, folder })
       return

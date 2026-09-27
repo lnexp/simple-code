@@ -44,10 +44,17 @@ function replayRounds(texts: string[]) {
   let calls = 0
   const inputSizes: number[] = []
   const models: (string | undefined)[] = []
+  // 最后一条 user 消息的文本：粘贴用例要验「整段进了同一条消息」
+  const users: string[] = []
   const impl = (async (_url: string, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body ?? '{}')) as { messages?: unknown[]; model?: string }
+    const body = JSON.parse(String(init?.body ?? '{}')) as {
+      messages?: { role: string; content?: unknown }[]
+      model?: string
+    }
     inputSizes.push(body.messages?.length ?? 0)
     models.push(body.model)
+    const lastUser = [...(body.messages ?? [])].reverse().find((m) => m.role === 'user')
+    users.push(JSON.stringify(lastUser?.content ?? null))
     const text = texts[calls] ?? texts[texts.length - 1] ?? '好'
     calls += 1
     return new Response(
@@ -60,7 +67,7 @@ function replayRounds(texts: string[]) {
       { status: 200 },
     )
   }) as unknown as typeof fetch
-  return { impl, calls: () => calls, inputSizes, models: () => models }
+  return { impl, calls: () => calls, inputSizes, models: () => models, users: () => users }
 }
 
 function collector() {
@@ -966,5 +973,103 @@ describe('斜杠命令 /model /effort', () => {
     // 第一轮旧配置（m），重载后第二轮发到 v
     expect(fetchStub.models()[0]).toBe('m')
     expect(fetchStub.models()[1]).toBe('v')
+  })
+})
+
+
+const tick = (): Promise<void> => new Promise((r) => setImmediate(r))
+/** onReady 要等 session 建立 + readline 建好——一拍不够 */
+const ticks = async (n = 8): Promise<void> => {
+  for (let i = 0; i < n; i++) await tick()
+}
+
+describe('括号粘贴（bracketed paste）', () => {
+  const pasteInput = (): PassThrough & { pushRaw(s: string): void } => {
+    const s = new PassThrough()
+    return Object.assign(s, { pushRaw: (t: string) => s.write(t) })
+  }
+
+  it('整段粘贴 + 回车 → 一次请求、一条 user 消息（多行原文进上下文）', async () => {
+    // 2026-09-22 Documents 实测的形态：崩溃报告 8 行粘进 REPL，逐行变 8 个 turn。
+    // 修后：整段缓冲、回车发送——模型看到的是完整多行文本
+    const input = pasteInput()
+    const { impl, inputSizes, users } = replayRounds(['看到了'])
+    const { dir, globalPath } = await workspace()
+    const c = collector()
+    // 不先 await：REPL 起来后在等输入，先拿 promise 再喂
+    const code = runInteractive({
+      cwd: dir,
+      sink: c.sink,
+      globalPath,
+      env: { TEST_KEY: KEY },
+      fetchImpl: impl,
+      input,
+      output: sink0(),
+    })
+    await ticks()
+    input.pushRaw('\x1b[200~Command:  org.eclipse\nPath: /Users/x\nOS Version: macOS\x1b[201~')
+    await tick()
+    input.pushRaw('\n') // 粘贴后回车 = 发送
+    input.end()
+    const r = await code
+    expect(r).toBe(0)
+    expect(inputSizes).toHaveLength(1) // 只发了一次请求，不是三行三次
+    expect(users()[0]).toContain('Command:  org.eclipse\\nPath: /Users/x')
+  })
+
+  it('粘贴 + 追加一行 → 合并成一条发送', async () => {
+    const input = pasteInput()
+    const { impl, inputSizes, users } = replayRounds(['好'])
+    const { dir, globalPath } = await workspace()
+    const c = collector()
+    const code = runInteractive({
+      cwd: dir,
+      sink: c.sink,
+      globalPath,
+      env: { TEST_KEY: KEY },
+      fetchImpl: impl,
+      input,
+      output: sink0(),
+    })
+    await ticks()
+    input.pushRaw('\x1b[200~line1\nline2\x1b[201~')
+    await tick()
+    input.pushRaw('帮我看看这个\\n') // 非空行 = 追加
+    input.end()
+    const r = await code
+    expect(r).toBe(0)
+    expect(inputSizes).toHaveLength(1)
+    expect(users()[0]).toContain('line1\\nline2\\n帮我看看这个')
+  })
+
+  it('粘贴后 Ctrl-C 丢弃 → 不发请求，后续提问正常', async () => {
+    const input = pasteInput()
+    let rl: Interface | null = null
+    const { impl, inputSizes, users } = replayRounds(['答'])
+    const { dir, globalPath } = await workspace()
+    const c = collector()
+    const code = runInteractive({
+      cwd: dir,
+      sink: c.sink,
+      globalPath,
+      env: { TEST_KEY: KEY },
+      fetchImpl: impl,
+      input,
+      output: sink0(),
+      onReady: (r) => {
+        rl = r
+      },
+    })
+    await waitFor(() => rl !== null)
+    input.pushRaw('\x1b[200~要丢的内容\x1b[201~')
+    await tick()
+    ;(rl as unknown as Interface).emit('SIGINT') // 丢粘贴，不是退出
+    await tick()
+    input.pushRaw('正常提问\\n')
+    input.end()
+    const r = await code
+    expect(r).toBe(0) // Ctrl-C 没把 REPL 弄退出
+    expect(inputSizes).toHaveLength(1)
+    expect(users()[0]).toContain('正常提问')
   })
 })

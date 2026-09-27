@@ -60,6 +60,7 @@ const state = (
       presets: [],
   approvalOn: true,
   imagesEnabled: false,
+  contextWindow: 0,
 })
 
 /** 一轮完整对话；`end` 决定跑不跑完 */
@@ -157,6 +158,7 @@ describe('页脚模型按轮记录（切换不漂移）', () => {
       presets: [],
     approvalOn: true,
     imagesEnabled: false,
+    contextWindow: 0,
   })
 
   // 用 DOM 查询而不是 html 字符串：模型名在下拉选择器里也出现（哨兵教训）

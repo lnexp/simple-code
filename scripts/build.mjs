@@ -125,6 +125,15 @@ const TARGETS = [
       format: 'cjs',
       // vscode 模块由宿主注入，磁盘上不存在——不 external 的话打包直接失败
       external: ['vscode'],
+      // **navigator 必须钉成 undefined。** zod 的 Cloudflare 探测（typeof
+      // navigator）在远端 vscode-server 的 exthost 里炸：那里 navigator 不是
+      // 真全局，而是 VS Code 的迁移守卫（PendingMigrationError 的 throwing
+      // getter）——typeof 也会触发 getter 直接抛错，模块加载即失败。本机
+      // Electron exthost 的 navigator 是真全局，所以本机永远复现不了
+      // （2026-09-27 memeda 远端首装才暴露）。define 把标识符替换成
+      // undefined：typeof undefined 安全，?. 链安全，属性键 navigator: 不受
+      // 影响。webview 千万别加——浏览器里 navigator 是真的
+      define: { navigator: 'undefined' },
       // Cursor 是 Electron 40 / Node 24，但按基线 1.85 对应的 Node 18 打更保险
       target: 'node18',
       // **web-tree-sitter 强制走 cjs 入口。** 它的 ESM 版在 node 下靠
@@ -136,6 +145,22 @@ const TARGETS = [
       alias: {
         'web-tree-sitter': `${root}packages/core/node_modules/web-tree-sitter/tree-sitter.cjs`,
       },
+    },
+  },
+  {
+    // 伴生扩展（UI kind，跑本机侧）：Remote-SSH 时远端的模型请求经隧道
+    // 回到它的代理转发。cjs/external 的理由与上面 extension 完全同款
+    name: 'companion',
+    entry: 'packages/companion/src/extension.ts',
+    outfile: 'packages/companion/dist/extension.cjs',
+    options: {
+      platform: 'node',
+      format: 'cjs',
+      target: 'node18',
+      external: ['vscode'],
+      // 同 extension：zod 的 navigator 探测——见上（UI kind 只跑本机，
+      // 但同款代码同款风险，一起钉死）
+      define: { navigator: 'undefined' },
     },
   },
   {
@@ -163,6 +188,12 @@ for (const target of TARGETS) {
   await build({
     entryPoints: [`${root}${target.entry}`],
     outfile: `${root}${target.outfile}`,
+    absWorkingDir: root,
+    // 钉死构建目录：esbuild 把模块路径打进 bundle（sourcemap 注释 +
+    // 模块名字符串），相对谁算取决于 absWorkingDir（默认 process.cwd()）。
+    // 不钉的话 `node scripts/build.mjs`（仓库根）与 `pnpm run package`
+    // （packages/* 下）产出同码不同 md5 的三版产物——「md5 一致 = 装机
+    // 一致」的判据被 cwd 漂移污染（2026-09-27 实案：374a/cb4d/7fe6 三版）
     bundle: true,
     // 出错时栈指回 .ts。产物是几百 KB 的单文件，没有它只能看到
     // 「main.js:8137」，等于没有栈

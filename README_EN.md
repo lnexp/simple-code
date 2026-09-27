@@ -36,17 +36,19 @@ The more fundamental reason is that the command line is the interface the model 
 
 ## Installation
 
+macOS and Linux are supported; on Windows, use WSL (the toolchain is designed for POSIX — native Windows is not supported).
+
 **VS Code extension**: search for `SimpleCode` in the Extensions panel. Model configuration is required before first use (see below).
 
-**Terminal command `sc`** (optional): the extension does not modify `PATH`, nor does it write anything into the home directory. To use it from a terminal, create the link manually — `sc.js` ships with the extension, under its `dist/` directory:
+No separate Node.js installation is required: tool scripts (apply_patch, web search, memory, …) run on the host editor's built-in Node (VS Code / Cursor) by default and fall back to a system Node when one is present.
+
+**Terminal command `sc`** (optional): on activation the extension creates command entries (including `sc`) under `~/.simple-code/bin/`. Add that directory to `PATH`:
 
 ```bash
-mkdir -p ~/.simple-code/bin
-ln -sf "$(ls -d ~/.vscode/extensions/lnexp.simplecode-*/dist/sc.js | tail -1)" ~/.simple-code/bin/sc
 export PATH="$HOME/.simple-code/bin:$PATH"   # add to ~/.zshrc to persist
 ```
 
-The extension directory name contains the version, so the `ln` command must be repeated after an upgrade. Installing from source requires none of this: `node scripts/deploy.mjs` creates the link and repoints it on every deployment.
+The entries are small scripts rewritten by the extension on every activation (they also run on the built-in Node), so the versioned extension directory needs no manual maintenance.
 
 A terminal does not inherit VS Code's settings, so any key referenced as `${ENV_VAR}` in the configuration must be exported in the shell, otherwise the first invocation fails:
 

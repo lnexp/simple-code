@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve as resolvePath } from 'node:path'
 import type { z } from 'zod'
 import type { Protocol } from '../llm/protocol.ts'
 import { resolveProtocol } from '../llm/registry.ts'
@@ -120,7 +120,17 @@ export async function loadConfig(
   const workspacePath = join(folderPath, WORKSPACE_CONFIG_RELATIVE)
 
   const global = await readJson(globalPath)
-  const { value: workspace, stripped } = stripDenied(await readJson(workspacePath))
+  // 同一个文件不能既当全局又当工作区：空工作区时面板的 folderList 兜底成
+  // home，<home>/.simple-code/settings.json 恰好是（默认）全局配置——再按
+  // 工作区读一遍会把它剥掉 provider/model/baseUrl/apiKey，空壳过不了校验。
+  // Remote-SSH 实测：远端窗口刚连上还没开文件夹时报「providers.deepseek.
+  // baseUrl undefined」就是这个撞路径（远端 home 有份 CLI 时代的旧配置）
+  const wsAbs = resolvePath(workspacePath)
+  const sameAsGlobal =
+    wsAbs === resolvePath(globalPath) || wsAbs === resolvePath(GLOBAL_CONFIG_PATH)
+  const { value: workspace, stripped } = sameAsGlobal
+    ? { value: null, stripped: [] }
+    : stripDenied(await readJson(workspacePath))
 
   const merged = deepMerge(global ?? {}, workspace ?? {})
   const config = parse(merged)

@@ -11,6 +11,7 @@ import {
   renderMergeInput,
 } from '../src/loop/summarize.ts'
 import { MEMORY_RELATIVE, openStore, type Store } from '../src/session/store.ts'
+import { forkTask, scopeOf } from '../src/session/task.ts'
 
 /**
  * 3b-2 的两段式验收之一：**纯逻辑**（挑合并组、渲染、请求）和 **store 层**
@@ -32,6 +33,7 @@ const workspace = async () => {
 
 describe('挑合并组', () => {
   const s = (over: Partial<Summary> = {}): Summary => ({
+    owner: over.owner ?? null,
     id: over.id ?? 1,
     level: over.level ?? 0,
     name: over.name ?? '',
@@ -97,6 +99,106 @@ describe('挑合并组', () => {
     expect(pickMergeGroup(group, 3)?.members.map((m) => m.id)).toEqual([3, 4, 5])
   })
 
+  it('**纯死缝可跨**：fork 预留尾巴零内容零摘要 → 跨缝成组', () => {
+    // task-v3：对话 fork 时跳过整段预留号段，任务关闭后没用完的尾巴
+    // 谁也不会再写——不跨的话每 fork 一次索引地板永久抬一行
+    const group = pickMergeGroup(
+      [
+        s({ id: 1, level: 1, coversFrom: 100, coversTo: 200 }),
+        s({ id: 2, level: 1, coversFrom: 50100, coversTo: 50200 }),
+      ],
+      2,
+      // 缝 (200, 50100) 里零消息零外主 steps
+      () => false,
+    )
+    expect(group?.members.map((m) => m.id)).toEqual([1, 2])
+  })
+
+  it('**缝里有摘要不跨**：缝内被别的行罩着的历史会被新节点吞掉', () => {
+    // 场景：缝里躺着别的层/别的链的摘要（它罩的消息行可能已被
+    // applyPendingMerges 整删，只查消息会误判成空缝）——跨过去后新节点
+    // 的 covers 罩住它，coversActive 把它收掉，它的内容没进新节点的 text
+    const group = pickMergeGroup(
+      [
+        s({ id: 1, level: 0, coversFrom: 100, coversTo: 200 }),
+        s({ id: 9, level: 1, coversFrom: 300, coversTo: 400 }),
+        s({ id: 2, level: 0, coversFrom: 500, coversTo: 600 }),
+        s({ id: 3, level: 0, coversFrom: 700, coversTo: 800 }),
+      ],
+      2,
+      () => false,
+    )
+    // L0 层 1 和 2 之间的缝 (200, 500) 里有 id 9 的 covers [300,400] →
+    // 不可跨。1 凑不够两条，从 2 重新数：2、3 相邻成组
+    expect(group?.members.map((m) => m.id)).toEqual([2, 3])
+  })
+
+  it('**罩着缝两侧的上层节点放行**：它跟缝相交但不会被新节点罩住（2026-09-25 索引区悬空根因）', () => {
+    // 真库现场：L2 大节点（covers 1–663613）罩住老区所有 fork 空缝——
+    // 按旧判据「缝里有任何行」全判不可跨，金字塔永久碎着。它一端伸出
+    // 合并组跨度外（coversFrom=50 < 首成员 100），新节点罩不住它 → 放行
+    const group = pickMergeGroup(
+      [
+        s({ id: 1, level: 1, coversFrom: 100, coversTo: 200 }),
+        s({ id: 9, level: 2, coversFrom: 50, coversTo: 60000 }),
+        s({ id: 2, level: 1, coversFrom: 50100, coversTo: 50200 }),
+      ],
+      2,
+      () => false,
+    )
+    expect(group?.members.map((m) => m.id)).toEqual([1, 2])
+  })
+
+  it('**跨缝的行完整落在合并组跨度内 → 仍拒**：新节点会整个罩住它', () => {
+    // 行 [150, 50150] 跟缝 (200, 50100) 相交、跨过缝两侧，但首尾都落在
+    // 合并组跨度 [100, 50200] 里——新节点会罩住它，收掉它的历史。放行
+    // 上层节点的口径收窄到这里为止，不是放开「跨过缝就算罩不住」
+    const group = pickMergeGroup(
+      [
+        s({ id: 1, level: 1, coversFrom: 100, coversTo: 200 }),
+        s({ id: 9, level: 2, coversFrom: 150, coversTo: 50150 }),
+        s({ id: 2, level: 1, coversFrom: 50100, coversTo: 50200 }),
+      ],
+      2,
+      () => false,
+    )
+    expect(group).toBeNull()
+  })
+
+  it('**缝里有消息或活任务 steps 不跨**（谓词为真 = 有内容痕迹）', () => {
+    const group = pickMergeGroup(
+      [
+        s({ id: 1, level: 1, coversFrom: 100, coversTo: 200 }),
+        s({ id: 2, level: 1, coversFrom: 50100, coversTo: 50200 }),
+      ],
+      2,
+      () => true,
+    )
+    expect(group).toBeNull()
+  })
+
+  it('store.gapHasContent：可见消息、活任务 steps、纯死缝三种口径', async () => {
+    const dir = await workspace()
+    const main = openStore(dir)
+    main.save([{ role: 'user', parts: [{ type: 'text', text: '主干' }] }])
+    const step = main.withTurns(main.load())[0]?.stepId ?? 0
+    // 可见消息：盖着消息的 step 两侧 → true
+    expect(main.gapHasContent(step - 1, step + 1)).toBe(true)
+    // 纯死缝：远离一切内容的号段 → false
+    expect(main.gapHasContent(500000, 600000)).toBe(false)
+
+    // 活任务：fork 出的任务在预留段里写 step（对话视角看不见消息，
+    // 但 steps 行在库里）→ 对话的 gapHasContent 必须报 true
+    const m = forkTask(dir, '跨缝保险')
+    const task = openStore(dir, { task: scopeOf(m) })
+    task.save([{ role: 'user', parts: [{ type: 'text', text: '任务里干活' }] }])
+    const taskStep = task.withTurns(task.load())[0]?.stepId ?? 0
+    expect(taskStep).toBeGreaterThan(0)
+    expect(main.gapHasContent(taskStep - 1, taskStep + 1)).toBe(true)
+    main.close()
+    task.close()
+  })
+
   it('没生效的、没 ready 的、已被合并过的不算数', () => {
     expect(
       pickMergeGroup(
@@ -129,6 +231,7 @@ describe('渲染与请求', () => {
     const text = renderMergeInput([
       {
         id: 1,
+        owner: null,
         level: 0,
         coversFrom: 3,
         coversTo: 3,
@@ -142,6 +245,7 @@ describe('渲染与请求', () => {
       },
       {
         id: 2,
+        owner: null,
         level: 0,
         coversFrom: 4,
         coversTo: 4,
@@ -220,6 +324,67 @@ describe('store：合并落库（只写库）', () => {
     const parent = all.find((s) => s.id === parentId)
     expect(parent?.level).toBe(1)
     expect(parent?.inContext).toBe(false)
+    store.close()
+  })
+
+  it('**等宽互罩双 L1 不死锁**：同范围两条都在场 → 留 id 小的，重复那条当场收掉', async () => {
+    // 2026-09-24 真机：66889/66891 同范围（612876-612983）双 L1 都在场——
+    // 互为 root，off 把双双翻 0 后 roots 循环又把双双翻回 1，谁也收不掉谁
+    // （12:28:49 前缀断裂里那对重复摘要一直僵在场内的根因）。修复：roots
+    // 取极大根，等宽时留 id 小的
+    const dir = await workspace()
+    const store = openStore(dir)
+    const row = (level: number, coversFrom: number, coversTo: number, inContext: boolean) => ({
+      level,
+      coversFrom,
+      coversTo,
+      name: '',
+      text: '摘要',
+      status: 'ready' as const,
+      inContext,
+      supersededBy: null,
+      head: null,
+      archivePath: null,
+    })
+    store.addSummary(row(0, 1, 1, true))
+    store.addSummary(row(0, 2, 2, true))
+    const a = store.addSummary(row(1, 1, 2, true))
+    const b = store.addSummary(row(1, 1, 2, true))
+    expect(a).toBeLessThan(b)
+
+    const dropped = store.applyMerges()
+    const after = store.summaries()
+    const at = (id: number) => after.find((s) => s.id === id)?.inContext
+    expect(at(a)).toBe(true) // 留下的那条
+    expect(at(b)).toBe(false) // 重复的那条——修复前它被 roots 循环翻回 1
+    expect(dropped.size).toBeGreaterThan(0)
+    store.close()
+  })
+
+  it('**嵌套的候选根出局**：L2 已进场且罩着在场的 L1 → L1 不再当根保自己，整棵收进 L2', async () => {
+    const dir = await workspace()
+    const store = openStore(dir)
+    const row = (level: number, coversFrom: number, coversTo: number, inContext: boolean) => ({
+      level,
+      coversFrom,
+      coversTo,
+      name: '',
+      text: '摘要',
+      status: 'ready' as const,
+      inContext,
+      supersededBy: null,
+      head: null,
+      archivePath: null,
+    })
+    store.addSummary(row(0, 1, 1, true)) // L1 的成员（也是 L1 当候选根的依据）
+    const l1 = store.addSummary(row(1, 1, 2, true))
+    const l2 = store.addSummary(row(2, 1, 3, true))
+
+    store.applyMerges()
+    const after = store.summaries()
+    const at = (id: number) => after.find((s) => s.id === id)?.inContext
+    expect(at(l1)).toBe(false) // 被罩住的候选根不再保自己
+    expect(at(l2)).toBe(true)
     store.close()
   })
 })
@@ -306,6 +471,84 @@ describe('store：生效', () => {
     store.applyMerges()
 
     expect(store.summaries().find((s) => s.id === orphan)?.inContext).toBe(true)
+    store.close()
+  })
+
+  it('**已进场的链根也收**：activateBacklog 先翻 L1 进场、成员还压着 → apply 当场收掉，重开库不再动', async () => {
+    // 2026-09-24 真机事故链：压缩点上 activateBacklog（activateSummary 只翻
+    // 自己）把 L1 翻进场，紧跟的 applyMerges 只认「还没进场」的 root——L1
+    // 已进场就跳过，成员留在场内与 L1 重叠。这个脏态留到 reload 被
+    // repairAppliedChains 收掉，首请求前缀在中段被改写，两个目录双双
+    // PrefixBrokenError。修复：root 判据不要求 !inContext，重叠在同一个
+    // 压缩点内收掉——重开库（repairAppliedChains）从此无事可做
+    const dir = await workspace()
+    let store = openStore(dir)
+    // 三个真 step（activateSummary 认 steps.unloaded，假号过不了它的门）
+    store.save([
+      { role: 'user', parts: [{ type: 'text', text: '第一轮' }] },
+      { role: 'assistant', parts: [{ type: 'text', text: '答一' }] },
+      { role: 'user', parts: [{ type: 'text', text: '第二轮' }] },
+      { role: 'assistant', parts: [{ type: 'text', text: '答二' }] },
+      { role: 'user', parts: [{ type: 'text', text: '第三轮' }] },
+      { role: 'assistant', parts: [{ type: 'text', text: '答三' }] },
+    ])
+    store.unload([0, 1, 2, 3, 4, 5])
+    const steps = [...store.unloadedSteps()].sort((a, b) => a - b)
+    expect(steps.length).toBeGreaterThanOrEqual(3) // save 的切步不保证 3 段，取前 3 个真 step 即可
+    // 三段 L0 在场（真实路径：卸载时 activateSummary 翻进来的，这里直接造终态）
+    const ids = steps.slice(0, 3).map((t) =>
+      store.addSummary({
+        level: 0,
+        coversFrom: t,
+        coversTo: t,
+        name: '',
+        text: '摘要',
+        status: 'ready',
+        inContext: true,
+        supersededBy: null,
+        head: '开头',
+        archivePath: '.simple-code/turns/turn-000001.jsonl',
+      }),
+    )
+    const parentId = store.recordMerge(
+      {
+        level: 1,
+        coversFrom: steps[0]!,
+        coversTo: steps[2]!,
+        name: '',
+        text: 'L1',
+        status: 'ready',
+        inContext: false,
+        supersededBy: null,
+        head: null,
+        archivePath: null,
+      },
+      ids,
+    )
+
+    // 压缩点的第一步：activateBacklog 把 L1 翻进场（成员 superseded，查不到
+    // 自己，只会命中 L1）
+    expect(store.activateSummary(steps[0]!)).toBe(true)
+    const overlapped = store.summaries()
+    // 事故现场：L1 与成员同时在场
+    expect(overlapped.find((s) => s.id === parentId)?.inContext).toBe(true)
+    expect(overlapped.find((s) => s.id === ids[0])?.inContext).toBe(true)
+
+    // 压缩点的第二步：apply 必须当场收掉成员（修复前成员留 1）
+    const dropped = store.applyMerges()
+    expect(dropped).toEqual(new Set(steps.slice(0, 3)))
+    const after = store.summaries()
+    for (const id of ids) expect(after.find((s) => s.id === id)?.inContext).toBe(false)
+    expect(after.find((s) => s.id === parentId)?.inContext).toBe(true)
+    store.close()
+
+    // reload 等价物：重开库（repairAppliedChains 在 openStore 里跑）——
+    // 修复后无事可做，在场集合一个字节不动
+    store = openStore(dir)
+    const reopened = store.summaries()
+    for (const s of after) {
+      expect(reopened.find((x) => x.id === s.id)?.inContext).toBe(s.inContext)
+    }
     store.close()
   })
 })

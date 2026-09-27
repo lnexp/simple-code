@@ -137,6 +137,12 @@ describe('子 agent 权限上限（SIMPLE_CODE_ROOTS，逐级只减不增）', (
     expect(assertRootAllowed('/a', '["x",5]')).toContain('字符串数组')
   })
   it('scMain：越界拒绝启动（exit 2），范围内放行到干活那步', async () => {
+    // HOME 换临时目录：放行后会走到 injectLocalTools——shim 要写
+    // ~/.simple-code/bin，不换就污染真实 HOME（2026-09-19 实测发生过）
+    const home = await mkdtemp(join(tmpdir(), 'sc-home-'))
+    dirs.push(home)
+    const savedHome = process.env.HOME
+    process.env.HOME = home
     const bad = io({
       argv: ['--root', '/etc', '任务'],
       env: { SIMPLE_CODE_ROOTS: JSON.stringify(['/Users/dev/Code/proj']) },
@@ -150,7 +156,12 @@ describe('子 agent 权限上限（SIMPLE_CODE_ROOTS，逐级只减不增）', (
       env: { SIMPLE_CODE_ROOTS: JSON.stringify(['/Users/dev/Code/proj']) },
     })
     const code = await scMain(ok.argv, ok.io)
-    expect(ok.stderr()).not.toContain('审批范围')
+    try {
+      expect(ok.stderr()).not.toContain('审批范围')
+    } finally {
+      if (savedHome !== undefined) process.env.HOME = savedHome
+      else delete process.env.HOME
+    }
   })
   it('scMain：--root 相对路径按 cwd 解析后再校验（绕道相对路径不豁免）', async () => {
     const h = io({

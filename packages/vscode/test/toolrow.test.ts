@@ -194,6 +194,26 @@ describe('审批卡挂在工具行下方（approval.md §4.2 位置 + 样式）'
     )
     expect(out).not.toContain('approval-card')
   })
+
+  it('批量目录预览（paths）：列出各目录，按钮带数量（2026-09-21 方案 1）', () => {
+    // multi 卡的第三键：触发点全是项目外目录时一键全记。本地 fixture——
+    // 共享的 approval 会被倒计时用例原地改字段，别碰它
+    const out = renderToStaticMarkup(
+      createElement(ToolRow, {
+        tool: toolItem({ id: 't1' }),
+        approval: {
+          ...approval,
+          category: 'multi' as const,
+          always: { kind: 'paths', dirs: ['/Users/x/knowledge-base', '/Users/x/mb-inference'] },
+        },
+        onReply: () => {},
+      }),
+    )
+    // 按钮文案带数量（区别于单目录的「始终允许」）
+    expect(out).toContain('始终允许这 2 个目录')
+    // 预览列出会记什么：每个目录的 /* 形态
+    expect(out).toContain('/Users/x/knowledge-base/*、/Users/x/mb-inference/*')
+  })
 })
 
 describe('折叠 CSS 契约（grid-auto-rows）', () => {

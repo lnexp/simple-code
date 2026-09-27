@@ -1,0 +1,35 @@
+{
+  "name": "SimpleCode-Companion",
+  "displayName": "SimpleCode Companion",
+  "description": "SimpleCode 的本机伴生扩展：Remote-SSH 时模型请求走本机网络（key 不出本机），并自动配置反向隧道。",
+  "version": "0.1.1",
+  "publisher": "lnexp",
+  "main": "./dist/extension.cjs",
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "categories": [
+    "AI"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lnexp/simple-code"
+  },
+  "icon": "assets/marketplace-icon.png",
+  "dependencies": {
+    "@simple-code/core": "workspace:*"
+  },
+  "scripts": {
+    "package": "node ../../scripts/build.mjs && vsce package --no-dependencies",
+    "deploy": "node ../../scripts/deploy.mjs companion"
+  },
+  "devDependencies": {
+    "@types/vscode": "~1.106.0"
+  }
+}

@@ -17,7 +17,11 @@ CREATE TABLE IF NOT EXISTS turns (
   id          INTEGER PRIMARY KEY,
   started_at  TEXT NOT NULL,
   state       TEXT NOT NULL DEFAULT 'live',
-  meta        TEXT
+  meta        TEXT,
+  -- task-v3（docs/proposals/task-v3.md）：NULL=对话的轮；'task-xxx'=任务
+  -- 的轮。对话流/记忆分治的唯一开关——关闭任务=owner 还俗为 NULL，该段
+  -- 从此就是对话的历史，零特殊路径
+  owner       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -26,7 +30,10 @@ CREATE TABLE IF NOT EXISTS messages (
   role         TEXT NOT NULL,
   content_json TEXT NOT NULL,
   state        TEXT NOT NULL DEFAULT 'live',
-  step_id      INTEGER
+  step_id      INTEGER,
+  -- 行归属：NULL=主任务；'task-xxx'=任务（自己的轮 + fork 时复制来的主任务
+  -- 上下文）。见 MIGRATIONS 末尾与 store.ts ensureInheritedCopy
+  owner        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS messages_live ON messages(state, id);
@@ -60,7 +67,11 @@ CREATE TABLE IF NOT EXISTS summaries (
   archive_path  TEXT,
   -- 短标题，温区那一行显示它。跟 text（描述）分列：两者是模型一次生成的
   -- 两样东西，挤一列的话温区想只显示标题就得再切一次字符串
-  name          TEXT
+  name          TEXT,
+  -- task-v3：摘要归属。NULL=对话的（含任务关闭后还俗的）；'task-xxx'=任务
+  -- 私有的。私有摘要只在 owner 自己的组装里可见/进场——in_context 和行
+  -- 的 state 一样是「窗口账本」，账本记在归属上而不是行的比特上
+  owner         TEXT
 );
 
 -- search 的 FTS5 倒排索引（search-index.ts）。虚表 + 游标表，均可随时
@@ -74,6 +85,56 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
 CREATE TABLE IF NOT EXISTS search_fts_meta (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL
+);
+
+-- system prompt 四个磁盘源段（agents/notes/events/lessons）的快照，**每个
+-- 会话域一行**（主任务 owner=''，任务 owner=任务 id，与 prefix_baseline
+-- 同款）。建会话时若 prompt cache 还热（距上次响应 < cacheTtlMs）就
+-- 沿用快照、不重读磁盘：磁盘内容变了会让 system prompt 变一个字，而
+-- system prompt 在请求最前，它一变后面全部历史错位——2026-09-21 实测
+-- 27 字符的事件索引行废掉 77k token 的前缀缓存（note
+-- system-prompt-refresh-paths）。缓存冷了照常重读并回写这里。
+-- reloadSystem（卸载触发点）刷新时也回写。
+--
+-- **必须按 owner 分行**（2026-09-25 实测翻车）：原来是全文件夹单行
+-- （id=1），任务会话的 reloadSystem 在它自己的压缩点写快照——对主任务
+-- 不是压缩点。主任务会话实例重建（面板重开/settings 变更，合法）读到
+-- 被任务换过的快照 → system 在非压缩点变了 → PrefixBrokenError
+-- （现场 prefix-breaks/2026-09-25T12-33-30-179Z.json：task-ws12fr 的
+-- stale 车 12:27:30 写快照，主任务 12:33:30 重建即炸）。前缀不变式按
+-- 会话域算，快照也必须按会话域分
+CREATE TABLE IF NOT EXISTS prompt_snapshot (
+  owner      TEXT PRIMARY KEY,
+  agents     TEXT,
+  notes      TEXT,
+  events     TEXT,
+  lessons    TEXT,
+  updated_at TEXT NOT NULL
+);
+
+-- 前缀不变式的基线（loop/prefix-guard.ts）：上一次请求的指纹（各块哈希），
+-- 每个会话域一行（对话 owner=''，任务 owner=任务 id）。落盘是为了跨
+-- reload：缓存还热的话 reload 后第一次请求也必须接得上上一次的前缀
+CREATE TABLE IF NOT EXISTS prefix_baseline (
+  owner       TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+
+-- recall 线索层（docs/proposals/recall.md §5）：每个 turn 的 cue 冻结快照
+-- ——send 入口算一次，之后**永不变**。lines 是渲染好的成品行（JSON 数组），
+-- names 是被撞候选的名字（短窗去重用，同一记忆连轮重撞 = 狼来了放大器）。
+-- 渲染是装配期纯函数（relay 同款）：库里的消息行一个字节不动，assemble
+-- 把 lines 贴在该 turn 的用户消息后面。turn 卸载（被摘要顶替）后 live 块
+-- 不再出现，cue 随之自然消失，不删行也不用清——行很小，留着当影子模式
+-- 的观察日志（mode=shadow 时只写不渲染）
+CREATE TABLE IF NOT EXISTS cues (
+  owner      TEXT NOT NULL DEFAULT '',
+  turn_id    INTEGER NOT NULL,
+  lines      TEXT NOT NULL,
+  names      TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (owner, turn_id)
 );
 `
 
@@ -99,6 +160,11 @@ export const MIGRATIONS = [
      unloaded   INTEGER NOT NULL DEFAULT 0
    )`,
   `ALTER TABLE messages ADD COLUMN step_id INTEGER`,
+  // task-v3：owner 列。老库（含 v2 时代合并进来的段）全 NULL=对话，语义不变
+  `ALTER TABLE turns ADD COLUMN owner TEXT`,
+  // task-v3：摘要归属列（见 schema 的列注释）
+  `ALTER TABLE summaries ADD COLUMN owner TEXT`,
+  `CREATE INDEX IF NOT EXISTS turns_owner ON turns(owner)`,
   // 见 store.ts 的 clearLegacySummaries——一次性清空不能放这里（每次开库都跑）
   `CREATE INDEX IF NOT EXISTS messages_step ON messages(step_id)`,
   // 一次性迁移的「跑过了」标记，一个迁移一行。
@@ -116,4 +182,13 @@ export const MIGRATIONS = [
   // 页脚耗时落盘（用户拍板：历史事实不可变——落盘的是当时的值，之后换
   // 模型不改写历史轮）。model/effort 本来就在 turns.meta，缺的只是耗时
   `ALTER TABLE turns ADD COLUMN elapsed_ms INTEGER`,
+  // 上下文隔离（2026-09-23 用户定死：任务与主任务只共享数据，上下文隔离、
+  // 压缩独立）：消息行的归属。NULL=主任务；'task-xxx'=任务——含任务自己
+  // 的轮，以及 fork 时从主任务上下文复制来的行（turn_id 仍是主任务的轮，
+  // 所以归属不能再靠 turn 推）。回填只动「轮归任务、行还没标」的老行，
+  // 幂等，每次开库跑一遍无害
+  `ALTER TABLE messages ADD COLUMN owner TEXT`,
+  `CREATE INDEX IF NOT EXISTS messages_owner ON messages(owner)`,
+  `UPDATE messages SET owner = (SELECT t.owner FROM turns t WHERE t.id = messages.turn_id)
+   WHERE owner IS NULL AND turn_id IN (SELECT id FROM turns WHERE owner IS NOT NULL)`,
 ]

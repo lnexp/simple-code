@@ -160,6 +160,7 @@ describe('unloaded', () => {
       count: 37,
       estimated: 36769,
       reason: 'budget',
+      sinceMs: null,
     })
     expect(view.items.some((i) => i.kind === 'notice' && i.text.includes('37'))).toBe(true)
     // 已有的气泡一个字没变
@@ -167,14 +168,16 @@ describe('unloaded', () => {
   })
 
   it('**stale 触发不说「接近上限」**——预算没超，喊上限是误导（实测 raw 14% 也喊过）', () => {
-    const view = feed({ type: 'unloaded', count: 13, estimated: 32674, reason: 'stale' })
+    const view = feed({ type: 'unloaded', count: 13, estimated: 32674, reason: 'stale', sinceMs: 11 * 60_000 })
     const notice = view.items.find((i) => i.kind === 'notice')
     expect(notice?.kind === 'notice' && notice.text.includes('缓存已过期')).toBe(true)
     expect(notice?.kind === 'notice' && notice.text.includes('接近上限')).toBe(false)
+    // 带实际间隔自证（2026-09-20）：到没到 TTL 文案自己说话
+    expect(notice?.kind === 'notice' && notice.text.includes('距上次响应 11 分钟')).toBe(true)
   })
 
   it('**force 触发说「超出上限」**——连保底区都卸了，跟「接近」是两回事', () => {
-    const view = feed({ type: 'unloaded', count: 5, estimated: 0, reason: 'force' })
+    const view = feed({ type: 'unloaded', count: 5, estimated: 0, reason: 'force', sinceMs: null })
     const notice = view.items.find((i) => i.kind === 'notice')
     expect(notice?.kind === 'notice' && notice.text.includes('超出模型上限')).toBe(true)
   })

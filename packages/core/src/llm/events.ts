@@ -23,7 +23,16 @@ export type LLMEvent =
   | { type: 'tool_input_delta'; id: string; partial: string }
   /** 累积完成并已 parse。这是内部信号，loop 收到后转成对外的 tool_call */
   | { type: 'tool_input_end'; id: string; name: string; input: unknown }
-  | { type: 'finish'; reason: FinishReason; usage: Usage }
+  | { type: 'finish'; reason: FinishReason; usage: Usage; refusal?: RefusalDetail }
+
+/**
+ * content-filter 拒答的详情（Anthropic 的 stop_details）。HTTP 200、内容为空，
+ * 不透传的话用户只看到模型「什么都没说」——为什么被拒全在 explanation 里
+ * （2026-09-23 实测 Opus 5 的 reasoning_extraction 误报，Claude Code 官方
+ * 仓库也有同款抱怨：吞掉 explanation 只给分类标签）。只有 Anthropic 协议
+ * 给得出，其余协议没有这个字段。
+ */
+export type RefusalDetail = { category?: string; explanation?: string }
 
 /** SSE 行解析的产物，协议无关。见 protocols/utils/sse.ts */
 export type SSEMessage = {

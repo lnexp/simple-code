@@ -59,6 +59,7 @@ const state = (over: Partial<Extract<ToWebview, { type: 'state' }>> = {}): ToWeb
   effortOverridden: false,
       presets: [],
   imagesEnabled: false,
+  contextWindow: 0,
   ...over,
 })
 
@@ -157,12 +158,15 @@ describe('底栏布局', () => {
       },
       at: 1,
     })
-    // 底栏一行：首字/总时延/↑↓（本用例只发了 step_finish，时延是骨架 0）
-    // + 上下文水位。1234 现在格式化成 1.2k（fmtTok）
-    expect(app.host.querySelector('.usage')?.textContent).toContain('1.2k')
-    expect(app.host.querySelector('.usage')?.textContent).toContain('上下文')
-    // 在 .bar 里但不在 .bar-right 里——right 靠 margin-left:auto 推到右边
+    // 底栏左侧是**两个并列的子项**（2026-09-20 拆分）：耗时统计 .usage
+    // 与上下文按钮 .usage-ctx。挤在一个 span 里时窄侧栏会把按钮推到第二
+    // 行，所以拆开——耗时可收缩、按钮 flex:none。1234 → 1.2k（fmtTok）
+    expect(app.host.querySelector('.usage')?.textContent).toContain('首字')
+    expect(app.host.querySelector('.usage-ctx')?.textContent).toContain('1.2k')
+    expect(app.host.querySelector('.usage-ctx')?.textContent).toContain('上下文')
+    // 都在 .bar 里但不在 .bar-right 里——right 靠 margin-left:auto 推到右边
     expect(app.host.querySelector('.bar-right .usage')).toBeNull()
+    expect(app.host.querySelector('.bar-right .usage-ctx')).toBeNull()
   })
 
   it('跑的时候发送变停止，仍然在最后', () => {
