@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Message, Request } from '../src/llm/types.ts'
 import { stripImagesWhenUnsupported } from '../src/llm/resizer.ts'
-import { regionSizes } from '../src/loop/regions.ts'
+import { regionSizes, regionsEstimate, usageRatio } from '../src/loop/regions.ts'
 
 /**
  * 四个区的记账（提案 §13）。**这是纯诊断口径**，不参与任何运行时判断——
@@ -41,7 +41,7 @@ describe('四个区的记账', () => {
   it('摘要进 ②、存根进 ③、其余进 ④', () => {
     const sizes = regionSizes(
       request([
-        text('<历史摘要 step=1-10>\n摘要：改了鉴权\n</历史摘要>'),
+        text('<历史摘要 turn=1-10>\n摘要：改了鉴权\n</历史摘要>'),
         stub('.simple-code/memory/turns/turn-000001.jsonl'),
         text('你来继续实现'),
       ]),
@@ -56,7 +56,7 @@ describe('四个区的记账', () => {
     // 这条钉死的是「决定进哪个区的是形状本身」：把摘要标签去掉、把卸载标记
     // 去掉，同一段文字就整体挪到 ④
     const body = '改了鉴权'
-    const asSummary = regionSizes(request([text(`<历史摘要 step=1-10>\n${body}\n</历史摘要>`)]))
+    const asSummary = regionSizes(request([text(`<历史摘要 turn=1-10>\n${body}\n</历史摘要>`)]))
     expect(asSummary.warm).toBeGreaterThan(0)
     expect(asSummary.live).toBe(0)
 
@@ -124,7 +124,7 @@ describe('四个区的记账', () => {
     const cold = regionSizes(
       request([
         text(
-          '<历史摘要 step=1-100>\n摘要：早期改造\n详情：turns-000/a.md … turns-000/z.md（共 10 个）\n</历史摘要>',
+          '<历史摘要 turn=1-100>\n摘要：早期改造\n详情：turns-000/a.md … turns-000/z.md（共 10 个）\n</历史摘要>',
         ),
       ]),
     )
@@ -134,7 +134,7 @@ describe('四个区的记账', () => {
     const hot = regionSizes(
       request([
         text(
-          '<历史摘要 step=1-10>\n摘要：改了鉴权\n## 用户要求\n做 X\n## 实际完成\n完成了\n</历史摘要>',
+          '<历史摘要 turn=1-10>\n摘要：改了鉴权\n## 用户要求\n做 X\n## 实际完成\n完成了\n</历史摘要>',
         ),
       ]),
     )
@@ -142,7 +142,7 @@ describe('四个区的记账', () => {
     expect(hot.warm).toBe(0)
 
     const warm = regionSizes(
-      request([text('<历史摘要 step=1-10>\n摘要：改了鉴权\n</历史摘要>')]),
+      request([text('<历史摘要 turn=1-10>\n摘要：改了鉴权\n</历史摘要>')]),
     )
     expect(warm.warm).toBeGreaterThan(0)
     expect(warm.hot).toBe(0)
@@ -189,51 +189,30 @@ describe('四个区的记账', () => {
   })
 })
 
-describe('范围列（step 闭区间）', () => {
-  const summaryMsg = (from: number, to: number, kind: 'cold' | 'hot' | 'warm'): Message => {
-    const body =
-      kind === 'cold' ? '详情：x 详情行（共 3 个）' : kind === 'hot' ? '## 标题\n正文' : '开头：x'
-    return text(`<历史摘要 step=${from}-${to}>\n${body}\n</历史摘要>`)
-  }
-  const liveMsg = text('普通消息')
-  const floorMsg = text('保底消息')
-  const stubMsg = stub('.simple-code/memory/turns/000/turn-000001.jsonl')
-
-  it('摘要范围从渲染首行解析，冷温热各归各', () => {
-    const req = request([
-      summaryMsg(3, 40, 'cold'),
-      summaryMsg(41, 50, 'warm'),
-      summaryMsg(51, 51, 'hot'),
-    ])
-    const r = regionSizes(req)
-    expect(r.ranges).toEqual({
-      cold: { from: 3, to: 40 },
-      warm: { from: 41, to: 50 },
-      hot: { from: 51, to: 51 },
-      stub: null,
-      floor: null,
-      live: null,
-    })
+describe('范围列已删（2026-09-30 拍板）', () => {
+  it('regionSizes 只给各区大小，不再给 ranges', () => {
+    const r = regionSizes(request([text('<历史摘要 turn=1-2>\n开头：x\n</历史摘要>'), text('普通消息')]))
+    expect(r).not.toHaveProperty('ranges')
+    expect(r.warm).toBeGreaterThan(0)
   })
+})
 
-  it('live 三类从 stepIds 查归属；多条消息取 min–max', () => {
-    const req = request([stubMsg, liveMsg, floorMsg])
-    const r = regionSizes(req, new Set([floorMsg]), new Map([[stubMsg, 12], [liveMsg, 14], [floorMsg, 15]]))
-    expect(r.ranges.stub).toEqual({ from: 12, to: 12 })
-    expect(r.ranges.live).toEqual({ from: 14, to: 14 })
-    expect(r.ranges.floor).toEqual({ from: 15, to: 15 })
+describe('估算 → 真实系数（usageRatio，2026-09-29 额度按 usage 校准）', () => {
+  it('两个方向都照实：opus 估小（>1）、glm 估大（<1）', () => {
+    expect(usageRatio(40_000, 50_000)).toBe(1.25)
+    expect(usageRatio(50_000, 41_000)).toBe(0.82)
   })
-
-  it('同类多条消息聚合区间；stepIds 缺席时范围空但不炸', () => {
-    const a = text('a')
-    const b = text('b')
-    const r = regionSizes(request([a, b]), undefined, new Map([[a, 7], [b, 3]]))
-    expect(r.ranges.live).toEqual({ from: 3, to: 7 })
-    expect(regionSizes(request([a])).ranges.live).toBeNull()
+  it('坏数夹在 [0.5, 2]：一次报错的 usage 不至于把额度砍掉大半', () => {
+    expect(usageRatio(100_000, 222_924 * 3)).toBe(2)
+    expect(usageRatio(100_000, 1)).toBe(0.5)
   })
-
-  it('摘要首行没有 step= 时不给范围（宁缺毋猜）', () => {
-    const s = text('<历史摘要 手写的旧格式>\n开头：x\n</历史摘要>')
-    expect(regionSizes(request([s])).ranges.warm).toBeNull()
+  it('拿不到 usage → null（调用方沿用上一个系数）', () => {
+    expect(usageRatio(40_000, null)).toBeNull()
+    expect(usageRatio(40_000, 0)).toBeNull()
+    expect(usageRatio(0, 50_000)).toBeNull()
+  })
+  it('regionsEstimate = 七个区之和，不含 budget/real/ranges 这些行里的其它字段', () => {
+    const line = { at: 'x', budget: 290_000, overhead: 1, cold: 2, warm: 3, hot: 4, stub: 5, floor: 6, live: 7, real: 99, ranges: null }
+    expect(regionsEstimate(line)).toBe(28)
   })
 })

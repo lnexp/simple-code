@@ -27,6 +27,10 @@
  */
 import { readFileSync } from 'node:fs'
 import { type LessonWriteInput, listLessons, parseStdinLessonInput, readLesson, searchLessons, writeLesson } from '@simple-code/core/src/tools/lesson.ts'
+import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts'
+
+// 工作区根：cwd 可能是子目录（workspace-root.ts）
+const root = findWorkspaceRoot(process.cwd())
 
 const usage = `用法：
   lesson list                                   全部教训的描述清单（文件内二级筛选）
@@ -46,15 +50,15 @@ const [sub, target] = process.argv.slice(2)
 
 try {
   if (sub === 'list') {
-    console.log(listLessons(process.cwd()))
+    console.log(listLessons(root))
   } else if (sub === 'read' && target) {
-    console.log(readLesson(process.cwd(), target))
+    console.log(readLesson(root, target))
   } else if (sub === 'search' && target) {
-    console.log(searchLessons(process.cwd(), target))
+    console.log(searchLessons(root, target))
   } else if (sub === 'write') {
     const fromStdin = stdinJsonInput() as Partial<LessonWriteInput> | null
     console.log(
-      writeLesson(process.cwd(), {
+      writeLesson(root, {
         // 两种形态的字段校验都交给 writeLesson（缺段/坏名同一套报错）
         ...(fromStdin ?? {
           name: arg('--name') ?? '',

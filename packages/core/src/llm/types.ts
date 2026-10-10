@@ -134,8 +134,19 @@ export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type Request = {
   model: string
   maxTokens: number
+  /** 客户端稳定标识（官方客户端同款 metadata.user_id 的值）。多账号池的
+   * 网关按它做粘性路由——不发就每请求随机路由，prompt cache 撞不到同一
+   * 账号就全量 miss（2026-09-28 同一网关两个渠道实测；官方客户端发了
+   * 所以命中正常） */
+  userId?: string
+  /** OpenAI Responses 的 prompt_cache_key（主流客户端用 thread_id 或
+   * sessionID，同款）。网关/上游按它把同前缀请求路由到同一台机器——不发
+   * 就按前缀哈希分散，连发两次同前缀也 miss（2026-09-29 实测：不发
+   * 0/2，发了第二次 cached=41472） */
+  cacheKey?: string
   thinking: 'adaptive' | 'disabled'
-  effort: Effort
+  /** 'none' 只来自副模型 ref（摘要/视觉转述，config/schema.ts sideModelRef），主模型配不出 */
+  effort: Effort | 'none'
   reasoningDisplay: 'omitted' | 'summarized'
   system: string
   tools: ToolDefinition[]

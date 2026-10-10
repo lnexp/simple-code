@@ -62,6 +62,7 @@ export type TaskApprovalQ = {
     | { kind: 'path'; dir: string }
     | { kind: 'nonpath'; lead: string; from: number }
     | { kind: 'paths'; dirs: string[] }
+    | { kind: 'hidden'; path: string; write: boolean }
   task?: string
 }
 export type TaskApprovalResult = 'allow' | 'always' | 'deny' | { deny: string }
@@ -171,7 +172,8 @@ export function createTaskCenter(deps: TaskDeps) {
   const states = (): TaskState[] =>
     [...runs.values()].map((r) => {
       // 控件状态从 session 现算（setModel/setEffort 直改 session，不另记账）
-      const preset = r.session?.presetState().current
+      const ps = r.session?.presetState()
+      const preset = ps?.current
       const effortState = r.session?.effortState()
       return {
         name: r.name,
@@ -182,6 +184,11 @@ export function createTaskCenter(deps: TaskDeps) {
         effort: effortState?.effort ?? null,
         effortOverridden: effortState?.overridden ?? false,
         ...(preset === undefined ? {} : { preset }),
+        presets: ps?.available ?? [],
+        // 同 bridge refresh 的判据（直收图或走 visionRelay 转述）
+        imagesEnabled:
+          r.session !== null &&
+          (r.session.config.model.capabilities.images || r.session.config.vision !== null),
         contextWindow: r.session?.config.model.contextWindow ?? 0,
         approvalOn: r.approvalOn,
       }
@@ -420,7 +427,18 @@ export function createTaskCenter(deps: TaskDeps) {
       approvalOn: true,
     }
     runs.set(name, run)
-    logRun({ ev: 'task_fork', folder: deps.folder, task: name, owner: manifest.owner })
+    // 号段只在 manifest 里，关闭时 manifest 删、owner 还俗——事后对账只剩这一行
+    logRun({
+      ev: 'task_fork',
+      folder: deps.folder,
+      task: name,
+      owner: manifest.owner,
+      forkTurn: manifest.forkTurn,
+      turnCeil: manifest.turnCeil,
+      stepFloor: manifest.stepFloor,
+      msgFloor: manifest.msgFloor,
+      sumFloor: manifest.sumFloor,
+    })
     postTasks()
     // 任务身份的轻量框架：系统提示词与对话共享（root 相同），只补一句
     // 「你是派出去的任务」——它知道自己看得见 fork 点以前的一切
@@ -572,25 +590,37 @@ export function createTaskCenter(deps: TaskDeps) {
    *   ④ owner 还俗 NULL + FTS 全量重灌 + 删 manifest
    * 摘要连续失败 3 次 → 照样收尾（裸段由对话空闲摘要兜底）+ runlog 记一行
    */
-  const close = async (name: string): Promise<TaskOutcome> => {
+  const close = async (
+    name: string,
+    /** 主任务闸（用户设计：开/关任务都只在主任务 turn 结束后）。busy 在点击时
+     *  拒绝；排空要跑几分钟、期间主任务可能又开跑——只有 finalizeTask 改主任务
+     *  的历史，它之前 waitIdle 等主任务这轮结束（flip/排空只碰任务自己的行） */
+    gate?: { busy: () => string | null; waitIdle: () => Promise<void> },
+  ): Promise<TaskOutcome> => {
     const r = runs.get(name)
     if (!r) return { ok: false, error: `没有任务「${name}」` }
     // 幂等：已经在关了就无事可做（双击是正常输入，不是错误）
     if (r.status === 'closing') return { ok: true }
+    const refused = gate?.busy() ?? null
+    if (refused !== null) return { ok: false, error: refused }
     r.status = 'closing'
     postTasks()
+    const t0 = Date.now()
     try {
-      await r.sessionP?.then((s) => s?.interrupt()).catch(() => {})
+      await r.sessionP?.then((s) => s?.interrupt('task_close')).catch(() => {})
       const session = (await r.sessionP) ?? null
-      flipTaskLive(deps.folder, r.manifest.owner)
+      const flipped = flipTaskLive(deps.folder, r.manifest.owner)
+      let rounds = 0
+      let failures = 0
+      let debt = false
       if (session !== null) {
-        let failures = 0
         for (let i = 0; i < 500 && failures < 3; i++) {
-          let debt = false
+          rounds++
           try {
             await session.summarizeIdle()
-          } catch {
+          } catch (error) {
             failures++
+            logRun({ ev: 'task_close_summary_fail', folder: deps.folder, task: name, i, error: String(error) })
           }
           // 债 = 摘要器挑不出段（session.summaryDebt，与 summarizeIdle 同一
           // 判据——原来这里是 task.ts 里同构的第二份 SQL，判据演进会漂移）
@@ -598,11 +628,23 @@ export function createTaskCenter(deps: TaskDeps) {
           if (!debt) break
         }
       }
-      finalizeTask(deps.folder, r.manifest.owner)
+      await gate?.waitIdle()
+      const counts = finalizeTask(deps.folder, r.manifest.owner)
       await closeRun(r)
       runs.delete(name)
       postTasks()
-      logRun({ ev: 'task_close', folder: deps.folder, task: name, owner: r.manifest.owner })
+      logRun({
+        ev: 'task_close',
+        folder: deps.folder,
+        task: name,
+        owner: r.manifest.owner,
+        ms: Date.now() - t0,
+        rounds,
+        failures,
+        debtLeft: debt,
+        flipped,
+        ...counts,
+      })
       return { ok: true }
     } catch (error) {
       // 关闭失败：状态回 idle，任务还在（可重试关闭）
@@ -616,7 +658,7 @@ export function createTaskCenter(deps: TaskDeps) {
   const stop = (name: string): boolean => {
     const r = runs.get(name)
     if (!r || r.status !== 'running') return false
-    void r.sessionP?.then((s) => s?.interrupt()).catch(() => {})
+    void r.sessionP?.then((s) => s?.interrupt('task_stop')).catch(() => {})
     return true
   }
 

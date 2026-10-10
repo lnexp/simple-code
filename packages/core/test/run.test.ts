@@ -603,6 +603,14 @@ const truncated = (text: string): StreamEvent[] => [
   { type: 'finish', reason: 'length', usage: usage() },
 ]
 
+/** 还没写正文就被 max_tokens 砍断——预算全烧在推理上（DeepSeek 实证形态） */
+const starved = (thinking: string): StreamEvent[] => [
+  { type: 'reasoning_start' },
+  { type: 'reasoning_delta', text: thinking },
+  { type: 'reasoning_end' },
+  { type: 'finish', reason: 'length', usage: usage() },
+]
+
 describe('任务跑超（task-v3 配额闸）', () => {
   it('命中即收口：一个 error 事件、不发请求、排队输入不消费', async () => {
     const h = await drive({
@@ -641,6 +649,17 @@ describe('输出被 max_tokens 截断', () => {
     expect(second).toContain('直接接着写')
     // 不许道歉和复述是有代价考量的：那会再烧掉一截输出
     expect(second).toContain('不要复述')
+  })
+
+  it('零正文被截断（预算全烧在推理上）：换指令让模型精简推理直接给答案', async () => {
+    // 「直接接着写」对这个形态是误导——模型没写过正文，无从接着写；
+    // 而且截断的推理在重放时会被丢（openai-chat 守卫 / 无签名的 thinking），
+    // 模型看不见自己想过什么，只能引导它重想时大幅精简
+    const h = await drive({ rounds: [starved('想了很多很多字'), says('答案')] })
+
+    const second = JSON.stringify(h.sent[1]?.messages)
+    expect(second).toContain('精简推理')
+    expect(second).not.toContain('直接接着写')
   })
 
   it('连续截断最多续 3 次，然后报错停下', async () => {
@@ -755,7 +774,8 @@ function spyMemory(over: Partial<NonNullable<LoopDeps['memory']>> = {}) {
   const activated: number[] = []
   const remaps: (number | null)[][] = []
   const cold: number[][] = []
-  const regions: { sizes: RegionSizes; budget: number }[] = []
+  const stubs: Message[][] = []
+  const regions: { sizes: RegionSizes; budget: number; real: number | null }[] = []
   const memory: LoopDeps['memory'] = {
     cues: () => new Map(),
     contextWindow: 1000,
@@ -772,7 +792,7 @@ function spyMemory(over: Partial<NonNullable<LoopDeps['memory']>> = {}) {
     floorTokens: 1,
     // 默认大值=水位检查不触发；要测三级递进第二级的用例自己覆盖成小值
     stubTokens: 1e9,
-    stubTurns: 1e9,
+    stubSteps: 1e9,
         // 测试里关掉余量，让预算就是 contextWindow - maxTokens，好算
     safetyMargin: 0,
     keepHeadChars: 20,
@@ -800,9 +820,10 @@ function spyMemory(over: Partial<NonNullable<LoopDeps['memory']>> = {}) {
     demoteBatch: 10,
     withTurns: (messages) => messages.map((message, i) => ({ message, turnId: i, stepId: i })),
     applyMerges: () => new Set<number>(),
-    recordRegions: (sizes, budget) => regions.push({ sizes, budget }),
+    recordRegions: (sizes, budget, real) => regions.push({ sizes, budget, real }),
     remap: (o) => remaps.push(o),
     pruneMessages: () => {},
+    markStubs: (ms) => stubs.push(ms),
     ...over,
   }
   return {
@@ -811,6 +832,7 @@ function spyMemory(over: Partial<NonNullable<LoopDeps['memory']>> = {}) {
     activated,
     remaps,
     cold,
+    stubs,
     regions,
     unloadedCount: () => calls.flat().length,
   }
@@ -850,60 +872,49 @@ describe('上下文卸载', () => {
     expect(estimated).toBeLessThan(1500 * 0.5) // 且确实是大幅下降，不是蹭过线
   })
 
-  it('保底区 = max(floorTokens, 预算 × targetRatio)，再夹 20% 上限（compaction-v2 §0.2）', async () => {
-    // 原来这个位置测的是「卸载 target 的基数是预算」（35% 时代）——v2 没有
-    // target 了（保底区外全卸），基数问题换到保底区上：比例参与的是 floor。
-    // 预算 600（窗口 1000 − maxTokens 400），四条 300 + 短 user：
-    //
-    // ratio 0.001 → floor = max(1, 0.6) = 1 → 只圈住短消息，四条全卸
-    const m1 = spyMemory({ targetRatio: 0.001 })
+  it('保底区 = min(floorTokens, 预算 × targetRatio)——两个都是上限（2026-09-28 由 max 改 min）', async () => {
+    // 预算 600（窗口 1000 − maxTokens 400），四条 300 + 短 user。三组各钉一面：
+    const msgs = (): Message[] => [
+      bulky('user', 300),
+      bulky('assistant', 300),
+      bulky('user', 300),
+      bulky('assistant', 300),
+      { role: 'user', parts: [{ type: 'text', text: '短' }] },
+    ]
+    const run = async (floorTokens: number, targetRatio: number) => {
+      const m = spyMemory({ floorTokens, targetRatio })
+      await drive({ messages: msgs(), memory: m.memory, rounds: [says('好的')], maxTokens: 400 })
+      return m.calls.flat()
+    }
+    // ① floorTokens 小、比例大：min(1, 600) = 1 → 只圈短消息，四条全卸。
+    //    **这组区分 max 与 min**：max 时 = 600，下标 2、3 都会保住
+    expect(await run(1, 1)).toContain(3)
+    // ② floorTokens 比整个预算还大、比例小：min(100000, 60) = 60 → 圈住短
+    //    消息 + 最后一条 bulky（对齐 step 起点整条保下）→ 卸 0..2，保 3。
+    //    守的是「floorTokens 配大了保底区吞掉预算、一条都卸不动」（原
+    //    FLOOR_MAX_RATIO 夹子的职责，summary-e2e 窗口 3000 当场红过）
+    const wide = await run(100_000, 0.1)
+    expect(wide).not.toContain(3)
+    expect(wide).toContain(2)
+    // ③ 两者都大：min(100000, 600) = 600 → 短 + 下标 3、2 → 只卸 0、1
+    const both = await run(100_000, 1)
+    expect(both).not.toContain(2)
+    expect(both).toContain(1)
+  })
+
+  it('保底线按 usage 校准：同一组 min(100000, 600)，系数 2 → 估算尺子上只剩 300（2026-09-29）', async () => {
+    // 与上一条 ③ 同一份数据同一组配置，**只多了 tokenRatio**：600 是真实
+    // token，真实是估算的 2 倍 → 估算只能数到 300 → 短 + 下标 3，下标 2 出局
+    const m = spyMemory({ floorTokens: 100_000, targetRatio: 1, tokenRatio: () => 2 })
     await drive({
-      messages: [
-        bulky('user', 300),
-        bulky('assistant', 300),
-        bulky('user', 300),
-        bulky('assistant', 300),
-        { role: 'user', parts: [{ type: 'text', text: '短' }] },
-      ],
-      memory: m1.memory,
+      messages: [bulky('user', 300), bulky('assistant', 300), bulky('user', 300), bulky('assistant', 300), { role: 'user', parts: [{ type: 'text', text: '短' }] }],
+      memory: m.memory,
       rounds: [says('好的')],
       maxTokens: 400,
     })
-    expect(m1.calls.flat()).toContain(3)
-    // ratio 0.5 → max(1, 300) = 300，被 20% 上限（600×0.2=120）夹住 →
-    // floor 圈住短消息 + 最后一条 bulky（一条 300 就把 120 撑破，对齐 step
-    // 起点整条保下）→ 卸 0..2，下标 3 保住
-    const m2 = spyMemory({ targetRatio: 0.5 })
-    await drive({
-      messages: [
-        bulky('user', 300),
-        bulky('assistant', 300),
-        bulky('user', 300),
-        bulky('assistant', 300),
-        { role: 'user', parts: [{ type: 'text', text: '短' }] },
-      ],
-      memory: m2.memory,
-      rounds: [says('好的')],
-      maxTokens: 400,
-    })
-    expect(m2.calls.flat()).not.toContain(3)
-    expect(m2.calls.flat()).toContain(2) // 前提：确实卸了东西，不是空集
-    // ratio 1（想要整个预算 600 当保底）→ 同样被 120 夹住：保底区不许
-    // 吞掉预算——不夹的话一条都卸不动，summary-e2e（窗口 3000）当场红过
-    const m3 = spyMemory({ targetRatio: 1 })
-    await drive({
-      messages: [
-        bulky('user', 300),
-        bulky('assistant', 300),
-        bulky('user', 300),
-        bulky('assistant', 300),
-        { role: 'user', parts: [{ type: 'text', text: '短' }] },
-      ],
-      memory: m3.memory,
-      rounds: [says('好的')],
-      maxTokens: 400,
-    })
-    expect(m3.calls.flat()).not.toContain(3)
+    const unloaded = m.calls.flat()
+    expect(unloaded).toContain(2)
+    expect(unloaded).not.toContain(3)
   })
 
   it('对照组：没到阈值时一条都不卸', async () => {
@@ -1000,8 +1011,8 @@ describe('上下文卸载', () => {
   })
 
   it('**存根区外的段摘要才进场，区内的不动**（compaction-v2 位置制）', async () => {
-    // 三条存根消息各占一轮（turn 0/1/2）+ user（turn 3，floor 只圈它）。
-    // stubTurns=2：区里装 turn 2、turn 1，turn 0 在区外——coversFrom 0 的
+    // 三条存根消息各占一个 step（夹具里一轮一步，turn/step 同号 0/1/2）+ user（3，floor 只圈它）。
+    // stubSteps=2：区里装 step 2、step 1，step 0 在区外——coversFrom 0 的
     // 摘要进场，1、2 的不进。跨界的（covers 1..2）也不进——半存根半摘要
     // 没有意义
     const summaries = [
@@ -1011,8 +1022,8 @@ describe('上下文卸载', () => {
     ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>
     const m = spyMemory({
       ...COMPACTION_POINT,
-      stubTokens: 1e9, // token 界不设限，只让轮数界起作用
-      stubTurns: 2,
+      stubTokens: 1e9, // token 界不设限，只让 step 数界起作用
+      stubSteps: 2,
       summaries: () => summaries,
       activateSummary: (stepId) => {
         m.activated.push(stepId) // override 掉 spy 默认实现后得自己记
@@ -1044,7 +1055,7 @@ describe('上下文卸载', () => {
       ...COMPACTION_POINT,
       stubTokens: 1e9,
       // 区里只装得下 1 轮（默认 withTurns：一条消息一轮）：stubby(0) 在区外
-      stubTurns: 1,
+      stubSteps: 1,
       summaries: () => [],
     })
     const kicks: number[] = []
@@ -1058,7 +1069,7 @@ describe('上下文卸载', () => {
   })
 
   it('**token 界先到也收口**（两界先到先停的另一条腿）', async () => {
-    // stubTurns 放开，只让 token 界起作用：界 = 一条存根的 1.5 倍——
+    // stubSteps 放开，只让 token 界起作用：界 = 一条存根的 1.5 倍——
     // 区里装得下一条、装不下两条。stubby(2) 在区里，stubby(0)/stubby(1) 在区外
     const oneStub = estimateMessageTokens(stubby(0).parts)
     const summaries = [
@@ -1069,7 +1080,7 @@ describe('上下文卸载', () => {
     const m = spyMemory({
       ...COMPACTION_POINT,
       stubTokens: Math.ceil(oneStub * 1.5),
-      stubTurns: 1e9,
+      stubSteps: 1e9,
       summaries: () => summaries,
       activateSummary: (stepId) => {
         m.activated.push(stepId)
@@ -1085,10 +1096,39 @@ describe('上下文卸载', () => {
     expect(m.activated).toEqual([0, 1])
   })
 
+  it('**存根区 token 界按 usage 校准**：界配 3 条存根，系数 2 → 估算尺子上 1.5 条（2026-09-29）', async () => {
+    // 与上一条同一份数据。界 = 3 条存根：按估算三条全装得下，一条都不进场；
+    // 真实是估算的 2 倍 → 界缩成 1.5 条 → 结果与上一条相同。系数没接进
+    // activateByZone 的话这里是 []
+    const oneStub = estimateMessageTokens(stubby(0).parts)
+    const summaries = [
+      { id: 11, level: 0, coversFrom: 0, coversTo: 0, status: 'ready', inContext: false, supersededBy: null },
+      { id: 12, level: 0, coversFrom: 1, coversTo: 1, status: 'ready', inContext: false, supersededBy: null },
+      { id: 13, level: 0, coversFrom: 2, coversTo: 2, status: 'ready', inContext: false, supersededBy: null },
+    ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>
+    const m = spyMemory({
+      ...COMPACTION_POINT,
+      stubTokens: oneStub * 3,
+      stubSteps: 1e9,
+      tokenRatio: () => 2,
+      summaries: () => summaries,
+      activateSummary: (stepId) => {
+        m.activated.push(stepId)
+        return true
+      },
+    })
+    await drive({
+      messages: [stubby(0), stubby(1), stubby(2), bulky('user', 10)],
+      memory: m.memory,
+      rounds: [says('好的')],
+    })
+    expect(m.activated).toEqual([0, 1])
+  })
+
   it('**前缀不变式：没触发压缩点，存根超线也不进场**（进场只搭压缩点的车）', async () => {
     const m = spyMemory({
       stubTokens: 1,
-      stubTurns: 1e9,
+      stubSteps: 1e9,
       summaries: () => [
         { id: 31, level: 0, coversFrom: 0, coversTo: 0, status: 'ready', inContext: false, supersededBy: null },
       ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>,
@@ -1122,8 +1162,8 @@ describe('上下文卸载', () => {
   it('**纯文本段（裁不动、无存根）出存根区也进场**——否则原文一直全文在场', async () => {
     // 位置制判据只看「段在哪」，不看「有没有存根形态」：纯文本段裁不动，
     // 出了存根区照样该被摘要顶替——否则它的原文永远全文在场，token 一点
-    // 不降。stubTurns=1 + 默认 withTurns（一条消息一轮）：text(0) 出区，
-    // text(1) 是区里那一轮
+    // 不降。stubSteps=1 + 默认 withTurns（一条消息一轮一步）：text(0) 出区，
+    // text(1) 是区里那一步
     const text = (i: number): Message => ({
       role: i % 2 ? 'assistant' : 'user',
       parts: [{ type: 'text', text: `第${i}段较长的纯文本内容。${'补'.repeat(200)}` }],
@@ -1131,7 +1171,7 @@ describe('上下文卸载', () => {
     const m = spyMemory({
       ...COMPACTION_POINT,
       stubTokens: 1e9,
-      stubTurns: 1,
+      stubSteps: 1,
       summaries: () => [
         { id: 21, level: 0, coversFrom: 0, coversTo: 0, status: 'ready', inContext: false, supersededBy: null },
       ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>,
@@ -1199,7 +1239,7 @@ describe('上下文卸载', () => {
     // 单独的 user 撑不满 floor——floorStartIndex 在 result 上收口，call 落在
     // 区外被卸。v2 的保底区从后往前**加到哪条哪条进来**，所以 crossing 必须由
     // result 自己完成，不能指望「下一条太大就停」——那会把 call 也保进来
-    const m = spyMemory({ floorTokens: 300, targetRatio: 0.001 })
+    const m = spyMemory({ floorTokens: 300, targetRatio: 1 })
     const h = await drive({
       messages: [
         // **这条用纯文本撑体积，不用 bulky。** bulky 现在自带 tool_call /
@@ -1310,6 +1350,28 @@ describe('缓存过期触发（提案 §12）', () => {
     expect(m.calls).toEqual([])
   })
 
+  it('生成的存根登记给 store（markStubs），归档才不会把它当新消息再写一遍（2026-09-30）', async () => {
+    const m = spyMemory({ now: () => 0, lastResponseAt: () => -4 * 60 * 60 * 1000 })
+    const h = await drive({ messages: three(), memory: m.memory, rounds: [says('好的')] })
+    // 登记的正是换进 ctx.messages 的那两个存根（内容一致即可——归档按指纹去重；
+    // 引用不同：normalize 的 dropParts 每次都 {...msg} 复制，见 incremental-save.md §3.1 订正）
+    expect(m.stubs).toEqual([[h.ctx.messages[0], h.ctx.messages[1]]])
+  })
+
+  it('unload_trigger 单记 mergePending：主因是 stale 时也看得出车票被这次吃掉（2026-09-30 补观测）', async () => {
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      const m = spyMemory({ now: () => 0, lastResponseAt: () => -4 * 60 * 60 * 1000, consumeMergePending: () => true })
+      await drive({ messages: three(), memory: m.memory, rounds: [says('好的')] })
+      const ev = calls.find((c) => c.ev === 'unload_trigger')
+      expect(ev).toMatchObject({ reason: 'stale', mergePending: true })
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   it('stale 触发时调用 reloadSystem（搭破缓存的车刷新 AGENTS.md/notes）', async () => {
     const m = spyMemory({ now: () => 0, lastResponseAt: () => -4 * 60 * 60 * 1000 })
     const calls: string[] = []
@@ -1344,7 +1406,7 @@ describe('缓存过期触发（提案 §12）', () => {
       messages: three(),
       memory: m.memory,
       rounds: [says('好的')],
-      reloadSystem: async () => ({ agentsOverLimit: true }),
+      reloadSystem: async () => ({ agentsOverLimit: ['AGENTS.md'] }),
     })
     const ev = h.events.find((e) => e.type === 'error')
     expect(ev).toMatchObject({ type: 'error', retryable: false })
@@ -1586,7 +1648,7 @@ describe('上下文预算：真实 usage + 新增估算', () => {
 
     // **对照：floorTokens 配得比整个预算还大，也照样卸得动。**
     //
-    // 这条守的是 `FLOOR_MAX_RATIO` 那道夹子。没有它，「floorTokens 比预算大」
+    // 这条守的是「保底区与预算比例取小」。没有它，「floorTokens 比预算大」
     // 会让保底区吞掉全部历史——**又变回改动前那个「一条都卸不动」的病**，
     // 而且静默。本次实施时 summary-e2e / merge-e2e（窗口 3,000、floorTokens
     // 默认 16,000）当场全红，就是这个洞
@@ -2100,6 +2162,24 @@ describe('四个区的记账（提案 §13）', () => {
     expect(m.regions.every((r) => r.budget === 900)).toBe(true)
   })
 
+  it('每行带**同一次请求**的真实输入 token（缓存读写都算）；渠道报 0 记 null', async () => {
+    // 两次请求 usage 不同：第一次 3+50+7=60，第二次全 0（网关不报）。
+    // 行和请求对不上号（比如错记成上一次的）这里就会红
+    const m = spyMemory()
+    const zero: Usage = { ...usage(), inputTokens: 0, outputTokens: 0 }
+    const first: Usage = { ...usage(), inputTokens: 3, cacheReadInputTokens: 50, cacheCreationInputTokens: 7 }
+    await drive({
+      messages: [{ role: 'user', parts: [{ type: 'text', text: '跑一下' }] }],
+      memory: m.memory,
+      rounds: [
+        calls('t1').map((e) => (e.type === 'finish' ? { ...e, usage: first } : e)),
+        says('跑完了').map((e) => (e.type === 'finish' ? { ...e, usage: zero } : e)),
+      ],
+    })
+
+    expect(m.regions.map((r) => r.real)).toEqual([60, null])
+  })
+
   it('**卸载之后那一行的 ③ 才有数**——记的是真发出去的那份，不是内存历史', async () => {
     // 对照组在下一条。没有它的话，一个「stub 恒等于 0」的实现在这里也是绿的
     const m = spyMemory()
@@ -2348,3 +2428,26 @@ function ctxRelayText(root: string, data: string): string {
   expect(text).toBeDefined()
   return text!.replace(/^\[视觉转述\] /, '')
 }
+
+describe('拒答透传（finish.refusal → error 事件，2026-09-27 欠账补测）', () => {
+  it('content-filter 带详情：yield 不可重试 error，消息含 category/explanation', async () => {
+    const h = await drive({
+      rounds: [[
+        { type: 'finish', reason: 'content-filter', usage: usage(), refusal: { category: 'harm_category', explanation: '涉及敏感内容' } },
+      ]],
+    })
+    const err = h.events.find((e) => e.type === 'error') as { message: string; retryable: boolean } | undefined
+    expect(err).toBeDefined()
+    expect(err!.retryable).toBe(false)
+    expect(err!.message).toContain('harm_category')
+    expect(err!.message).toContain('涉及敏感内容')
+    // 不算错误流：这轮正常结束（无 tool call），只补一条说明
+    expect(kinds(h.events)).toContain('step_finish')
+    expect(h.requests()).toBe(1)
+  })
+
+  it('普通 stop 无 refusal：不 yield error', async () => {
+    const h = await drive({ rounds: [says('好的')] })
+    expect(h.events.filter((e) => e.type === 'error')).toHaveLength(0)
+  })
+})

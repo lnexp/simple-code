@@ -198,6 +198,35 @@ describe('anthropic-messages / parseStream', () => {
     }
     await expect(run()).rejects.toThrow('模型不存在')
   })
+
+  it('网关夹在 200 流里的上游错误（type 不认识）→ 可重试；认得出的类型照旧不重试', async () => {
+    // 真机原文（runlog 9-18 / 9-29）：网关把上游 502 包成流内 error 事件，
+    // type 是 bad_response_status_code / <nil>，原来归 unknown、首次失败即放弃
+    const caught = async (error: Record<string, unknown>) => {
+      try {
+        await feed([['error', { error }]])
+      } catch (e) {
+        return (e as { detail: { kind: string; retryable: boolean } }).detail
+      }
+      throw new Error('没抛')
+    }
+    expect(
+      await caught({ type: 'bad_response_status_code', message: '上游服务错误[502]: bad response status code 502' }),
+    ).toMatchObject({ kind: 'unknown', retryable: true })
+    expect(await caught({ type: '<nil>', message: 'No available accounts: no available accounts' })).toMatchObject({
+      retryable: true,
+    })
+    expect(await caught({ message: 'handshake timed out after 15000ms' })).toMatchObject({ retryable: true })
+    // 对照组：流内也能认出的不可恢复错误，不能因为 status=0 就被放行重试
+    expect(await caught({ type: 'authentication_error', message: 'bad key' })).toMatchObject({
+      kind: 'auth',
+      retryable: false,
+    })
+    expect(await caught({ type: 'invalid_request_error', message: 'model not found' })).toMatchObject({
+      kind: 'invalid_request',
+      retryable: false,
+    })
+  })
 })
 
 describe('anthropic-messages / usage 的三个输入字段', () => {
@@ -253,6 +282,14 @@ describe('anthropic-messages / buildRequest', () => {
     expect(body().system).toEqual([
       { type: 'text', text: 'S', cache_control: { type: 'ephemeral' } },
     ])
+  })
+
+  it('带 userId 时发 metadata.user_id（官方客户端同款），没有则整个字段不发', () => {
+    expect(body({ userId: '{"session_id":"abc"}' }).metadata).toEqual({
+      user_id: '{"session_id":"abc"}',
+    })
+    expect(body().metadata).toBeUndefined()
+    expect('metadata' in body()).toBe(false)
   })
 
   it('tool schema 用 input_schema 而不是 parameters', () => {
@@ -363,42 +400,38 @@ describe('anthropic-messages / 缓存断点', () => {
   const messagesOf = (over: Partial<Request>) =>
     body(over).messages as { content: Record<string, unknown>[] }[]
 
-  it('历史够长时打满四个断点：system 一个 + 末尾三条消息各一个', () => {
-    // 四个断点是硬上限。每条消息都打的话短会话看着一切正常，
-    // 等历史攒到第五条才 400——那种错最难联想到是这里
+  it('断点共两个：system 一个 + 末条消息一个（官方客户端同款）', () => {
+    // 更多断点没有额外收益（写入按断点间增量段计价），反而在中转链上
+    // 多一个变量。2026-09-28 从「尾 3 条各一个」回退到官方客户端同款单断点
     const many = Array.from({ length: 20 }, (_, i) => text(`第 ${i} 条`))
 
-    expect(countBreakpoints({ messages: many })).toBe(4)
+    expect(countBreakpoints({ messages: many })).toBe(2)
     expect(countBreakpoints({ messages: [text('就一条')] })).toBe(2)
-    expect(countBreakpoints({ messages: [text('甲'), text('乙')] })).toBe(3)
+    expect(countBreakpoints({ messages: [text('甲'), text('乙')] })).toBe(2)
   })
 
-  it('断点落在末尾三条消息上，更早的一个都没有', () => {
+  it('断点只落在末条消息上，其余一个都没有', () => {
     const wire = messagesOf({
       messages: [text('旧一'), text('旧二'), text('旧三'), text('新')],
     })
 
     expect(wire[0]?.content[0]).not.toHaveProperty('cache_control')
-    expect(wire[1]?.content[0]).toHaveProperty('cache_control')
-    expect(wire[2]?.content[0]).toHaveProperty('cache_control')
+    expect(wire[1]?.content[0]).not.toHaveProperty('cache_control')
+    expect(wire[2]?.content[0]).not.toHaveProperty('cache_control')
     expect(wire[3]?.content[0]).toHaveProperty('cache_control')
   })
 
-  it('上一请求的断点位置在新请求里原位保留（无回看网关的命中前提）', () => {
-    // 请求 = 上一请求 + assistant + user，所以上一请求的末条在新请求里
-    // 恒为倒数第三条。真 API 靠 20 块回看找旧条目；只认「断点位置精确
-    // 相同」的网关靠这个钉子（2026-09-23 modelbest 实测 miss 的根因）
+  it('末条断点随消息追加前移（真 API 靠 20 块回看找上一请求的条目）', () => {
     const prev = [text('问一'), reply('答一'), text('问二')]
     const prevWire = messagesOf({ messages: prev })
     expect(prevWire[2]?.content[0]).toHaveProperty('cache_control')
 
     const next = [...prev, reply('答二'), text('问三')]
     const nextWire = messagesOf({ messages: next })
-    // 同一个 index、同一块内容，断点原位保留
-    expect(nextWire[2]?.content[0]).toHaveProperty('cache_control')
+    // 上一请求的末条（index 2）不再带断点——命中交给官方回看
+    expect(nextWire[2]?.content[0]).not.toHaveProperty('cache_control')
     expect(nextWire[4]?.content[0]).toHaveProperty('cache_control')
-    // 中间那条（本请求的倒数第二）也钉上——覆盖只追加一条的插话轮
-    expect(nextWire[3]?.content[0]).toHaveProperty('cache_control')
+    expect(nextWire[3]?.content[0]).not.toHaveProperty('cache_control')
   })
 
   it('最后一条消息以 thinking 结尾时，断点往前挪到能打的块上', () => {

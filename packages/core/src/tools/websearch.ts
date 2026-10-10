@@ -4,7 +4,11 @@ import type { Tool, ToolContext, ToolOutput } from './types.ts'
 
 /**
  * websearch（web-tools §4，D2 拍板 Exa）：jsonrpc tools/call 打 Exa 的
- * MCP 端点，匿名层缺省可用，settings.json websearch.exaApiKey 可选。
+ * MCP 端点，匿名层缺省可用，key/url 可选（~/.simple-code/websearch.json，
+ * 缺该文件 = 匿名层——见 websearch-bin）。
+ * websearch.url 可选：指向同形状的代理端点（如 LLM Center 网关的
+ * dashboard.exa.ai——2026-10-08 实测工具名/参数/响应格式与官方一致），
+ * 此时 exaApiKey 改走 Authorization: Bearer 头。
  *
  * 匿名层挂了的用户体验是「websearch 报错、webfetch 仍可用」——模型看到
  * 错误会自己改用 fetch，可恢复，所以不做 fallback provider。
@@ -13,6 +17,8 @@ import type { Tool, ToolContext, ToolOutput } from './types.ts'
 export type WebsearchConfig = {
   /** 可选。缺省走匿名层 */
   exaApiKey?: string | undefined
+  /** 可选。自定义 MCP 端点，须与 mcp.exa.ai 同形状（web_search_exa） */
+  url?: string | undefined
 }
 
 /** 超时 25 秒 */
@@ -86,9 +92,11 @@ export function createWebsearchTool(config: WebsearchConfig): Tool {
       const args = parseArgs(input)
       if (typeof args === 'string') return { output: args, exitCode: -1, isError: true }
 
-      const url = config.exaApiKey
-        ? `https://mcp.exa.ai/mcp?exaApiKey=${encodeURIComponent(config.exaApiKey)}`
-        : 'https://mcp.exa.ai/mcp'
+      const url =
+        config.url ??
+        (config.exaApiKey
+          ? `https://mcp.exa.ai/mcp?exaApiKey=${encodeURIComponent(config.exaApiKey)}`
+          : 'https://mcp.exa.ai/mcp')
 
       let body: string
       let status: number
@@ -99,6 +107,10 @@ export function createWebsearchTool(config: WebsearchConfig): Tool {
           headers: {
             'content-type': 'application/json',
             accept: 'application/json, text/event-stream',
+            // 自定义端点（url）时 key 走 Bearer 头；官方端点 key 在 URL 上
+            ...(config.url && config.exaApiKey
+              ? { authorization: `Bearer ${config.exaApiKey}` }
+              : {}),
           },
           body: JSON.stringify({
             jsonrpc: '2.0',

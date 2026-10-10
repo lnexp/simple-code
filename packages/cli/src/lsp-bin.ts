@@ -11,7 +11,7 @@
 import { resolve } from 'node:path'
 
 export type ParsedArgs =
-  | { ok: true; cmd: string; file: string; line: number; col: number }
+  | { ok: true; cmd: string; file: string; line: number; col: number; colGiven: boolean }
   | { ok: false; error: string }
 
 export function parseLspArgs(argv: string[]): ParsedArgs {
@@ -28,7 +28,7 @@ export function parseLspArgs(argv: string[]): ParsedArgs {
   if (!Number.isFinite(line) || line < 1) {
     return { ok: false, error: cmd === 'symbols' ? `行号不合法：${String(parts[1] ?? '')}` : `${cmd} 需要位置：${fileArg}（file:行[:列]）` }
   }
-  return { ok: true, cmd, file, line, col }
+  return { ok: true, cmd, file, line, col, colGiven: parts[2] !== undefined && parts[2] !== '' }
 }
 
 export async function lspMain(argv: string[]): Promise<number> {
@@ -54,7 +54,13 @@ export async function lspMain(argv: string[]): Promise<number> {
       process.stderr.write(`桥报错：${body.error}\n`)
       return 1
     }
-    process.stdout.write(`${body.text}\n`)
+    // 缺列落在第 1 列（缩进/修饰符）→ 无结果，读起来像「真没引用」（历史实例：
+    // refs store.ts:620 无结果、:620:11 命中）。只 bin 知道列是不是缺省的
+    const colHint =
+      parsed.cmd !== 'symbols' && !parsed.colGiven && body.text?.startsWith('无结果')
+        ? '\n（未给列号，按第 1 列查的——列须落在符号名上，如 refs a.ts:620:11）'
+        : ''
+    process.stdout.write(`${body.text}${colHint}\n`)
     return 0
   } catch (error) {
     process.stderr.write(`LSP 桥不可达：${error instanceof Error ? error.message : String(error)}（宿主关闭或端口失效）。回落 grep 吧。\n`)

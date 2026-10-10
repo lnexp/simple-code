@@ -310,12 +310,21 @@ describe('空闲摘要', () => {
     await new Promise((r) => setTimeout(r, 20))
     expect(f.calls()).toBe(1) // 前提：第一个确实卡在请求里
 
-    await session.summarizeIdle() // 第二次：有 turn 可挑，但该被闸挡住
-    await session.summarizeIdle()
+    // 第二、三次：有 turn 可挑，但该被闸挡住。闸内拿到的是**在途那一次**
+    // （2026-09-29 起，不再立即 resolve）——所以这里不 await，否则等的正是
+    // 被 gate 卡住的第一次
+    let settled = false
+    const blocked = Promise.all([session.summarizeIdle(), session.summarizeIdle()]).then(() => {
+      settled = true
+    })
+    await new Promise((r) => setTimeout(r, 20))
     expect(f.calls()).toBe(1) // 没有第二个请求
+    expect(settled).toBe(false) // 等的是在途那次，没提前放行
 
     f.release()
     await first
+    await blocked
+    expect(f.calls()).toBe(1) // 在途那次跑完，挡住的两次随之返回，不补发
     await session.close()
   })
 

@@ -1,6 +1,7 @@
 import { estimateMessageTokens } from './tokens.ts'
 import type { Message, Part, Request } from '../llm/types.ts'
 import type { LiveMessage, Summary } from './assemble.ts'
+import { INDEX_LINE_MAX_CHARS } from './index-cap.ts'
 
 /**
  * L0 摘要：把一个 turn 压成一两句「想做什么 + 工具返回了什么」（design.md §9.6）。
@@ -123,7 +124,7 @@ const L0_SYSTEM =
   '你在为一段已经发生的对话写索引条目。严格按下面的格式输出，不要有别的话：\n' +
   '\n' +
   '名称: <十来个字的短标题>\n' +
-  '描述: <一两句话说明做了什么、结果如何>\n' +
+  `描述: <一两句话说明做了什么、结果如何，不超过 ${INDEX_LINE_MAX_CHARS} 字>\n` +
   '\n' +
   '## 用户要求\n' +
   '## 实际完成\n' +
@@ -258,7 +259,10 @@ export function cleanSummaryText(raw: string): string {
 
 // ======================= 分层合并（3b-2）=======================
 
-/** 一个可合并的组：同层、连续、都已生效的一批摘要 */
+/**
+ * 一个可合并的组：连续、都已生效的一批摘要。通常同层；同层凑不满时是跨层
+ * 兜底组（方案 D），`level` = 成员最高层，新节点 = level + 1
+ */
 export type MergeGroup = {
   level: number
   members: Summary[]
@@ -322,6 +326,8 @@ export function indexMembers(summaries: Summary[]): Summary[] {
 /**
  * 找下一个该合并的组：同层、`inContext`、`ready`、未被合并过，且 **covers
  * 严格连续**，条数 ≥ mergeFactor。从最老的（最低 level、最靠前）开始。
+ * **同层一组都凑不出时**，退到跨层：时间轴上最老的连续 mergeFactor 条
+ * （2026-09-28 方案 D，理由见函数体第二轮）。
  *
  * 四个条件各有理由：
  * - **代表 context**（见 representsContext）：合并的是「context 正在用的
@@ -351,86 +357,160 @@ export function pickMergeGroup(
   const eligible = indexMembers(summaries)
   const levels = [...new Set(eligible.map((s) => s.level))].sort((a, b) => a - b)
 
+  // 第一轮：同层连续 ≥ mergeFactor（金字塔的正常形态，从最低层、最老的开始）
   for (const level of levels) {
     // covers_from 升序。同层连续段从这里才谈得上「最老的优先」
     const layer = eligible
       .filter((s) => s.level === level)
       .sort((a, b) => a.coversFrom - b.coversFrom)
+    const group = firstRun(summaries, layer, mergeFactor, gapHasContent)
+    if (group) return { level, members: group }
+  }
 
-    let run: Summary[] = []
-    // **只吃 mergeFactor 条，不吃整段。** 原来是 `run.slice()`——积压越多一次
-    // 吞得越狠，真库里 25 条连续 L0 被一次合成一行。扇出是个常数，不该随
-    // 「后台摘要攒了多少还没合」浮动
-    const flush = (): MergeGroup | null => {
-      if (run.length >= mergeFactor) return { level, members: run.slice(0, mergeFactor) }
-      return null
-    }
-
-    for (const summary of layer) {
-      const last = run[run.length - 1]
-      const chainable = (last: Summary, next: Summary): boolean => {
-        if (next.coversFrom === last.coversTo + 1) return true
-        // fork 预留号段留下的死缝（task-v3）：对话在 fork 时跳过整段，任务
-        // 关闭后没用完的尾巴谁也不会再写。可跨，但三重保险缺一不可——
-        // 任何一条不满足都意味着缝里有内容、跨过去会静默丢历史：
-        // ① 缝里没有被【新节点的 covers】罩住的摘要行：有摘要就有被它盖着
-        //    的历史，消息行可能还已被 applyPendingMerges 整删——跨过去后
-        //    新节点的 covers 罩住它，coversActive 把它收掉，而它的内容没
-        //    进新节点的 text。判据不是「缝里没有任何行」——**罩着缝两侧
-        //    的上层节点**也跟缝相交，那样判会把空缝全锁死：真库 L2 大节点
-        //    （covers 1–663613）罩住老区所有空缝，五条空缝全部不可跨，
-        //    金字塔永久碎着、索引区悬在配额上方 53%（2026-09-25 实测
-        //    18243/11900，事件 pickmergegroup-gap-crossing）。精确口径：
-        //    会出事的只有「完整落进本次合并组跨度 [本组首成员, next] 里」
-        //    的行——跨过缝两侧的上层节点至少一端伸出跨度外，新节点罩不
-        //    住它，放行。跨度用当前 run 的首成员：run 比 mergeFactor 长
-        //    时实际只合前 mergeFactor 条，这里判得更宽 = 更保守，安全
-        // ② 缝里没有可见消息行：未摘要的活内容（如前沿段）会被新节点的
-        //    covers 罩住，装配的 findCovering 从此不渲染原文
-        // ③ 缝里没有外主 steps：任务活着时它的 step 在缝里（owner 分治，
-        //    ②查不见）——跨过去等它关闭合并回来，经历摘要落在新节点
-        //    covers 里面被收掉，任务经历丢失。①② 由本函数/调用方各查
-        //    一半：① 用手头的 summaries 纯查，②③ 走 store 的
-        //    gapHasContent
-        if (!gapHasContent) return false
-        const from = last.coversTo
-        const to = next.coversFrom
-        // run[0] 必在：调用方只在 last（= run 尾成员）存在时调本函数
-        const spanFrom = run[0]?.coversFrom
-        if (spanFrom === undefined) return false
-        if (
-          summaries.some(
-            (x) =>
-              x.coversTo > from &&
-              x.coversFrom < to &&
-              x.coversFrom >= spanFrom &&
-              x.coversTo <= next.coversTo,
-          )
-        )
-          return false
-        return !gapHasContent(from, to)
-      }
-      // 连续才延长；断了先看前一段够不够，够就地返回，不够从当前重新数。
-      // 连续的同一层还得**同 owner**（task-v3）：任务视角的可见集里混着
-      // 对话的行和自己的私有行，混着合会让私有父行顶替对话的成员——对话
-      // 看不见那个父行，成员被幽灵顶掉，历史凭空缺一块。对话视角全
-      // owner=null，此约束自然不生效
-      if (
-        last &&
-        chainable(last, summary) &&
-        (summary.owner ?? null) === (last.owner ?? null)
-      ) {
-        run.push(summary)
-      } else {
-        const done = flush()
-        if (done) return done
-        run = [summary]
+  // 第二轮（2026-09-28 方案 D）：**同层凑不满、且有节点被夹住时，跨层合
+  // 时间轴上最老的、含被夹住节点的连续 mergeFactor 条**，层 = 成员最高层
+  // （调用方再 +1）。
+  //
+  // 为什么需要：层在时间轴上会交错（L1 L0 L3 L1 L0 …）——链只要暂时断过
+  // 一次（摘要还在生成、任务开着没关、摘要被撤场），断点之后的新 L0 照样
+  // 攒满合成 L1，断点之前不满 mergeFactor 的那几条就被夹在高层节点之前，
+  // 同层永远连不上。真库 119 条稳态成员按时间轴两两全可链（零真断点），
+  // 同层却 5 次合并后卡在配额上方 27%（18.4k/14.5k）。
+  //
+  // **「被夹住」= 时间轴上更新的一侧有比它更高层的节点**：它的同层段再也
+  // 长不大了。反过来，从老到新层级只降不升（L3 L2 L1 L0 L0）是正常金字塔
+  // 在攒，等就行——这里不许动它，否则刚合出一条 L1、下一条 L0 还没到齐就
+  // 被 L1+L0 跨层吞掉，退化成方案 C 的滚雪球（每次吞最老的，几次后整个
+  // 历史只剩一行 + 最近几十条）。merge-e2e 级联测试（配额恒超）就是这么
+  // 抓到的。
+  //
+  // 调用方只在索引超配额时来要组。跨缝保险与同 owner 约束与第一轮同一套
+  const timeline = [...eligible].sort((a, b) => a.coversFrom - b.coversFrom)
+  // 没有被夹住的节点时下面挑不出窗口，自然返回 null
+  const stuck = strandedIds(timeline)
+  for (const run of runs(summaries, timeline, gapHasContent)) {
+    for (let start = 0; start + mergeFactor <= run.length; start++) {
+      const window = run.slice(start, start + mergeFactor)
+      if (window.some((s) => stuck.has(s.id))) {
+        return { level: Math.max(...window.map((s) => s.level)), members: window }
       }
     }
-    const done = flush()
-    if (done) return done
   }
   return null
+}
+
+/** 被夹住的节点：时间轴（coversFrom 升序）上更新的一侧有比它层级更高的 */
+function strandedIds(timeline: Summary[]): Set<number> {
+  const out = new Set<number>()
+  let maxAfter = -1
+  for (let i = timeline.length - 1; i >= 0; i--) {
+    const s = timeline[i]
+    if (!s) continue
+    if (s.level < maxAfter) out.add(s.id)
+    maxAfter = Math.max(maxAfter, s.level)
+  }
+  return out
+}
+
+/**
+ * 在按 coversFrom 升序的 `seq` 里找第一段「可链」的连续 ≥ mergeFactor 条，
+ * 返回它的前 mergeFactor 条。
+ *
+ * **只吃 mergeFactor 条，不吃整段。** 原来是 `run.slice()`——积压越多一次
+ * 吞得越狠，真库里 25 条连续 L0 被一次合成一行。扇出是个常数，不该随
+ * 「后台摘要攒了多少还没合」浮动
+ */
+function firstRun(
+  summaries: Summary[],
+  seq: Summary[],
+  mergeFactor: number,
+  gapHasContent?: (from: number, to: number) => boolean,
+): Summary[] | null {
+  for (const run of runs(summaries, seq, gapHasContent)) {
+    if (run.length >= mergeFactor) return run.slice(0, mergeFactor)
+  }
+  return null
+}
+
+/**
+ * 把 `seq` 切成一段段「可链」的连续 run，按先后产出。
+ *
+ * 连续还得**同 owner**（task-v3）：任务视角的可见集里混着对话的行和自己的
+ * 私有行，混着合会让私有父行顶替对话的成员——对话看不见那个父行，成员被
+ * 幽灵顶掉，历史凭空缺一块。对话视角全 owner=null，此约束自然不生效
+ */
+function* runs(
+  summaries: Summary[],
+  seq: Summary[],
+  gapHasContent?: (from: number, to: number) => boolean,
+): Generator<Summary[]> {
+  let run: Summary[] = []
+  for (const summary of seq) {
+    const last = run[run.length - 1]
+    if (
+      last &&
+      run[0] &&
+      chainable(summaries, run[0].coversFrom, last, summary, gapHasContent) &&
+      (summary.owner ?? null) === (last.owner ?? null)
+    ) {
+      run.push(summary)
+    } else {
+      if (run.length > 0) yield run
+      run = [summary]
+    }
+  }
+  if (run.length > 0) yield run
+}
+
+/** `last` 与 `next` 之间能否链上。`spanFrom` = 当前合并组首成员的 coversFrom */
+function chainable(
+  summaries: Summary[],
+  spanFrom: number,
+  last: Summary,
+  next: Summary,
+  gapHasContent?: (from: number, to: number) => boolean,
+): boolean {
+  if (next.coversFrom === last.coversTo + 1) return true
+  // 重叠的不是「缝」，是两条在场节点互相罩着（异常态，正常流程到不了）。
+  // 同层扫描几乎碰不到；跨层时间轴会把它们排成邻居——链上的话新节点把
+  // 两边一起收掉，重叠那截的两份表述只剩一份。拒，等修复路径去处理
+  if (next.coversFrom <= last.coversTo) return false
+  // fork 预留号段留下的死缝（task-v3）：对话在 fork 时跳过整段，任务
+  // 关闭后没用完的尾巴谁也不会再写。可跨，但三重保险缺一不可——
+  // 任何一条不满足都意味着缝里有内容、跨过去会静默丢历史：
+  // ① 缝里没有被【新节点的 covers】罩住的摘要行：有摘要就有被它盖着
+  //    的历史，消息行可能还已被 applyPendingMerges 整删——跨过去后
+  //    新节点的 covers 罩住它，coversActive 把它收掉，而它的内容没
+  //    进新节点的 text。判据不是「缝里没有任何行」——**罩着缝两侧
+  //    的上层节点**也跟缝相交，那样判会把空缝全锁死：真库 L2 大节点
+  //    （covers 1–663613）罩住老区所有空缝，五条空缝全部不可跨，
+  //    金字塔永久碎着、索引区悬在配额上方 53%（2026-09-25 实测
+  //    18243/11900，事件 pickmergegroup-gap-crossing）。精确口径：
+  //    会出事的只有「完整落进本次合并组跨度 [本组首成员, next] 里」
+  //    的行——跨过缝两侧的上层节点至少一端伸出跨度外，新节点罩不
+  //    住它，放行。跨度用当前 run 的首成员：run 比 mergeFactor 长
+  //    时实际只合前 mergeFactor 条，这里判得更宽 = 更保守，安全
+  // ② 缝里没有可见消息行：未摘要的活内容（如前沿段）会被新节点的
+  //    covers 罩住，装配的 findCovering 从此不渲染原文
+  // ③ 缝里没有外主 steps：任务活着时它的 step 在缝里（owner 分治，
+  //    ②查不见）——跨过去等它关闭合并回来，经历摘要落在新节点
+  //    covers 里面被收掉，任务经历丢失。①② 由本函数/调用方各查
+  //    一半：① 用手头的 summaries 纯查，②③ 走 store 的
+  //    gapHasContent
+  if (!gapHasContent) return false
+  const from = last.coversTo
+  const to = next.coversFrom
+  if (
+    summaries.some(
+      (x) =>
+        x.coversTo > from &&
+        x.coversFrom < to &&
+        x.coversFrom >= spanFrom &&
+        x.coversTo <= next.coversTo,
+    )
+  )
+    return false
+  return !gapHasContent(from, to)
 }
 
 /**
@@ -470,13 +550,15 @@ export function renderMergeInput(members: Summary[]): string {
  * 不调模型的是事件 D（热区降级成键），因为键在 B 那次已经和正文一并生成了。
  */
 const MERGE_SYSTEM =
-  '你在为一段项目历史写**索引目录的一行**，不是写摘要。\n' +
-  '读者拿这一行只做一件事：判断自己要找的东西在不在这段里，在就去展开原文。\n' +
-  '所以要关键词，不要句子。格式：\n' +
+  '你在为一段项目历史写**索引目录**，不是写摘要。\n' +
+  '读者拿它只做一件事：判断自己要找的东西在不在这段里，在就去展开原文。\n' +
+  '所以要关键词，不要句子。每行一个主题，格式：\n' +
   '\n' +
   '<这段的主题>：<关键词> · <关键词> · <关键词>\n' +
   '\n' +
   '例：UI 排版修复：折叠动画、流式 CSS、消息页脚\n' +
+  `**总长不超过 ${INDEX_LINE_MAX_CHARS} 字，输入再多也不许超**：这是往上一层归并，` +
+  '信息必须比输入少——主题相近的并成一行，次要的关键词删掉，不要逐条照抄输入。\n' +
   '关键词优先用文件名、命令、专有名词——那是能被搜到的东西。\n' +
   '后来被推翻的结论也留一个词并标「(已推翻)」，那是后面最需要知道的。\n' +
   '不要完整句子，不要「本段历史进行了……」这类开场，不要引号。'
@@ -500,14 +582,13 @@ export function buildMergeRequest(
  * 的车**（前缀不变式：进场改写前缀中段）。
  *
  * 三层从新往旧：保底区（floorStart 起，原文全保真）→ 存根区（保底上方
- * 最多 stubTurns 轮 **且** 最多 stubTokens，先到先停）→ 区外段摘要行进场。
+ * 最多 stubSteps 个 step **且** 最多 stubTokens，先到先停）→ 区外段摘要行进场。
  *
  * **判据是位置制，不是水位**：2026-09-12 的水位闸（存根段超 16k 才进场）
  * 在 v2 的节奏下退役——四趟车都卸后每趟只新卸一小段增量，水位几乎永远
  * 不再冲高，判据永远不开、老段摘要进不来（这正是 v2 要治的病）。改从
- * 保底往上**数实际存在的轮行**定界：fork 的预留号段缝（turn 号 +10000
- * 的空洞）数不进去——按「段尾之后又过几轮」做减法的话，fork 缝会把
- * 6 轮虚报成 1020 轮。
+ * 保底往上**数实际存在的 step**定界：fork 的预留号段缝（号段跳号的空洞）
+ * 数不进去——按「段尾之后又过几步」做减法的话，fork 缝会把几步虚报成几万步。
  *
  * 进场条件：段的 live 消息**全部**在存根区天花板之外（更老）。跨在
  * 天花板上的段不进——半存根半摘要没有意义，等它整段老化出界。
@@ -521,22 +602,43 @@ export function activateBeyondStubZone(opts: {
   live: LiveMessage[]
   /** 保底区第一条消息的下标（run.ts floorStartIndex 的产出） */
   floorStart: number
-  stubTurns: number
+  stubSteps: number
   stubTokens: number
   summaries: () => Summary[]
   activateSummary: (stepId: number) => boolean
   kick?: () => void
 }): void {
-  const ceiling = stubCeiling(opts.live, opts.floorStart, opts.stubTurns, opts.stubTokens)
+  const ceiling = stubCeiling(opts.live, opts.floorStart, opts.stubSteps, opts.stubTokens)
+  const all = opts.summaries()
+  const ready = all.filter((s) => s.status === 'ready' && !s.inContext && s.supersededBy === null)
+  const liveIn = (s: Summary) =>
+    opts.live
+      .map((entry, index) => ({ index, stepId: entry.stepId }))
+      .filter((e) => e.stepId >= s.coversFrom && e.stepId <= s.coversTo)
+
+  // **孤儿段：段内一条 live 都没有、摘要又不在场**（2026-09-28 真库 409 步
+  // 空洞）。来源已查实：**关闭任务留下的尾巴**——任务关闭时还是原文的那段，
+  // flipTaskLive 把原文全卸、摘要还俗但从没进过场，停在 in_context=0（真库
+  // 两段孤儿 663622-663686、714065-714410 恰是 task-4f6pqq/ws12fr 段尾）。
+  // 下面「段内 live 全在区外」要求 indices 非空，这种段永远满足不了，模型对
+  // 那几小时一无所知、也没有任何线索去 cat。它们比一切 live 都老，与存根区
+  // 位置无关，所以放在 ceiling 判断之前。端到端钉在 task.test.ts「关闭任务
+  // 留下的尾巴」。
+  //
+  // 只防一件事：与在场摘要重叠（重复顶替同一段）。高层优先——同一段有 L1
+  // 和未合并的 L0 并存时，先进 L1，L0 随之被判重叠
+  const active = all.filter((s) => s.inContext).map((s) => [s.coversFrom, s.coversTo] as const)
+  const overlapsActive = (s: Summary) => active.some(([from, to]) => from <= s.coversTo && to >= s.coversFrom)
+  const orphans = ready.filter((s) => liveIn(s).length === 0).sort((a, b) => b.level - a.level || a.coversFrom - b.coversFrom)
+  for (const summary of orphans) {
+    if (overlapsActive(summary)) continue
+    if (opts.activateSummary(summary.coversFrom)) active.push([summary.coversFrom, summary.coversTo])
+  }
+
   if (ceiling === 0) return
-  const ready = opts
-    .summaries()
-    .filter((s) => s.status === 'ready' && !s.inContext && s.supersededBy === null)
   for (const summary of ready) {
     // 段内 live 消息全在 ceiling 之外（下标更小 = 更老）才进场
-    const indices = opts.live
-      .map((entry, index) => ({ index, stepId: entry.stepId }))
-      .filter((e) => e.stepId >= summary.coversFrom && e.stepId <= summary.coversTo)
+    const indices = liveIn(summary)
     if (indices.length > 0 && indices.every((e) => e.index < ceiling)) {
       opts.activateSummary(summary.coversFrom)
     }
@@ -559,20 +661,22 @@ export function activateBeyondStubZone(opts: {
 function stubCeiling(
   live: LiveMessage[],
   floorStart: number,
-  stubTurns: number,
+  stubSteps: number,
   stubTokens: number,
 ): number {
-  let turns = 0
+  let steps = 0
   let tokens = 0
-  let lastTurn: number | null = null
+  let lastStep: number | null = null
   for (let i = floorStart - 1; i >= 0; i--) {
     const entry = live[i]
     if (!entry) continue
-    // 新的一轮：区里已经装满 stubTurns 轮就停在第 31 轮门口
-    if (entry.turnId !== lastTurn) {
-      if (turns >= stubTurns) return i + 1
-      turns++
-      lastTurn = entry.turnId
+    // 按 step 数，不按 turn（2026-09-28 纠偏：用户 9-24 原话「保底区往上再数
+    // 30 个组 tool call」，并否决 turn——一个 turn 常有 20~50 次工具调用，
+    // 30 turn 永远到不了、实际只剩 16k 界在管）。新的 step：已装满就停在门口
+    if (entry.stepId !== lastStep) {
+      if (steps >= stubSteps) return i + 1
+      steps++
+      lastStep = entry.stepId
     }
     tokens += estimateMessageTokens(entry.message.parts)
     // 这条把区撑到 stubTokens——它自己算区外，先到先停

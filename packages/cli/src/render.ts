@@ -173,7 +173,7 @@ export function createRenderer(
         return sink.err('\n')
 
       case 'tool_call':
-        return sink.out(`\n${outPaint.cyan('$')} ${describe(agentEv.name, agentEv.input)}\n`)
+        return sink.out(`\n${outPaint.cyan('$')} ${describe(agentEv.name, agentEv.input, outPaint)}\n`)
       case 'tool_result':
         return sink.out(outPaint.dim(resultText(agentEv.output, agentEv.exitCode)))
       case 'tool_error':
@@ -262,9 +262,12 @@ export function createRenderer(
  *
  * 这不是协议特化——工具定义是我们自己写的，不是某家模型的格式。
  */
-function describe(name: string, input: unknown): string {
-  const command = (input as { command?: unknown } | null)?.command
-  return typeof command === 'string' ? command : `${name} ${JSON.stringify(input)}`
+function describe(name: string, input: unknown, paint: Paint): string {
+  // description：glm 照官方 Bash 工具的参数名写，同 bash.ts hasDesc
+  const { desc: d, description, command } = (input ?? {}) as Record<string, unknown>
+  const desc = typeof d === 'string' && d !== '' ? d : description
+  const label = typeof desc === 'string' && desc !== '' ? `${paint.cyan(desc)} ${paint.dim('·')} ` : ''
+  return `${label}${typeof command === 'string' ? command : `${name} ${JSON.stringify(input)}`}`
 }
 
 function resultText(output: string, exitCode: number): string {

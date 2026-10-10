@@ -405,10 +405,10 @@ describe('config / deepMerge', () => {
 })
 
 describe('config / 示例配置', () => {
-  it('docs/settings.example.json 能通过校验', async () => {
+  it('settings.example.json 能通过校验', async () => {
     // 一份自己解析不了的示例比没有更糟——第一版就踩到了：$comment 被
     // .strict() 拒了。这条测试防止示例和 schema 再次漂移
-    const path = fileURLToPath(new URL('../../../docs/settings.example.json', import.meta.url))
+    const path = fileURLToPath(new URL('../../../settings.example.json', import.meta.url))
     const raw = JSON.parse(await readFile(path, 'utf8'))
     const result = configSchema.safeParse(raw)
     expect(result.error?.issues ?? []).toEqual([])
@@ -461,8 +461,43 @@ describe('visionModel 解析', () => {
     expect(loaded.model.contextWindow).toBe(100)
   })
 
+  it('副模型 ref 可配 effort（含 none），只改副模型、不带跑主模型（2026-09-30）', async () => {
+    // 起因：openai-chat 不读 thinking，摘要请求默认发 reasoning_effort=high，
+    // deepseek 合并偶尔推理吃满输出、正文为空。none 只对部分端点安全
+    // （117 会 400、71 推理漏进正文），所以做成副模型上的显式配置
+    await writeGlobal({
+      ...MINIMAL,
+      providers: {
+        ...MINIMAL.providers,
+        vis: {
+          protocol: 'openai-chat',
+          baseUrl: 'https://vis.example/v1',
+          apiKey: 'sk-vis',
+          models: { eye: { contextWindow: 60000 } },
+        },
+      },
+      memory: { summaryModel: { provider: 'vis', model: 'eye', effort: 'none' } },
+      visionModel: { provider: 'vis', model: 'eye', effort: 'low' },
+    })
+    const loaded = await load()
+    expect(loaded.summary.request.effort).toBe('none')
+    expect(loaded.vision?.request.effort).toBe('low')
+    expect(loaded.request.effort).toBe('high')
+  })
+
+  it('对照组：副模型 ref 不配 effort 就沿用模型级/全局（行为不变）', async () => {
+    await writeGlobal({ ...MINIMAL, memory: { summaryModel: { provider: 'p', model: 'm' } } })
+    expect((await load()).summary.request.effort).toBe('high')
+  })
+
+  it('主模型的 effort 不接受 none——none 只开放给副模型', async () => {
+    await writeGlobal({ ...MINIMAL, request: { effort: 'none' } })
+    await expect(load()).rejects.toThrow()
+  })
+
   it('指向不存在的模型时报错并列出已配置的', async () => {
     await writeGlobal({ ...MINIMAL, visionModel: 'nope' })
     await expect(load()).rejects.toThrow(/visionModel "nope".*已配置的：m/s)
   })
 })
+

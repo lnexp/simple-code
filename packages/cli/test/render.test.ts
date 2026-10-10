@@ -216,3 +216,21 @@ describe('renderer 感知层（着色 + 代码块缓冲）', () => {
     expect(c.out_()).not.toContain('•')
   })
 })
+
+describe('bash 入参 desc 前置（2026-09-28）', () => {
+  it('带 desc：青色短语 + 暗色 · + 命令；缺省维持现状', () => {
+    const c = collector()
+    const r = createRenderer(c, { out: true, err: true })
+    r.on(ev({ type: 'tool_call', name: 'bash', input: { command: 'npx vitest run', desc: '跑全量测试' } }))
+    r.on(ev({ type: 'tool_call', name: 'bash', input: { command: 'ls' } }))
+    expect(c.out_()).toContain('跑全量测试\x1b[0m \x1b[90m·\x1b[0m npx vitest run')
+    expect(c.out_()).toContain('$\x1b[0m ls\n')
+  })
+
+  it('写成 description（glm 照官方 Bash 工具参数名）同样前置', () => {
+    const c = collector()
+    const r = createRenderer(c, { out: true, err: true })
+    r.on(ev({ type: 'tool_call', name: 'bash', input: { command: 'ls', description: '列目录', timeout: 15 } }))
+    expect(c.out_()).toContain('列目录\x1b[0m \x1b[90m·\x1b[0m ls')
+  })
+})

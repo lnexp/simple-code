@@ -9,7 +9,7 @@
       "models": {
         "claude-opus-4-8": {
           "contextWindow": 200000,
-          "capabilities": { "images": true, "reasoning": true }
+          "capabilities": { "images": true }
         }
       }
     }
@@ -19,9 +19,6 @@
     "thinking": "adaptive"
   },
   "bash": {
-    "defaultTimeoutMs": 60000,
-    "approval": {
-      "nonPathFrom": { "xcli": 2 }
-    }
+    "defaultTimeoutMs": 60000
   }
 }

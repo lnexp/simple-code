@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
-import type { Message } from '../src/llm/types.ts'
+import type { Message, Part } from '../src/llm/types.ts'
 import { listBucketFiles, resolveBucketFile } from '../src/session/buckets.ts'
 import { forkTask, scopeOf } from '../src/session/task.ts'
 import { lastRegionLine, MEMORY_RELATIVE, openStore, type Store } from '../src/session/store.ts'
@@ -93,7 +93,7 @@ describe('落盘与读回', () => {
     store.close()
   })
 
-  it('重启兜底：lastRespondedAt 读最后一轮的完成时刻（开始 + 耗时）', async () => {
+  it('重启兜底：lastRespondedAt 读最后一轮的完成时刻（ended_at）', async () => {
     // 提案 §12。正常计时走 session 闭包的 lastResponseAt（响应结束时刻），
     // 只有重启后那份丢了才读这里。口径是完成时刻（2026-09-20 从「最后一个
     // step 的开始」改来：TTL 按模型配、glm-5.3 是 5 分钟，开始口径会把
@@ -115,9 +115,14 @@ describe('落盘与读回', () => {
     const when = at as number
     expect(when).toBeLessThanOrEqual(Date.now())
     expect(when).toBeGreaterThan(Date.now() - 60_000)
-    // 落了耗时就得加上：完成时刻 = 开始 + 耗时
-    store.finishTurn(turn, 5 * 60_000)
-    expect(store.lastRespondedAt()).toBe(when + 5 * 60_000)
+    // 定稿后读 ended_at（真实结束时刻），不是开始 + 耗时：续接轮的耗时是累加
+    // 的干活时长、不含中间停顿，相加会算早（turn-resume.md）
+    const before = Date.now()
+    store.finishTurn(turn, 5 * 60_000, 'done')
+    const ended = store.lastRespondedAt() as number
+    expect(ended).toBeGreaterThanOrEqual(before)
+    expect(ended).toBeLessThanOrEqual(Date.now())
+    expect(ended).not.toBe(when + 5 * 60_000)
     store.close()
   })
 
@@ -278,13 +283,17 @@ describe('turns/ 归档', () => {
 
 /** 归档文件里所有消息的文本，按写入顺序 */
 async function archiveTexts(dir: string): Promise<string[]> {
+  return (await archiveLines(dir)).map((m) => m.parts[0]?.text ?? '')
+}
+
+/** 归档文件里所有消息（整条），按写入顺序 */
+async function archiveLines(dir: string): Promise<{ parts: { type?: string; text?: string }[] }[]> {
   const files = listBucketFiles(join(dir, MEMORY_RELATIVE), 'turns', '.jsonl')
-  const out: string[] = []
+  const out: { parts: { type?: string; text?: string }[] }[] = []
   for (const file of files) {
     const text = await readFile(file, 'utf8')
     for (const line of text.trim().split('\n').filter(Boolean)) {
-      const msg = JSON.parse(line) as { parts: { text?: string }[] }
-      out.push(msg.parts[0]?.text ?? '')
+      out.push(JSON.parse(line) as { parts: { type?: string; text?: string }[] })
     }
   }
   return out
@@ -324,7 +333,7 @@ describe('历史分页（historyPage）', () => {
     const store = openStore(dir)
     const turn = store.beginTurn({ model: 'p/m1', effort: null })
     store.save([userSays('问'), assistantSays('答')])
-    store.finishTurn(turn, 4321)
+    store.finishTurn(turn, 4321, 'done')
     store.unload([0, 1])
     store.close()
 
@@ -342,7 +351,7 @@ describe('历史分页（historyPage）', () => {
     const store = openStore(dir)
     const t1 = store.beginTurn({ model: 'p/m1', effort: 'high' })
     const t2 = store.beginTurn({ model: 'p/m2', effort: null })
-    store.finishTurn(t1, 1111)
+    store.finishTurn(t1, 1111, 'done')
     store.close()
 
     const reopened = openStore(dir)
@@ -421,6 +430,56 @@ describe('历史分页（historyPage）', () => {
 
     const reopened = openStore(dir)
     expect(reopened.historyPage(null, 10)).toEqual({ rows: [], next: null })
+    reopened.close()
+  })
+
+  // 2026-09-30 真库：turn 16400–16637 里 235 个 turn 的用户消息、106 条末尾
+  // 回复在库里一行都不剩——短消息从不被卸载挑中，一直是 live，被合并顶替时
+  // pruneMessages 直接 DELETE，面板往上翻就缺了（jsonl 里原文还在）
+  it('**被顶替时没卸载过的原文留作 unloaded，存根副本照删；按 turn/step 排序而非 id**', async () => {
+    const dir = await workspace()
+    const store = openStore(dir)
+    store.beginTurn({ model: 'p/m', effort: null })
+    store.save([userSays('问1'), assistantSays('答1原文')])
+    store.unload([1]) // 答1 被卸载：原文进 unloaded
+    store.save([userSays('问1'), assistantSays('答1存根')]) // 存根回到 live
+    store.beginTurn({ model: 'p/m', effort: null })
+    store.save([userSays('问1'), assistantSays('答1存根'), userSays('问2'), assistantSays('答2原文')])
+    store.unload([3]) // 答2 先卸载——它的 id 比下面才翻的问1 小
+    store.pruneMessages([0, 1]) // 第一轮被合并顶替：问1 从没卸载过、答1 是存根副本
+    store.close()
+
+    const reopened = openStore(dir)
+    const text = (r: { parts: Part[] }) => (r.parts[0] as { text: string }).text
+    expect(reopened.historyPage(null, 10).rows.map(text)).toEqual(['问1', '答1原文', '答2原文'])
+    // 分页游标仍是 id，但「更早」按同一个排序键算
+    const page1 = reopened.historyPage(null, 2)
+    expect(page1.rows.map(text)).toEqual(['答1原文', '答2原文'])
+    const page2 = reopened.historyPage(page1.next, 2)
+    expect(page2.rows.map(text)).toEqual(['问1'])
+    expect(page2.next).toBeNull()
+    reopened.close()
+  })
+
+  it('同 step 里后面的早卸、前面的这会儿才留下：prune 后 step 内仍是真实顺序', async () => {
+    // 最常见的形态：命令短没被卸、输出长早卸了（真库 tool 存根 199 / assistant
+    // 原文未卸 97）。原地翻 unloaded 的话按 id 输出排到命令前面。再叠一个续接：
+    // resumeTurn 不开新 step，「继续」落进同一个 step 的末尾——按角色排序会把它提到最前
+    const dir = await workspace()
+    const store = openStore(dir)
+    store.beginTurn({ model: 'p/m', effort: null })
+    store.save([userSays('问'), callsTool('c1', 'ls'), toolReturns('c1', '输出原文'), userSays('继续')])
+    store.unload([2]) // 输出早卸：id 小于 问/命令/继续
+    store.save([userSays('问'), callsTool('c1', 'ls'), toolReturns('c1', '输出存根'), userSays('继续')])
+    store.pruneMessages([0, 1, 2, 3])
+    store.close()
+
+    const reopened = openStore(dir)
+    const show = (r: { parts: Part[] }) => {
+      const p = r.parts[0]
+      return p?.type === 'text' ? p.text : p?.type === 'tool_call' ? 'call' : p?.type === 'tool_result' ? p.output : '?'
+    }
+    expect(reopened.historyPage(null, 10).rows.map(show)).toEqual(['问', 'call', '输出原文', '继续'])
     reopened.close()
   })
 })
@@ -534,6 +593,34 @@ describe('卸载', () => {
     expect(texts).toContain('五') // 新的也写进去了
   })
 
+  it('markStubs 登记过的存根不进归档——原文已在，无标记的去推理副本同样跳过（2026-09-30）', async () => {
+    // 真库实测：016 桶 11235 行里 4043 行是存根副本，其中 1469 行没有「已卸载」
+    // 标记（只丢了 reasoning、正文不动）——按文本正则认不全，只能由生成存根的
+    // 一方（run.ts unloadOldest）直接告诉 store
+    const dir = await workspace()
+    const store = openStore(dir)
+    store.beginTurn({ model: 'p/m', effort: null })
+    const original = {
+      role: 'assistant' as const,
+      parts: [
+        { type: 'reasoning' as const, text: '想了很久' },
+        { type: 'text' as const, text: '回答正文' },
+      ],
+    }
+    store.save([userSays('问'), original])
+    store.unload([1])
+    const stub = { role: 'assistant' as const, parts: [{ type: 'text' as const, text: '回答正文' }] }
+    store.markStubs([stub])
+    store.save([userSays('问'), stub, userSays('新')])
+    store.close()
+
+    const lines = await archiveLines(dir)
+    expect(lines.filter((m) => m.parts.some((p) => p.text === '回答正文'))).toHaveLength(1)
+    // 留下的是原文（带 reasoning），不是存根
+    expect(lines.some((m) => m.parts.some((p) => p.type === 'reasoning'))).toBe(true)
+    expect(lines.some((m) => m.parts.some((p) => p.text === '新'))).toBe(true)
+  })
+
   it('卸载让 live 缩得比归档还短时，新消息不能被跳过', async () => {
     // 同一个游标 bug 的另一面：游标偏大 → 新消息被当成"已归档"**静默跳过**，
     // 归档里缺一段。跳过是不报错的，比重复更难发现
@@ -599,6 +686,21 @@ describe('摘要（3b-1）', () => {
       archivePath: null,
       owner: null,
     })
+    store.close()
+  })
+
+  it('读回时从 steps 表带出 turn 范围（渲染首行 turn= 与 cue 名用）', async () => {
+    const dir = await workspace()
+    let store = openStore(dir)
+    const t1 = store.beginTurn({ model: 'p/m', effort: null })
+    store.save([userSays('第一轮')])
+    const t2 = store.beginTurn({ model: 'p/m', effort: null })
+    store.save([userSays('第一轮'), userSays('第二轮')])
+    const [a, b] = store.withTurns([userSays('第一轮'), userSays('第二轮')])
+    store.addSummary(draft({ coversFrom: a!.stepId, coversTo: b!.stepId }))
+    store = reopen(dir, store)
+    expect(store.summaries()[0]).toMatchObject({ turnFrom: t1, turnTo: t2 })
+    expect(t2).not.toBe(t1)
     store.close()
   })
 
@@ -1417,10 +1519,12 @@ describe('regions.jsonl：四个区的诊断记录（提案 §13）', () => {
     store.recordRegions(
       { overhead: 900, cold: 40, warm: 100, hot: 160, stub: 1_200, floor: 2_000, live: 18_000 },
       238_000,
+      26_000,
     )
     store.recordRegions(
       { overhead: 900, cold: 40, warm: 110, hot: 170, stub: 1_300, floor: 2_000, live: 19_000 },
       238_000,
+      null,
     )
 
     const lines = (await readFile(join(dir, MEMORY_RELATIVE, 'regions.jsonl'), 'utf8'))
@@ -1431,6 +1535,9 @@ describe('regions.jsonl：四个区的诊断记录（提案 §13）', () => {
     expect(first).toMatchObject({ overhead: 900, cold: 40, hot: 160, stub: 1_200, live: 18_000 })
     expect(first.budget).toBe(238_000) // 比例是拿它当基数算的，缺了这一列没法复算
     expect(typeof first.at).toBe('string') // 唯一能跟 turns/*.jsonl 对上的东西
+    // 真实 usage 与估算同行：面板按 real/估算和 缩放；没拿到记 null（不是 0）
+    expect(first.real).toBe(26_000)
+    expect(JSON.parse(lines[1] as string).real).toBeNull()
     store.close()
   })
 
@@ -1444,14 +1551,17 @@ describe('regions.jsonl：四个区的诊断记录（提案 §13）', () => {
     main.recordRegions(
       { overhead: 900, cold: 40, warm: 100, hot: 160, stub: 1_200, floor: 2_000, live: 137_000 },
       238_000,
+      null,
     )
     task.recordRegions(
       { overhead: 900, cold: 40, warm: 100, hot: 160, stub: 1_200, floor: 2_000, live: 30_000 },
       238_000,
+      null,
     )
     main.recordRegions(
       { overhead: 900, cold: 40, warm: 110, hot: 170, stub: 1_300, floor: 2_000, live: 138_000 },
       238_000,
+      null,
     )
 
     // 任务视图：跳过主任务的后写行，取到任务自己的

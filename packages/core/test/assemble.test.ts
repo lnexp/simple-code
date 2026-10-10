@@ -117,6 +117,15 @@ describe('context 拼装', () => {
     expect(texts([msg as Message])[0]).toMatch(/^<历史摘要/)
   })
 
+  it('首行标 turn 范围，不标 step（2026-09-30：step 对模型无法定位，turn 能直接 memory show）', () => {
+    const s = summary({ id: 1, coversFrom: 766214, coversTo: 766304, turnFrom: 16533, turnTo: 16536 })
+    const [msg] = assembleContext([at(766400, 'user', '现在')], [s])
+    expect(texts([msg as Message])[0]?.split('\n')[0]).toBe('<历史摘要 turn=16533-16536>')
+    // 缺 turn（只有测试夹具会这样，生产由 loadSummaries 从 steps 表带出）显式标问号
+    const [bare] = assembleContext([at(2, 'user', '现在')], [summary({ id: 2, coversFrom: 1, coversTo: 1 })])
+    expect(texts([bare as Message])[0]?.split('\n')[0]).toBe('<历史摘要 turn=?>')
+  })
+
   it('同一个 turn 里的多条消息保持原顺序', () => {
     // 分组时用 Map 攒，攒错的话 tool_call 和 tool_result 会被拆散顺序，
     // 那是下一轮 400
@@ -195,7 +204,7 @@ describe('分辨率梯度：热区展开正文，其余只给键', () => {
   })
 
   describe('emittedSummaries：热区窗口只数真正渲染的行', () => {
-    // 2026-09-23 真机回归（ai-legal-advisor，prefix-break 12:54:38）：
+    // 2026-09-23 真机回归（某项目，prefix-break 12:54:38）：
     // 11 条可见 L0 + 1 条被遮住的在场行。开库修复把被遮住的行翻成离场，
     // 消息一条没变（241→241），旧口径的在场数却从 12 跨到 11、越过
     // demoteBatch 的降级线——热区边界跳一整批，第 23 条摘要从键变正文

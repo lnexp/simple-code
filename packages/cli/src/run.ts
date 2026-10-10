@@ -112,11 +112,13 @@ export const createApproval = (sink: Sink): ApprovalShared => {
         const alwaysHint = q.always
           ? q.always.kind === 'lead'
             ? `[a]始终允许（${q.always.lead} * 今后免审）`
-            : q.always.kind === 'nonpath'
-              ? `[a]始终允许（${q.always.lead} 的第 ${q.always.from} 位参数起不是路径，今后免审）`
-              : q.always.kind === 'paths'
-                ? `[a]始终允许（这 ${q.always.dirs.length} 个目录今后免审）`
-                : `[a]始终允许（${q.always.dir}/ 今后免审）`
+            : q.always.kind === 'hidden'
+              ? `[a]始终允许（${q.always.write ? '写' : '读'} ${q.always.path} 今后免审）`
+              : q.always.kind === 'nonpath'
+                ? `[a]始终允许（${q.always.lead} 的第 ${q.always.from} 位参数起不是路径，今后免审）`
+                : q.always.kind === 'paths'
+                  ? `[a]始终允许（这 ${q.always.dirs.length} 个目录今后免审）`
+                  : `[a]始终允许（${q.always.dir}/ 今后免审）`
           : ''
         sink.err(
           `\n[需要审批·${APPROVAL_LABEL[q.category] ?? q.category}] ${q.reason}\n  ${q.command}\n` +
@@ -177,7 +179,7 @@ export async function runOnce(options: RunOptions): Promise<number> {
   if (options.model) session.setModel(options.model)
   if (options.effort) session.setEffort(options.effort)
 
-  options.signal?.addEventListener('abort', () => session.interrupt(), { once: true })
+  options.signal?.addEventListener('abort', () => session.interrupt('signal'), { once: true })
 
   // 一次性模式也着色：stdout 是管道时自动无色（makePaint 的约定），
   // stderr 若仍是终端则元信息有色

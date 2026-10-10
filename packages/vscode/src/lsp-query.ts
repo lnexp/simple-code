@@ -3,7 +3,7 @@
  * 把结果格式化成模型好读的文本。不 import vscode（执行器注入）——
  * 这样它可以直接进 vitest；lsp-bridge.ts 只做 http + vscode 胶水。
  *
- * 位置一律 1-based（`file.ts:120:5`，模型友好，与 OC 的 LSP 工具同口径）。
+ * 位置一律 1-based（`file.ts:120:5`，模型友好，与主流 LSP 工具同口径）。
  * 空结果不是错误：返回一句「无结果」让模型知道该换路（grep 回落），
  * 而不是对着 exit code 猜。
  */

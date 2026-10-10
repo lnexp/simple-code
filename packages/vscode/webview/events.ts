@@ -55,6 +55,13 @@ export type ChatItem =
       kind: 'tool'
       id: string
       name: string
+      /** 模型写的 4-10 字短语（bash 入参 desc）——标题位扫读用 */
+      desc: string
+      /**
+       * 参数流式中间态：tool_input_delta 拼起来的半截 JSON，只为提前抠出
+       * desc。抠到或 tool_call 到达即丢——长 heredoc 不在视图里常驻一份
+       */
+      rawInput?: string
       command: string
       output: string
       failed: boolean
@@ -71,8 +78,9 @@ export type ChatItem =
       images?: string[]
     }
   /** 归档提示之类的系统说明，不是对话内容。error 落下来的 notice 带
-   * errorKind/retryable——UI 据此标色、给重试按钮 */
-  | { kind: 'notice'; text: string; errorKind?: string; retryable?: boolean }
+   * errorKind——UI 据此标色。resumable：报错/中断落下的那条，停稳后是最后一条
+   * 时给「继续」按钮（发一条「继续」，core 续进上一轮，turn-resume.md） */
+  | { kind: 'notice'; text: string; errorKind?: string; resumable?: boolean }
 
 export type ChatView = {
   items: ChatItem[]
@@ -112,7 +120,7 @@ export const fmtMs = (ms: number): string =>
 
 /** token → 人话：850 / 1k / 45.2k / 96k */
 export const fmtTok = (n: number): string =>
-  n < 1000 ? `${n}` : `${parseFloat((n / 1000).toFixed(1))}k`
+  Math.round(n) < 1000 ? `${Math.round(n)}` : `${parseFloat((n / 1000).toFixed(1))}k`
 
 export function reduce(view: ChatView, agentEv: AgentEvent, now: number): ChatView {
   switch (agentEv.type) {
@@ -126,7 +134,12 @@ export function reduce(view: ChatView, agentEv: AgentEvent, now: number): ChatVi
     case 'text_delta':
       return appendText(view, 'assistant', agentEv.text, now)
     case 'reasoning_start':
-      return append(view, { kind: 'reasoning', text: '', startedAt: now })
+      // 紧挨着的上一条也是思考 → 续进同一行。Opus 5.5 等模型在工具调用前
+      // 另发一个 progress update 块（官方文档 thinking#progress-updates），
+      // display=summarized 下与思考块不可区分，分开画就是一次调用两行「已思考」
+      return view.items.at(-1)?.kind === 'reasoning'
+        ? patchLast(view, ({ endedAt: _, ...r }) => ({ ...r, text: r.text === '' ? '' : `${r.text}\n\n` }))
+        : append(view, { kind: 'reasoning', text: '', startedAt: now })
     case 'reasoning_delta':
       return appendText(view, 'reasoning', agentEv.text, now)
 
@@ -135,14 +148,16 @@ export function reduce(view: ChatView, agentEv: AgentEvent, now: number): ChatVi
         kind: 'tool',
         id: agentEv.id,
         name: agentEv.name,
-        command: '',
+        desc: '',
+      command: '',
         output: '',
         failed: false,
         startedAt: now,
       })
     case 'tool_call':
       return withTool(view, agentEv.id, agentEv.name, now, (tool) => ({
-        ...tool,
+        ...withoutRaw(tool),
+        desc: descOf(agentEv.input),
         command: commandOf(agentEv.input),
       }))
     case 'tool_result':
@@ -207,13 +222,12 @@ export function reduce(view: ChatView, agentEv: AgentEvent, now: number): ChatVi
         kind: 'notice',
         text: agentEv.message,
         ...(agentEv.kind ? { errorKind: agentEv.kind } : {}),
-        ...(agentEv.retryable ? { retryable: true } : {}),
+        resumable: true,
       })
 
     // 这些不改变界面模型：
     // - text_end：气泡的结束由「下一个 start」决定，不需要标记
     //   （reasoning_end 例外：它记墙钟给折叠头的时长用，见上）
-    // - tool_input_delta：攒参数的中间态，攒完的 tool_call 才有意义
     // - truncated：**故意什么都不做**。它是续写，前面的内容仍然有效，
     //   清空的话前半段凭空消失。跟 restart 相反，搞混了不报错
     case 'reasoning_end':
@@ -222,9 +236,11 @@ export function reduce(view: ChatView, agentEv: AgentEvent, now: number): ChatVi
       return patchLast(view, (r) => ({ ...r, endedAt: now }))
 
     case 'text_end':
-    case 'tool_input_delta':
     case 'truncated':
       return view
+
+    case 'tool_input_delta':
+      return earlyDesc(view, agentEv.id, agentEv.partial)
   }
 }
 
@@ -255,7 +271,7 @@ export function finishTurn(
   now: number = Date.now(),
 ): ChatView {
   const at = view.items.findLastIndex((item) => item.kind === 'assistant')
-  const stopped: ChatItem[] = interrupted ? [{ kind: 'notice', text: '已中断' }] : []
+  const stopped: ChatItem[] = interrupted ? [{ kind: 'notice', text: '已中断', resumable: true }] : []
   if (at === -1) return { ...view, items: [...view.items, ...stopped], turnStartedAt: null }
   const items = [...view.items]
   items[at] = {
@@ -308,6 +324,9 @@ const append = (view: ChatView, item: ChatItem): ChatView => ({
   items: [...view.items, item],
 })
 
+/** 回放时两段思考接成一段：中间空一行，有一边是空的就不加（实时流在 reasoning_start 接） */
+const joinReasoning = (a: string, b: string): string => (a === '' || b === '' ? a + b : `${a}\n\n${b}`)
+
 /**
  * 往最后一条同类条目上追加文本。类型对不上就新建一条——`text_delta` 先于
  * `text_start` 到达是不该发生的，但真发生时新建一条比丢掉强
@@ -351,6 +370,7 @@ function withTool(
       kind: 'tool',
       id,
       name,
+      desc: '',
       command: '',
       output: '',
       failed: false,
@@ -374,6 +394,51 @@ function dropTrailingAssistant(items: ChatItem[]): ChatItem[] {
     end--
   }
   return items.slice(0, end)
+}
+
+/**
+ * 流式期间提前显示 desc：bash 参数片段拼进 rawInput，一旦 `"desc":"…"`
+ * 的字符串闭合就抠出来、丢掉 rawInput。之后的片段直接返回原 view（不复制
+ * items）——长 heredoc 有几百个片段，抠到之后每片都是零成本。
+ *
+ * 抠错也无害：tool_call 到达时 descOf 用完整入参覆盖。非 bash 工具没有
+ * desc，不攒
+ */
+function earlyDesc(view: ChatView, id: string, partial: string): ChatView {
+  const index = view.items.findIndex((i) => i.kind === 'tool' && i.id === id)
+  const target = view.items[index]
+  if (target?.kind !== 'tool' || target.name !== 'bash' || target.desc !== '') return view
+  const raw = (target.rawInput ?? '') + partial
+  const desc = partialDesc(raw)
+  const items = [...view.items]
+  items[index] = desc === null ? { ...target, rawInput: raw } : { ...withoutRaw(target), desc }
+  return { ...view, items }
+}
+
+/** 半截 JSON 里找已闭合的 "desc"（或 "description"，见 descOf）字符串值；没闭合或解不开返回 null */
+function partialDesc(raw: string): string | null {
+  const m = /"desc(?:ription)?"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(raw)
+  if (!m) return null
+  try {
+    const v: unknown = JSON.parse(`"${m[1]}"`)
+    return typeof v === 'string' && v !== '' ? v : null
+  } catch {
+    return null
+  }
+}
+
+function withoutRaw(tool: Extract<ChatItem, { kind: 'tool' }>): Extract<ChatItem, { kind: 'tool' }> {
+  const { rawInput: _drop, ...rest } = tool
+  return rest
+}
+
+/** bash 入参里模型写的短语（desc）。同 commandOf 的防御姿态，不猜。
+ * desc 为空时认 description：glm 照官方 Bash 工具的参数名写（同 core bash.ts hasDesc） */
+function descOf(input: unknown): string {
+  if (typeof input !== 'object' || input === null) return ''
+  const { desc, description } = input as { desc?: unknown; description?: unknown }
+  if (typeof desc === 'string' && desc !== '') return desc
+  return typeof description === 'string' ? description : ''
 }
 
 /** bash 工具的参数里取命令。其他工具或参数不合预期时留空，不猜 */
@@ -618,13 +683,17 @@ export function hydrateItems(
           items.push({ kind: 'assistant', text: part.text })
         } else if (part.type === 'reasoning') {
           if (isStub(part.text) || part.text === '') continue
-          items.push({ kind: 'reasoning', text: part.text })
+          // 相邻的思考块并成一行，与实时流同口径（reasoning_start 的注释）
+          const prev = items.at(-1)
+          if (prev?.kind === 'reasoning') items[items.length - 1] = { ...prev, text: joinReasoning(prev.text, part.text) }
+          else items.push({ kind: 'reasoning', text: part.text })
         } else if (part.type === 'tool_call') {
           const command = commandOf(part.input)
           const item: Extract<ChatItem, { kind: 'tool' }> = {
             kind: 'tool',
             id: part.id,
             name: part.name,
+            desc: descOf(part.input),
             command,
             output: '',
             failed: false,
@@ -663,7 +732,8 @@ export function hydrateItems(
           kind: 'tool',
           id: part.toolCallId,
           name: 'bash',
-          command: '',
+          desc: '',
+      command: '',
           output: part.output,
           failed: part.isError,
           ...(thumbs ? { images: thumbs } : {}),

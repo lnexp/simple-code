@@ -75,6 +75,31 @@ describe('websearch / 网络', () => {
       vi.unstubAllGlobals()
     }
   })
+  it('配了 url → 打自定义端点，key 走 Bearer 头', async () => {
+    const seen: { url: string; auth: string | undefined }[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        seen.push({
+          url: String(url),
+          auth: (init?.headers as Record<string, string>)?.authorization,
+        })
+        return new Response('{"result":{"content":[{"text":"ok"}]}}')
+      }),
+    )
+    try {
+      await createWebsearchTool({
+        url: 'https://gateway.example.com/llm/mcp?mcp=dashboard.exa.ai',
+        exaApiKey: 'gw-key',
+      }).execute({ query: 'q' }, ctx)
+      expect(seen[0]).toEqual({
+        url: 'https://gateway.example.com/llm/mcp?mcp=dashboard.exa.ai',
+        auth: 'Bearer gw-key',
+      })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
   it('非 200 → isError 且提示 webfetch', async () => {
     vi.stubGlobal(
       'fetch',

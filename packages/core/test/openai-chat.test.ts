@@ -26,6 +26,38 @@ const body = (over: Partial<Request> = {}) =>
 const wireMessages = (messages: Message[]) =>
   body({ messages }).messages as Record<string, unknown>[]
 
+describe('openai-chat / 序列化', () => {
+  it('纯 reasoning 的 assistant 消息整条跳过——DeepSeek 官方 API 对 content:null 且无 tool_calls 的 assistant 报 400', () => {
+    // finish=length 掐在推理段中间就会存出这种消息（远程工作区
+    // turn-000178 实证）。续写请求原样回放它 → Invalid assistant
+    // message: content or tool_calls must be set，且 invalid_request 不可重试
+    const out = body({
+      system: '',
+      messages: [
+      { role: 'user', parts: [{ type: 'text', text: '继续' }], at: 't' } as Message,
+      { role: 'assistant', parts: [{ type: 'reasoning', text: '想了 12k 字被截断' }], at: 't' } as Message,
+      ],
+    }).messages as Record<string, unknown>[]
+    expect(out).toHaveLength(1)
+    expect(out[0]?.role).toBe('user')
+  })
+
+  it('文本 + reasoning 的 assistant 照常带 reasoning_content——回传瘦身不在本修复范围', () => {
+    const out = body({
+      system: '',
+      messages: [
+      { role: 'assistant', parts: [
+        { type: 'reasoning', text: '想过了' },
+        { type: 'text', text: '答案' },
+      ], at: 't' } as Message,
+      ],
+    }).messages as Record<string, unknown>[]
+    expect(out).toHaveLength(1)
+    expect(out[0]?.reasoning_content).toBe('想过了')
+    expect(out[0]?.content).toBe('答案')
+  })
+})
+
 /** 喂合成 chunk。fixture 覆盖不到的分支只能这样测 */
 async function feed(chunks: Record<string, unknown>[]): Promise<LLMEvent[]> {
   const sse = chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join('') + 'data: [DONE]\n\n'
@@ -361,6 +393,13 @@ describe('openai-chat / parseError', () => {
     )
     // 对照组：同样 400，文案不匹配时不能误判
     expect(err(400, 'invalid_request_error', 'unknown parameter').kind).toBe('invalid_request')
+  })
+
+  it('流内错误（status 0）归不上类 → 可重试；认得出的照旧不重试', () => {
+    // 流里 `ev.error` 走同一个 toError、status 传 0。真机原文见 runlog 9-18
+    expect(err(0, '', '上游服务错误[503]: No available accounts')).toMatchObject({ kind: 'unknown', retryable: true })
+    expect(err(0, 'invalid_api_key')).toMatchObject({ kind: 'auth', retryable: false })
+    expect(err(0, 'context_length_exceeded')).toMatchObject({ kind: 'context_overflow', retryable: false })
   })
 })
 

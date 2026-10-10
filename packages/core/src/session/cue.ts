@@ -14,7 +14,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { EVENTS_INDEX_LIMIT, loadEvents } from '../tools/events.ts'
 import { lessonsDir, parseLessonFrontMatter } from '../tools/lesson.ts'
-import { listNoteCards, NOTES_INDEX_LIMIT } from '../tools/note.ts'
+import { activeNoteCards, NOTES_INDEX_LIMIT } from '../tools/note.ts'
 import { listSkills } from '../tools/skill.ts'
 import { CUE_STOPWORDS } from './cue-stopwords.ts'
 import type { Summary } from '../loop/assemble.ts'
@@ -48,14 +48,31 @@ export function cueTokens(text: string): string[] {
  *  五轮各碰一次的词——频率指「多少轮在碰」，不是「单轮里多密」 */
 export function wordScores(turnTexts: string[], halfLife: number): Map<string, number> {
   const out = new Map<string, number>()
+  /** 每词在场轮数：查询侧 idf 用 */
+  const presence = new Map<string, number>()
   turnTexts.forEach((text, i) => {
     const age = turnTexts.length - 1 - i
     const w = 2 ** (-age / halfLife)
     // 停用词只在查询侧滤（cue-stopwords.ts 头注）：不进 scores 就不进
     // 贡献，候选侧语料照旧——recall 规格「只加查询侧」铁律
-    for (const tok of new Set(cueTokens(text)))
+    for (const tok of new Set(cueTokens(text))) {
       if (!CUE_STOPWORDS.has(tok)) out.set(tok, (out.get(tok) ?? 0) + w)
+      presence.set(tok, (presence.get(tok) ?? 0) + 1)
+    }
   })
+  // 查询侧 idf（2026-10-08）：出现在越多轮的词越不值钱。只有候选侧 idf
+  // 压不住「之后」这种词——它在候选里稀有（df≈0）、idf 反而高，但每轮
+  // 对话都在、裸分最高（真库 27/30 轮 → 11.1），候选碰巧含一次就冲顶：
+  // 40 轮 80 条命中里 78 条是这种泛词噪声。乘 ln((N+1)/(在场轮数+1)) 后
+  // 之后 11.1→1.1、在场 3/30 的「采样」2.6→5.4 反超。停用词表挡不住英文
+  // 虚词（the/of/is 来自工具输出、25-30/30 轮在场，列不完），公式不挑语言
+  const n = turnTexts.length
+  for (const [tok, v] of out) {
+    const scaled = v * Math.log((n + 1) / ((presence.get(tok) ?? 0) + 1))
+    // 在场率 100% 归零删除（含单轮窗口的全部词）——那时本就没什么可召回
+    if (scaled <= 0) out.delete(tok)
+    else out.set(tok, scaled)
+  }
   return out
 }
 
@@ -73,19 +90,27 @@ export function buildCues(
   // idf：出现在越多候选里越不值钱。df=全部时 ln(1)=0，全自动压掉
   const total = candidates.length
   const docFreq = new Map<string, number>()
+  let lenSum = 0
   for (const c of candidates) {
     const seen = new Set(cueTokens(c.text))
+    lenSum += seen.size
     for (const tok of seen) docFreq.set(tok, (docFreq.get(tok) ?? 0) + 1)
   }
+  const avgLen = lenSum / total || 1
   const ranked = candidates
     .filter((c) => !opts.excludeNames?.has(c.name))
     .map((c) => {
       // 顺手留 top 贡献词——线索行带命中词，认出靠它（报碰撞给证据）
-      const contrib = [...new Set(cueTokens(c.text))]
+      const toks = [...new Set(cueTokens(c.text))]
+      const contrib = toks
         .map((tok) => ({ tok, v: (scores.get(tok) ?? 0) * Math.log((total + 1) / ((docFreq.get(tok) ?? 0) + 1)) }))
         .filter((x) => x.v > 0)
         .sort((a, b) => b.v - a.v || a.tok.localeCompare(b.tok))
-      return { c, score: contrib.reduce((s, x) => s + x.v, 0), hits: contrib.slice(0, 3).map((x) => x.tok) }
+      // BM25 长度项（b=0.75，2026-10-08）：逐词求和下谁长谁赢——真库候选
+      // 去重词数中位 26，反复上榜的 summary 全是 100-165 词的长 head，靠
+      // 词多碰巧撞泛词。除以 1-b+b·len/avg：长为平均 4 倍的除 3.25，等长不变
+      const norm = 0.25 + (0.75 * toks.length) / avgLen
+      return { c, score: contrib.reduce((s, x) => s + x.v, 0) / norm, hits: contrib.slice(0, 3).map((x) => x.tok) }
     })
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score || a.c.name.localeCompare(b.c.name))
@@ -106,7 +131,8 @@ const clip = (s: string, n: number): string => (s.length <= n ? s : `${s.slice(0
  */
 export function loadCueCandidates(root: string, summaries: Summary[]): CueCandidate[] {
   const out: CueCandidate[] = []
-  for (const c of listNoteCards(root).slice(NOTES_INDEX_LIMIT))
+  // 作废的不进候选：撞到它等于把被推翻的结论当线索递回来
+  for (const c of activeNoteCards(root).slice(NOTES_INDEX_LIMIT))
     out.push({ kind: 'note', name: c.name, text: `${c.name} ${c.description ?? ''}` })
   for (const c of loadEvents(root).slice(EVENTS_INDEX_LIMIT))
     out.push({ kind: 'event', name: c.name, text: `${c.name} ${c.description}` })
@@ -125,8 +151,15 @@ export function loadCueCandidates(root: string, summaries: Summary[]): CueCandid
     if (!name) continue
     out.push({ kind: 'skill', name, text: line })
   }
+  // 名字 2026-09-30 前是 t<covers_from step id>，之后是 t<turn>（跨 turn 写
+  // t<起>-<止>）：与摘要首行 turn= 同口径，拿去 memory show 就能用
+  // 只收 L0（2026-09-30 起）：内部节点 name 空、head 取自首成员，候选文本
+  // 是首成员的子集——两条一起撞中、名字不同去重拦不住，白占一个线索位
   for (const s of summaries)
-    if (!s.inContext) out.push({ kind: 'summary', name: `t${s.coversFrom}`, text: `${s.name} ${s.head ?? ''}` })
+    if (!s.inContext && s.level === 0) {
+      const t = s.turnFrom === s.turnTo ? `${s.turnFrom ?? '?'}` : `${s.turnFrom ?? '?'}-${s.turnTo ?? '?'}`
+      out.push({ kind: 'summary', name: `t${t}`, text: `${s.name} ${s.head ?? ''}` })
+    }
   return out
 }
 

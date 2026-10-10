@@ -61,6 +61,17 @@ describe('openai-responses / parseStream', () => {
     ])
   })
 
+  it('网关只发 data: 行、没有 event: 行时按 data.type 认事件（2026-09-30 真机抓包）', async () => {
+    // 某网关渠道 9-30 起的实际形态：9 条事件全是
+    // `data: {"type":"response.…"}`，一条 event: 行都没有。只认 event: 行的
+    // 话全部落进 default 被丢，EOF 时报「未收到结束标记」，界面一个字没有。
+    // fixture = 真机抓包，删掉回显的上游 instructions/tools、身份字段换占位
+    const events = await eventsFromFixture(openaiResponses.parseStream, 'openai-responses.data-only.sse')
+    expect(shape(events)).toEqual(['text_start', 'text_delta', 'text_end', 'finish'])
+    expect(events.find((e) => e.type === 'text_delta')).toMatchObject({ text: '好' })
+    expect(events.at(-1)).toMatchObject({ type: 'finish', reason: 'stop' })
+  })
+
   it('done 重发完整 arguments 时整体替换，不追加', async () => {
     const raw = (await readFixture(FIXTURE)).toString('utf8')
     // 前提：done 里带的是完整 JSON 而不是最后一个分片。若网关改了行为，
@@ -188,6 +199,11 @@ describe('openai-responses / buildRequest', () => {
     expect(body().instructions).toBe('S')
   })
 
+  it('带 cacheKey 时发 prompt_cache_key，没有则整个字段不发', () => {
+    expect(body({ cacheKey: 'k-1' }).prompt_cache_key).toBe('k-1')
+    expect('prompt_cache_key' in body()).toBe(false)
+  })
+
   it('store:false 时必须 include encrypted_content，否则下一轮没有 reasoning 可回传', () => {
     expect(body().store).toBe(false)
     expect(body().include).toEqual(['reasoning.encrypted_content'])
@@ -299,5 +315,18 @@ describe('tool_result 带图（web-tools D4）', () => {
         { type: 'input_text', text: '抓到了' },
       ],
     })
+  })
+})
+
+describe('openai-responses / parseError', () => {
+  const err = (status: number, code: string, message = 'm') =>
+    openaiResponses.parseError(status, { error: { code, message } })
+
+  it('流内错误（status 0）归不上类 → 可重试；认得出的照旧不重试', () => {
+    // 流里 error / response.failed 走同一个 toError、status 传 0
+    expect(err(0, '', 'passthrough stream idle timeout after 120s')).toMatchObject({ kind: 'unknown', retryable: true })
+    expect(err(0, 'rate_limit_exceeded')).toMatchObject({ kind: 'rate_limit', retryable: true })
+    expect(err(0, 'invalid_api_key')).toMatchObject({ kind: 'auth', retryable: false })
+    expect(err(0, 'context_length_exceeded')).toMatchObject({ kind: 'context_overflow', retryable: false })
   })
 })

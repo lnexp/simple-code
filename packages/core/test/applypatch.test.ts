@@ -88,6 +88,30 @@ PATCH`)
       /无法定位/,
     )
   })
+  it('update 里夹了中间的 *** End Patch（多文件各写一对 Begin/End）：报语法错误，不当上下文吃进 chunk', () => {
+    // 2026-09-30 实案：曾被 lenient 收成上下文行，报「找不到要替换的行（第 1 行是…）」，
+    // 而第 1 行在文件里明明存在——真正对不上的是 chunk 末尾这行
+    const two = '*** Begin Patch\n*** Update File: a\n@@\n ctx\n+x\n*** End Patch\n*** Update File: b\n@@\n ctx\n+y\n*** End Patch'
+    expect(() => parsePatch(two)).toThrow(/补丁第 6 行：.*\*\*\* End Patch.*一对 Begin\/End/)
+    expect(() => parsePatch('*** Begin Patch\n*** Update File: a\n@@\n ctx\n*** Begin Patch\n+x\n*** End Patch')).toThrow(
+      /补丁第 5 行/,
+    )
+    // End of File / Move to 仍是合法标记
+    expect(parsePatch('*** Begin Patch\n*** Update File: a\n*** Move to: b\n@@\n ctx\n+x\n*** End of File\n*** End Patch')).toHaveLength(1)
+  })
+  it('报错行号是 1 起算的真实行号（曾为 0 起算下标，少 1）', () => {
+    // 第 3 行：Add 里混入普通行
+    expect(() => parsePatch('*** Begin Patch\n*** Add File: x\nhello\n*** End Patch')).toThrow(/补丁第 3 行/)
+    // 第 3 行：End of File 不在 chunk 内
+    expect(() => parsePatch('*** Begin Patch\n*** Update File: x\n*** End of File\n*** End Patch')).toThrow(/补丁第 3 行/)
+    // 第 3 行：chunk（@@ 所在行）没有上下文
+    expect(() => parsePatch('*** Begin Patch\n*** Update File: x\n@@\n+a\n*** End Patch')).toThrow(/补丁第 3 行/)
+    // 第 3 行：隐式 chunk 起始行
+    expect(() => parsePatch('*** Begin Patch\n*** Update File: x\n+a\n*** End Patch')).toThrow(/补丁第 3 行/)
+    // 结尾缺 End：指最后一个非空行（第 2 行），不指末尾换行后的空串
+    expect(() => parsePatch('*** Begin Patch\n*** Delete File: x\n')).toThrow(/补丁第 2 行/)
+    expect(() => parsePatch('*** Begin Patch\n*** Delete File: x')).toThrow(/补丁第 2 行/)
+  })
 })
 
 describe('applyPatch 应用', () => {

@@ -38,10 +38,25 @@ export async function* requestWithRetry(
 ): AsyncIterable<StreamEvent> {
   for (let tries = 0; ; tries++) {
     let emitted = false
+    let sawContent = false
     try {
       for await (const llmEv of attempt(signal)) {
         emitted = true
+        // 内容类事件 = 模型说过话：文本/推理/工具调用，finish 上的 refusal
+        // 也算（拒答是回答）。message_start 与 finish 本身是元信息。零内容
+        // 的「正常」收尾是网关损伤的另一种形态（2026-10-09 某后端项目实案：
+        // claude-opus 31.6s 返回零内容、零 usage、带完整终止标记）——不拦
+        // 的话循环当它正常结束，轮子无声死掉，界面上连继续按钮都没有
+        if (llmEv.type === 'finish') sawContent ||= !!llmEv.refusal
+        else if (llmEv.type !== 'message_start') sawContent = true
         yield llmEv
+      }
+      if (!sawContent) {
+        throw new LLMStreamError({
+          kind: 'server',
+          message: '响应正常结束但没有返回任何内容（无文本/推理/工具调用），按可重试错误处理',
+          retryable: true,
+        })
       }
       return
     } catch (error) {

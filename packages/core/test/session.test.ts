@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent } from '../src/events.ts'
 import type { Request, Usage } from '../src/llm/types.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
@@ -331,6 +331,27 @@ describe('AGENTS.md', () => {
     expect(system).not.toContain('正文不进索引')
   })
 
+  it('作废的 note（status: superseded）不进索引', async () => {
+    const system = await systemAfterRound(async (dir) => {
+      await mkdir(join(dir, '.simple-code', 'notes'), { recursive: true })
+      await writeFile(join(dir, '.simple-code', 'notes', 'live.md'), '---\nname: live\ndescription: 现行结论\n---\n\n# L', 'utf8')
+      await writeFile(
+        join(dir, '.simple-code', 'notes', 'old.md'),
+        '---\nname: old\ndescription: 旧结论\nstatus: superseded\nby: live\n---\n\n# O',
+        'utf8',
+      )
+    })
+    expect(system).toContain('- live — 现行结论')
+    expect(system).not.toContain('旧结论')
+  })
+
+  it('约定段头写明与内建段冲突时以内建为准（2026-09-30 拍板）', async () => {
+    const system = await systemAfterRound(async (dir) => {
+      await writeFile(join(dir, 'AGENTS.md'), '项目约定', 'utf8')
+    })
+    expect(system).toContain('与上面的内建段冲突时以内建段为准')
+  })
+
   it('notes 不存在时 system 不带索引段', async () => {
     const system = await systemAfterRound()
     expect(system).not.toContain('notes 索引')
@@ -341,7 +362,7 @@ describe('AGENTS.md', () => {
       // 中文 ~1 token/字：2400 字稳超 2048
       writeFile(join(dir, 'AGENTS.md'), '约'.repeat(2400), 'utf8'),
     )
-    expect(system).toContain('已截断')
+    expect(system).toContain('⚠ AGENTS.md 超过')
     expect(system).not.toContain('约'.repeat(2400))
   })
 
@@ -377,6 +398,10 @@ describe('AGENTS.md', () => {
     expect(withBoth).toContain('与 skill（该怎么做）')
     expect(none).toContain('两步都过仍无法确定的，停下来问用户')
     expect(none).toContain('或不确定该怎么做时查用（求证链的第一步）')
+    // 方案检索（2026-10-09）：自信的误判不产生不确定感，动手前拿方案
+    // 名词检索教训/note，与确信与否无关；不列领域清单（本仓病历不进产品段）
+    expect(none).toContain('搜一遍教训与 note')
+    expect(none).toContain('与确信与否无关')
     // t885 常驻清单：同为 core 行为，无条件在场
     expect(none).toContain('常驻上下文（每轮全价重发）')
     expect(none).toContain('各类正文只在你主动 read 时才进上下文')
@@ -394,7 +419,10 @@ describe('AGENTS.md', () => {
     })
     expect(withAll).toContain('你是 SimpleCode（SC）里的编码 agent')
     expect(withAll).toContain('grep "<关键词>" "$SIMPLE_CODE_DOC"')
-    expect(withAll).toContain('代码符号检索优先用 "$SIMPLE_CODE_LSP"')
+    // 2026-09-30 收窄：「优先于 grep」近 7 天四目录仅 1 次调用（grep 5881）；
+    // 主流 agent 的 LSP 查询工具默认都关。只留 LSP 真比 grep 强的场景
+    expect(withAll).toContain('重命名、改签名前查全部引用用 "$SIMPLE_CODE_LSP" refs')
+    expect(withAll).not.toContain('优先于 grep')
     expect(withAll).toContain('④事件归档：压缩点由 archiver 自动按事归档')
     expect(withAll).toContain('查教训用 "$SIMPLE_CODE_LESSON" read <name>')
     expect(withAll).toContain('读结论记忆用 "$SIMPLE_CODE_NOTE" read <name>')
@@ -503,6 +531,51 @@ describe('中断', () => {
 
     const toolMsg = session.messages().find((m) => m.role === 'tool')
     expect(toolMsg?.parts[0]).toMatchObject({ toolCallId: 't1', interrupted: true })
+  })
+
+  it('中断记来源（ev=interrupt）；没在跑时不记（2026-09-30 补观测）', async () => {
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      const { session } = await open({
+        rounds: [
+          [
+            { type: 'tool_input_start', id: 't1', name: 'bash' },
+            { type: 'tool_input_end', id: 't1', name: 'bash', input: {} },
+            { type: 'finish', reason: 'tool-calls', usage: usage() },
+          ],
+        ],
+      })
+      session.interrupt('stop') // 没在跑：空操作
+      for await (const ev of session.send('跑一下')) {
+        if (ev.type === 'tool_input_start') {
+          session.interrupt('stop')
+          session.interrupt('dispose') // 已中断：不重复记
+        }
+      }
+      await session.close()
+    } finally {
+      spy.mockRestore()
+    }
+    const lines = calls.filter((c) => c.ev === 'interrupt')
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatchObject({ source: 'stop', owner: null })
+  })
+
+  it('关闭记一行 session_close（2026-09-30 补观测：exthost 报库已关，runlog 查不到谁关的）', async () => {
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      const { session } = await open({ rounds: [] })
+      await session.close('detach')
+    } finally {
+      spy.mockRestore()
+    }
+    const lines = calls.filter((c) => c.ev === 'session_close')
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatchObject({ owner: null, summarizing: false, source: 'detach' })
   })
 })
 

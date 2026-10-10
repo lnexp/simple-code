@@ -145,20 +145,6 @@ export const bashConfig = strictObject({
       'SIMPLE_CODE_LSP_PORT',
       'SIMPLE_CODE_DOC',
     ]),
-  // 审批判定的白名单（approval.md §6）。只管规则内容，开/关不进配置——
-  // 那是 UI 两态开关（宿主内存态），配置文件不该有第二个真理源
-  approval: strictObject({
-    hiddenAllow: z.array(z.string()).default(['.git']),
-    networkAllow: z
-      .array(z.string())
-      .default(['npm', 'pnpm', 'yarn', 'git', 'node']),
-    /** 命令名 → 从第几位位置参数起不判为路径（0 基，区间豁免）。
-     * 给「参数不是文件路径、只是长得像路径」的私有工具用——典型是
-     * 元素寻址语法（`xcli get deck.pptx /slide[2]` 的 `/slide[2]`），
-     * 以 / 开头会被当成绝对路径误拦。core 不内置任何条目（内置的都是
-     * 通用工具：sed/grep 的 pattern 位在判定器里），用到哪个配哪个 */
-    nonPathFrom: z.record(z.string(), z.number().int().min(0)).default({}),
-  }).prefault({}),
 })
 
 const webfetchConfig = strictObject({
@@ -167,25 +153,6 @@ const webfetchConfig = strictObject({
   maxOutputChars: z.number().int().positive().default(100_000),
 })
 
-const websearchConfig = strictObject({
-  /** 可选。缺省走 Exa 匿名层——匿名层是缺省路径，不是错误（缺失静默） */
-  exaApiKey: z.string().optional(),
-})
-
-const mcpServerSpec = strictObject({
-  /** 启动命令。stdio MCP server，如 npx/node/uvx/python3 */
-  command: z.string().min(1),
-  args: z.array(z.string()).optional(),
-  /** server 进程工作目录，依赖相对路径文件的 server 需要 */
-  cwd: z.string().min(1).optional(),
-  /** server 私有凭证放这里——注入子进程 env，不进模型上下文 */
-  env: z.record(z.string(), z.string()).optional(),
-})
-
-const mcpConfig = strictObject({
-  /** server 名 → 启动配置。名字即 CLI 里的 <server> 参数（mcp.md） */
-  servers: z.record(z.string(), mcpServerSpec).default({}),
-})
 
 /**
  * 视觉转述副模型（vision relay）。主模型无视觉（capabilities.images
@@ -193,10 +160,19 @@ const mcpConfig = strictObject({
  * 上下文里只有文字。null = 不转述，view_image 维持占位文本现状。
  * 形态与 memory.summaryModel 相同：string = 当前 provider 下的模型名，
  * { provider, model } = 跨 provider
+ *
+ * 两处共用这一个形态。对象形态可带 effort 覆盖副模型的推理档位，比主模型
+ * 多一档 'none'：openai-chat 不认 thinking，关推理只能发 reasoning_effort
+ * =none，而它只对部分端点安全（2026-09-30 实测某端点会 400、另一端点
+ * 推理漏进正文），所以不做成默认映射，由用户按端点显式配
  */
-const visionModelRef = z.union([
+const sideModelRef = z.union([
   z.string(),
-  strictObject({ provider: z.string(), model: z.string() }),
+  strictObject({
+    provider: z.string(),
+    model: z.string(),
+    effort: z.enum(['none', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
+  }),
 ])
 
 const retryConfig = strictObject({
@@ -233,18 +209,18 @@ const memoryConfig = strictObject({
   // 比例形式的问题是它把「给输出留多少」藏在一个数字里——0.7 碰巧盖住了
   // 默认 maxTokens，配成 0.95 就直接撞窗口，而那时配置看起来完全合理
   /**
-   * 保底区的**比例下限**（compaction-v2 §0.2，2026-09-24 拍板）：
-   * 保底区 = max(`floorTokens`, 预算 × 这个比例)。预算 238,000 时
-   * max(16k, 23.8k) = 23.8k——比 35% 时代保得更多，靠「保底外 reasoning
-   * 整块丢弃」把存根压回来（实测每轮 4.36k → 1.05k）。
+   * 保底区的**比例上限**：保底区 = min(`floorTokens`, 预算 × 这个比例)
+   * （2026-09-28 用户拍板由 max 改 min，推翻 compaction-v2 §0.2）。预算
+   * 290,000 时 min(16k, 29k) = 16k；小窗口按比例缩（预算 39k → 3.9k）。
+   * max 时预算越大保底越大，压缩谷底跟着抬（opus 300k 窗口实测保底 29k）。
    *
    * **键名沿用、语义换了**：原来（proposal §8.3）是「卸载目标压回预算的
    * 这个比例」，默认 0.35——v2 推翻：四趟车（stale/预算/force/任务关闭）
    * 触发即「保底区外全卸」，没有「压回某个比例」的目标，比例改作保底区
-   * 的下限，默认 0.10。旧值 0.35 在新语义下 = 保底 83k，偏大但合法。
+   * 的上限，默认 0.10。
    *
    * 基数是预算（`contextWindow - maxTokens - reservedTokens`）不是窗口，
-   * 见提案 §10.5；另有 FLOOR_MAX_RATIO 上限夹住小窗口，见 run.ts。
+   * 见提案 §10.5。
    */
   unloadTargetRatio: z.number().gt(0).lte(1).default(0.10),
   /**
@@ -268,9 +244,9 @@ const memoryConfig = strictObject({
   floorTokens: z.number().int().positive().default(16_000),
   /**
    * 存根区的 token 上界（compaction-v2 §0.4）。存根区 = 保底区上方
-   * 「已卸成存根、摘要还没进场」的缓冲带，两个上界（这条 + `stubTurns`）
-   * **先到先停**：重会话（排查轮 ~1k/轮）16k 先到、实际管 ~15 轮，
-   * 轻会话（纯问答 ~0.5k/轮）30 轮先到——两个界各管一头，不冗余。
+   * 「已卸成存根、摘要还没进场」的缓冲带，两个上界（这条 + `stubSteps`）
+   * **先到先停**。实测（2026-09-28，方案 C 裁剪后）一个 step ≈ 280 token，
+   * 30 step ≈ 8.4k——常态是 step 界先到，这条只兜「单步特别大」的情况。
    *
    * 语义变更（v2）：原来（2026-09-12 水位闸）是「存根段超过这条线才让
    * 摘要进场」，v2 改成位置制（存根区从保底往上数），这条只剩「缓冲带
@@ -278,13 +254,17 @@ const memoryConfig = strictObject({
    */
   stubTokens: z.number().int().positive().default(16_000),
   /**
-   * 存根区的轮数上界（compaction-v2 §0.4）。与 `stubTokens` 先到先停。
+   * 存根区的 **step** 数上界（compaction-v2 §0.4）。与 `stubTokens` 先到先停。
    *
-   * **位置制，不是年龄制**：从保底往上数实际存在的轮行——fork 的预留
-   * 号段缝（turn 号 +10000 的空洞）数不进去。按「段尾之后又过几轮」做
-   * 减法的话，fork 缝会把 6 轮虚报成 1020 轮，这正是弃年龄改位置的原因。
+   * **是 step 不是 turn**（2026-09-28 纠偏，原名 stubTurns）：9-24 用户定的
+   * 是「保底区往上再数 30 个组 tool call」，并明确否决 turn 粒度——一个 turn
+   * 常有 20~50 次工具调用。定稿文档误写成「30 轮」、实现照着数了 turnId，
+   * 30 turn 在重会话里永远到不了，存根区一直由 16k 界撑满（实测 8 轮 17.9k）。
+   *
+   * **位置制，不是年龄制**：从保底往上数实际存在的 step——fork 的预留
+   * 号段缝（跳号空洞）数不进去，这正是弃年龄改位置的原因。
    */
-  stubTurns: z.number().int().positive().default(30),
+  stubSteps: z.number().int().positive().default(30),
   /**
    * 预算之外再留的 token 数：`预算 = contextWindow - maxTokens - 这个值`。
    *
@@ -297,21 +277,40 @@ const memoryConfig = strictObject({
    * 的常见比例缩到 128k 窗口取整）。真跑下来发现频繁早卸或仍然撞窗口，调这个值。
    */
   reservedTokens: z.number().int().nonnegative().default(2_000),
+  /** 本地 L0 摘要的描述截断长度（session.ts headOf）。卸载的裁剪长度见下面 clip* 三键 */
   keepHeadChars: z.number().int().positive().default(300),
   /**
+   * 卸载时命令（tool_call.command）留多少开头 / 输出留多少头和尾
+   * （2026-09-28 用户拍板方案 C）。实测存根区 8 轮 59 条 bash：命令中位数
+   * 318 字、输出 316 字，单条不长、胜在数量（合计 ≈18k token）。
+   *
+   * - 命令 200：39/59 条以 `cd <项目根> && ` 开头（36 字），100 只剩 ~64 字
+   *   有用；desc 说了「干什么」，命令里的「哪个文件哪几行」是回头定位的依据
+   * - 输出头 100 + 尾 100：测试/构建/git 的结论在尾部（`1 failed | 424
+   *   passed`），只留头会裁掉它
+   *
+   * 读回很少：9-21 起 7596 次调用里点名读旧轮次文件的 43 次（0.6%），抽样
+   * 几乎都是排查/修库，不是找回被裁内容——结论已写进不裁的回答正文。
+   * 三档实测省：300/300 ≈6k、200/200 ≈8k、本方案 ≈8k 但保住尾部结论
+   */
+  clipCommandChars: z.number().int().positive().default(200),
+  clipOutputHeadChars: z.number().int().positive().default(100),
+  clipOutputTailChars: z.number().int().positive().default(100),
+  /**
    * 工具输入/输出超过这么多字符才裁，**低于就原样留着、一个通知都不加**
-   * （提案 §4.2）。
+   * （提案 §4.2）。默认 0（2026-09-28 方案 C 由 1000 改）：只要裁完比原文短
+   * 就裁——存根区的量在几百字的短 I/O 上（见 clip* 三键的实测），1000 的
+   * 门槛让它们一条都不裁。
    *
-   * 默认 1000 有实测依据（提案 §8.2）：真库清洗后的语料里工具 I/O 占 53%，
-   * 阈值 1000 命中 474/8038 段（5.9%）、全语料省 18%。500 能到 22% 但命中
-   * 段数翻倍——1000 字符约 12 行输出，低于这个量扫一眼就读完了，裁掉省不下
-   * 多少却丢掉上下文。
+   * 原默认 1000 的依据（提案 §8.2）：阈值 1000 命中 474/8038 段（5.9%）、
+   * 全语料省 18%。那时存根区不常驻（摘要靠水位闸早进场），短 I/O 留着代价
+   * 小；位置制下存根区常驻十几轮，账变了。
    *
-   * **和 `keepHeadChars` 是两件事**：这个决定「什么时候动手」，那个决定
+   * **和 clip* 三键是两件事**：这个决定「什么时候动手」，那几个决定
    * 「动手后留多少」。两个都得配，因为「多长算长」和「留多少够索引」没有
    * 必然关系。
    */
-  clipThresholdChars: z.number().int().nonnegative().default(1_000),
+  clipThresholdChars: z.number().int().nonnegative().default(0),
   /**
    * 索引区（②，全部生效中的摘要）最多占预算的多少。超了才合并。
    *
@@ -326,17 +325,14 @@ const memoryConfig = strictObject({
    * ≈ 8 条热正文 + 120 条温键 ≈ 87 个 turn 才第一次需要折叠。
    *
    * **写成比例不是绝对值**，是 `floorTokens` 那次的教训（§11.6）：绝对值在
-   * 小窗口模型上会静默吞掉整个 context，当时要靠 `FLOOR_MAX_RATIO` 补夹子。
+   * 小窗口模型上会静默吞掉整个 context（现在靠保底区与比例取小来防）。
    */
   indexRatio: z.number().positive().max(1).default(0.05),
   /**
    * 一次合并吃几条。**是扇出，不是触发条件**——什么时候合由 `indexRatio` 决定。
    */
   mergeFactor: z.number().int().min(2).default(10),
-  summaryModel: z
-    .union([z.string(), strictObject({ provider: z.string(), model: z.string() })])
-    .nullable()
-    .default(null),
+  summaryModel: sideModelRef.nullable().default(null),
   idleSummarizeDelayMs: z.number().int().nonnegative().default(3_000),
   /**
    * 估算低于这个 token 数的 step 不做 L0 摘要，直接留截断存根。
@@ -426,9 +422,7 @@ export const configSchema = strictObject({
   request: requestPreferences.prefault({}),
   bash: bashConfig.prefault({}),
   webfetch: webfetchConfig.prefault({}),
-  websearch: websearchConfig.prefault({}),
-  mcp: mcpConfig.prefault({}),
-  visionModel: visionModelRef.nullable().default(null),
+  visionModel: sideModelRef.nullable().default(null),
   loop: loopConfig.prefault({}),
   memory: memoryConfig.prefault({}),
   // recall 线索层（docs/proposals/recall.md）：send 入口算一次 TF-IDF×

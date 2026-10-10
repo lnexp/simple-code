@@ -41,7 +41,7 @@ export type HistoryRow = {
   meta: TurnMeta | null
   /** 轮耗时（ms）。轮没跑完或加列之前的老轮次是 null */
   elapsedMs: number | null
-  /** 轮完成时刻（epoch ms）= started_at + elapsed_ms。没有 elapsed 时是 null。
+  /** 轮完成时刻（epoch ms）：ended_at；老轮没有该列时 = started_at + elapsed_ms。没有 elapsed 时是 null。
    * 页脚渲染以 finishedAt 为开关（App.tsx），缺了它历史轮整个页脚不显示 */
   finishedAt: number | null
 }
@@ -49,6 +49,9 @@ export type HistoryRow = {
 /** turn 创建时以 JSON 落进 turns.meta。model 用 `provider/name` 全身份——
  * 同名模型可以配在两个 provider 下（load.ts 的注释），只给名字就有歧义 */
 export type TurnMeta = { model: string; effort: string | null }
+
+/** 轮怎么结束的（turn-resume.md）。aborted/error 的轮下一次 send 可以续进去 */
+export type TurnEndState = 'done' | 'aborted' | 'error'
 
 /**
  * 一个摘要单位：闭区间的 step id。`summaries.covers_from/to` 就是这两个数，
@@ -86,8 +89,24 @@ export type Store = {
   save(messages: Message[]): void
   /** 一个 user 消息 + 后续往返算一个 turn（design.md §9.5）。返回 turn id */
   beginTurn(meta: TurnMeta): number
-  /** 轮定稿时写耗时。update 而非改 meta JSON：elapsed 是独立事实列 */
-  finishTurn(id: number, elapsedMs: number): void
+  /**
+   * 轮定稿时写耗时与结束状态。update 而非改 meta JSON：elapsed 是独立事实列。
+   * elapsed **累加**：续接轮每次 send 各记一段干活时长，不含中间停顿
+   */
+  finishTurn(id: number, elapsedMs: number, endState: TurnEndState): void
+  /**
+   * 下一次 send 能续进去的轮（docs/proposals/turn-resume.md）。null = 开新轮。
+   *
+   * 全部满足才续：本视角最后一轮以 aborted/error 结束；轮的模型与 `model`
+   * 相同（dropForeignSignatures 按轮 meta 判签名归属，一轮两个模型会把新
+   * 模型的签名当别家剥掉、改写前缀）；之后 turns 表没有新行（分出过任务就
+   * 不续，用户拍板）；最后一条 live 消息属于这一轮，且它的 step 没卸载、没被
+   * 摘要覆盖（续进来的用户消息会挂在这个 step 上，挂到已顶替的 step 等于
+   * 模型看不见）
+   */
+  resumableTurn(model: string): number | null
+  /** 续接：之后 save 的新消息归这一轮。不写库 */
+  resumeTurn(id: number): void
   /**
    * `normalizeHistory` 增删过消息之后，按它报告的来源下标重排归属数组。
    *
@@ -161,6 +180,15 @@ export type Store = {
    */
   markCold(stepIds: number[]): void
   /**
+   * 登记卸载刚生成的存根：原文早已归档，存根不再追加进 turns/*.jsonl。
+   * 归档按内容指纹去重，存根内容≠原文，不登记就会被下一次 save 当新消息
+   * 追加一遍——2026-09-30 真库 016 桶 11235 行里 4043 行是这种副本，其中
+   * 1469 行只丢了 reasoning、没有「已卸载」标记，按文本认不全。
+   * 换模型剥签名后的消息同理（session.ts dropForeignSignatures，2026-10-07
+   * 某项目实锤）：指纹变了但原文已在，登记后不再追加
+   */
+  markStubs(stubs: Message[]): void
+  /**
    * 追加一行「这次请求四个区各占多少」到 `memory/regions.jsonl`。
    *
    * **不入库。** 它是给人事后调比例看的（提案 §13.4 那几组数就是这么来的，
@@ -172,8 +200,13 @@ export type Store = {
    * memoryRoot，谁装配请求谁追加一行——没有归属标记的话面板读尾行就是
    * 「最后写入者赢」，任务视图看到主任务的数字（get_regions 的坑，2026-09-24
    * 任务实测：任务面板显示主任务的 137k live、主任务面板显示任务的几十 k）
+   *
+   * `real` = 同一次请求 API 报回的输入 token（缓存读写都算，totalInputTokens
+   * 口径）。null = 没拿到（请求失败/被守卫拦下/渠道没报）。各区仍存字符密度
+   * 估算原值，面板按 real/估算和 同比例缩放显示——模型切分各不相同，估算器
+   * 校不准，只有 usage 是这个模型的真账（2026-09-29 拍板）
    */
-  recordRegions(sizes: RegionSizes, budget: number): void
+  recordRegions(sizes: RegionSizes, budget: number, real: number | null): void
   /**
    * 把一段的摘要落成叶子文件（`summaries/turn-000087-s000123.md`，提案 §4.3）。
    *
@@ -232,9 +265,16 @@ export type Store = {
    * 不进 prompt，与 readNotesIndex 等的 null 语义一致）。建会话时缓存还
    * 热就沿用，见 schema.sql.ts prompt_snapshot 的表注释
    */
-  readPromptSnapshot(): { agents: string | null; notes: string | null; events: string | null; lessons: string | null } | null
+  readPromptSnapshot(): {
+    agents: string | null
+    userAgents: string | null
+    notes: string | null
+    events: string | null
+    lessons: string | null
+  } | null
   writePromptSnapshot(snap: {
     agents: string | null
+    userAgents: string | null
     notes: string | null
     events: string | null
     lessons: string | null
@@ -278,7 +318,7 @@ export type Store = {
   /** 缝 (from, to) 开区间里有没有内容痕迹（可见消息/外主 steps）——跨缝合的第②③道保险 */
   gapHasContent(from: number, to: number): boolean
   /** 建一条摘要行，返回 id。text 先存占位，ready 时再换 */
-  addSummary(row: Omit<Summary, 'id' | 'owner'>): number
+  addSummary(row: Omit<Summary, 'id' | 'owner' | 'turnFrom' | 'turnTo'>): number
   /**
    * 卸载这个 step 时启用它的 L0 摘要：翻 `in_context`，补上原话开头和归档路径。
    *
@@ -305,7 +345,7 @@ export type Store = {
    * 把成员的 `superseded_by` 指过去。一个事务——插了父行但成员没标的话，
    * 下次合并会把这些成员再吃一遍，一份历史进两个 L1
    */
-  recordMerge(row: Omit<Summary, 'id' | 'owner'>, memberIds: number[]): number
+  recordMerge(row: Omit<Summary, 'id' | 'owner' | 'turnFrom' | 'turnTo'>, memberIds: number[]): number
   /** 四表 MAX(id)——任务跑超检查（task-v3 配额闸）的输入。任务会话里只数
    *  **本段内**的号：对话 fork 后跳到段上方接着写，全库 max 越过段界是
    *  常态，不是配额烧穿 */
@@ -715,8 +755,42 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
       return currentTurn
     },
 
-    finishTurn: (id, elapsedMs) => {
-      db.run(`UPDATE turns SET elapsed_ms = ? WHERE id = ?`, elapsedMs, id)
+    finishTurn: (id, elapsedMs, endState) => {
+      db.run(
+        `UPDATE turns SET elapsed_ms = COALESCE(elapsed_ms, 0) + ?, end_state = ?, ended_at = ? WHERE id = ?`,
+        elapsedMs,
+        endState,
+        new Date().toISOString(),
+        id,
+      )
+    },
+
+    resumableTurn: (model) => {
+      const row = db.all<{ id: number; meta: string | null; end_state: string | null; started_at: string }>(
+        `SELECT id, meta, end_state, started_at FROM turns WHERE ${turnCond} ORDER BY id DESC LIMIT 1`,
+      )[0]
+      if (!row || (row.end_state !== 'aborted' && row.end_state !== 'error')) return null
+      if (row.meta === null || (JSON.parse(row.meta) as TurnMeta).model !== model) return null
+      // fork 会插 reserved 行、任务写自己的轮：都是更晚的 started_at
+      if (db.all(`SELECT 1 AS x FROM turns WHERE id <> ? AND started_at > ? LIMIT 1`, row.id, row.started_at).length)
+        return null
+      const last = db.all<{ turn_id: number; step_id: number | null }>(
+        `SELECT turn_id, step_id FROM messages WHERE state = 'live' AND ${msgVis} ORDER BY id DESC LIMIT 1`,
+      )[0]
+      if (!last || last.turn_id !== row.id || last.step_id === null) return null
+      const unloaded = db.all<{ u: number }>(`SELECT unloaded AS u FROM steps WHERE id = ?`, last.step_id)[0]?.u
+      if (unloaded !== 0) return null
+      const covered = db.all(
+        `SELECT 1 AS x FROM summaries WHERE ${sumVis} AND covers_from <= ? AND covers_to >= ? LIMIT 1`,
+        last.step_id,
+        last.step_id,
+      )
+      return covered.length ? null : row.id
+    },
+
+    resumeTurn: (id) => {
+      currentTurn = id
+      currentMeta = db.all<{ meta: string | null }>(`SELECT meta FROM turns WHERE id = ?`, id)[0]?.meta ?? null
     },
 
     /** run loop 每收到一条 assistant 响应开新 step。与 beginTurn 并列 */
@@ -755,15 +829,54 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
       // 定位，标中的是上两轮已经卸过的 step 1、2；真正该卸的 step 4、5 一次
       // 都没被碰到。现象是「卸载看起来在跑，但该卸的没卸」，且不报错。
       //
-      // 删的是存根行：原文早已在 `unloaded` 行里（卸载时留下的），现在又被
-      // 合并摘要顶替，留在 live 集合里没有任何意义。下一次 save 的
-      // replaceLive 本来也会删掉它们，这里只是把对齐提前到 unload 之前。
+      // **存根副本删，没卸载过的原文留作 `unloaded`。** 同 step 同 role 已有
+      // unloaded 行 = 原文卸载时留下过（这条是存根/去推理副本）；没有 = 这条
+      // 就是唯一原文（短消息从不被卸载挑中），删了面板历史就缺——2026-09-30
+      // 真库 turn 16400–16637 里 235 个 turn 的用户消息一行不剩。判据靠「live
+      // 的 assistant/tool 每 step 至多一行」（真库核过）。
+      //
+      // **按 live 顺序整 step 重插。** 早卸的原文 id 小、这会儿才留下的 id 大，
+      // 原地翻的话 step 内顺序就乱（续接的「继续」和被中断的回复同 step）；
+      // 重插让 step 内 id 序 = 真实顺序，跨 step 由 historyKey 按 step 排
       const rows = liveRowIds(db, msgVis)
+      type Row = { id: number; turn_id: number; step_id: number | null; role: string; content_json: string; owner: string | null }
+      const pick = (where: string, ...params: SqlValue[]): Row[] =>
+        db.all<Row>(`SELECT id, turn_id, step_id, role, content_json, owner FROM messages WHERE ${where} ORDER BY id`, ...params)
       db.transaction(() => {
+        const bySteps = new Map<number, number[]>()
         for (const index of indices) {
           const row = rows[index]
-          // 继承的行（任务模式）不删——那是对话的 live，删了对话就丢上下文
-          if (row && isOwnTurn(row.turn_id)) db.run(`DELETE FROM messages WHERE id = ?`, row.id)
+          // 继承的复制行（任务模式）照剪：隔离（35732d3）后它们归任务所有
+          // （msgVis=owner），剪的是任务那份，对话的 live 不受影响，关闭时
+          // finalizeTask 整删。原先「继承的不删」是隔离前的语义——内存剪了、
+          // 库里还 live，load() 比内存长，按下标查库的 liveTurnModels/
+          // liveRowIds 全体错位（2026-10-08 某项目真库：opus 刚签的
+          // reasoning 被认成更早 glm 轮的、当别家签名剥掉，PrefixBroken）
+          if (!row) continue
+          if (row.step_id === null) db.run(`UPDATE messages SET state = 'unloaded' WHERE id = ?`, row.id)
+          else bySteps.set(row.step_id, [...(bySteps.get(row.step_id) ?? []), row.id])
+        }
+        for (const [step, ids] of bySteps) {
+          const live = pick(`id IN (${ids.map(() => '?').join(', ')})`, ...ids)
+          const unloaded = pick(`state = 'unloaded' AND step_id = ? AND owner IS ?`, step, live[0]?.owner ?? null)
+          const used = new Set<number>()
+          const ordered = live.flatMap((r) => {
+            const originals = unloaded.filter((u) => u.role === r.role && !used.has(u.id))
+            for (const u of originals) used.add(u.id)
+            return originals.length > 0 ? originals : [r]
+          })
+          for (const r of [...live, ...ordered]) db.run(`DELETE FROM messages WHERE id = ?`, r.id)
+          for (const r of ordered) {
+            db.run(
+              `INSERT INTO messages(id, turn_id, role, content_json, state, step_id, owner) VALUES(?, ?, ?, ?, 'unloaded', ?, ?)`,
+              alloc === null ? null : alloc.msg(),
+              r.turn_id,
+              r.role,
+              r.content_json,
+              r.step_id,
+              r.owner,
+            )
+          }
         }
       })
     },
@@ -823,7 +936,10 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
     },
 
     nextSegmentToSummarize: (budgetTokens, activeTurn) =>
-      nextSegment(db, budgetTokens, activeTurn, stepVis, sumVis, ownerEq),
+      // 没在跑时，以 aborted/error 结束的最后一轮也不当候选（turn-resume.md）：
+      // 下一次 send 可能续进去，现在摘了，续进来的内容会成为同一轮的第二段，
+      // 摘要照样割裂。等 send 定了续还是开新轮，它才够格
+      nextSegment(db, budgetTokens, activeTurn ?? openAbnormalTurn(db, turnCond), stepVis, sumVis, ownerEq),
 
     dropSummary: (id) => {
       db.run(`DELETE FROM summaries WHERE id = ? AND in_context = 0`, id)
@@ -837,6 +953,10 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
         ensureBucketFile(dir, 'raw', name),
         join(MEMORY_RELATIVE, bucketedRel('raw', name)),
       )
+    },
+
+    markStubs: (stubs) => {
+      for (const stub of stubs) archived.add(fingerprint(stub))
     },
 
     markCold: (stepIds) => {
@@ -854,7 +974,7 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
       })
     },
 
-    recordRegions: (sizes, budget) => {
+    recordRegions: (sizes, budget, real) => {
       // 时间戳是唯一能把它跟 turns/*.jsonl 对上的东西——这个文件里没有
       // turn/step 号（组装点拿不到，那是 store 侧的归属）
       const line = JSON.stringify({
@@ -862,6 +982,7 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
         budget,
         owner: scope ? scope.owner : null,
         ...sizes,
+        real,
       })
       appendFileSync(join(dir, 'regions.jsonl'), `${line}\n`, 'utf8')
     },
@@ -1003,10 +1124,10 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
     },
 
     lastRespondedAt: () => {
-      const row = db.all<{ started_at: string; elapsed_ms: number | null }>(
-        `SELECT started_at, elapsed_ms FROM turns WHERE ${turnCond} ORDER BY id DESC LIMIT 1`,
+      const row = db.all<{ started_at: string; elapsed_ms: number | null; ended_at: string | null }>(
+        `SELECT started_at, elapsed_ms, ended_at FROM turns WHERE ${turnCond} ORDER BY id DESC LIMIT 1`,
       )[0]
-      return row ? Date.parse(row.started_at) + (row.elapsed_ms ?? 0) : null
+      return row ? (finishedAtOf(row) ?? Date.parse(row.started_at)) : null
     },
 
     liveTurnModels: () =>
@@ -1020,23 +1141,28 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
     readPromptSnapshot: () => {
       const row = db.all<{
         agents: string | null
+        userAgents: string | null
         notes: string | null
         events: string | null
         lessons: string | null
-      }>(`SELECT agents, notes, events, lessons FROM prompt_snapshot WHERE owner = ?`, scope?.owner ?? '')[0]
+      }>(
+        `SELECT agents, user_agents AS userAgents, notes, events, lessons FROM prompt_snapshot WHERE owner = ?`,
+        scope?.owner ?? '',
+      )[0]
       return row ?? null
     },
 
     writePromptSnapshot: (snap) => {
       db.run(
-        `INSERT INTO prompt_snapshot (owner, agents, notes, events, lessons, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO prompt_snapshot (owner, agents, user_agents, notes, events, lessons, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(owner) DO UPDATE SET
-           agents = excluded.agents, notes = excluded.notes,
+           agents = excluded.agents, user_agents = excluded.user_agents, notes = excluded.notes,
            events = excluded.events, lessons = excluded.lessons,
            updated_at = excluded.updated_at`,
         scope?.owner ?? '',
         snap.agents,
+        snap.userAgents,
         snap.notes,
         snap.events,
         snap.lessons,
@@ -1075,7 +1201,9 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
       // JOIN turns 带出每轮的 meta。state/id 两张表都有，条件必须加 m. 前缀
       const own = `m.${ownerEq}`
       const where =
-        cursor === null ? `m.state = 'unloaded' AND ${own}` : `m.state = 'unloaded' AND ${own} AND m.id < ?`
+        cursor === null
+          ? `m.state = 'unloaded' AND ${own}`
+          : `m.state = 'unloaded' AND ${own} AND (${historyKey('m')}) < (SELECT ${historyKey('c')} FROM messages c WHERE c.id = ?)`
       if (cursor !== null) params.push(cursor)
       const rows = db.all<{
         id: number
@@ -1085,10 +1213,11 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
         meta: string | null
         elapsed_ms: number | null
         started_at: string
+        ended_at: string | null
       }>(
-        `SELECT m.id, m.turn_id AS turnId, m.role, m.content_json, t.meta, t.elapsed_ms, t.started_at
+        `SELECT m.id, m.turn_id AS turnId, m.role, m.content_json, t.meta, t.elapsed_ms, t.started_at, t.ended_at
          FROM messages m JOIN turns t ON t.id = m.turn_id
-         WHERE ${where} AND ${turnCondT} ORDER BY m.id DESC LIMIT ?`,
+         WHERE ${where} AND ${turnCondT} ORDER BY ${historyKeyDesc('m')} LIMIT ?`,
         ...params,
         limit,
       )
@@ -1104,8 +1233,7 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
           parts: JSON.parse(r.content_json).parts as Part[],
           meta: r.meta === null ? null : (JSON.parse(r.meta) as TurnMeta),
           elapsedMs: r.elapsed_ms,
-          finishedAt:
-            r.elapsed_ms === null ? null : Date.parse(r.started_at) + r.elapsed_ms,
+          finishedAt: finishedAtOf(r),
         })),
         next,
       }
@@ -1119,8 +1247,9 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
         meta: string | null
         elapsed_ms: number | null
         started_at: string
+        ended_at: string | null
       }>(
-        `SELECT id, meta, elapsed_ms, started_at FROM turns WHERE id IN (${ids.map(() => '?').join(',')})`,
+        `SELECT id, meta, elapsed_ms, started_at, ended_at FROM turns WHERE id IN (${ids.map(() => '?').join(',')})`,
         ...ids,
       )
       return new Map(
@@ -1129,8 +1258,7 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
           {
             meta: r.meta === null ? null : (JSON.parse(r.meta) as TurnMeta),
             elapsedMs: r.elapsed_ms,
-            finishedAt:
-              r.elapsed_ms === null ? null : Date.parse(r.started_at) + r.elapsed_ms,
+            finishedAt: finishedAtOf(r),
           },
         ]),
       )
@@ -1468,6 +1596,7 @@ function migrate(db: Db): void {
     db.run(`CREATE TABLE prompt_snapshot_new (
       owner      TEXT PRIMARY KEY,
       agents     TEXT,
+      user_agents TEXT,
       notes      TEXT,
       events     TEXT,
       lessons    TEXT,
@@ -1620,12 +1749,47 @@ function createTaskTurn(db: Db, meta: string | null, id: number, owner: string):
 /** 该 id 之下还有没有 unloaded 行。有 = 还有上一页（hasMore） */
 function hasRowBelow(db: Db, id: number, msgVis: string): boolean {
   return (
-    db.all(`SELECT 1 AS x FROM messages WHERE state = 'unloaded' AND id < ? AND ${msgVis} LIMIT 1`, id).length > 0
+    db.all(
+      `SELECT 1 AS x FROM messages m WHERE m.state = 'unloaded' AND ${msgVis}
+         AND (${historyKey('m')}) < (SELECT ${historyKey('c')} FROM messages c WHERE c.id = ?) LIMIT 1`,
+      id,
+    ).length > 0
   )
 }
 
+/**
+ * 历史页的时间轴：turn → step → id。**不能只按 id**：prune 时才留下的原文
+ * （pruneMessages 按 step 重插）id 比后面 turn 早卸的行还大。step 内的 id 序
+ * 由重插保证；step_id 为 null 的老行排在同 turn 最前，内部按 id
+ */
+const historyKeys = (a: string): string[] => [
+  `${a}.turn_id`,
+  `COALESCE(${a}.step_id, 0)`,
+  `${a}.id`,
+]
+const historyKey = (a: string): string => historyKeys(a).join(', ')
+const historyKeyDesc = (a: string): string => historyKeys(a).map((k) => `${k} DESC`).join(', ')
+
 function lastTurnId(db: Db, turnCond: string): number | null {
   return db.all<{ id: number }>(`SELECT id FROM turns WHERE ${turnCond} ORDER BY id DESC LIMIT 1`)[0]?.id ?? null
+}
+
+/** 最后一轮以 aborted/error 结束 → 它的 id（可能被续接，摘要先别碰）；否则 null */
+function openAbnormalTurn(db: Db, turnCond: string): number | null {
+  const row = db.all<{ id: number; end_state: string | null }>(
+    `SELECT id, end_state FROM turns WHERE ${turnCond} ORDER BY id DESC LIMIT 1`,
+  )[0]
+  return row && (row.end_state === 'aborted' || row.end_state === 'error') ? row.id : null
+}
+
+/**
+ * 轮完成时刻（epoch ms）。ended_at 优先：续接轮的 elapsed 是累加的干活时长，
+ * started_at + elapsed 会比真实结束早（turn-resume.md）。加列前的老轮退回
+ * 老算法；两者都没有 = 没跑完，null
+ */
+function finishedAtOf(r: { started_at: string; elapsed_ms: number | null; ended_at: string | null }): number | null {
+  if (r.ended_at !== null) return Date.parse(r.ended_at)
+  return r.elapsed_ms === null ? null : Date.parse(r.started_at) + r.elapsed_ms
 }
 
 /**
@@ -1754,6 +1918,8 @@ type SummaryRow = {
   head: string | null
   archive_path: string | null
   name: string | null
+  turn_from: number | null
+  turn_to: number | null
 }
 
 /**
@@ -1766,7 +1932,9 @@ function loadSummaries(db: Db, sumVis: string): Summary[] {
   return db
     .all<SummaryRow>(
       `SELECT id, level, covers_from, covers_to, text, status, in_context, superseded_by,
-              head, archive_path, name, owner
+              head, archive_path, name, owner,
+              (SELECT turn_id FROM steps WHERE id = covers_from) AS turn_from,
+              (SELECT turn_id FROM steps WHERE id = covers_to) AS turn_to
        FROM summaries WHERE ${sumVis} ORDER BY covers_from, level`,
     )
     .map((row) => ({
@@ -1774,6 +1942,7 @@ function loadSummaries(db: Db, sumVis: string): Summary[] {
       level: row.level,
       coversFrom: row.covers_from,
       coversTo: row.covers_to,
+      ...(row.turn_from !== null && row.turn_to !== null ? { turnFrom: row.turn_from, turnTo: row.turn_to } : {}),
       // 老库迁移出来的行 name 是 NULL，空串是「没有标题」的正常态
       name: row.name ?? '',
       text: row.text,

@@ -28,7 +28,7 @@
     "盖得住默认的 maxTokens，配成 0.95 就直接撞窗口，而那时配置看起来完全合理。",
     "unloadTargetRatio 保留，它管的是「卸到多低」，跟预留无关。",
     "reservedTokens 是那个「安全余量」：给 system prompt 和工具定义留的（它们",
-    "每轮都发但不在历史里）。默认 2000 没有实测依据，是从 CC 的 13k 按窗口比例",
+    "每轮都发但不在历史里）。默认 2000 没有实测依据，是从官方客户端的 13k 按窗口比例",
     "推的——发现频繁早卸就调小，发现仍然撞窗口就调大。",
     "",
     "memory 段整段可以不写，全有默认值。idleSummarizeDelayMs 只在交互式",
@@ -36,7 +36,7 @@
     "写 0 就是关掉后台摘要，卸载时退回「只有头部+归档路径」。",
     "mergeFactor 现在还不生效，分层合并是第 3b-2 步的事。",
     "",
-    "bash.approval.nonPathFrom：给「参数不是文件路径、只是长得像」的工具用。",
+    "nonPathFrom（审批白名单，写在 ~/.simple-code/approval.json，不在本文件）：给「参数不是文件路径、只是长得像」的工具用。",
     "键是命令名，值是位置参数起始位（0 基）——从该位起（含）不判为路径。",
     "典型是元素寻址语法（/slide[2] 以 / 开头，长得像绝对路径会误拦）；",
     "从起始位起的整段豁免（flag 值也会被数进位置参数），带写意图的",
@@ -108,10 +108,7 @@
     "maxOutputChars": 16000,
     "killGraceMs": 3000,
     "sandbox": "none",
-    "envPassthrough": ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "USER"],
-    "approval": {
-      "nonPathFrom": { "xcli": 2 }
-    }
+    "envPassthrough": ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "USER"]
   },
 
   "memory": {

@@ -191,7 +191,6 @@ describe('交互式循环', () => {
           floor: 500,
           live: 12000,
           maxTokens: 8000,
-          ranges: { hot: { from: 12, to: 40 } },
         }),
       ].join('\n') + '\n',
       'utf8',
@@ -211,7 +210,7 @@ describe('交互式循环', () => {
     // 用尾行不用首行：26821 = 2000+4321+500+12000+8000（CONFIG 测试模型窗口 100000）
     expect(err).toContain('上下文 26821/100000（26.8%）· 记录于 2026-09-14T01:00:00Z')
     expect(err).toContain('热 4321')
-    expect(err).toContain('范围  冷 — · 温 — · 热 s12-s40')
+    expect(err).not.toContain('范围') // 范围行 2026-09-30 删除
   })
 
   it('连续两轮，两轮都发了请求', async () => {

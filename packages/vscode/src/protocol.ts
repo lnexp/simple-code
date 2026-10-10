@@ -41,8 +41,6 @@ export type ToHost =
    */
   | { type: 'switchFolder'; folder: string }
   | { type: 'send'; text: string; images?: ImageInput[] }
-  /** 失败轮的重试：宿主重发上一条用户消息（含图）。没有存档时静默忽略 */
-  | { type: 'retry' }
   | { type: 'interrupt' }
   /** markdown 里的链接被点了。宿主拿去 openExternal——webview 自己不能导航 */
   | { type: 'openLink'; url: string }
@@ -132,6 +130,7 @@ export type ToWebview =
         /** paths：multi 卡同质 external_dir 的批量目录（方案 1，
          * 2026-09-21）——按钮「始终允许这 N 个目录」 */
         | { kind: 'paths'; dirs: string[] }
+        | { kind: 'hidden'; path: string; write: boolean }
     }
   /** 气泡关掉（答复/超时/中断）。webview 重载后收不到它——超时兜底在宿主 */
   /** folder：非 active 文件夹的卡关掉时路由层标注，webview 按 (folder,id) 关卡 */
@@ -261,12 +260,17 @@ export type TaskState = {
   error?: string
   /** 控件区跟着分支走（同一次拍板）：模型/深度/预设/窗口是分支 session
    *  自己的账。session 还没建好时 current 为 null——控件显示空态。
-   *  models/presets/approvalOn/imagesEnabled 不带：配置全 folder 一份，
-   *  UI 借主干的 */
+   *  models 不带：配置全 folder 一份，UI 借主干的 */
   current: ModelRef | null
   effort: Effort | null
   effortOverridden: boolean
   preset?: string
+  /** 分支当前模型配的预设名。presets 按模型配，不按 folder——借主干的话
+   *  主干模型没配、分支模型配了时分支里控件整个消失（2026-10-08） */
+  presets: string[]
+  /** 分支的贴图通道（判据同 state.imagesEnabled）。也是模型级的，借主干的话
+   *  主干能收图、分支不能时分支里贴的图会被 core 拒 */
+  imagesEnabled: boolean
   contextWindow: number
   /** 分支自己的审批开关（内存态，对齐主干） */
   approvalOn: boolean
@@ -299,18 +303,12 @@ export type RegionsInfo = {
   stub: number
   floor: number
   live: number
-  /** 各区覆盖的 step 闭区间。null = 老记录没有（过渡期当空显示） */
-  ranges: RegionRanges | null
-}
-
-export type StepRange = { from: number; to: number }
-export type RegionRanges = {
-  cold: StepRange | null
-  warm: StepRange | null
-  hot: StepRange | null
-  stub: StepRange | null
-  floor: StepRange | null
-  live: StepRange | null
+  /**
+   * 同一次请求 API 报回的输入 token（缓存读写都算）。上面七个区是字符密度
+   * 估算原值，面板按 real/估算和 同比例缩放显示。null = 没拿到（失败的尝试、
+   * 渠道不报 usage、9-29 之前的老行）——退回纯估算
+   */
+  real: number | null
 }
 
 /** 审批请求（approval_request 的命名类型，给 webview 和 bridge 引用） */

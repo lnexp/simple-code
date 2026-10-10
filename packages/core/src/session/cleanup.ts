@@ -111,7 +111,7 @@ function collapseStackedMarkers(db: Db): void {
 /**
  * 同一个 turn 里内容相同（剥掉结尾通知后）的 unloaded 行只留最早那条。
  *
- * 留最早而不是最晚：`historyPage` 按 id 排序当时间轴，留最早的那条，这段历史
+ * 留最早而不是最晚：`historyPage` 同 step 内按 id 排序当时间轴，留最早的那条，这段历史
  * 在面板里的位置才跟它真正发生的时刻对得上。
  */
 function dedupeUnloaded(db: Db): void {

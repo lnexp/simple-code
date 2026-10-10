@@ -114,7 +114,13 @@ function toWireMessages(msg: Message): WireMessage[] {
     .map((p) => p.text)
     .join('')
 
-  if (content.length === 0 && toolCalls.length === 0 && reasoning === '') return []
+  // **content 和 tool_calls 都空就整条跳过——reasoning 不能让它例外**。
+  // finish=length 掐在推理段中间会存出「纯 reasoning 的 assistant」，原样
+  // 回放是 {content:null} 无 tool_calls——DeepSeek 官方 API 直接 400
+  // 「content or tool_calls must be set」，且 invalid_request 不可重试，
+  // 续写每撞一次死一次（2026-10-10 远程工作区实案，turn-000178）。
+  // 有 content/tool_calls 的消息照常带 reasoning_content，回传瘦身另议
+  if (content.length === 0 && toolCalls.length === 0) return []
 
   return [
     {
@@ -338,7 +344,9 @@ function parseError(status: number, body: unknown, headers?: Headers): ProtocolE
 function toError(err: Record<string, unknown>, status: number): ProtocolError {
   const message = asString(err.message) || `HTTP ${status}`
   const kind = errorKind(asString(err.code) || asString(err.type), message, status)
-  return { kind, message, retryable: kind === 'rate_limit' || kind === 'server' }
+  // unknown 也重试：流内 error 事件归不上类的默认可重试，理由见
+  // anthropic-messages.ts 的 toError（2026-09-29 方案 A）
+  return { kind, message, retryable: kind === 'rate_limit' || kind === 'server' || kind === 'unknown' }
 }
 
 function errorKind(code: string, message: string, status: number): ProtocolError['kind'] {

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { ApprovalRequest } from '../src/protocol.ts'
 import { type ActivityItem, type ChatItem, toolCount } from './events.ts'
 import { formatElapsed } from './footer.tsx'
@@ -104,7 +104,11 @@ export function ToolRow({
           <span className="tool-icon" aria-hidden>
             {running ? <span className="spinner" /> : <i className={`codicon codicon-${icon}`} />}
           </span>
-          <span className="tool-title">{label}</span>
+          {/* 方案 C「desc 当标题」（2026-09-29 拍板，推翻 9-28 的「desc 并进
+              命令格」）：有 desc 时 desc 顶替「Shell 命令」站标题位——正常亮色、
+              界面字体、无底色；命令格照旧跟在后面（code 底色、单行截断）。
+              没 desc 的（旧历史、非 bash 工具）标题仍是工具人话名 */}
+          <span className="tool-title">{tool.desc || label}</span>
           <span className="tool-duration">{duration}</span>
           <code className="tool-cmd">{tool.command || tool.name}</code>
         </button>
@@ -160,11 +164,13 @@ export function ToolRow({
               <code>
                 {approval.always.kind === 'lead'
                   ? `${approval.always.lead} *`
-                  : approval.always.kind === 'nonpath'
-                    ? `${approval.always.lead} 的第 ${approval.always.from} 位参数起不是路径`
-                    : approval.always.kind === 'paths'
-                      ? approval.always.dirs.map((d) => `${d}/*`).join('、')
-                      : `${approval.always.dir}/*`}
+                  : approval.always.kind === 'hidden'
+                    ? `${approval.always.write ? '写' : '读'} ${approval.always.path}`
+                    : approval.always.kind === 'nonpath'
+                      ? `${approval.always.lead} 的第 ${approval.always.from} 位参数起不是路径`
+                      : approval.always.kind === 'paths'
+                        ? approval.always.dirs.map((d) => `${d}/*`).join('、')
+                        : `${approval.always.dir}/*`}
               </code>
             </div>
           )}
@@ -316,6 +322,15 @@ export function ThinkingBlock({ block, streaming }: { block: ReasoningItem; stre
 }
 
 /**
+ * memo 化的行组件（2026-10-06 内存事件）：流式期间 Log 每 100ms 重渲一次，
+ * 已完成的行 props 引用稳定（events.ts 折叠只替换末条）→ 整行跳过。此前
+ * 每秒 10 次对全部历史 thinking 块重跑 renderMarkdown、全部工具行重渲，
+ * 垃圾以内容千倍的量级产出，V8 提交的堆只涨不还——面板进程 24h 涨到 2.9GB
+ */
+const MThinkingBlock = memo(ThinkingBlock)
+const MToolRow = memo(ToolRow)
+
+/**
  * 活动组：一轮的 thinking + 命令（D8a 两层折叠的外层）。
  * **收起时机**：组后面一有别的块（assistant 正文/用户消息）就自动收起
  * ——「最终回答出现时，之前的流程折叠」是用户在 D13 的补充需求。用户手动
@@ -372,13 +387,13 @@ export function ActivityGroup({
         return item.kind === 'reasoning' ? (
           // startedAt 做身份：组开合切换 preview 切片时块的组件状态不丢。
           // 历史回放没有墙钟，落到下标——同组内已回放块不会增删改，够稳
-          <ThinkingBlock
+          <MThinkingBlock
             key={`r${item.startedAt ?? `h${j}`}`}
             block={item}
             streaming={last && running && isTail}
           />
         ) : (
-          <ToolRow
+          <MToolRow
             key={item.id}
             tool={item}
             {...(() => {

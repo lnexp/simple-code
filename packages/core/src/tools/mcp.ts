@@ -29,7 +29,9 @@ export type McpServerConfig = {
 }
 export type McpServers = Record<string, McpServerConfig>
 
-const CONNECT_TIMEOUT_MS = 10_000
+/** 30s：npx 型 HTTP 桥（mcp-remote）要 spawn + OAuth 发现 + 握手，
+    慢的 server 实测 11s+（2026-10-08 网关 jina，10s 超时误判连不上） */
+const CONNECT_TIMEOUT_MS = 30_000
 const CALL_TIMEOUT_MS = 60_000
 
 /** 连接（SDK 自动 initialize 握手）→ fn → close，fn 抛错也保证关 */

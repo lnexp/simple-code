@@ -32,6 +32,10 @@ const defaultTimer: SetTimer = (ms, fn) => {
 export function watchIdle(session: Session, setTimer: SetTimer = defaultTimer) {
   const delay = session.config.config.memory.idleSummarizeDelayMs
   let cancel: (() => void) | null = null
+  // disarm 撤不掉已经在跑的摘要，只能让它跑完别再排下一次：代次变了就不 arm。
+  // 不挡的话会话关闭（先 disarm 再关库）后 3 秒读已关的库——2026-09-28~30
+  // exthost 里 8 次 `database is not open`；用户插话 disarm 后同样会被偷偷重新计时
+  let generation = 0
 
   const arm = () => {
     // 配 0 就是关掉这个功能。配置项本来就允许 0（schema 是 nonnegative），
@@ -40,15 +44,19 @@ export function watchIdle(session: Session, setTimer: SetTimer = defaultTimer) {
     cancel?.()
     cancel = setTimer(delay, () => {
       cancel = null
+      const gen = generation
       // 不 await：这里是定时器回调，没人接它的 promise。摘要本身永不抛异常
       // （session.ts 的注释），所以不会有未处理的 rejection
-      void session.summarizeIdle().then(arm) // 跑完接着摘下一个
+      void session.summarizeIdle().then(() => {
+        if (gen === generation) arm() // 跑完接着摘下一个
+      })
     })
   }
 
   return {
     arm,
     disarm: () => {
+      generation++
       cancel?.()
       cancel = null
     },

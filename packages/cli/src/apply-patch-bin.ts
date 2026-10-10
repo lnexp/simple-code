@@ -11,11 +11,13 @@
  *   *** End Patch
  *   PATCH
  *
- * 相对路径按当前工作目录解析（bash 工具的 cwd 就是工作区根）。补丁是
+ * 相对路径按工作区根解析（从 cwd 往上找，workspace-root.ts）——bash 的 cwd
+ * 可能是子目录，工具描述承诺的是「相对工作区根」。补丁是
  * 原子的：任何一个文件操作失败，全部不落盘。stdout 出摘要（+N/-M），
  * 错误进 stderr、exit 1——配合 bash 的输出合并，模型一眼能看到失败原因。
  */
 import { applyPatch } from '@simple-code/core/src/tools/applypatch.ts'
+import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts'
 
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = []
@@ -29,7 +31,7 @@ if (raw.trim() === '') {
   process.exit(2)
 }
 try {
-  const summary = await applyPatch(process.cwd(), raw)
+  const summary = await applyPatch(findWorkspaceRoot(process.cwd()), raw)
   process.stdout.write(`${summary}\n`)
 } catch (err) {
   process.stderr.write(`apply_patch 失败：${err instanceof Error ? err.message : String(err)}\n`)

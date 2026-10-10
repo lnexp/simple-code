@@ -30,7 +30,10 @@ type SyntaxNode = import('web-tree-sitter').Node
 /** 一个 token：text 是词面（引号留给 judge 的 unquote），write 标记
  * 重定向目标方向（> >> 2> 是写；< 是读） */
 export type AstItem = { text: string, write: boolean }
-export type AstSegment = { lead: string, items: AstItem[], unparseable?: string }
+/** nested：命令不只处在顺序结构里（program/list/redirected_statement 之外
+ * 还有子 shell、管道、$( )、if/for 等）。只有顶层的 cd 会改变之后各段的
+ * 当前目录，nested 的 cd 效果不确定（hidden-path.ts 第 2 层据此判「算不出」） */
+export type AstSegment = { lead: string, items: AstItem[], unparseable?: string, nested?: true }
 
 let parser: Parser | null = null
 let warmup: Promise<boolean> | null = null
@@ -83,19 +86,53 @@ export function warmupShellParser(): Promise<boolean> {
 /** AST → 段列表。null = 未就绪/解析失败/含错误节点（调用方回退正则） */
 export function astSegments(cmd: string): AstSegment[] | null {
   if (!parser) return null
-  let tree: ReturnType<Parser['parse']> | null = null
-  try {
-    tree = parser.parse(cmd)
-  } catch {
-    return null
-  }
-  if (!tree || tree.rootNode.hasError) return null
+  const tree = parseClean(cmd)
+  if (!tree) return null
   const out: AstSegment[] = []
   for (const node of tree.rootNode.descendantsOfType('command').filter((n): n is SyntaxNode => Boolean(n))) {
     const seg = commandToSegment(node)
-    if (seg) out.push(seg)
+    if (seg) out.push(isTopLevel(node) ? seg : { ...seg, nested: true })
   }
   return out.length > 0 ? out : null
+}
+
+/** 无错误的语法树；有错返回 null。
+ *
+ * tree-sitter-bash 0.25.0 grammar bug：双引号串里处在串首/行首的 `((`
+ * （`"(() => 1)()"`、`"\n((…"`）被当算术开头报错，bash 本身合法——JS IIFE
+ * 必中，agent-browser eval 整条退回正则路径、白名单失效（2026-09-30 实测
+ * 近 7 天 114 条解析失败里 83 条是它）。首解析失败才把 `((` 换成 `( (` 重解析：
+ * 引号内两者都是字面量；引号外算术 `((e))` 变子 shell 只会多枚举一个命令
+ * ——判定只严不松，$(…) 里的子命令照样全量枚举。同类绕行见 isTopLevel */
+function parseClean(cmd: string): ReturnType<Parser['parse']> | null {
+  const attempt = (text: string): ReturnType<Parser['parse']> | null => {
+    try {
+      const tree = parser?.parse(text) ?? null
+      return tree && !tree.rootNode.hasError ? tree : null
+    } catch {
+      return null
+    }
+  }
+  return attempt(cmd) ?? (cmd.includes('((') ? attempt(cmd.replaceAll('((', '( (')) : null)
+}
+
+const TOP_TYPES = new Set(['program', 'list', 'redirected_statement'])
+/** tree-sitter-bash 把 `cd x && a 2>/dev/null | b` 解析成
+ * pipeline(redirected_statement(list(cd, a)), b)——管道被抬到 && 之上
+ * （不带重定向的 `cd x && a | b` 解析正确，list 在外）。bash 的真实优先级是
+ * cd x && (a 2>/dev/null | b)，cd 仍在顶层。所以 pipeline 祖先放行一种形态：
+ * 从它的第一个子节点上来、且本命令不是那一块的最右一条（最右那条才真在
+ * 管道里）。真机踩过：历史 10 条 `cd root && sqlite3 … ".tables" 2>/dev/null
+ * | head` 里 3 条因此被判 cd 算不出 */
+function isTopLevel(node: SyntaxNode): boolean {
+  let from: SyntaxNode = node
+  for (let up = node.parent; up; from = up, up = up.parent) {
+    if (TOP_TYPES.has(up.type)) continue
+    const first = up.namedChild(0)
+    if (up.type === 'pipeline' && first?.id === from.id && TOP_TYPES.has(from.type) && lastCommandWithin(from)?.id !== node.id) continue
+    return false
+  }
+  return true
 }
 
 /** 沿祖先链找承载本命令重定向的 redirected_statement。

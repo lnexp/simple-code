@@ -32,18 +32,29 @@ export type RegionSizes = {
   live: number
 }
 
-/** step 闭区间。摘要的 covers 与 live 的归属本来就是 step 粒度
- * （findCovering 按 stepId 比较、实库 covers_from 落在 steps 表区间内） */
-export type StepRange = { from: number; to: number }
+const REGION_KEYS = ['overhead', 'cold', 'warm', 'hot', 'stub', 'floor', 'live'] as const
 
-/** 各区覆盖的 step 范围（观测用；null = 该区没有消息或 step 不可知） */
-export type RegionRanges = {
-  cold: StepRange | null
-  warm: StepRange | null
-  hot: StepRange | null
-  stub: StepRange | null
-  floor: StepRange | null
-  live: StepRange | null
+/** 七个区之和 = 这份请求的估算输入（输出预留不算）。面板 ctx-panel 的 estimateOf 同口径 */
+export const regionsEstimate = (sizes: Partial<Record<keyof RegionSizes, unknown>>): number =>
+  REGION_KEYS.reduce((sum, key) => {
+    const v = sizes[key]
+    return sum + (typeof v === 'number' ? v : 0)
+  }, 0)
+
+/**
+ * 估算 → 真实的换算系数 = 真实 usage ÷ 估算（2026-09-29 用户拍板：各家模型
+ * 切分不同，估算器怎么调都校不准，额度按 usage 校）。压缩的三道额度
+ * （保底/存根区/索引）配的是**真实** token，量的却是估算——除以这个系数
+ * 才是同一把尺子。实测两个方向都有：opus 中位 1.25（估小了→额度收紧），
+ * glm-5.3 中位 0.82–0.86（估大了→放宽），全体 0.78–1.36。
+ *
+ * 夹在 [0.5, 2]：挡的是渠道报错的 usage（9-28 某渠道实约 10.2 万报
+ * 222,924），一次坏数不至于把额度砍掉大半。拿不到 usage 返回 null——调用方
+ * 沿用上一个系数
+ */
+export function usageRatio(estimate: number, real: unknown): number | null {
+  if (typeof real !== 'number' || real <= 0 || estimate <= 0) return null
+  return Math.min(2, Math.max(0.5, real / estimate))
 }
 
 /**
@@ -57,11 +68,7 @@ export type RegionRanges = {
 export function regionSizes(
   request: Request,
   floor?: ReadonlySet<Message>,
-  /** live 消息 → stepId。装配是引用传递（floorSet 已依赖此事实），
-   * 所以 request 里的 live 消息能查到归属。摘要不用进这张表——
-   * covers 直接写在渲染首行 `step=from-to`，按文本解析（同冷温热判据） */
-  stepIds?: ReadonlyMap<Message, number>,
-): RegionSizes & { ranges: RegionRanges } {
+): RegionSizes {
   const sizes: RegionSizes = {
     overhead: overheadTokens(request),
     cold: 0,
@@ -71,19 +78,6 @@ export function regionSizes(
     floor: 0,
     live: 0,
   }
-  const ranges: RegionRanges = {
-    cold: null,
-    warm: null,
-    hot: null,
-    stub: null,
-    floor: null,
-    live: null,
-  }
-  /** [from,to] 并进所属区的范围槽 */
-  const mergeRange = (key: keyof RegionRanges, from: number, to: number) => {
-    const cur = ranges[key]
-    ranges[key] = cur ? { from: Math.min(cur.from, from), to: Math.max(cur.to, to) } : { from, to }
-  }
   for (const message of request.messages) {
     const tokens = message.parts.reduce((sum, part) => sum + estimateTokens(part), 0)
     if (isSummary(message)) {
@@ -92,35 +86,14 @@ export function regionSizes(
       // 「（共 N 个）」只会出现在内部节点详情行；热区正文以四段标题开头，
       // clampBody 截断不动开头
       const summary = summaryText(message)
-      // 渲染首行 `<历史摘要> step=8-20>` 是唯一的 covers 来源（assemble 的
-      // toMessage 不带 id）——解析失败就不给范围，宁缺毋猜
-      const m = new RegExp(`^${SUMMARY_TAG} step=(\\d+)-(\\d+)>`).exec(summary)
-      if (/（共 \d+ 个）/.test(summary)) {
-        sizes.cold += tokens
-        if (m) mergeRange('cold', Number(m[1]), Number(m[2]))
-      } else if (/^## /m.test(summary)) {
-        sizes.hot += tokens
-        if (m) mergeRange('hot', Number(m[1]), Number(m[2]))
-      } else {
-        sizes.warm += tokens
-        if (m) mergeRange('warm', Number(m[1]), Number(m[2]))
-      }
-    }
-    else {
-      const stepId = stepIds?.get(message)
-      if (message.parts.some(isStubPart)) {
-        sizes.stub += tokens
-        if (stepId !== undefined) mergeRange('stub', stepId, stepId)
-      } else if (floor?.has(message)) {
-        sizes.floor += tokens
-        if (stepId !== undefined) mergeRange('floor', stepId, stepId)
-      } else {
-        sizes.live += tokens
-        if (stepId !== undefined) mergeRange('live', stepId, stepId)
-      }
-    }
+      if (/（共 \d+ 个）/.test(summary)) sizes.cold += tokens
+      else if (/^## /m.test(summary)) sizes.hot += tokens
+      else sizes.warm += tokens
+    } else if (message.parts.some(isStubPart)) sizes.stub += tokens
+    else if (floor?.has(message)) sizes.floor += tokens
+    else sizes.live += tokens
   }
-  return { ...sizes, ranges }
+  return sizes
 }
 
 const isSummary = (message: Message): boolean =>

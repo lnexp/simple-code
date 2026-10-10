@@ -4,12 +4,20 @@ import { join, resolve as resolvePath } from 'node:path'
 import type { z } from 'zod'
 import type { Protocol } from '../llm/protocol.ts'
 import { resolveProtocol } from '../llm/registry.ts'
-import type { Request } from '../llm/types.ts'
+import type { Effort, Request } from '../llm/types.ts'
 import { deepMerge, stripDenied } from './denylist.ts'
 import { expandEnv } from './env.ts'
 import { type Config, configSchema, type ModelSpec } from './schema.ts'
 
 export const GLOBAL_CONFIG_PATH = join(homedir(), '.simple-code', 'settings.json')
+/** MCP servers 的独立配置文件（2026-09-27 拍板移出 settings.json）。
+ *  只认用户级——项目级不开放：MCP server 是可执行命令 + env 凭证，
+ *  克隆来的仓库能塞一条就能借 agent 之手执行任意代码（settings 的
+ *  workspace denylist 拦 mcp.servers 就是这个理由） */
+export const MCP_CONFIG_PATH = join(homedir(), '.simple-code', 'mcp.json')
+/** websearch 的独立配置文件（对齐 mcp.json：凭据类配置单独文件——bin 经
+ *  bash 白名单 env 运行，宿主变量不在里面，key 只能落明文进文件） */
+export const WEBSEARCH_CONFIG_PATH = join(homedir(), '.simple-code', 'websearch.json')
 export const WORKSPACE_CONFIG_RELATIVE = join('.simple-code', 'settings.json')
 
 export type LoadedConfig = {
@@ -20,7 +28,8 @@ export type LoadedConfig = {
   baseUrl: string
   apiKey: string
   /** 合并后的请求偏好，已应用「模型级覆盖全局」 */
-  request: Omit<Request, 'system' | 'tools' | 'messages' | 'model'>
+  /** effort 收窄为 Effort：'none' 只开放给副模型（SideModel.request） */
+  request: Omit<Request, 'system' | 'tools' | 'messages' | 'model' | 'effort'> & { effort: Effort }
   /**
    * 后台摘要用的模型规格和请求偏好。`memory.summaryModel` 为 null 时就是主
    * 模型那一份（同一个对象）。
@@ -249,7 +258,7 @@ function resolveSummary(
  */
 function resolveSideModel(
   label: string,
-  ref: string | { provider: string; model: string },
+  ref: string | { provider: string; model: string; effort?: Request['effort'] | undefined },
   config: Config,
   ctx: { env: NodeJS.ProcessEnv; warnings: string[] },
   main: SideModel,
@@ -273,7 +282,11 @@ function resolveSideModel(
   return {
     name: modelName,
     model,
-    request: mergeRequest(config, model),
+    // ref 上的 effort 只作用于这个副模型（摘要/转述），可取 'none'（见 schema sideModelRef）
+    request: {
+      ...mergeRequest(config, model),
+      ...(typeof ref !== 'string' && ref.effort ? { effort: ref.effort } : {}),
+    },
     protocol: resolveProtocol(provider.protocol),
     baseUrl: provider.baseUrl,
     apiKey: expandEnv(provider.apiKey, ctx.env),

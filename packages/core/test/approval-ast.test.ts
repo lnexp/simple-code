@@ -15,7 +15,9 @@ beforeAll(async () => {
 })
 
 const ROOT = '/Users/dev/Code/proj'
-const cfg = { hiddenAllow: [...DEFAULT_HIDDEN_ALLOW], networkAllow: [...DEFAULT_NETWORK_ALLOW] }
+// 假 root 下文件都不存在：注入「都存在」，这里测的是第 1 层（按名字判）
+// 与各类别规则；第 2 层（存在检查）在 hidden-path.test.ts 用真目录测
+const cfg = { hiddenAllow: [...DEFAULT_HIDDEN_ALLOW], networkAllow: [...DEFAULT_NETWORK_ALLOW], askCommands: [], pathExists: () => true }
 const ask = (cmd: string) => classify(cmd, ROOT, cfg)
 const allow = (cmd: string) => expect(ask(cmd)).toEqual({ kind: 'allow' })
 const blocked = (cmd: string, reasonIncludes: string) => {
@@ -25,6 +27,15 @@ const blocked = (cmd: string, reasonIncludes: string) => {
 }
 
 describe('AST 路径：与正则路径同规则的抽样回归', () => {
+  it('`"((` grammar bug 绕行后按普通规则判：已批的 agent-browser eval 放行，藏着的危险段照弹（2026-09-30）', () => {
+    const real = `export AGENT_BROWSER_SESSION="$(agent-browser session id --scope worktree --prefix hide-menu)"; agent-browser click @e4 && sleep 6 && agent-browser eval "(() => JSON.stringify([...document.querySelectorAll('.ant-menu-item')].filter(e=>e.offsetParent).map(e=>e.textContent.trim()).filter(Boolean)))()" 2>&1 | head -2`
+    expect(classify(real, ROOT, { ...cfg, alwaysLeads: ['agent-browser eval'] })).toEqual({ kind: 'allow' })
+    // 没批过：是可「始终允许」的 eval 卡，不再是无键的「$( ) 无法静态判定」
+    const v = ask(real)
+    expect(v).toMatchObject({ kind: 'ask', detail: 'eval', alwaysLead: 'agent-browser eval' })
+    blocked('agent-browser eval "(() => 1)()" && rm -rf /etc/zz', '/etc/zz')
+  })
+
   it('路径 / 隐藏 / 网络 / 读写分离', () => {
     blocked('cat /etc/passwd', '项目外')
     blocked('cat .env', '隐藏')
@@ -62,8 +73,9 @@ describe('AST 路径：正则做不到的结构性判定（本次升级的目的
     allow('cd /Users/dev/Code/proj && "$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n*** Begin Patch\n*** Update File: docs/x.md\n@@\n ctx\n+要改 ~/.ssh/authorized_keys 的文档段落\n*** End Patch\nPATCH')
   })
   it('$() 子命令全量枚举——里面的危险命令照样弹', () => {
-    blocked('echo $(cat ~/.ssh/id_rsa)', '项目外')
-    blocked('echo file_$(rm ~/.zshrc)', '项目外')
+    // 项目外点开头报隐藏路径（2026-09-30）；这里要验的是子命令被枚举到
+    blocked('echo $(cat ~/.ssh/id_rsa)', '隐藏路径')
+    blocked('echo file_$(rm ~/.zshrc)', '隐藏路径')
     allow('echo $(ls src)')
   })
   it('引号内的 | 和 ; 不再误切段（正则会切成多段，只影响收紧方向）', () => {
@@ -71,7 +83,7 @@ describe('AST 路径：正则做不到的结构性判定（本次升级的目的
     allow('git commit -m "fix; deploy"')
   })
   it('重定向目标 write 标记（file_redirect 兄弟节点）', () => {
-    blocked('cat src/a.ts >> ~/.zshrc', '项目外')
+    blocked('cat src/a.ts >> ~/.zshrc', '隐藏路径')
     // 段内（单命令多路径）仍是首中即返——multi 合并只在段间（2026-09-15
     // 拍板时的取舍：judge 核心流收集化侵入大，单命令双触发场景边缘）
     blocked('sort < /etc/passwd > .simple-code/memory/x', '项目外')
@@ -87,7 +99,7 @@ describe('AST 路径：正则做不到的结构性判定（本次升级的目的
     }
   })
   it('双引号内的 $() 子命令同样枚举', () => {
-    blocked('echo "x$(cat ~/.ssh/id_rsa)y"', '项目外')
+    blocked('echo "x$(cat ~/.ssh/id_rsa)y"', '隐藏路径')
     allow('echo "file_$(basename src/a.ts).log"')
   })
   it('FOO=1 前缀剥离后按动词判', () => {

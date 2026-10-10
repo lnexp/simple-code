@@ -182,6 +182,61 @@ describe('restart', () => {
   })
 })
 
+describe('空响应', () => {
+  const zeroUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    reasoningTokens: 0,
+  }
+
+  /** 只有元信息的「正常」流：message_start + finish，零内容——2026-10-09
+   * 某项目实案（claude-opus 走 31.6s 返回零内容带终止标记）的形状 */
+  const emptyAttempt = (): LLMEvent[] => [
+    { type: 'message_start', usage: zeroUsage },
+    { type: 'finish', reason: 'stop', usage: zeroUsage },
+  ]
+
+  it('零内容的正常收尾按可重试错误处理——先空一次再正常返回，应该重试成功', async () => {
+    let calls = 0
+    const attempt = async function* (): AsyncIterable<LLMEvent> {
+      const i = calls++
+      if (i === 0) {
+        yield* emptyAttempt()
+        return
+      }
+      yield text('ok')
+    }
+    const events = await collect(requestWithRetry(attempt, FAST, new AbortController().signal))
+    expect(calls).toBe(2)
+    expect(events.some((ev) => ev.type === 'text_delta')).toBe(true)
+  })
+
+  it('始终零内容：用尽 maxAttempts 后抛出去（放弃后顶层 catch 变成 error 事件）', async () => {
+    let calls = 0
+    const attempt = async function* (): AsyncIterable<LLMEvent> {
+      calls++
+      yield* emptyAttempt()
+    }
+    await expect(
+      collect(requestWithRetry(attempt, FAST, new AbortController().signal)),
+    ).rejects.toThrow('没有返回任何内容')
+    expect(calls).toBe(FAST.maxAttempts)
+  })
+
+  it('finish 带 refusal 不算空——拒答是内容，不能被重试', async () => {
+    let calls = 0
+    const attempt = async function* (): AsyncIterable<LLMEvent> {
+      calls++
+      yield { type: 'finish', reason: 'content-filter', usage: zeroUsage, refusal: { category: 'reasoning_extraction' } }
+    }
+    const events = await collect(requestWithRetry(attempt, FAST, new AbortController().signal))
+    expect(calls).toBe(1)
+    expect(events).toHaveLength(1)
+  })
+})
+
 describe('退避', () => {
   it('Retry-After 优先于退避', async () => {
     const slow: RetryConfig = {

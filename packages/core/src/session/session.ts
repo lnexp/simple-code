@@ -1,7 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { readFile, readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { createHash } from 'node:crypto'
 import {
+  GLOBAL_CONFIG_PATH,
   type LoadedConfig,
   type LoadOptions,
   loadConfig,
@@ -11,12 +13,13 @@ import {
 import type { ModelSpec } from '../config/schema.ts'
 import type { AgentEvent } from '../events.ts'
 import { sendRequest } from '../llm/client.ts'
+import type { LLMEvent } from '../llm/events.ts'
 import { logRun } from '../runlog.ts'
 import { thumbnailDataUrl } from '../llm/resizer.ts'
 import type { ProviderContext } from '../llm/protocol.ts'
 import type { Effort, ImageInput, Message, Part, Request } from '../llm/types.ts'
 import { hotSummaryIds, indexTokens, type Summary } from '../loop/assemble.ts'
-import { regionSizes } from '../loop/regions.ts'
+import { regionSizes, regionsEstimate, usageRatio } from '../loop/regions.ts'
 import { requestWithRetry, type StreamEvent } from '../loop/retry.ts'
 import { headOf, type LoopContext, type LoopDeps, run, type Task, userParts } from '../loop/run.ts'
 import { buildCues, loadCueCandidates } from './cue.ts'
@@ -31,17 +34,25 @@ import {
   renderTurn,
   type SummaryOutput,
 } from '../loop/summarize.ts'
+import { fitIndexLine, oversizedNodes } from '../loop/index-cap.ts'
 import { estimateMessageTokens, estimateTextTokens, inputBudget } from '../loop/tokens.ts'
 import { runEventArchive, type ArchiveSummary } from '../loop/archiver.ts'
 import { readEventsIndex } from '../tools/events.ts'
 import { lessonNamesIndex } from '../tools/lesson.ts'
-import { listNoteCards, NOTES_INDEX_LIMIT } from '../tools/note.ts'
+import { activeNoteCards, listNoteCards, NOTES_INDEX_LIMIT } from '../tools/note.ts'
 import { createBashTool } from '../tools/bash.ts'
 import { BgRegistry, type BgProcessInfo } from '../tools/bg.ts'
 import type { Tool, ToolContext } from '../tools/types.ts'
 import { createViewImageTool } from '../tools/viewimage.ts'
 import { acquireLock } from './lock.ts'
-import { type HistoryRow, MEMORY_RELATIVE, openStore, type Segment, type Store } from './store.ts'
+import {
+  type HistoryRow,
+  lastRegionLine,
+  MEMORY_RELATIVE,
+  openStore,
+  type Segment,
+  type Store,
+} from './store.ts'
 import { createPrefixGuard, type PrefixFingerprint } from '../loop/prefix-guard.ts'
 
 /**
@@ -129,8 +140,12 @@ export type Session = {
    * 那次 send 出）。丢消息和跑两个 loop 都是不报错的错。
    */
   send(text: string, images?: ImageInput[]): AsyncIterable<AgentEvent>
-  /** 中断正在跑的 loop。没在跑就是空操作 */
-  interrupt(): void
+  /**
+   * 中断正在跑的 loop。没在跑就是空操作。
+   * source 只进运行日志（ev=interrupt），区分是谁按的停：llm 行的 aborted
+   * 一律写 'user interrupt'，9-17~9-30 有 123 次分不清来源（2026-09-30 补）
+   */
+  interrupt(source?: string): void
   /**
    * 用户在 UI 关掉一个后台残留进程（bg.ts）：SIGTERM 并返回更新后的快照。
    * 不走事件流——宿主调完拿返回值直接推给 webview，少一次状态同步
@@ -190,7 +205,8 @@ export type Session = {
    *  同一判据）：原 task.ts 的 taskSummaryDebt 是同构的第二份 SQL，段选择
    *  判据演进它会悄悄漂移；合一后债 = nextSegmentToSummarize 挑不出段 */
   summaryDebt(): boolean
-  close(): Promise<void>
+  /** source：谁关的（bridge 传 detach / reload / dispose），只进 session_close 日志 */
+  close(source?: string): Promise<void>
 }
 
 export type SessionOptions = LoadOptions & {
@@ -248,6 +264,17 @@ export async function getSession(
         ? null
         : openStore(options.memoryRoot ?? folderPath)
       : openStore(folderPath, { task: options.task })
+  // 估算 → 真实的换算系数（regions.ts usageRatio）：压缩三道额度按它校。
+  // 建会话时从 regions.jsonl 本 owner 的最后一行恢复——reload 后第一次
+  // 压缩（stale 那趟车，最常见的一次）还没有任何响应，不恢复就退回 1。
+  // 之后每次拿到 usage 的请求更新（recordRegions 那一处）。只读一次文件：
+  // 它有好几 MB，不能每请求读
+  const owner = options.task?.owner ?? null
+  let tokenRatio = 1
+  if (store) {
+    const tail = lastRegionLine(store.root, owner)
+    tokenRatio = (tail && usageRatio(regionsEstimate(tail), tail.real)) ?? 1
+  }
   // 四个磁盘源段（AGENTS.md 本体 / notes / events / lessons 索引）只读一次，
   // 之后 buildDeps 复用，reloadSystem 才重读。理由与「故意不热重载」都在
   // systemPrompt 上；建会话超限 → 截断 + 内嵌警告行（agent 可见，会转告
@@ -265,22 +292,36 @@ export async function getSession(
   // 被模型看到——AGENTS.md 热重载本来就是被否掉过的提案，这里不是在
   // 偷偷把它做回来
   const snap = store?.readPromptSnapshot() ?? null
+  // 用户级约定文件与全局 settings.json 同目录（~/.simple-code/）：测试传
+  // 临时 globalPath 时自然隔离，不会读到真机的
+  // 临时 globalPath 时自然隔离，不会读到真机的。两条路径撞上（把
+  // ~/.simple-code 当项目打开）只算项目级，不叠两遍
+  const projectAgentsPath = join(folderPath, 'AGENTS.md')
+  const userAgentsPath = join(dirname(options.globalPath ?? GLOBAL_CONFIG_PATH), 'AGENTS.md')
+  const readUserAgents = () =>
+    userAgentsPath === projectAgentsPath ? Promise.resolve(null) : readAgentsFile(userAgentsPath)
   let agents: string | null
+  let userAgents: string | null
   let notes: string | null
   let events: string | null
   let lessons: string | null
   if (snap) {
     agents = snap.agents
+    userAgents = snap.userAgents
     notes = snap.notes
     events = snap.events
     lessons = snap.lessons
   } else {
-    const agentsText = await readAgentsFile(folderPath)
-    agents = agentsText === null ? null : clampAgents(agentsText)
+    const [agentsText, userText] = await Promise.all([
+      readAgentsFile(projectAgentsPath),
+      readUserAgents(),
+    ])
+    agents = agentsText === null ? null : clampAgents(agentsText, 'AGENTS.md')
+    userAgents = userText === null ? null : clampAgents(userText, '~/.simple-code/AGENTS.md')
     notes = await readNotesIndex(folderPath)
     events = readEventsIndex(folderPath)
     lessons = lessonNamesIndex(folderPath)
-    store?.writePromptSnapshot({ agents, notes, events, lessons })
+    store?.writePromptSnapshot({ agents, userAgents, notes, events, lessons })
   }
 
   // 重启后接着上次的历史往下走。这是第 2 步的全部目的
@@ -304,8 +345,10 @@ export async function getSession(
    * 与 effortOverride 并列存在会话里：配置本身不记「现在选的是哪个」，
    * 那是运行时状态不是文件形状 */
   let currentPreset: string | undefined
-  /** AGENTS.md 本体建会话读一次（const，可能已截断）；notes 索引可被 reloadSystem 重读 */
+  /** AGENTS.md 本体建会话读一次（可能已截断），之后只有 reloadSystem 重读；
+   * 用户级同款 */
   let agentsMutable: string | null = agents
+  let userAgentsMutable: string | null = userAgents
   /**
    * visionRelay 转述缓存（图 data → 成品文本）。session 级：ctx 每次 send
    * 新建，挂 ctx 上每条消息都要把历史图重述一遍。run.ts 的
@@ -445,11 +488,29 @@ export async function getSession(
       // 覆盖压在 config 算出来的值上面。展开在后面，顺序不能反
       ...(effortOverride === null ? {} : { effort: effortOverride }),
       model: config.config.model,
+      // 稳定客户端标识：同项目跨重启不变（路径哈希）。必须是官方客户端的
+      // 三件套形状 {device_id, account_uuid, session_id}——2026-09-28
+      // 探针实锤（cache-probe9/10，Q/R/T 臂）：网关只对带 device_id 的
+      // user_id 走按内容匹配的前缀缓存（挪标记位置、3 秒间隔、流式
+      // 全命中）；单键 session_id 落进只认断点精确位置的模式（0/8），
+      // 标记每轮前移就永远 miss。folderPath 为空的临时会话不发
+      ...(folderPath
+        ? {
+            userId: JSON.stringify({
+              device_id: createHash('sha256').update(folderPath).digest('hex'),
+              account_uuid: '',
+              session_id: uuidFromHash(folderPath),
+            }),
+            // OpenAI Responses 用；和 session_id 同值，同项目跨重启不变
+            cacheKey: uuidFromHash(folderPath),
+          }
+        : {}),
       // 状态行跟着 deps 每轮现算：setModel 之后下一轮 system 自动带上新
       // 模型的能力（方案 A——模型切换是静默操作，agent 得能低头看到现状）
       system: systemPrompt(
         folderPath,
         agentsMutable,
+        userAgentsMutable,
         notes,
         events,
         lessons,
@@ -484,13 +545,19 @@ export async function getSession(
             },
             floorTokens: config.config.memory.floorTokens,
             stubTokens: config.config.memory.stubTokens,
-            stubTurns: config.config.memory.stubTurns,
+            stubSteps: config.config.memory.stubSteps,
+            tokenRatio: () => tokenRatio,
             safetyMargin: config.config.memory.reservedTokens,
-            keepHeadChars: config.config.memory.keepHeadChars,
+            // 命令留头用 clipCommandChars，不用 keepHeadChars——后者还管本地
+            // L0 的描述截断（headOf），两边默认值已分家（2026-09-28 方案 C）
+            keepHeadChars: config.config.memory.clipCommandChars,
+            outputHeadChars: config.config.memory.clipOutputHeadChars,
+            outputTailChars: config.config.memory.clipOutputTailChars,
             clipThresholdChars: config.config.memory.clipThresholdChars,
             remap: (origin) => store.remapMessages(origin),
             unload: (indices: number[]) => store.unload(indices),
             markCold: (stepIds: number[]) => store.markCold(stepIds),
+            markStubs: (stubs: Message[]) => store.markStubs(stubs),
             activateSummary: (stepId) => store.activateSummary(stepId),
             summaries: () => store.summaries(),
             leafBodies: (rows) => store.leafBodies(rows),
@@ -500,7 +567,10 @@ export async function getSession(
             withTurns: (msgs: Message[]) => store.withTurns(msgs),
             // shadow 模式：算+落库（观察日志）但不渲染——上线与否就看这行
             cues: () => (config.config.recall.mode === 'on' ? store.cues() : new Map()),
-            recordRegions: (sizes, budget) => store.recordRegions(sizes, budget),
+            recordRegions: (sizes, budget, real) => {
+              store.recordRegions(sizes, budget, real)
+              tokenRatio = usageRatio(regionsEstimate(sizes), real) ?? tokenRatio
+            },
             pruneMessages: (indices) => store.pruneMessages(indices),
             applyMerges: () => store.applyMerges(),
           },
@@ -512,15 +582,21 @@ export async function getSession(
     // 只有 system 这一个字段在压缩点上被原地换新。重读后顺手更新闭包变量，
     // setModel 重建 deps 时拼出来的就是已刷新的版本，不会闪回旧文
     deps.reloadSystem = async () => {
-      const [freshAgents, freshNotes] = await Promise.all([
-        readAgentsFile(folderPath),
+      const [freshAgents, freshUser, freshNotes] = await Promise.all([
+        readAgentsFile(projectAgentsPath),
+        readUserAgents(),
         readNotesIndex(folderPath),
       ])
       // AGENTS.md 新版超限 → 保旧版不换 + 报给 run 侧发提示。缩小/删除/
-      // 改名都照常生效——「停止」只拦「变大到超限」，死保旧版仅此一种触发
-      const overLimit =
-        freshAgents !== null && estimateTextTokens(freshAgents) > AGENTS_MAX_TOKENS
-      agentsMutable = overLimit ? agentsMutable : freshAgents === null ? null : clampAgents(freshAgents)
+      // 改名都照常生效——「停止」只拦「变大到超限」，死保旧版仅此一种触发。
+      // 用户级与项目级各算各的额度、各自保旧（2026-09-29 拍板各 2048）
+      const over = (text: string | null) => text !== null && estimateTextTokens(text) > AGENTS_MAX_TOKENS
+      const overLimit = [
+        ...(over(freshUser) ? [userAgentsPath] : []),
+        ...(over(freshAgents) ? ['AGENTS.md'] : []),
+      ]
+      if (!over(freshAgents)) agentsMutable = freshAgents === null ? null : clampAgents(freshAgents, 'AGENTS.md')
+      if (!over(freshUser)) userAgentsMutable = freshUser === null ? null : clampAgents(freshUser, '~/.simple-code/AGENTS.md')
       notes = freshNotes
       // events 索引同款：压缩点换新（proposals/events.md §6——新归档的事件
       // 这时才进索引；此前原文还热着，本来不需要档案）
@@ -528,10 +604,11 @@ export async function getSession(
       lessons = lessonNamesIndex(folderPath)
       // 快照回写：让「缓存还热的重建」沿用到的正是此刻生效的这四段。
       // agentsMutable 而非 freshAgents——超限保旧版时生效的是旧版
-      store?.writePromptSnapshot({ agents: agentsMutable, notes, events, lessons })
+      store?.writePromptSnapshot({ agents: agentsMutable, userAgents: userAgentsMutable, notes, events, lessons })
       deps.request.system = systemPrompt(
         folderPath,
         agentsMutable,
+        userAgentsMutable,
         notes,
         events,
         lessons,
@@ -545,7 +622,7 @@ export async function getSession(
         visionRelay !== undefined,
         new Date().toLocaleDateString('sv-SE'),
       )
-      return overLimit ? { agentsOverLimit: true } : {}
+      return overLimit.length > 0 ? { agentsOverLimit: overLimit } : {}
     }
     // 存根段水位检查的「催摘要」：summarizeIdle 自带并发闸（同时最多一个、
     // 正在跑的不打断），这里只管点火不管等——水位检查是同步路径，不能挂
@@ -603,7 +680,13 @@ export async function getSession(
    * §9.7 修正二。规则 1（同时最多一个）保留，成本仍然封顶。
    */
   const kickSummary = (): Promise<void> => {
-    if (summarizing || !store) return Promise.resolve()
+    if (!store) return Promise.resolve()
+    // 闸内返回**在途那一次**，不是立即 resolve 的空 promise：await 的调用方
+    // （summarizeIdle 的「摘一次」、任务关闭的排空循环、idle.ts 的 .then(arm)）
+    // 要的是「等这一轮摘完」。原来直接放行，关闭循环撞上在途摘要时 500 次
+    // 迭代在微任务里转完、带着欠账去 finalizeTask；测试里的 tick 同理空转
+    // （2026-09-29 L0 路径多一次 await 就把 merge-e2e 的节奏打乱，才暴露）
+    if (summarizing) return summarizing
 
     // 进展快照：本次真产出了摘要（L0 或合并）才接着踢下一次，把积压的债
     // 连续还完；没进展（无候选 / LLM 失败）就停，等下一个触发点。
@@ -620,7 +703,10 @@ export async function getSession(
     // 目录（memoryRoot），但 events 是跨主干/分身共享的检索层，归档直写
     // 主干目录——工具侧 $SIMPLE_CODE_EVENT 本就按 cwd（=项目根）解析，
     // system prompt 索引也读 folderPath，三处对齐后 merge 无需回收 events
-    const task = summarizeOnce(store, config, options.fetchImpl, activeTurn, folderPath).finally(() => {
+    const task = summarizeOnce(store, config, options.fetchImpl, activeTurn, folderPath, {
+      owner,
+      ratio: tokenRatio,
+    }).finally(() => {
       summarizing = null
       // try/catch 挡 close 竞态：close 不等摘要跑完，迟到的 finally 撞上
       // closed db（node:sqlite ERR_INVALID_STATE）。丢掉即可，下次触发再续
@@ -700,7 +786,13 @@ export async function getSession(
       return { ...page, rows: await toHydrateRows(page.rows) }
     },
     isRunning: () => running !== null,
-    interrupt: () => running?.abort(),
+    interrupt: (source) => {
+      // 已 abort 的不再记：abort 同步、running 置空要等 loop 收尾，
+      // dispose 紧跟 close 会记两行
+      if (!running || running.signal.aborted) return
+      logRun({ ev: 'interrupt', folder: folderPath, owner: options.task?.owner ?? null, source: source ?? 'unknown' })
+      running.abort()
+    },
     terminateBg: (pid) => bg.terminate(pid),
     bgSnapshot: () => bg.snapshot(),
 
@@ -749,8 +841,14 @@ export async function getSession(
       store !== null &&
       store.nextSegmentToSummarize(config.config.memory.segmentTokens, activeTurn) !== null,
 
-    close: async () => {
-      running?.abort()
+    close: async (source?: string) => {
+      // 谁、何时关的库（2026-09-30 补观测）：exthost 里 `database is not open`
+      // 查到最后卡在 runlog 没有关闭记录；summarizing = 关的那刻摘要还在跑
+      logRun({ ev: 'session_close', folder: folderPath, owner: options.task?.owner ?? null, summarizing: summarizing !== null, source })
+      if (running && !running.signal.aborted) {
+        logRun({ ev: 'interrupt', folder: folderPath, owner: options.task?.owner ?? null, source: 'close' })
+        running.abort()
+      }
       // **不等摘要跑完。** 等的话用户按了 /exit 还得干等几秒。中途丢下的
       // generating 行由下次启动的 resetStaleGenerating 兜住（§9.7）
       store?.close()
@@ -803,14 +901,35 @@ export async function getSession(
       // 无库（ephemeral）时没有轮归属可查：整段历史都算上一次 send 的模型
       const current = modelId(config)
       const models = store ? store.liveTurnModels() : messages.map(() => lastSendModel)
-      if (dropForeignSignatures(messages, models, current)) store?.save(messages)
+      const stripped = dropForeignSignatures(messages, models, current)
+      if (stripped.length > 0) {
+        // 剥完的消息指纹已变——不登记的话 save 会把无签名版当新消息再归档
+      // 一遍（2026-10-07 某项目 turn 54/60 实锤：同轮两份，带签名在前、
+        // 剥完在后）。markStubs 的语义本来就是「已归档原文的等价内容，不追加」
+        store?.markStubs(stripped)
+        store?.save(messages)
+      }
       lastSendModel = current
-      activeTurn =
-        store?.beginTurn({
-          model: modelId(config),
-          effort: effortOverride ?? config.request.effort ?? null,
-        }) ?? null
-      messages.push({ role: 'user', parts: userParts(text, images) })
+      // turn 续接（docs/proposals/turn-resume.md，2026-09-29 拍板）：上一轮被
+      // 中断或报错结束的，这条消息续进那一轮，不开新轮——与排队插话同形。
+      // SC 的摘要/归档/检索/cue 都按 turn，「继续」另起一轮会把一件事拆成
+      // 两半。条件见 resumableTurn
+      const resumed = store ? store.resumableTurn(current) : null
+      if (store && resumed !== null) {
+        store.resumeTurn(resumed)
+        activeTurn = resumed
+      } else {
+        activeTurn =
+          store?.beginTurn({
+            model: current,
+            effort: effortOverride ?? config.request.effort ?? null,
+          }) ?? null
+      }
+      const userMessage: Message = { role: 'user', parts: userParts(text, images) }
+      // 防重复：上一轮停在一条没被回复的用户消息上（如 PrefixBroken 拦在
+      // 请求前），用户原话重发——不再追加第二遍，直接跑（官方客户端同款：
+      // 「so the model sees it exactly once」）
+      if (!(resumed !== null && sameAsLastUser(messages, userMessage))) messages.push(userMessage)
       // 先落盘再发请求。反过来的话，请求发出去了但用户这条消息没记下来，
       // 崩溃重启后模型的回答在历史里成了没有来由的一段话
       store?.save(messages)
@@ -819,7 +938,11 @@ export async function getSession(
       // （重装配字节要一致）。任务会话不算（v1）：任务短命、上下文有继承
       // 语义，语料撞出主任务的线索对任务是噪声；排队插话的轮也拿不到
       // cue——beginTurn 在 loop 里，那是第二处接线点，痛了再接
-      computeCue()
+      //
+      // 续接轮不算：cue 贴在该轮**第一条**用户消息后面（assemble.ts），那条
+      // 早发出去过。原轮没落 cue（lines 为空）的话，现在补一条等于改写已发
+      // 的消息，前缀守卫必炸（turn-resume.md）
+      if (resumed === null) computeCue()
 
       const controller = new AbortController()
       running = controller
@@ -852,7 +975,9 @@ export async function getSession(
         persist()
         // 定稿写耗时。update 的是当时的 turn 行，meta（model）也是当时的
         // 快照——之后换模型不会改写这一轮的任何记录
-        if (activeTurn !== null) store?.finishTurn(activeTurn, Date.now() - turnStartedAt)
+        // 结束状态决定下一次 send 续不续（turn-resume.md）
+        const endState = controller.signal.aborted ? 'aborted' : ctx.failed ? 'error' : 'done'
+        if (activeTurn !== null) store?.finishTurn(activeTurn, Date.now() - turnStartedAt, endState)
         running = null
         // **清在 persist 之后**：那一脚 kickSummary 还属于「turn 正在跑」，
         // 早清的话它会摘到刚结束但还没落定的这一轮。清完之后空闲摘要才够得着
@@ -864,7 +989,9 @@ export async function getSession(
 }
 
 /**
- * 剥掉历史里**不是当前模型签的** reasoning 签名。**就地改 messages**，改了返回 true。
+ * 剥掉历史里**不是当前模型签的** reasoning 签名。**就地改 messages**，
+ * 返回改写后的消息——调用方要拿去 markStubs 登记（指纹已变，不登记的话
+ * 归档会把剥完的版本当新消息再追加一遍，2026-10-07 某项目实锤）。
  *
  * 判据是每条消息所在轮的产出模型（`models[i]`，turns.meta 记的），不是
  * 「刚才 setModel 换过没有」：后者把重建会话时的恢复选择也当成换模型，
@@ -892,14 +1019,13 @@ function dropForeignSignatures(
   messages: Message[],
   models: readonly (string | null)[],
   current: string,
-): boolean {
-  let changed = false
+): Message[] {
+  const stripped: Message[] = []
   for (const [i, message] of messages.entries()) {
     const by = models[i] ?? null
     if (by === null || by === current) continue
     if (!message.parts.some((p) => p.type === 'reasoning' && p.encrypted !== undefined)) continue
-    changed = true
-    messages[i] = {
+    const next: Message = {
       ...message,
       parts: message.parts.map((part) => {
         if (part.type !== 'reasoning' || part.encrypted === undefined) return part
@@ -907,8 +1033,10 @@ function dropForeignSignatures(
         return rest
       }),
     }
+    messages[i] = next
+    stripped.push(next)
   }
-  return changed
+  return stripped
 }
 
 const modelId = (config: LoadedConfig): string => `${config.config.provider}/${config.config.model}`
@@ -934,6 +1062,11 @@ async function summarizeOnce(
   activeTurn: number | null,
   /** 事件归档根：项目根，不是 store.root（分身的 store 在任务目录） */
   eventsRoot: string,
+  /**
+   * owner = 日志归属（null = 主任务）：runlog 主任务与任务共写一个文件；
+   * ratio = 估算→真实系数，索引配额按它校（mergeWhileDue）
+   */
+  scope: { owner: string | null; ratio: number } = { owner: null, ratio: 1 },
 ): Promise<void> {
   try {
     // 候选是**一个 turn 内的一段连续 step**（live 与 unloaded 都在 messages
@@ -961,7 +1094,7 @@ async function summarizeOnce(
     // 没有 L0 债：看该层攒够没有。级联在一次空闲 tick 里做完——L1 合并
     // 不依赖 context（纯库操作 + 一次模型调用），不级联的话 L2 要等
     // 「L1 攒够 10 条」之后的**下一次**空闲，而那可能是很久以后
-    await mergeWhileDue(store, config, fetchImpl)
+    await mergeWhileDue(store, config, fetchImpl, { folder: eventsRoot, ...scope })
   } catch {
     // 吞掉。没生成完的行由 summarizeSegment 自己收掉（它的 finally），
     // 进程直接没了那种由下次启动的 dropUnfinishedSummaries 兜底
@@ -1084,11 +1217,15 @@ async function summarizeSegment(
  *  session 实例（reload 前后）也共享这道闸 */
 const archivingRoots = new Set<string>()
 
-/** 待归档摘要队列（闸内不吞的代价）：跑完 finally 里续排，每批恰好一次分类 */
-const pendingArchive = new Map<string, Array<{ s: ArchiveSummary; cfg: LoadedConfig; fetchImpl?: typeof fetch }>>()
+/** 待归档摘要队列（闸内不吞的代价）：跑完 finally 里续排。调用失败排回队尾
+ *  重试一次（tries）——原来直接丢，9-26~30 约 2661 批里 10 批就此不进事件档案 */
+const pendingArchive = new Map<
+  string,
+  Array<{ s: ArchiveSummary; cfg: LoadedConfig; fetchImpl?: typeof fetch; tries: number }>
+>()
 
-function queueEventArchive(root: string, s: ArchiveSummary, cfg: LoadedConfig, fetchImpl?: typeof fetch): void {
-  const q = (pendingArchive.get(root) ?? []).concat([{ s, cfg, ...(fetchImpl ? { fetchImpl } : {}) }])
+export function queueEventArchive(root: string, s: ArchiveSummary, cfg: LoadedConfig, fetchImpl?: typeof fetch): void {
+  const q = (pendingArchive.get(root) ?? []).concat([{ s, cfg, ...(fetchImpl ? { fetchImpl } : {}), tries: 0 }])
   pendingArchive.set(root, q)
   if (archivingRoots.has(root)) return // 在跑：留在队列，跑完续
   archivingRoots.add(root)
@@ -1100,11 +1237,20 @@ function queueEventArchive(root: string, s: ArchiveSummary, cfg: LoadedConfig, f
       return
     }
     void runEventArchive({ root, summary: next.s, config: next.cfg, ...(next.fetchImpl ? { fetchImpl: next.fetchImpl } : {}) })
-      .catch((e) => console.error('[archiver] 归类失败（本批跳过，不重试）:', e))
+      .catch((e) => {
+        const retry = next.tries === 0
+        const message = e instanceof Error ? e.message : String(e)
+        logRun({ ev: 'archive', folder: root, action: 'failed', retry, steps: `${next.s.coversFrom}–${next.s.coversTo}`, message })
+        if (retry) pendingArchive.get(root)?.push({ ...next, tries: 1 })
+        else console.error('[archiver] 归类失败（已重试一次，本批跳过）:', e)
+      })
       .finally(drain)
   }
   drain()
 }
+
+/** 每个 folder+owner 上一次记下的合并停止状态（`原因|成员数`），mergeWhileDue 去重用 */
+const lastMergeStop = new Map<string, string>()
 
 /**
  * **索引区超了配额就合并**，一直合到降回配额以内或没有可合的为止。
@@ -1124,15 +1270,27 @@ async function mergeWhileDue(
   store: Store,
   config: LoadedConfig,
   fetchImpl: typeof fetch | undefined,
+  /**
+   * 每次合并/停止都记一行 `ev: 'merge'`（2026-09-28 补）：原来只有 llm
+   * tag=merge 的耗时行，合了谁、跨没跨层、合前多大、为什么停全靠翻库
+   * 倒推——那天方案 D 真机合了 12 次、比预测多 3 次跨层，就是翻库 + 回放
+   * 才看清停止判据量的数。ratio = 估算→真实系数（regions.ts usageRatio）：
+   * 配额是真实 token，indexTokens 量的是估算，配额除以它（2026-09-29）；
+   * 跟着 stop 行一起落日志
+   */
+  log: { folder: string; owner: string | null; ratio?: number } = { folder: '', owner: null },
 ): Promise<void> {
   const { mergeFactor: factor, indexRatio, hotLeaves, demoteBatch } = config.config.memory
   const quota =
-    inputBudget({
+    (inputBudget({
       contextWindow: config.model.contextWindow,
       maxTokens: config.request.maxTokens,
       safetyMargin: config.config.memory.reservedTokens,
-    }) * indexRatio
+    }) *
+      indexRatio) /
+    (log.ratio ?? 1)
 
+  await rewriteOversized(store, config, fetchImpl, log)
   for (;;) {
     const summaries = store.summaries()
     // 稳态成员而不是 inContext：刚 recordMerge 完的那一刻新节点还没生效、
@@ -1140,25 +1298,35 @@ async function mergeWhileDue(
     const index = indexMembers(summaries)
     const hot = hotSummaryIds(index, { hotLeaves, batch: demoteBatch })
     const bodies = store.leafBodies(index.filter((s) => hot.has(s.id)))
-    if (indexTokens(index, bodies) <= quota) return
+    const size = indexTokens(index, bodies)
+    const stop = (reason: string): void => {
+      // 空闲 tick 约 3 秒一次，没事可做时每次都停在同一处——9-29 真机 16 分钟
+      // 87 行一模一样的 under_quota。停止原因或成员数变了才记
+      const key = `${log.folder}\0${log.owner ?? ''}`
+      const state = `${reason}|${index.length}`
+      if (lastMergeStop.get(key) === state) return
+      lastMergeStop.set(key, state)
+      logRun({ ev: 'merge', ...log, action: 'stop', reason, index: Math.round(size), members: index.length, quota: Math.round(quota) })
+    }
+    if (size <= quota) return stop('under_quota')
 
     // 第三参 = 跨缝保险的②③道（缝里的可见消息/活任务 steps），
     // ①道（缝里的摘要行）pickMergeGroup 拿手头的 summaries 自己查
     const group = pickMergeGroup(summaries, factor, (from, to) => store.gapHasContent(from, to))
-    if (!group) return
+    if (!group) return stop('no_group')
 
     const members = group.members
     const text = await requestMerge(members, config, fetchImpl, store.root)
-    if (!text) return // 合并失败：下次空闲再试（成员原样，没有半截状态）
+    if (!text) return stop('llm_failed') // 合并失败：下次空闲再试（成员原样，没有半截状态）
 
-    store.recordMerge(
+    const id = store.recordMerge(
       {
         level: group.level + 1,
         coversFrom: members[0]?.coversFrom ?? 0,
         coversTo: members[members.length - 1]?.coversTo ?? 0,
-        // 内部节点没有单独的标题：它产出的**本来就是一行**
-        // 「<主题>：<关键词> · <关键词>」，主题就在 text 里，再切一个
-        // 标题出来等于把同一句话拆两半
+        // 内部节点没有单独的标题：它产出的就是路由行
+        // 「<主题>：<关键词> · <关键词>」（可多行、总长 ≤400 字），主题就在
+        // text 里，再切一个标题出来等于把同一句话拆两半
         name: '',
         text,
         status: 'ready',
@@ -1174,10 +1342,111 @@ async function mergeWhileDue(
       },
       members.map((m) => m.id),
     )
+    const levels = members.map((s) => s.level)
+    logRun({
+      ev: 'merge',
+      ...log,
+      action: 'record',
+      id,
+      level: group.level + 1,
+      from: members[0]?.coversFrom ?? 0,
+      to: members[members.length - 1]?.coversTo ?? 0,
+      // 成员层级原样记：跨层（方案 D 兜底）一眼看出来，滚雪球也一眼看出来
+      levels: levels.join(','),
+      crossLayer: new Set(levels).size > 1,
+      chars: text.length,
+      index: Math.round(size),
+      quota: Math.round(quota),
+    })
   }
 }
 
-/** 发一次非流式意义上的请求——协议层恒流式（§5），这里只是把文本收全 */
+/**
+ * 稳态索引里超过 400 字的内部节点，单条重写一次（index-cap.ts）。
+ *
+ * 上限落地前合出来的节点不会自己变短：同层合并轮不到它（它常是最老最高
+ * 的那一条），跨层兜底把它当成员再合，输入里就带着它的 7k 字。所以单拎
+ * 出来重写——新节点罩同一段、**同层**（内容没有往上归并，只是变短），走
+ * 普通合并的路：只写库，下一个压缩点 applyMerges 换入（前缀不变式）。
+ * 与配额无关：上限是每一条的规矩，不是索引总量的事
+ */
+async function rewriteOversized(
+  store: Store,
+  config: LoadedConfig,
+  fetchImpl: typeof fetch | undefined,
+  log: { folder: string; owner: string | null },
+): Promise<void> {
+  for (const node of oversizedNodes(indexMembers(store.summaries()))) {
+    const text = await requestMerge([node], config, fetchImpl, store.root)
+    if (!text) return // 摘要模型不通：下次空闲再来，节点原样
+    const id = store.recordMerge(
+      { ...node, name: '', text, status: 'ready', inContext: false, supersededBy: null },
+      [node.id],
+    )
+    logRun({ ev: 'merge', ...log, action: 'rewrite', id, of: node.id, level: node.level, before: node.text.length, chars: text.length })
+  }
+}
+
+/**
+ * 发一次非流式意义上的请求——协议层恒流式（§5），这里只是把文本收全。
+ * 摘要与合并共用：两者都走摘要模型自己的连接（跨 provider 时与主模型无关，
+ * resolveSummary 里解析）
+ */
+async function collectText(
+  request: Request,
+  opts: { config: LoadedConfig; fetchImpl: typeof fetch | undefined; folder: string | undefined; tag: string },
+): Promise<string> {
+  const { config, fetchImpl, folder, tag } = opts
+  let text = ''
+  let reasoningChars = 0
+  let finish: Extract<LLMEvent, { type: 'finish' }> | undefined
+  const stream = sendRequest(request, {
+    protocol: config.summary.protocol,
+    provider: {
+      baseUrl: config.summary.baseUrl,
+      apiKey: config.summary.apiKey,
+      headers: config.summary.model.headers,
+      extraBody: config.summary.model.extraBody,
+    },
+    signal: new AbortController().signal,
+    idleTimeoutMs: config.config.loop.streamIdleTimeoutMs,
+    ...(fetchImpl ? { fetchImpl } : {}),
+    tag,
+    ...(folder ? { folder } : {}),
+  })
+  for await (const llmEv of stream) {
+    if (llmEv.type === 'text_delta') text += llmEv.text
+    else if (llmEv.type === 'reasoning_delta') reasoningChars += llmEv.text.length
+    else if (llmEv.type === 'finish') finish = llmEv
+  }
+  // 空文本是摘要/合并失败的唯一信号（调用方 !text → llm_failed），但流是
+  // 正常走完的，llm 行没有 error——9-29 某项目 4 次约 28s 的空返回看不出
+  // 为什么。只记观测，不改判定：拿到真实原因再决定怎么修
+  if (text.trim() === '') {
+    logRun({
+      ev: 'llm_empty',
+      model: request.model,
+      tag,
+      ...(folder ? { folder } : {}),
+      finish: finish?.reason ?? null,
+      reasoningChars,
+      outputTokens: finish?.usage.outputTokens ?? null,
+      reasoningTokens: finish?.usage.reasoningTokens ?? null,
+    })
+  }
+  return text
+}
+
+/** 在原请求后面接上「模型刚才那份 + 超长反馈」，让它就地重写（index-cap.ts） */
+const followUp = (request: Request, previous: string, feedback: string): Request => ({
+  ...request,
+  messages: [
+    ...request.messages,
+    { role: 'assistant', parts: [{ type: 'text', text: previous }] },
+    { role: 'user', parts: [{ type: 'text', text: feedback }] },
+  ],
+})
+
 async function requestSummary(
   messages: Message[],
   config: LoadedConfig,
@@ -1188,27 +1457,16 @@ async function requestSummary(
     ...config.summary.request,
     model: config.summary.name,
   })
-
-  let text = ''
-  const stream = sendRequest(request, {
-    // 摘要自己的连接（跨 provider 时与主模型无关），resolveSummary 里解析
-    protocol: config.summary.protocol,
-    provider: {
-      baseUrl: config.summary.baseUrl,
-      apiKey: config.summary.apiKey,
-      headers: config.summary.model.headers,
-      extraBody: config.summary.model.extraBody,
-    },
-    signal: new AbortController().signal,
-    idleTimeoutMs: config.config.loop.streamIdleTimeoutMs,
-      ...(fetchImpl ? { fetchImpl } : {}),
-      tag: 'summary',
-      ...(folder ? { folder } : {}),
-    })
-  for await (const llmEv of stream) {
-    if (llmEv.type === 'text_delta') text += llmEv.text
-  }
-  return parseSummaryOutput(text)
+  const opts = { config, fetchImpl, folder, tag: 'summary' }
+  const raw = await collectText(request, opts)
+  const out = parseSummaryOutput(raw)
+  // 描述就是索引行，同样受 400 字上限（index-cap.ts）。重写只要描述那一行，
+  // 正文沿用第一次的——热区正文另有 1200 字的上限，不归这里管
+  const description = await fitIndexLine(out.description, async (feedback) => {
+    const again = await collectText(followUp(request, raw, `${feedback}（只重写「描述」这一行的内容）`), opts)
+    return cleanSummaryText(again).replace(/^\s*\*{0,2}描述\*{0,2}\s*[:：]\s*/, '')
+  })
+  return { ...out, description }
 }
 
 /** 视觉转述的 system：描述者是主模型的眼睛，不是聊天对象 */
@@ -1282,7 +1540,8 @@ function makeVisionRelay(
 /**
  * 把一组摘要合成一条上层节点。请求形态跟 L0 一致（不带工具、关 thinking），
  * 只有指令不同（buildMergeRequest）——L0 写「这一轮做了什么」，上层写
- * **目录里的一行路由**，不是把十条摘要再压一遍（提案 §3.2）
+ * **目录里的路由行**（每行一主题、总长 ≤400 字），不是把十条摘要再压一遍
+ * （提案 §3.2；上限见 index-cap.ts）
  */
 async function requestMerge(
   members: Summary[],
@@ -1294,26 +1553,12 @@ async function requestMerge(
     ...config.summary.request,
     model: config.summary.name,
   })
-
-  let text = ''
-  const stream = sendRequest(request, {
-    protocol: config.summary.protocol,
-    provider: {
-      baseUrl: config.summary.baseUrl,
-      apiKey: config.summary.apiKey,
-      headers: config.summary.model.headers,
-      extraBody: config.summary.model.extraBody,
-    },
-    signal: new AbortController().signal,
-    idleTimeoutMs: config.config.loop.streamIdleTimeoutMs,
-    ...(fetchImpl ? { fetchImpl } : {}),
-    tag: 'merge',
-    ...(folder ? { folder } : {}),
-  })
-  for await (const llmEv of stream) {
-    if (llmEv.type === 'text_delta') text += llmEv.text
-  }
-  return cleanSummaryText(text)
+  const opts = { config, fetchImpl, folder, tag: 'merge' }
+  const first = cleanSummaryText(await collectText(request, opts))
+  // 400 字上限（index-cap.ts）：超了重写一次，还超就截——合并一定能完成
+  return fitIndexLine(first, async (feedback) =>
+    cleanSummaryText(await collectText(followUp(request, first, feedback), opts)),
+  )
 }
 
 /**
@@ -1396,18 +1641,26 @@ function httpStream(
  */
 const AGENTS_MAX_TOKENS = 2_048
 
-function clampAgents(text: string): string {
+// sha256(folderPath) 前 32 位排成 8-4-4-4-12 的 UUID 形状——官方客户端的
+// session_id 就是这形状，网关的会话粘性按它解析
+function uuidFromHash(source: string): string {
+  const h = createHash('sha256').update(source).digest('hex').slice(0, 32)
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+}
+
+function clampAgents(text: string, file: string): string {
   if (estimateTextTokens(text) <= AGENTS_MAX_TOKENS) return text
   // 两步保守切：先按 1.5 字/token 粗切（多数文本），复查仍超再按纯中文
   // 1 字/token 切。宁可多切一点也不超——常驻区超限的代价是每轮的
   let sliced = text.slice(0, Math.floor(AGENTS_MAX_TOKENS * 1.5))
   if (estimateTextTokens(sliced) > AGENTS_MAX_TOKENS) sliced = sliced.slice(0, AGENTS_MAX_TOKENS)
-  return `${sliced}\n\n<!-- ⚠ AGENTS.md 超过 ${AGENTS_MAX_TOKENS} token 上限，此处已截断。请精简——常驻区每轮全价，砍下来的内容可拆进 .simple-code/notes/ -->`
+  return `${sliced}\n\n<!-- ⚠ ${file} 超过 ${AGENTS_MAX_TOKENS} token 上限，此处已截断。请精简——常驻区每轮全价，砍下来的内容可拆进 .simple-code/notes/ -->`
 }
 
-async function readAgentsFile(root: string): Promise<string | null> {
+/** 读不到 = null（可选文件缺失静默跳过，CLAUDE.md §1.2） */
+async function readAgentsFile(path: string): Promise<string | null> {
   try {
-    return await readFile(join(root, 'AGENTS.md'), 'utf8')
+    return await readFile(path, 'utf8')
   } catch {
     return null
   }
@@ -1423,18 +1676,21 @@ async function readAgentsFile(root: string): Promise<string | null> {
  * 挤出索引的不删，list 全量可查。
  */
 async function readNotesIndex(root: string): Promise<string | null> {
-  const cards = listNoteCards(root)
+  const total = listNoteCards(root).length
+  // 作废的（status: superseded）不常驻，只在 list/search 里
+  const cards = activeNoteCards(root)
   if (cards.length === 0) return null
   const lines = cards
     .slice(0, NOTES_INDEX_LIMIT)
     .map((c) => `- ${c.name}${c.description ? ` — ${c.description}` : ''}`)
-  const rest = cards.length - NOTES_INDEX_LIMIT
-  if (rest > 0) lines.push(`- （另有 ${rest} 条较旧未入索引："$SIMPLE_CODE_NOTE" list 全量可查）`)
+  const rest = total - lines.length
+  if (rest > 0) lines.push(`- （另有 ${rest} 条较旧或已作废未入索引："$SIMPLE_CODE_NOTE" list 全量可查）`)
   return lines.join('\n')
 }
 
 /**
- * system prompt = 内建段（一句话 + 产品工具约定，见 toolRules）+ 项目的 AGENTS.md。
+ * system prompt = 内建段（一句话 + 产品工具约定，见 toolRules）+ 用户级
+ * ~/.simple-code/AGENTS.md + 项目的 AGENTS.md。
  *
  * 配置里**没有** systemPrompt 字段（design.md §8）：它属于产品行为，不是
  * 用户配置项，放开了会让「模型表现不一致」变成无法排查的问题。
@@ -1446,9 +1702,8 @@ async function readNotesIndex(root: string): Promise<string | null> {
  * turn 96 用户不得不重说一遍「源码在 code external 目录下，之前告诉过你了」
  * ——那条信息其实一直写在 CLAUDE.md §8 里，只是从来没人打开过。
  *
- * **只在建会话时读一次**，改了 AGENTS.md 要重开会话才生效。
- * 刻意不做热重载：我们的 deps 只在 setModel 时重建，做热重载得改 send
- * 的结构，属于当前没有需求的复杂度（CLAUDE.md §2）。真嫌麻烦了再加。
+ * 建会话读一次，之后只在压缩点经 reloadSystem 重读（前缀不变式：非压缩点
+ * 不许改 system），改了要等下一次压缩才生效。
  *
  * 模型状态行（方案 A，2025-09）：模型切换是静默操作——UI 和 host 的状态
  * 变了，agent 侧零感知，只能从工具输出倒推（view_image 的转述前缀曾
@@ -1459,6 +1714,8 @@ async function readNotesIndex(root: string): Promise<string | null> {
 const systemPrompt = (
   root: string,
   agents: string | null,
+  /** 用户级 ~/.simple-code/AGENTS.md（全局 settings.json 同目录）。null = 不进段 */
+  userAgents: string | null,
   notes: string | null,
   /** 事件档案名称索引（proposals/events.md）。null = 空库不进段 */
   events: string | null,
@@ -1492,16 +1749,23 @@ const systemPrompt = (
         ? '不支持图片：view_image 返回视觉副模型的文字转述，原图只存档。\n'
         : '不支持图片：view_image 只返回图片的格式与字节数。\n') +
     `需要了解或修改项目时，用 bash 工具执行命令。${contextRules(env)}${growthRules(lessons, env)}${toolRules(env)}${modelRules(env)}`
-  // notes 段独立于 AGENTS.md——没有约定文件的项目照样可以记笔记
+  // 用户级在前、项目级在后，冲突以项目级为准（2026-09-29 拍板，三家同款
+  // 叠放）。notes 段独立于 AGENTS.md——没有约定文件的项目照样可以记笔记
+  const withUser =
+    userAgents === null
+      ? base
+      : `${base}\n\n以下是用户的个人约定（所有项目通用），来自 ~/.simple-code/AGENTS.md；与下面的项目约定冲突时以项目约定为准，与上面的内建段冲突时以内建段为准（发现冲突时告诉用户是哪两句）：\n\n${userAgents}`
   const withAgents =
-    agents === null ? base : `${base}\n\n以下是本项目的约定，来自 AGENTS.md：\n\n${agents}`
+    agents === null
+      ? withUser
+      : `${withUser}\n\n以下是本项目的约定，来自 AGENTS.md；与上面的内建段冲突时以内建段为准（发现冲突时告诉用户是哪两句）：\n\n${agents}`
   // notes / events 各自独立成段：notes 为 null 就只跳过 notes 段，**不该连
   // events 段一起吞掉**——原来的提前 return 把两段串成了依赖链，有事件没
   // 笔记的项目事件索引永远进不了 system prompt，还不报错
   const withNotes =
     notes === null
       ? withAgents
-      : `${withAgents}\n\n## notes 索引（相关的读正文："$SIMPLE_CODE_NOTE" read <name>；新结论当场写：write；改：同名 write 整条重写或 "$SIMPLE_CODE_APPLY_PATCH" 局部改）：\n\n${notes}`
+      : `${withAgents}\n\n## notes 索引（相关的读正文："$SIMPLE_CODE_NOTE" read <name>；新结论当场写：write；改："$SIMPLE_CODE_APPLY_PATCH" 改文件）：\n\n${notes}`
   return events === null
     ? withNotes
     : `${withNotes}\n\n## 历史事件档案（按事归档、跨摘要窗口完整；检索："$SIMPLE_CODE_EVENT" search <关键词> / read <name>）：\n\n${events}`
@@ -1532,7 +1796,7 @@ const toolRules = (env: NodeJS.ProcessEnv): string => {
   // 与 APPLY_PATCH 分工对齐：工具约定管「该用哪个」，描述管「怎么写」
   if (env.SIMPLE_CODE_LSP !== undefined)
     lines.push(
-      '- 代码符号检索优先用 "$SIMPLE_CODE_LSP"（查引用/看文件结构时优先于 grep——grep 找字符串会漏同名遮蔽，' +
+      '- 重命名、改签名前查全部引用用 "$SIMPLE_CODE_LSP" refs（按符号查，grep 按字符串会混进同名、漏掉遮蔽；' +
         '语言无关，TS/Java/Python 只要宿主有语言服务就通；命令格式在 bash 工具描述里）。',
     )
   // LESSON/NOTE 行（2026-09-17 v2 拍板）：read 入口从经验沉淀节挪来——分工
@@ -1572,7 +1836,7 @@ const contextRules = (env: NodeJS.ProcessEnv): string => {
     // 「未完成」、做完的记录落在新份（turn-700 误报熔断未修的教训：引用旧份
     // 的快照当现状）。警示无条件在场：不依赖检索工具，git/notes 是盘上事实
     '摘要按 step 窗口压缩，横跨边界的事会分进两份——旧摘要的「未完成/待办」是窗口结束时的快照，不是现状；凡「做没做过/改没改过」的结论，以 git、notes 与 events 为准，别引用摘要下结论。' +
-    '也因此，重要的决策、约定、路径应写进文件（AGENTS.md、代码注释、commit message）——对话会衰减，文件不会。' +
+    '也因此，重要的决策、约定、路径应写进文件（本项目的约定写项目根 AGENTS.md；跨项目通用的个人约定写 ~/.simple-code/AGENTS.md；代码注释、commit message）——对话会衰减，文件不会。' +
     // 上提自 AGENTS.md（t884 拍板）：这两条是产品前提不是用户偏好——原文
     // 全量落盘、捞得回来，所以不必处处加保险，也因此核实的代价很低。合成
     // 一段是因为共享同一个前提；写成动作而非态度是因为态度版在 AGENTS.md
@@ -1588,11 +1852,17 @@ const contextRules = (env: NodeJS.ProcessEnv): string => {
     // 「发生过什么」，skill 回答「该怎么做」——不知道怎么做也是不确定的
     // 常见形态，查一次比瞎做便宜
     '碰到不确定的事按此顺序求证：先查记忆（memory 的 turns、note、event、lesson——之前怎么做的、定过什么、吃过的亏）与 skill（该怎么做），再看代码与 git log（现在是什么样、怎么变成这样的）；两步都过仍无法确定的，停下来问用户，不要用猜测填补。' +
+    // 方案检索（2026-10-09 websearch ${ENV} 事故）：求证链的入口是「碰到
+    // 不确定的事」，而自信的误判不产生不确定感，条件句拦不住（09-23 注释
+    // 「想不起来的人没有模糊感」的另一半）。不列领域清单——事故的领域
+    // 词表只是本仓的病历，产品段只写对所有项目成立的形状：动手前拿方案
+    // 自己的名词检索，撞的是用户自己项目的经验库，代价一次检索
+    '有方案要动手前，先拿方案里的名词（工具名、文件名、机制词）搜一遍教训与 note——这类误判恰恰发生在自信时，与确信与否无关。' +
     // 常驻清单（t885 用户提出）：模型只有读了本仓源码才知道「AGENTS.md 每轮
     // 全价」——换个目录就不知道自己在花钱，会往 AGENTS.md 猛写、把该记 note
     // 的塞进常驻区。只写「谁常驻/谁不常驻」的相对关系，不写 2048/30 条这类
     // 参数：数字会变，写进 prompt 就是第二处真相，细节归 DOC（§1 常驻层）
-    '常驻上下文（每轮全价重发）：内建段 + AGENTS.md 全文 + notes/教训/事件的索引行；各类正文只在你主动 read 时才进上下文。放不进 AGENTS.md 的内容拆进 notes，别硬塞常驻区。' +
+    '常驻上下文（每轮全价重发）：内建段 + 两份 AGENTS.md 全文 + notes/教训/事件的索引行；各类正文只在你主动 read 时才进上下文。放不进 AGENTS.md 的内容拆进 notes，别硬塞常驻区。' +
     // 〔recall〕线索行（recall 提案 §5）：装配期机械贴在用户消息后的碰撞
     // 结果。不说明的话模型会把它当用户的话或权威指令——它是证据不是结论
     '用户消息尾部可能出现〔recall〕行：系统按词面撞出的记忆线索，撞到≠相关——真相关就顺着 read/search 下钻，不相关直接忽略，不要复述它。'
@@ -1621,7 +1891,7 @@ const growthRules = (lessons: string | null, env: NodeJS.ProcessEnv): string =>
   '用户 `~/.simple-code/skills/<name>/SKILL.md`（同名时用户级覆盖项目级），' +
   '目录名即名字，按 SKILL.md 内容执行；改项目级 SKILL.md 走 "$SIMPLE_CODE_APPLY_PATCH"，用户级写走 bash 审批。\n' +
   '③note：结论记忆（决策/约定/一次性事实）。' +
-  '重要的结论当场 `write` 记一条（name/title/description/正文，一笔记一事，读法见工具约定），' +
+  '重要的结论当场 `write` 记一条（一笔记一事，格式与读法见工具约定），' +
   '别指望对话衰减后还记得。\n' +
   // 常驻推论（t885）：①的 name、③的 description 是索引行，每轮全价重发；
   // 正文只在 read 时才进。模型不知道这个落差时会把力气花在正文、把
@@ -1663,3 +1933,10 @@ async function* finallyDo<T>(source: AsyncIterable<T>, cleanup: () => void): Asy
     cleanup()
   }
 }
+
+/** 历史末条就是这条用户消息（原话、同图）——续接时原话重发不再追加 */
+function sameAsLastUser(messages: readonly Message[], message: Message): boolean {
+  const last = messages.at(-1)
+  return last?.role === 'user' && JSON.stringify(last.parts) === JSON.stringify(message.parts)
+}
+

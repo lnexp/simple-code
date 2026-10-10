@@ -36,6 +36,7 @@ export interface PatchChunk {
   removed: number
 }
 
+/** line 是 1 起算的真实行号（lines[i] 传 i + 1） */
 const fail = (line: number, msg: string): never => {
   throw new Error(`补丁第 ${line} 行：${msg}`)
 }
@@ -52,7 +53,7 @@ export function parsePatch(raw: string): PatchHunk[] {
   if (lines[0]?.trim() !== BEGIN) fail(1, `补丁必须以 ${BEGIN} 开头`)
   const last = lines[lines.length - 1]?.trim()
   if (last === '' && lines[lines.length - 2]?.trim() !== END) {
-    fail(lines.length, `补丁必须以 ${END} 结尾`)
+    fail(lines.length - 1, `补丁必须以 ${END} 结尾`)
   }
   if (last !== '' && last !== END) fail(lines.length, `补丁必须以 ${END} 结尾`)
   const endIdx = last === '' ? lines.length - 2 : lines.length - 1
@@ -93,7 +94,7 @@ export function parsePatch(raw: string): PatchHunk[] {
     if (add) {
       if (line.startsWith('+')) add.lines.push(line.slice(1))
       else if (line === '') add.lines.push('')
-      else fail(i, `Add File 的内容行必须以 + 开头（收到了「${line.slice(0, 40)}」）`)
+      else fail(i + 1, `Add File 的内容行必须以 + 开头（收到了「${line.slice(0, 40)}」）`)
       continue
     }
     if (upd) {
@@ -104,14 +105,14 @@ export function parsePatch(raw: string): PatchHunk[] {
       if (line.trim() === '@@' || line.startsWith('@@ ')) {
         flushChunk()
         chunk = { context: [], oldLines: [], newLines: [], endOfFile: false, added: 0, removed: 0 }
-        chunkLineNo = i
+        chunkLineNo = i + 1
         const ctx = line.slice(2).trim()
         if (ctx !== '') chunk.context.push(ctx)
         continue
       }
       if (line.trim() === EOF_MARK) {
         // 不用「if (!chunk) fail()」——TS 的 never-call 不在条件分支里做 narrowing
-        if (chunk === null) fail(i, `${EOF_MARK} 只能出现在 @@ chunk 内`)
+        if (chunk === null) fail(i + 1, `${EOF_MARK} 只能出现在 @@ chunk 内`)
         else {
           chunk.endOfFile = true
           flushChunk()
@@ -120,7 +121,17 @@ export function parsePatch(raw: string): PatchHunk[] {
       }
       if (chunk === null) {
         chunk = { context: [], oldLines: [], newLines: [], endOfFile: false, added: 0, removed: 0 }
-        chunkLineNo = i
+        chunkLineNo = i + 1
+      }
+      // 标记形的行（中间的 End Patch、多写的 Begin Patch）不走 lenient 收成
+      // 上下文——收进去会报「找不到要替换的行（第 1 行是…）」，而第 1 行明明
+      // 在文件里（2026-09-30 实案）。合法标记 Move to / End of File 已在上面处理
+      if (line.startsWith('*** ')) {
+        fail(
+          i + 1,
+          `update 里出现「${line.trim()}」——一个补丁只有一对 Begin/End，` +
+            `多个文件在同一对里接着写 *** Update File`,
+        )
       }
       if (line.startsWith('+')) {
         chunk.newLines.push(line.slice(1))

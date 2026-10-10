@@ -10,16 +10,20 @@
  *   "$SIMPLE_CODE_SKILL" search <关键词> # name+SKILL.md 全文命中（用户级遮蔽语义同 list）
  */
 import { listSkills, readSkill, searchSkills } from '@simple-code/core/src/tools/skill.ts'
+import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts'
+
+// 工作区根：cwd 可能是子目录（workspace-root.ts）
+const root = findWorkspaceRoot(process.cwd())
 
 const [, , sub, target] = process.argv
 
 try {
   if (sub === 'list') {
-    console.log(listSkills(process.cwd()).join('\n'))
+    console.log(listSkills(root).join('\n'))
   } else if (sub === 'search' && target) {
-    console.log(searchSkills(process.cwd(), target))
+    console.log(searchSkills(root, target))
   } else if (sub === 'read' && target) {
-    console.log(readSkill(process.cwd(), target))
+    console.log(readSkill(root, target))
   } else {
     console.log('用法：skill list | skill read <name> | skill search <关键词>（编辑走 "$SIMPLE_CODE_APPLY_PATCH"；用户级 ~/.simple-code 写走 bash 保留审批）')
     process.exitCode = sub === 'help' ? 0 : 1

@@ -7,9 +7,10 @@
  *   "$SIMPLE_CODE_MCP" tools <server>           工具清单（名字/描述/schema）
  *   "$SIMPLE_CODE_MCP" <server> <tool> '<json>' 调用，结果写 stdout
  *
- * server 配置在 ~/.simple-code/settings.json 的 mcp.servers；凭证在
- * server 子进程的 env 里，不进模型上下文。审批按 bash 命令前缀，
- * `mcp <server> [tool]` 可逐级放行。
+ * server 配置在 ~/.simple-code/mcp.json（2026-09-27 移出 settings.json，
+ * 形状同原 mcp 段：{ "servers": { ... } }，只认用户级——项目级不开放，
+ * 克隆的仓库不能借配置塞可执行命令）；凭证在 server 子进程的 env 里，
+ * 不进模型上下文。审批按 bash 命令前缀，`mcp <server> [tool]` 可逐级放行。
  *
  * unix 语义同 webfetch-bin：正文 stdout、错误 stderr、isError → 非零 exit。
  */
@@ -19,23 +20,23 @@ import {
   callMcpTool,
   type McpServers,
 } from '@simple-code/core/src/tools/mcp.ts'
-import { GLOBAL_CONFIG_PATH } from '@simple-code/core/src/config/load.ts'
+import { MCP_CONFIG_PATH } from '@simple-code/core/src/config/load.ts'
 import { describeError } from '@simple-code/core/src/tools/describe.ts'
 
-/** 只取 settings 的 mcp 段，读不到 = 没配置，正常情况（同 websearch-bin） */
+/** 读 mcp.json 的 servers 段，读不到 = 没配置，正常情况（同 websearch-bin） */
 async function mcpServers(): Promise<McpServers> {
   try {
-    const parsed = JSON.parse(await readFile(GLOBAL_CONFIG_PATH, 'utf8')) as {
-      mcp?: { servers?: McpServers }
+    const parsed = JSON.parse(await readFile(MCP_CONFIG_PATH, 'utf8')) as {
+      servers?: McpServers
     }
-    return parsed.mcp?.servers ?? {}
+    return parsed.servers ?? {}
   } catch {
     return {}
   }
 }
 
 const USAGE = `用法：mcp list | mcp tools <server> | mcp <server> <tool> [json参数]
-list   列 settings.json 里配置的 MCP servers
+list   列 mcp.json 里配置的 MCP servers
 tools  列某 server 的工具（名字、描述、参数 schema）
 调用   mcp <server> <tool> '{"key":"value"}'，结果文本写 stdout`
 
@@ -52,8 +53,8 @@ if (argv[0] === '--help' || argv[0] === '-h' || argv.length === 0) {
   const names = Object.keys(servers)
   if (names.length === 0) {
     process.stdout.write(
-      'settings.json 还没配 mcp.servers。示例：\n' +
-        '"mcp": { "servers": { "github": { "command": "npx", ' +
+      '~/.simple-code/mcp.json 还没配 servers。示例：\n' +
+        '{ "servers": { "github": { "command": "npx", ' +
         '"args": ["-y", "@modelcontextprotocol/server-github"] } } }\n',
     )
   } else {

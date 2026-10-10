@@ -182,3 +182,58 @@ describe('裁剪幂等', () => {
     expect(unloadMessage(legacy, OPTS)).toEqual(legacy)
   })
 })
+
+describe('输出留头 + 留尾（2026-09-28 方案 C：命令 200 / 输出头 100 + 尾 100）', () => {
+  const C: ClipOptions = { threshold: 0, keepHeadChars: 200, outputHeadChars: 100, outputTailChars: 100, archive: ARCHIVE }
+  // 真实形状：开头是无关报错，结论在最后一行（本项目 t16495「类型检查与相关测试」）
+  const testRun = [
+    "error TS5058: The specified path does not exist: 'packages/vscode/webview/tsconfig.json'.",
+    ...Array.from({ length: 30 }, (_, i) => `  ✓ case ${i} passed in 3ms`),
+    ' Test Files  1 failed | 33 passed (34)',
+    '      Tests  1 failed | 424 passed (425)',
+    '',
+  ].join('\n')
+
+  it('尾部结论保住，头部开头保住，中间省略并注明字数', () => {
+    const out = outputOf(unloadMessage(toolResult(testRun), C))
+    expect(out).toContain('error TS5058') // 头
+    expect(out).toContain('1 failed | 424 passed (425)') // 尾：只留头时会被裁掉的那句
+    expect(out).not.toContain('case 10 passed') // 中间确实省了
+    expect(out).toMatch(/# …（省略 \d+ 字符）…/)
+    expect(out.length).toBeLessThan(testRun.length)
+  })
+
+  it('**通知仍在末尾**：isStubbed 认得出、再裁一遍原样返回（幂等）', () => {
+    const once = unloadMessage(toolResult(testRun), C)
+    expect(outputOf(once).endsWith(`# [已卸载，完整内容见 ${ARCHIVE}]`)).toBe(true)
+    expect(unloadMessage(once, C)).toEqual(once)
+  })
+
+  it('两端对齐行边界：头不留半行、尾不以半行开头', () => {
+    const out = outputOf(unloadMessage(toolResult(testRun), C))
+    const [head, rest] = out.split(/\n# …（省略 \d+ 字符）…\n/)
+    expect(testRun.split('\n')).toContain(head?.split('\n').at(-1))
+    const tailFirstLine = rest?.split('\n')[0]
+    expect(testRun.split('\n')).toContain(tailFirstLine)
+  })
+
+  it('阈值 0 也不做赔本买卖：裁完不比原文短就原样留着', () => {
+    const short = 'x'.repeat(150)
+    expect(outputOf(unloadMessage(toolResult(short), C))).toBe(short)
+  })
+
+  it('命令只留头 200，不留尾（heredoc 的尾巴是终止符，留了诱导续写）', () => {
+    const cmd = `cd /repo && python3 - <<'EOF'\n${Array.from({ length: 40 }, (_, i) => `print(${i})`).join('\n')}\nEOF`
+    const out = commandOf(unloadMessage(toolCall(cmd), C))
+    expect(out.startsWith("cd /repo && python3 - <<'EOF'")).toBe(true)
+    expect(out).not.toContain('print(39)')
+    expect(out).not.toContain('省略')
+    expect(out.length).toBeLessThan(260)
+  })
+
+  it('没配头尾时退回只留头（旧行为，测试夹具与旧配置不受影响）', () => {
+    const out = outputOf(unloadMessage(toolResult(testRun), { threshold: 0, keepHeadChars: 100, archive: ARCHIVE }))
+    expect(out).not.toContain('424 passed')
+    expect(out).not.toContain('省略')
+  })
+})

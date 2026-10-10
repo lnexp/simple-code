@@ -10,7 +10,7 @@ import type { RegionsInfo } from '../src/protocol.ts'
  * 交互就三条：Esc 关、点遮罩关、点条目无操作。
  */
 export function ContextPanel({
-  info,
+  info: raw,
   pending,
   onClose,
 }: {
@@ -27,6 +27,7 @@ export function ContextPanel({
     return () => document.removeEventListener('keydown', onKey)
   }, [onClose])
 
+  const info = raw && calibrate(raw)
   const body =
     info === null ? (
       <div className="ctx-empty">{pending ? '取数中…' : '还没有记录——跑一轮对话后可看'}</div>
@@ -36,6 +37,7 @@ export function ContextPanel({
           <div className="ctx-title">上下文分析</div>
           <div className="ctx-sub">
             {fmtTok(info.contextWindow)} 窗口 · 用 <b>{pct(usedOf(info), info.contextWindow)}</b>
+            {raw && !isCalibrated(raw) && '（估算）'}
             <span className="ctx-at">{fmtAt(info.at)}</span>
           </div>
         </div>
@@ -55,7 +57,6 @@ export function ContextPanel({
             <div className="ctx-row" key={r.label}>
               <i className="ctx-dot" style={{ background: r.color }} />
               <span className="ctx-label">{r.label}</span>
-              <span className="ctx-range">{r.range}</span>
               <span className="ctx-num">{fmtTok(r.tokens)}</span>
               <span className="ctx-pct">{r.pctText}</span>
             </div>
@@ -82,7 +83,6 @@ type Row = {
   tokens: number
   pct: number
   pctText: string
-  range: string
   /** 色点/堆叠段的颜色。**全部走 VS Code 图表色变量**，换主题自动跟随
    *  （style.ts 顶部的硬规则）；回落色只在变量缺失时生效 */
   color: string
@@ -90,32 +90,25 @@ type Row = {
 
 function rowsOf(info: RegionsInfo): Row[] {
   const w = info.contextWindow
-  const row = (label: string, tokens: number, color: string, range = ''): Row => ({
+  const row = (label: string, tokens: number, color: string): Row => ({
     label,
     tokens,
     pct: (tokens / w) * 100,
     pctText: `${((tokens / w) * 100).toFixed(1)}%`,
-    range,
     color,
   })
-  // 范围列：step 闭区间，纯数字（用户拍板：不要条数、不要单位字样）。
-  // 摘要的 covers 是「顶替掉的 step」，live 三类是「消息所在 step」，
-  // 同一 step 轴；未卸载/已卸载区间重叠是语义使然（同一 live 段两种状态）
-  const fmtRange = (x: { from: number; to: number } | null | undefined) =>
-    !x ? '' : x.from === x.to ? `${x.from}` : `${x.from}–${x.to}`
   const used = usedOf(info)
   const idle = Math.max(w - used, 0)
-  const g = info.ranges
   return [
-    row('system+tools', info.overhead, 'var(--vscode-descriptionForeground, #8a8a8a)', '0'),
-    row('冷区', info.cold, 'var(--vscode-charts-blue, #3794ff)', fmtRange(g?.cold)),
-    row('温区', info.warm, 'var(--vscode-charts-purple, #b180d7)', fmtRange(g?.warm)),
-    row('热区', info.hot, 'var(--vscode-charts-orange, #d18616)', fmtRange(g?.hot)),
-    row('已卸载', info.stub, 'var(--vscode-charts-yellow, #cca700)', fmtRange(g?.stub)),
-    row('未卸载', info.live, 'var(--vscode-charts-green, #89d185)', fmtRange(g?.live)),
+    row('system+tools', info.overhead, 'var(--vscode-descriptionForeground, #8a8a8a)'),
+    row('冷区', info.cold, 'var(--vscode-charts-blue, #3794ff)'),
+    row('温区', info.warm, 'var(--vscode-charts-purple, #b180d7)'),
+    row('热区', info.hot, 'var(--vscode-charts-orange, #d18616)'),
+    row('已卸载', info.stub, 'var(--vscode-charts-yellow, #cca700)'),
+    row('未卸载', info.live, 'var(--vscode-charts-green, #89d185)'),
     // 不可卸与未卸载同属「原文」，配同族色：绿混蓝得青，既区分又不割裂。
     // 直接用 charts-foreground 会撞上 system+tools 的灰（实测近白）
-    row('不可卸', info.floor, 'var(--ctx-teal)', fmtRange(g?.floor)),
+    row('不可卸', info.floor, 'var(--ctx-teal)'),
     // 输出预留用粉而不是正红：红在这套 UI 里是「停止/报警」，预留是常态
     row('输出预留', info.maxTokens, 'var(--ctx-pink)'),
     row('空闲', idle, 'var(--ctx-idle)'),
@@ -124,6 +117,29 @@ function rowsOf(info: RegionsInfo): Row[] {
 
 const usedOf = (info: RegionsInfo): number =>
   info.overhead + info.cold + info.warm + info.hot + info.stub + info.floor + info.live + info.maxTokens
+
+const REGION_KEYS = ['overhead', 'cold', 'warm', 'hot', 'stub', 'floor', 'live'] as const
+const estimateOf = (info: RegionsInfo): number => REGION_KEYS.reduce((sum, key) => sum + info[key], 0)
+
+/**
+ * 各区按真实 usage 同比例缩放（2026-09-29 拍板）。估算器是字符密度法，
+ * 各家模型切分不同，怎么调都校不准；usage 是这个模型对这一份请求的真账，
+ * 只是不分区——所以总量取 usage、比例取估算。输出预留是配置值，不缩
+ */
+export function calibrate(info: RegionsInfo): RegionsInfo {
+  const est = estimateOf(info)
+  if (info.real === null || est <= 0) return info
+  const k = info.real / est
+  const out = { ...info }
+  for (const key of REGION_KEYS) out[key] = info[key] * k
+  return out
+}
+
+/**
+ * 只在**没校准**时标「（估算）」（2026-09-29 拍板方案 2）：平时校准过是常态，
+ * 不占位置；失败的尝试、渠道不报 usage、老记录才退回估算，数字偏小，提示一下
+ */
+const isCalibrated = (raw: RegionsInfo): boolean => raw.real !== null && estimateOf(raw) > 0
 
 const pct = (used: number, window_: number): string => `${((used / window_) * 100).toFixed(1)}%`
 

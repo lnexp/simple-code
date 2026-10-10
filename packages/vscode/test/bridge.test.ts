@@ -177,6 +177,7 @@ function harness(
     setTimer?: SetTimer
     delayMs?: number
     saved?: SavedChoice
+    onTurnEnd?: () => void
   } = {},
 ) {
   const posted: ToWebview[] = []
@@ -220,6 +221,7 @@ function harness(
     saveChoice: store.saveChoice,
     clearChoice: store.clearChoice,
     ...(extra.setTimer ? { setTimer: extra.setTimer } : {}),
+    ...(extra.onTurnEnd ? { onTurnEnd: extra.onTurnEnd } : {}),
   })
   return { bridge, posted, opened, openedFiles, store, getApproval: () => capturedApproval, ...fake }
 }
@@ -1156,6 +1158,38 @@ describe('会话延续 > 关开竞态', () => {
     // 只断言「各自发生过」的话，乱序也能绿
     expect(timeline).toEqual(['create1', 'close1', 'create2'])
   })
+
+  it('close 带上来源：detach / reload / dispose（session_close 靠它分辨谁关的）', async () => {
+    // 2026-09-30：一刻钟里主会话关了 4 次，runlog 只有 session_close 没来源，
+    // 靠查 settings.json mtime 排除法才定到 detach
+    const sources: unknown[] = []
+    const factory = async (): Promise<Session> =>
+      ({
+        ...fakeSession().session,
+        close: async (source?: string) => {
+          sources.push(source)
+        },
+      }) as unknown as Session
+    const bridge = createBridge({
+      post: () => {},
+      session: factory,
+      taskSession: async () => {
+        throw new Error('本用例不测任务')
+      },
+      folder: '/tmp/x',
+      openExternal: async () => true,
+      openFile: async () => {},
+      savedChoice: () => null,
+      saveChoice: () => {},
+    })
+    for (const act of [() => bridge.detach(), () => bridge.requestReload(), () => bridge.dispose()]) {
+      bridge.handle({ type: 'ready' })
+      await settle()
+      act()
+      await settle()
+    }
+    expect(sources).toEqual(['detach', 'reload', 'dispose'])
+  })
 })
 
 // ── 审批中枢（approval.md §4.2）────────────────────────────────
@@ -1174,6 +1208,23 @@ describe('审批中枢', () => {
     h.bridge.handle({ type: 'approval_reply', id: 1, choice: 'allow' })
     await expect(p).resolves.toBe('allow')
     expect(h.posted.at(-1)).toEqual({ type: 'approval_closed', id: 1 })
+  })
+
+  it('挂卡通知时数已经加上：onTurnEnd 那一刻 pendingApprovals()=1（角标数据源）', async () => {
+    // 2026-09-30 真机：后台目录弹卡，标签角标迟迟不亮。router 的 onTurnEnd
+    // 就是 postFolders，同步读 pendingApprovals()——原来先通知后 set，读到 0，
+    // 要等下一次别的原因（轮结束/任务快照/切目录）重推才亮
+    const seen: number[] = []
+    let h: ReturnType<typeof harness> | undefined
+    h = harness({}, { onTurnEnd: () => seen.push(h!.bridge.pendingApprovals()) })
+    h.bridge.handle({ type: 'ready' })
+    await settle(); await settle(); await settle()
+    const p = h.getApproval()!({ command: 'cat ~/.ssh/id_rsa', toolCallId: 'tu_1', category: 'external_dir', detail: '~/.ssh/id_rsa', reason: 'r' })
+    await settle()
+    expect(seen.at(-1)).toBe(1)
+    h.bridge.handle({ type: 'approval_reply', id: 1, choice: 'allow' })
+    await p
+    expect(seen.at(-1)).toBe(0) // 关卡灭（对照：这一侧原本就对）
   })
 
   it('开关关掉：秒回 allow，不推气泡', async () => {
@@ -1295,7 +1346,7 @@ describe('settings 热重载（requestReload）', () => {
 })
 
 describe('插话镜像', () => {
-  it('**轮内插话不顶掉第一条 user 气泡**（ai-legal-advisor turn-822 回归）', async () => {
+  it('**轮内插话不顶掉第一条 user 气泡**（某项目 turn-822 回归）', async () => {
     // 单数 pendingUser 槽位的翻车：插话的 send 覆盖槽位，轮内重开面板
     // （attach 推镜像）只剩插话一条——第一条 user「被改写」。数组化后
     // 两条都在

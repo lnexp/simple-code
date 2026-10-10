@@ -134,6 +134,25 @@ describe('工具显示名与图标', () => {
     expect(html).not.toContain('$ls -la')
   })
 
+  it('有 desc：desc 顶替「Shell 命令」当标题，命令格照旧跟在后面（方案 C）', () => {
+    const html = render({ desc: '列出目录', command: 'ls -la /tmp/xyz' })
+    const head = html.slice(0, html.indexOf('tool-body'))
+    // desc 站标题位（界面字体、亮色、无底色），不再有「Shell 命令」
+    expect(head).toContain('<span class="tool-title">列出目录</span>')
+    expect(head).not.toContain('Shell 命令')
+    // 命令格原样（code 底色、单行截断）跟在后面
+    expect(head).toContain('<code class="tool-cmd">ls -la /tmp/xyz</code>')
+    // 完整命令仍在展开区
+    expect(html).toContain('class="tool-cmd-full"')
+    expect(html.slice(html.indexOf('tool-body'))).toContain('ls -la /tmp/xyz')
+  })
+
+  it('没 desc：标题仍是「Shell 命令」，命令格不变（旧历史/其他工具）', () => {
+    const head = render({ desc: '' }).split('tool-body')[0] ?? ''
+    expect(head).toContain('<span class="tool-title">Shell 命令</span>')
+    expect(head).toContain('<code class="tool-cmd">ls -la</code>')
+  })
+
   it('**未知工具兜底显示原始名**，不是空白', () => {
     // core 加了新工具而这里忘了加映射时，宁可显示 `grep` 也不能显示空行
     const html = render({ name: 'grep', command: 'grep -rn foo' })
@@ -204,7 +223,7 @@ describe('审批卡挂在工具行下方（approval.md §4.2 位置 + 样式）'
         approval: {
           ...approval,
           category: 'multi' as const,
-          always: { kind: 'paths', dirs: ['/Users/x/knowledge-base', '/Users/x/mb-inference'] },
+          always: { kind: 'paths', dirs: ['/Users/x/proj-a', '/Users/x/proj-b'] },
         },
         onReply: () => {},
       }),
@@ -212,7 +231,7 @@ describe('审批卡挂在工具行下方（approval.md §4.2 位置 + 样式）'
     // 按钮文案带数量（区别于单目录的「始终允许」）
     expect(out).toContain('始终允许这 2 个目录')
     // 预览列出会记什么：每个目录的 /* 形态
-    expect(out).toContain('/Users/x/knowledge-base/*、/Users/x/mb-inference/*')
+    expect(out).toContain('/Users/x/proj-a/*、/Users/x/proj-b/*')
   })
 })
 

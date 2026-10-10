@@ -1,8 +1,8 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent } from '../src/events.ts'
 import type { Message, Request, Usage } from '../src/llm/types.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
@@ -22,19 +22,19 @@ afterEach(async () => {
 
 const KEY = 'sk-SENTINEL-merge-e2e'
 
-const usage = (): Usage => ({
-  inputTokens: 1,
+const usage = (inputTokens = 1): Usage => ({
+  inputTokens,
   outputTokens: 1,
   cacheCreationInputTokens: 0,
   cacheReadInputTokens: 0,
   reasoningTokens: 0,
 })
 
-const says = (text: string): StreamEvent[] => [
+const says = (text: string, inputTokens = 1): StreamEvent[] => [
   { type: 'text_start' },
   { type: 'text_delta', text },
   { type: 'text_end' },
-  { type: 'finish', reason: 'stop', usage: usage() },
+  { type: 'finish', reason: 'stop', usage: usage(inputTokens) },
 ]
 
 /** 带 tool 往复的一轮：大 command（卸载时可裁成存根）+ isError result。
@@ -81,7 +81,7 @@ const CONFIG = {
   // unload.test.ts 里测
   memory: {
     unloadTargetRatio: 0.001,
-        stubTurns: 1,
+        stubSteps: 1,
     keepHeadChars: 40,
     mergeFactor: 2,
     idleSummarizeDelayMs: 0,
@@ -135,7 +135,9 @@ const smartFetch = (l0Text: string, mergeText: string) =>
       : typeof body.system === 'string'
         ? body.system
         : ''
-    const text = system.includes('索引') ? mergeText : l0Text
+    // 「索引目录」是 MERGE_SYSTEM 独有的。原来只认「索引」，会撞上 L0_SYSTEM 的
+    // 「写索引条目」——L0 也回 mergeText，「L0 文本不出现」一类断言因此空转
+    const text = system.includes('索引目录') ? mergeText : l0Text
     return new Response(
       new ReadableStream<Uint8Array>({
         start(c) {
@@ -258,20 +260,23 @@ describe('合并端到端', () => {
 
     const afterRestart = textOf(rec2.sent.at(-1)?.messages)
     expect(afterRestart).toContain('L1【索引】')
-    expect(afterRestart).not.toContain('L0：读了文件')
     const after = rowsOf(dir)
     expect(after.find((r) => r.level === 1)?.inContext).toBe(true)
     const stillActive = after.filter((r) => r.level === 0 && r.inContext)
     for (const m of members) {
       expect(stillActive.map((r) => r.id)).not.toContain(m.id)
     }
+    // 成员的 L0 文本被 L1 顶替；**不是成员的**生效 L0 照常渲染（本例 1 条）——
+    // 所以数次数而不是断言不出现
+    expect(stillActive.length).toBeGreaterThanOrEqual(1)
+    expect(afterRestart.split('L0：读了文件').length - 1).toBe(stillActive.length)
   })
 
   it('**级联：分批生效的 L0 先合成 L1a，下一批合成 L1b 时级联出 L2**', async () => {
     const { dir, globalPath } = await workspace({
       memory: {
         unloadTargetRatio: 0.001,
-        stubTurns: 1,
+        stubSteps: 1,
         keepHeadChars: 10,
         clipThresholdChars: 0,
         // 三级递进（2026-09-12）：L0 进场由存根段水位驱动。夹具消息小，
@@ -350,8 +355,6 @@ describe('合并端到端', () => {
     }
 
     const rows = rowsOf(dir)
-    const steps = new (require('node:sqlite').DatabaseSync)(join(dir, '.simple-code/memory/state.db'), { readOnly: true }).prepare('SELECT id, unloaded FROM steps ORDER BY id').all()
-    console.log('PROBE', JSON.stringify({ rows: rows.map((r) => ({ l: r.level, f: r.coversFrom, ic: r.inContext })), steps }))
     const l2 = rows.find((r) => r.level === 2)
     expect(l2).toBeDefined()
     expect(l2?.coversFrom).toBe(1)
@@ -369,7 +372,7 @@ describe('合并端到端', () => {
     const { dir, globalPath } = await workspace({
       memory: {
         unloadTargetRatio: 0.001,
-        stubTurns: 1,
+        stubSteps: 1,
         keepHeadChars: 40,
         clipThresholdChars: 0,
         stubTokens: 1, // 同上：水位不超线摘要不进场，对照组测不到「没合」
@@ -417,11 +420,16 @@ describe('合并端到端', () => {
    */
   const bigReply = (l: string) => `${l}${'。这段回答很长必须够长才卸得动'.repeat(40)}`
 
-  const sixTurnsThen = async (indexRatio: number) => {
+  /**
+   * inputTokens = 假响应报的真实输入：默认 1（系数夹到 0.5）；给大值时系数夹到 2；
+   * 给 0 = 拿不到 usage，系数一直是建会话时的值。seedRegions = 预先写进
+   * regions.jsonl 的行（模拟 reload 前留下的记录）
+   */
+  const sixTurnsThen = async (indexRatio: number, inputTokens = 1, seedRegions?: object, emptyMerge = false) => {
     const { dir, globalPath } = await workspace({
       memory: {
         unloadTargetRatio: 0.001,
-        stubTurns: 1,
+        stubSteps: 1,
         keepHeadChars: 40,
         clipThresholdChars: 0,
         mergeFactor: 2, // **攒得够**：老条件下这里必合
@@ -429,13 +437,18 @@ describe('合并端到端', () => {
         indexRatio,
       },
     })
-    const rec = recordingStream(Array.from({ length: 7 }, (_, i) => says(bigReply(String(i)))))
+    if (seedRegions) {
+      const mem = join(dir, '.simple-code', 'memory')
+      await mkdir(mem, { recursive: true })
+      await writeFile(join(mem, 'regions.jsonl'), `${JSON.stringify(seedRegions)}\n`, 'utf8')
+    }
+    const rec = recordingStream(Array.from({ length: 7 }, (_, i) => says(bigReply(String(i)), inputTokens)))
     const session = await getSession(dir, {
       globalPath,
       env: { TEST_KEY: KEY },
       tools: [],
       stream: rec.stream,
-      fetchImpl: smartFetch('L0：读了文件', 'L1：合并了'),
+      fetchImpl: smartFetch('L0：读了文件', emptyMerge ? '' : 'L1：合并了'),
       skipLock: true,
     })
     for (let n = 1; n <= 6; n++) await drain(session.send(`q${n}问题很短`))
@@ -464,6 +477,80 @@ describe('合并端到端', () => {
     expect(rows.every((r) => r.supersededBy === null)).toBe(true)
   })
 
+  it('**合并与压缩路径写运行日志**：合了谁/跨没跨层/合前多大/为什么停、生效几条、进场几条', async () => {
+    // 2026-09-28 补：原来只有 llm tag=merge 的耗时行，真机方案 D 多合 3 次
+    // 跨层要翻库 + 回放才看清
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      await sixTurnsThen(0.001)
+    } finally {
+      spy.mockRestore()
+    }
+    const rec = calls.find((c) => c.ev === 'merge' && c.action === 'record')
+    expect(rec).toMatchObject({ owner: null, level: 1, levels: '0,0', crossLayer: false })
+    expect(typeof rec?.index).toBe('number')
+    expect(typeof rec?.quota).toBe('number')
+    expect(typeof rec?.from).toBe('number')
+    // 停止原因必记：配额 0.5 token 永远超，停在「没有可合的组」
+    expect(calls.some((c) => c.ev === 'merge' && c.action === 'stop' && c.reason === 'no_group')).toBe(true)
+    expect(calls.some((c) => c.step === 'apply_merges_done' && typeof c.droppedSteps === 'number')).toBe(true)
+    expect(calls.some((c) => c.step === 'activate' && typeof c.entered === 'number')).toBe(true)
+    // 同一次请求的真实 usage × 面板估算记在同一行（底栏与面板对拍用）
+    const usage = calls.filter((c) => c.ev === 'llm_usage')
+    expect(usage.length).toBeGreaterThanOrEqual(7)
+    expect(usage.every((c) => typeof c.input === 'number' && typeof c.cacheRead === 'number')).toBe(true)
+    expect(usage.every((c) => typeof c.estimated === 'number' && (c.estimated as number) > 0)).toBe(true)
+  })
+
+  it('**停止行去重**：空闲 tick 反复停在同一原因、成员数没变，只记一行', async () => {
+    // 9-29 真机：约 3 秒一次 tick，16 分钟 87 行一模一样的 under_quota
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      await sixTurnsThen(0.5)
+    } finally {
+      spy.mockRestore()
+    }
+    const stops = calls.filter((c) => c.ev === 'merge' && c.action === 'stop').map((c) => `${c.reason}|${c.members}`)
+    // 前提：确实停过（否则测的是没走到合并判断）
+    expect(stops.some((s) => s.startsWith('under_quota|'))).toBe(true)
+    expect(new Set(stops).size).toBe(stops.length)
+  })
+
+  it('**合并返回空文本**：除了 llm_failed，还要记 llm_empty 带结束原因与输出 token（2026-09-29）', async () => {
+    // 9-29 某项目真机 4 次 llm_failed，llm 行没有 error、耗时约 28s——流正常
+    // 走完只是没有正文，原来的日志看不出是截断、只出了思考还是真空回
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      await sixTurnsThen(0.001, 1, undefined, true)
+    } finally {
+      spy.mockRestore()
+    }
+    expect(calls.some((c) => c.ev === 'merge' && c.reason === 'llm_failed')).toBe(true)
+    // SSE 夹具的 stop_reason=end_turn、output_tokens=4
+    expect(calls.find((c) => c.ev === 'llm_empty')).toMatchObject({
+      tag: 'merge',
+      model: 'm',
+      finish: 'stop',
+      reasoningChars: 0,
+      outputTokens: 4,
+    })
+    // 对照：正常合并不记
+    calls.length = 0
+    const spy2 = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      await sixTurnsThen(0.001)
+    } finally {
+      spy2.mockRestore()
+    }
+    expect(calls.some((c) => c.ev === 'llm_empty')).toBe(false)
+  })
+
   it('**对照：配额调到装不下，同一批叶子立刻就合**', async () => {
     // 配额 = 500×0.001 = 0.5 token，怎么都超。**只有 indexRatio 变了**
     const rows = await sixTurnsThen(0.001)
@@ -472,5 +559,35 @@ describe('合并端到端', () => {
     expect(
       rows.filter((r) => r.level === 0 && r.supersededBy !== null).length,
     ).toBeGreaterThanOrEqual(2)
+  })
+
+  it('**配额按 usage 校准**：估算装得下，但真实 usage 是估算的 2 倍以上 → 合（2026-09-29）', async () => {
+    // 与「没超配额就不合」同一个 indexRatio 0.5（配额 250，索引估算 ~155，
+    // 按估算装得下）。**只有假响应报的 usage 变了**：10 万 ≫ 估算 → 系数夹
+    // 到 2 → 配额 125 → 超了。系数不接进 mergeWhileDue 的话这里不合
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    let rows: Awaited<ReturnType<typeof sixTurnsThen>>
+    try {
+      rows = await sixTurnsThen(0.5, 100_000)
+    } finally {
+      spy.mockRestore()
+    }
+
+    expect(rows.filter((r) => r.level === 1).length).toBeGreaterThanOrEqual(1)
+    // 合并行带上系数，配额是校准后的 125
+    expect(calls.some((c) => c.ev === 'merge' && c.ratio === 2 && c.quota === 125)).toBe(true)
+  })
+
+  it('**系数跨 reload 恢复**：建会话读 regions.jsonl 本 owner 最后一行；本会话拿不到 usage 时就用它', async () => {
+    // usage 报 0 = 这个会话一直拿不到真实值，系数只能来自种子行（真实 = 估算×2）。
+    // 对照是「没超配额就不合」那条（同一个 0.5，系数 1 → 不合）
+    const seed = { at: 'x', budget: 500, owner: null, overhead: 50, cold: 0, warm: 0, hot: 0, stub: 0, floor: 25, live: 25, real: 200, ranges: null }
+    const rows = await sixTurnsThen(0.5, 0, seed)
+    expect(rows.filter((r) => r.level === 1).length).toBeGreaterThanOrEqual(1)
+    // 别人家的行不算：同一份种子挂在任务 owner 名下，主任务读不到 → 不合
+    const other = await sixTurnsThen(0.5, 0, { ...seed, owner: 'task-x' })
+    expect(other.filter((r) => r.level === 1)).toEqual([])
   })
 })

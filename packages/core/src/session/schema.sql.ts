@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS search_fts_meta (
 CREATE TABLE IF NOT EXISTS prompt_snapshot (
   owner      TEXT PRIMARY KEY,
   agents     TEXT,
+  user_agents TEXT,
   notes      TEXT,
   events     TEXT,
   lessons    TEXT,
@@ -167,6 +168,10 @@ export const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS turns_owner ON turns(owner)`,
   // 见 store.ts 的 clearLegacySummaries——一次性清空不能放这里（每次开库都跑）
   `CREATE INDEX IF NOT EXISTS messages_step ON messages(step_id)`,
+  // 用户级 ~/.simple-code/AGENTS.md（2026-09-29）。老快照这列是 NULL =
+  // 「没有用户级段」——与升级前的 system 一致，reload 后缓存照样接得上，
+  // 下一个压缩点 reloadSystem 才读进来
+  `ALTER TABLE prompt_snapshot ADD COLUMN user_agents TEXT`,
   // 一次性迁移的「跑过了」标记，一个迁移一行。
   //
   // **为什么不继续用 PRAGMA user_version**：一个单调整数扛不住两个互相独立的
@@ -191,4 +196,11 @@ export const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS messages_owner ON messages(owner)`,
   `UPDATE messages SET owner = (SELECT t.owner FROM turns t WHERE t.id = messages.turn_id)
    WHERE owner IS NULL AND turn_id IN (SELECT id FROM turns WHERE owner IS NOT NULL)`,
+  // turn 续接（docs/proposals/turn-resume.md，2026-09-29 拍板）：轮怎么结束的
+  // + 最后一次结束时刻。end_state：'done' | 'aborted' | 'error'，NULL = 老轮
+  // 或进行中，按 done 对待（不续）。ended_at 单独一列而不是 started_at +
+  // elapsed_ms：续接轮的 elapsed 是累加的干活时长，不含中间停顿，两者相加
+  // 算不出结束时刻
+  `ALTER TABLE turns ADD COLUMN end_state TEXT`,
+  `ALTER TABLE turns ADD COLUMN ended_at TEXT`,
 ]

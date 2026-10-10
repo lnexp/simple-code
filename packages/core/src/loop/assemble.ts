@@ -16,6 +16,14 @@ export type Summary = {
   coversFrom: number
   coversTo: number
   /**
+   * covers 两端所在的 turn（读库时从 steps 表带出，不落 summaries 列、不收
+   * 写入参——唯一来源是 loadSummaries，内存构造与读回渲染不会分家）。
+   * 渲染首行 `turn=` 与 cue 候选名用：模型拿 turn 号能直接 memory show，
+   * 全局 step id 什么工具都不收（2026-09-30）。缺省只出现在测试夹具
+   */
+  turnFrom?: number
+  turnTo?: number
+  /**
    * 短标题（十来个字），和 `text` 是模型一次生成的两样东西。
    *
    * 温区那一行显示「标题：描述」——标题让模型一眼扫过去就能定位，描述才
@@ -275,7 +283,13 @@ export function indexTokens(
  * ——这正是 §1.3 那种逐层衰减在本设计里产生不了的原因。
  */
 export function renderSummary(summary: Summary, body?: string): string {
-  const lines = [`${SUMMARY_TAG} step=${summary.coversFrom}-${summary.coversTo}>`]
+  // 2026-09-30 前首行是 `step=<covers_from>-<covers_to>`（全局 step id）；
+  // 之后是 turn 范围——面板范围列同日删除，这一行不再有程序读者
+  const turns =
+    summary.turnFrom === undefined || summary.turnTo === undefined
+      ? '?'
+      : `${summary.turnFrom}-${summary.turnTo}`
+  const lines = [`${SUMMARY_TAG} turn=${turns}>`]
   if (summary.head) lines.push(`开头：${summary.head}`)
   // **标题和描述同一行**，不是两行。分两行的话每条摘要多一个 `摘要：`/
   // `标题：` 的标签开销，而温区一共才 70 来 token，标签就吃掉 5%

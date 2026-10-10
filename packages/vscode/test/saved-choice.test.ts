@@ -7,25 +7,25 @@ import { asSavedChoice } from '../src/saved-choice.ts'
 describe('asSavedChoice', () => {
   it('preset 透传：存什么读回什么', () => {
     const saved = asSavedChoice({
-      provider: 'modelbest',
+      provider: 'gw',
       model: 'claude-opus-5',
-      preset: 'pulsarwave-claude',
+      preset: 'line-a',
     })
-    expect(saved).toEqual({ provider: 'modelbest', model: 'claude-opus-5', preset: 'pulsarwave-claude' })
+    expect(saved).toEqual({ provider: 'gw', model: 'claude-opus-5', preset: 'line-a' })
   })
 
   it('模型 + 档位 + 预设同时在场，全透传', () => {
     const saved = asSavedChoice({
-      provider: 'modelbest-openai',
+      provider: 'gw-openai',
       model: 'glm-5.3',
       effort: 'xhigh',
-      preset: 'sudocode',
+      preset: 'line-b',
     })
     expect(saved).toEqual({
-      provider: 'modelbest-openai',
+      provider: 'gw-openai',
       model: 'glm-5.3',
       effort: 'xhigh',
-      preset: 'sudocode',
+      preset: 'line-b',
     })
   })
 

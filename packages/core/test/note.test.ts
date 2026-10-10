@@ -1,8 +1,9 @@
-import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  activeNoteCards,
   listNoteCards,
   listNotes,
   NOTES_INDEX_LIMIT,
@@ -13,6 +14,7 @@ import {
 } from '../src/tools/note.ts'
 
 const dir = () => mkdtempSync(join(tmpdir(), 'sc-note-'))
+const readFileSyncText = (root: string, name: string) => readFileSync(join(root, '.simple-code', 'notes', `${name}.md`), 'utf8')
 
 describe('note 库', () => {
   it('write 落盘带 name/description/created 的 front matter + # 标题', () => {
@@ -43,6 +45,32 @@ describe('note 库', () => {
     const before = parseNoteMeta(readNote(root, 'a'))
     expect(before.lastRead).toBeTruthy()
     expect(before.created).toBeTruthy()
+  })
+
+  it('已有 lastRead 的再读一次也刷新（2026-09-30 修：正则没带 m，$ 只认串尾，旧值永远换不掉）', () => {
+    const root = dir()
+    mkdirSync(join(root, '.simple-code', 'notes'), { recursive: true })
+    const head = '---\nname: a\ndescription: d\ncreated: 2026-01-01 00:00:00\nlastRead: 2026-01-02 00:00:00\n---\n\n# t\n'
+    writeFileSync(join(root, '.simple-code', 'notes', 'a.md'), head, 'utf8')
+    const meta = parseNoteMeta(readNote(root, 'a'))
+    expect(meta.lastRead).not.toBe('2026-01-02 00:00:00')
+    expect(readNote(root, 'a').match(/lastRead:/g)).toHaveLength(1) // 换不是加
+  })
+
+  it('作废标记：activeNoteCards 剔除；list/read/search 标注「已作废」与接替者', () => {
+    const root = dir()
+    mkdirSync(join(root, '.simple-code', 'notes'), { recursive: true })
+    const w = (n: string, extra: string) =>
+      writeFileSync(join(root, '.simple-code', 'notes', `${n}.md`), `---\nname: ${n}\ndescription: 关于压缩${n}\n${extra}---\n\n# ${n}\n`, 'utf8')
+    w('new', '')
+    w('old', 'status: superseded\nby: new\n')
+    expect(parseNoteMeta(readFileSyncText(root, 'old'))).toMatchObject({ status: 'superseded', by: 'new' })
+    expect(activeNoteCards(root).map((c) => c.name)).toEqual(['new'])
+    expect(listNoteCards(root)).toHaveLength(2) // 全量照旧，不删
+    expect(listNotes(root)).toMatch(/- old — .*（已作废，现行见 new）/)
+    expect(readNote(root, 'old').startsWith('【已作废，现行见 new】')).toBe(true)
+    expect(readFileSyncText(root, 'old').startsWith('---')).toBe(true) // 提示只在输出，不写进文件
+    expect(searchNotes(root, '压缩')).toMatch(/old（已作废，现行见 new）/)
   })
 
   it('read 对裸文件（无 front matter）补头迁移，不报错', () => {

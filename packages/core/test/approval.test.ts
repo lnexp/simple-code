@@ -3,6 +3,7 @@ import { homedir, tmpdir } from 'node:os'
 import { mkdtempSync, rmSync, symlinkSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import {
+  DEFAULT_ASK_COMMANDS,
   DEFAULT_HIDDEN_ALLOW,
   DEFAULT_NETWORK_ALLOW,
   type ApprovalConfig,
@@ -11,7 +12,14 @@ import {
 
 // root 用固定假根，项目内/外的判定都以它为参照
 const ROOT = '/Users/dev/Code/proj'
-const cfg: ApprovalConfig = { hiddenAllow: [...DEFAULT_HIDDEN_ALLOW], networkAllow: [...DEFAULT_NETWORK_ALLOW] }
+const cfg: ApprovalConfig = {
+  hiddenAllow: [...DEFAULT_HIDDEN_ALLOW],
+  networkAllow: [...DEFAULT_NETWORK_ALLOW],
+  askCommands: [],
+  // 假 root 下文件都不存在：注入「都存在」，这里测第 1 层与各类别规则；
+  // 第 2 层（存在检查）在 hidden-path.test.ts 用真目录测
+  pathExists: () => true,
+}
 
 const ask = (cmd: string) => classify(cmd, ROOT, cfg)
 const allow = (cmd: string) => expect(classify(cmd, ROOT, cfg)).toEqual({ kind: 'allow' })
@@ -64,8 +72,7 @@ describe('规则 0：自家 bin', () => {
     allow(`"$SIMPLE_CODE_LESSON" write <<'JSON'\n{"name":"foo","title":"t","description":"d"}\nJSON`)
   })
 
-  it('APPLY_PATCH 通道豁免 .simple-code 成长区（notes/skills/lessons，2026-09-27 拍板）', () => {
-    // note/lesson/skill 的 patch 子命令退役后由这道豁免承接通道免审语义
+  it('.simple-code 成长区免审：补丁与裸 shell 同待遇（notes/lessons/events/skills，2026-09-29 拍板）', () => {
     allow(`"$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: .simple-code/notes/foo.md\n@@\n a\n-b\n+c\n*** End Patch\nPATCH`)
     allow(`"$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: .simple-code/lessons/foo.md\n@@\n a\n-b\n+c\n*** End Patch\nPATCH`)
     allow(`"$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: .simple-code/skills/foo/SKILL.md\n@@\n a\n-b\n+c\n*** End Patch\nPATCH`)
@@ -79,8 +86,13 @@ describe('规则 0：自家 bin', () => {
       `"$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: ~/.simple-code/skills/foo/SKILL.md\n@@\n x\n+y\n*** End Patch\nPATCH`,
       '项目外',
     )
-    // 豁免只给 APPLY_PATCH 通道：裸 shell 写这些目录照旧弹卡
-    blocked('rm .simple-code/notes/foo.md', '要写入 .simple-code 数据')
+    // 2026-09-29 起不再只给 APPLY_PATCH 通道：裸 shell 写这四个目录同样放行
+    allow('rm .simple-code/notes/foo.md')
+    allow('cat >> .simple-code/events/x.md <<\'EOF\'\nx\nEOF')
+    allow('mkdir -p .simple-code/skills/foo')
+    // 其余 .simple-code 写照拦（记忆档案、审批配置）
+    blocked('rm .simple-code/memory/state.db', '要写入 .simple-code 数据')
+    blocked('echo {} > .simple-code/approval.json', '要写入 .simple-code 数据')
   })
 })
 
@@ -137,7 +149,8 @@ describe('规则 3：项目外路径', () => {
     allow('cat ~/.simple-code/settings.json') // 用户级同样
     allow('cat ../other/.simple-code/events/x') // .. 逃逸形态但落在 .simple-code
     // 其余项目外读照弹——泄露面在读
-    blocked('cat ~/.ssh/id_rsa', '项目外')
+    // 点开头的报隐藏路径卡（2026-09-30：始终允许按隐藏段收敛、读写分开）
+    blocked('cat ~/.ssh/id_rsa', '隐藏路径')
     blocked('cat /etc/passwd', '项目外')
     blocked('ls ..', '项目外')
     blocked('cat /Users/dev/Code/other/x.ts', '项目外')
@@ -166,10 +179,10 @@ describe('规则 4：项目内隐藏路径', () => {
     // 弹「隐藏路径:...」，真报的项目外路径被抢戏）
     allow('echo ...')
     allow("echo '...'")
-    // 白名单：.git 整树（node_modules 是普通路径本来放行，无须白名单）
+    // node_modules 是普通路径本来放行；.git 2026-09-29 移出默认例外
     allow('ls node_modules')
     allow('cat node_modules/vitest/dist/x.js')
-    allow('cat .git/config')
+    blocked('cat .git/config', '隐藏')
     allow('git commit -m "x"')
   })
 })
@@ -229,7 +242,8 @@ describe('symlink 逃逸（路径判定按真实形态）', () => {
 })
 
 describe('多段命令：最严档生效', () => {
-  it('判定表', () => {    blocked('ls && cat ~/.ssh/id_rsa', '项目外')
+  it('判定表', () => {    blocked('ls && cat ~/.ssh/id_rsa', '隐藏路径')
+    blocked('ls && cat ~/Code/x', '项目外')
     blocked('cat x ; ls /etc', '项目外')
     blocked('cat x&&ls /etc', '项目外') // 控制符无空格粘连
     allow('ls && cat src/index.ts')
@@ -394,7 +408,8 @@ import type { ToolOutput } from '../src/tools/types.ts'
 describe('审批类别（approval.md §4.2 类别化）', () => {
   it('每条 ask 都带对类别与触发物', () => {
     const cases: [string, string, string][] = [
-      ['cat ~/.ssh/id_rsa', 'external_dir', '~/.ssh/id_rsa'],
+      ['cat ~/.ssh/id_rsa', 'hidden_path', '~/.ssh/id_rsa'], // 项目外点开头（2026-09-30）
+      ['cat ~/Code/x', 'external_dir', '~/Code/x'],
       // realpath 后 macOS 为 /private/etc/passwd——真实形态（symlink 逃逸修复的副作用）
       ['cat /etc/passwd', 'external_dir', '/private/etc/passwd'],
       ['cd /tmp && ls', 'external_dir', '/private/tmp'], // realpath 真实形态（macOS /tmp→/private/tmp）
@@ -436,6 +451,101 @@ describe('nonPathFrom 采集依据（卡上「此参数位不是路径」的出�
       expect(v.category).toBe('hidden_path')
       expect('nonPathFrom' in v).toBe(false)
     }
+  })
+})
+
+describe('自定义审批规则 askCommands（2026-09-27 拍板）', () => {
+  const gcfg: ApprovalConfig = { ...cfg, askCommands: [...DEFAULT_ASK_COMMANDS] }
+
+  it('默认规则：git push / gh 弹卡，git 本地操作照常自由', () => {
+    expect(classify('git push origin main', ROOT, gcfg)).toMatchObject({
+      kind: 'ask',
+      category: 'ask_rule',
+      detail: 'git push',
+      alwaysLead: 'git push',
+    })
+    expect(classify('gh release create v1', ROOT, gcfg)).toMatchObject({
+      kind: 'ask',
+      category: 'ask_rule',
+      detail: 'gh',
+    })
+    // 2026-09-27 v0.1.1 越权实案的回归线：发布链必须有人拦
+    expect(classify('git commit -m x', ROOT, gcfg).kind).toBe('allow')
+    expect(classify('git status', ROOT, gcfg).kind).toBe('allow')
+    expect(classify('git log --oneline', ROOT, gcfg).kind).toBe('allow')
+  })
+
+  it('git -C/-c 的 flag 值不是子命令——fail-open 绕过防护', () => {
+    // -C 的值 /tmp 会被 firstPositional 误当子命令，匹配不上就放过了
+    expect(classify('git -C /tmp push', ROOT, gcfg)).toMatchObject({
+      kind: 'ask',
+      detail: 'git push',
+    })
+    expect(classify('git -c a=b push', ROOT, gcfg)).toMatchObject({ kind: 'ask', detail: 'git push' })
+    // 无关 flag 不受影响
+    expect(classify('git --no-pager push', ROOT, gcfg)).toMatchObject({ kind: 'ask', detail: 'git push' })
+  })
+
+  it('「始终允许」按前缀收敛：git push 放行后 gh 照拦，子命令级不外溢', () => {
+    const ok = { ...gcfg, alwaysLeads: ['git push', 'appctl deploy'] }
+    expect(classify('git push origin main', ROOT, ok).kind).toBe('allow')
+    expect(classify('gh release list', ROOT, ok)).toMatchObject({ kind: 'ask', detail: 'gh' })
+    // 批过 appctl deploy ≠ 批过 appctl status（复合前缀的另一半）
+    const acfg: ApprovalConfig = { ...ok, askCommands: ['appctl deploy'] }
+    expect(classify('appctl deploy prod', ROOT, acfg).kind).toBe('allow')
+    expect(classify('appctl status', ROOT, acfg).kind).toBe('allow')
+  })
+
+  it('私有 CLI：子命令级条目只拦该子命令，裸 lead 条目拦整个 CLI', () => {
+    const sub = { ...cfg, askCommands: ['appctl deploy'] }
+    expect(classify('appctl deploy prod', ROOT, sub)).toMatchObject({
+      kind: 'ask',
+      category: 'ask_rule',
+      detail: 'appctl deploy',
+    })
+    expect(classify('appctl status', ROOT, sub).kind).toBe('allow')
+    const whole = { ...cfg, askCommands: ['appctl'] }
+    expect(classify('appctl status', ROOT, whole)).toMatchObject({ kind: 'ask', detail: 'appctl' })
+  })
+
+  it('三级条目：workloads apply 弹卡，workloads list 自由（词级匹配不误伤 deployx）', () => {
+    // 2026-09-27 用户实单：apply/delete/retry/domain 弹卡、list/get 自由
+    const t = {
+      ...cfg,
+      askCommands: ['appctl workloads apply', 'appctl workloads delete', 'appctl release create'],
+    }
+    expect(classify('appctl workloads apply my-app', ROOT, t)).toMatchObject({
+      kind: 'ask',
+      category: 'ask_rule',
+      detail: 'appctl workloads apply',
+    })
+    expect(classify('appctl workloads list', ROOT, t).kind).toBe('allow')
+    expect(classify('appctl release create v1', ROOT, t)).toMatchObject({
+      kind: 'ask',
+      detail: 'appctl release create',
+    })
+    // 词级匹配：deployx 是另一个词，不吃 deploy 的卡
+    expect(classify('appctl deployx foo', ROOT, { ...cfg, askCommands: ['appctl deploy'] }).kind).toBe('allow')
+  })
+
+  it('多条命中取最紧的：批过 workloads apply 不外溢（alwaysLead 粒度）', () => {
+    const both = { ...cfg, askCommands: ['appctl workloads', 'appctl workloads apply'] }
+    expect(classify('appctl workloads apply', ROOT, both)).toMatchObject({
+      kind: 'ask',
+      detail: 'appctl workloads apply',
+    })
+    // 三级豁免收敛：批了 apply，list 还是要卡（workloads 裸条目仍在）
+    const ok = { ...both, alwaysLeads: ['appctl workloads apply'] }
+    expect(classify('appctl workloads apply x', ROOT, ok).kind).toBe('allow')
+    expect(classify('appctl workloads list', ROOT, ok)).toMatchObject({ kind: 'ask', detail: 'appctl workloads' })
+  })
+
+  it('带项目外路径的命中报 ask_rule 而非 external_dir——规则优先级', () => {
+    const v = classify('appctl deploy /Users/dev/Code/external', ROOT, {
+      ...cfg,
+      askCommands: ['appctl deploy'],
+    })
+    expect(v).toMatchObject({ kind: 'ask', category: 'ask_rule', detail: 'appctl deploy' })
   })
 })
 
@@ -486,6 +596,13 @@ describe('always 白名单（approval.json，两个力度）', () => {
     allow2('cat ~/Code/external/foo/src/x.ts', cfgT)
     expect(classify('cat /Users/dev/Code/externalx/y', ROOT, cfgA).kind).toBe('ask') // 前缀伪造
     expect(classify('cat /Users/dev/Code/other/y', ROOT, cfgA).kind).toBe('ask') // 邻居
+    // 第一级目录不存在：realpath 逐级回退到 / 时曾拼出 //sc-nowhere，白名单失配
+    allow2('cat /sc-nowhere/a.py', { ...cfg, alwaysPaths: ['/sc-nowhere'] })
+    expect(classify('cat /sc-nowhere/a.py', ROOT, cfg)).toMatchObject({ detail: '/sc-nowhere/a.py' })
+  })
+  it('项目外路径的理由分读写', () => {
+    expect(classify('cat /sc-nowhere/a', ROOT, cfg)).toMatchObject({ reason: '要读项目外路径：/sc-nowhere/a' })
+    expect(classify('echo x > /sc-nowhere/a', ROOT, cfg)).toMatchObject({ reason: '要写项目外路径：/sc-nowhere/a' })
   })
   it('非路径参数位豁免：sed 地址范围 / grep pattern / awk program 不当路径（实弹回归）', () => {
     // 实弹：sed 地址范围 '/## 13/,/## 附录/p' 曾被判「要触碰项目外路径」
@@ -510,8 +627,8 @@ describe('always 白名单（approval.json，两个力度）', () => {
     // printf 的 /etc/passwd 是要打印的文本，不构成触碰
     allow(`printf '%s' "...[中略]..." /etc/passwd`)
     // 重定向目标不在豁免罩内：那是 echo 唯一的文件系统接触
-    // （.zshrc 在 root 外先走「项目外」分支，隐藏判定轮不到）
-    blocked('echo pwned > /Users/dev/.zshrc', '项目外')
+    // （项目外点开头报隐藏路径，2026-09-30；此夹具 pathExists 恒真）
+    blocked('echo pwned > /Users/dev/.zshrc', '隐藏路径')
     blocked('echo x > /Users/dev/Desktop/y.txt', '项目外')
   })
 
@@ -649,6 +766,77 @@ describe('nonPathFrom 一键采集（卡上「始终允许」→ approval.json�
       expect(hints).toHaveLength(2)
     } finally {
       rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('端到端：approval.json 的 askCommands 进判定（项目级）+ append 不冲掉手写规则', async () => {
+    const { createBashTool } = await import('../src/tools/bash.ts')
+    const { readFileSync, writeFileSync, mkdirSync } = await import('node:fs')
+    const root = mkdtempSync(join(tmpdir(), 'sc-approval-ask-'))
+    const home = mkdtempSync(join(tmpdir(), 'sc-approval-home-'))
+    try {
+      mkdirSync(join(root, '.simple-code'), { recursive: true })
+      // 项目级：手写静态规则
+      writeFileSync(
+        join(root, '.simple-code', 'approval.json'),
+        // 虚构 CLI 名：bash.ts 走生产的 ~/.simple-code/approval.json（真
+        // home），条目名撞上真机会让断言依赖机器状态
+        JSON.stringify({ askCommands: ['zz-deployctl deploy'], hiddenAllow: ['.env'] }),
+      )
+      // 用户级：独立文件（测试注入路径；生产是 ~/.simple-code/approval.json）
+      const userFile = join(home, 'approval.json')
+      writeFileSync(userFile, JSON.stringify({ askCommands: ['git commit', 'myctl deploy'] }))
+
+      const tool = createBashTool({
+        defaultTimeoutMs: 5000, maxTimeoutMs: 10_000, maxOutputChars: 1000,
+        killGraceMs: 200, envPassthrough: ['PATH'],
+      })
+      const asked: string[] = []
+      const ctx = {
+        root,
+        signal: new AbortController().signal,
+        requestApproval: async (q: { reason?: string }) => {
+          asked.push(q.reason ?? '')
+          return 'deny' as const
+        },
+      }
+      // monkey-patch loadAskRules 的默认路径不可行——bash.ts 里直接调用。
+      // 这里走公开参数：askRulesPath 由 ctx 传入？不——直接验证项目级；
+      // 用户级用 loadAskRules(userFile) 单测（见下一条）
+      const { loadUserApproval } = await import('../src/tools/approval-always.ts')
+      expect(loadUserApproval(userFile).askCommands).toEqual(['git commit', 'myctl deploy'])
+      expect(loadUserApproval(join(home, 'absent.json'))).toEqual({
+        askCommands: [], hiddenAllow: [], networkAllow: [], nonPathFrom: {},
+      })
+
+      // 项目级手写规则进判定：appctl deploy 弹（deny 不执行）
+      await tool.execute({ command: 'zz-deployctl deploy prod', cwd: root }, ctx)
+      expect(asked).toHaveLength(1)
+      expect(asked[0]).toContain('zz-deployctl deploy')
+      // 未配的子命令自由
+      // 未配的子命令不弹卡（命令本身 command-not-found 无妨——测的是
+      // 「不经过审批就直奔执行」，不是执行成功）
+      await tool.execute({ command: 'zz-deployctl status', cwd: root }, ctx)
+      expect(asked).toHaveLength(1)
+      // 内置默认兜底仍在：git push 弹
+      await tool.execute({ command: 'git push origin main', cwd: root }, ctx)
+      expect(asked).toHaveLength(2)
+      expect(asked[1]).toContain('git push')
+
+      // 例外面也走文件：hiddenAllow 免拦 .env 子树（settings 已无 approval，
+      // 2026-09-27 拍板「审批配置只住两级 approval.json」）
+      await tool.execute({ command: 'cat .env/secret', cwd: root }, ctx)
+      expect(asked).toHaveLength(2) // 没弹新卡
+
+      // 关键回归：卡上「始终允许」读改写后，手写的 askCommands 不丢
+      const ctxAllow = { ...ctx, requestApproval: async () => 'always' as const }
+      await tool.execute({ command: 'xcli get f.pptx /slide[2]', cwd: root }, ctxAllow)
+      const saved = JSON.parse(readFileSync(join(root, '.simple-code', 'approval.json'), 'utf8'))
+      expect(saved.nonPathFrom).toEqual({ xcli: 2 })
+      expect(saved.askCommands).toEqual(['zz-deployctl deploy'])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(home, { recursive: true, force: true })
     }
   })
 })

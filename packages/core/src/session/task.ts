@@ -15,7 +15,7 @@
  */
 import { join } from 'node:path'
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { openDb, type Db } from './db.ts'
+import { openDb, type Db, type SqlValue } from './db.ts'
 import { MEMORY_RELATIVE } from './store.ts'
 import { syncSearchIndex } from './search-index.ts'
 import { copyMarker, ensureInheritedCopy, type TaskScope } from './store.ts'
@@ -195,14 +195,18 @@ export function forkTask(root: string, name: string): TaskManifest {
  * 关闭第一步：任务的 live 尾巴翻成 unloaded——数据即刻成为历史。
  * 之后任务的摘要器还能继续摘它（段选择不要求 live）
  */
-export function flipTaskLive(root: string, owner: string): void {
+/** 返回翻成 unloaded 的行数（task_close 对账用） */
+export function flipTaskLive(root: string, owner: string): number {
   const db = openTaskDb(root)
   try {
+    const own = `turn_id IN (SELECT id FROM turns WHERE owner = ?)`
+    const flipped = db.all<{ c: number }>(`SELECT COUNT(*) AS c FROM messages WHERE state = 'live' AND ${own}`, owner)[0]?.c ?? 0
     db.run(
       `UPDATE messages SET state = 'unloaded'
        WHERE state = 'live' AND turn_id IN (SELECT id FROM turns WHERE owner = ?)`,
       owner,
     )
+    return flipped
   } finally {
     db.close()
   }
@@ -214,8 +218,19 @@ export function flipTaskLive(root: string, owner: string): void {
  * （它本来就是对话侧的路标）。最后 FTS 全量重灌：任务段的低号 step 在
  * 存活期间位于增量游标之下，从未入过倒排表
  */
-export function finalizeTask(root: string, owner: string): void {
+/** finalizeTask 各步改动行数——task_close 对账用（关闭后 owner/manifest 都没了，事后无从反推） */
+export type FinalizeCounts = {
+  sumDeleted: number
+  sumPromoted: number
+  msgDeleted: number
+  msgPromoted: number
+  turnsPromoted: number
+}
+
+export function finalizeTask(root: string, owner: string): FinalizeCounts {
   const db = openTaskDb(root)
+  const count = (sql: string, ...p: SqlValue[]): number => db.all<{ c: number }>(`SELECT COUNT(*) AS c ${sql}`, ...p)[0]?.c ?? 0
+  const counts: FinalizeCounts = { sumDeleted: 0, sumPromoted: 0, msgDeleted: 0, msgPromoted: 0, turnsPromoted: 0 }
   try {
     // 摘要账清尾（task-v3）：covers 继承段的私有摘要是任务跑期间的脚手架
     // ——它的内容只服务于任务的窗口，对话的历史由对话自己的摘要器负责，
@@ -235,16 +250,21 @@ export function finalizeTask(root: string, owner: string): void {
         owner,
         stepFloor,
       )
+      counts.sumDeleted = count(`FROM summaries WHERE owner = ? AND covers_from <= ?`, owner, stepFloor)
       db.run(`DELETE FROM summaries WHERE owner = ? AND covers_from <= ?`, owner, stepFloor)
+      counts.sumPromoted = count(`FROM summaries WHERE owner = ?`, owner)
       db.run(`UPDATE summaries SET owner = NULL WHERE owner = ?`, owner)
       // 消息副本（行归任务、轮归主任务）删掉；任务自己轮的行还俗
+      counts.msgDeleted = count(`FROM messages WHERE owner = ? AND turn_id NOT IN (SELECT id FROM turns WHERE owner = ?)`, owner, owner)
       db.run(
         `DELETE FROM messages WHERE owner = ? AND turn_id NOT IN (SELECT id FROM turns WHERE owner = ?)`,
         owner,
         owner,
       )
+      counts.msgPromoted = count(`FROM messages WHERE owner = ?`, owner)
       db.run(`UPDATE messages SET owner = NULL WHERE owner = ?`, owner)
       db.run(`DELETE FROM migrations WHERE name = ?`, copyMarker(owner))
+      counts.turnsPromoted = count(`FROM turns WHERE owner = ?`, owner)
       db.run(`UPDATE turns SET owner = NULL WHERE owner = ?`, owner)
       // 合并改写了主任务的前缀（任务的经历摘要从此渲染在主任务上下文里）。
       // 前缀不变式：合法改写只搭压缩的车——合并这一刻主任务会话多半不在手上，
@@ -264,5 +284,6 @@ export function finalizeTask(root: string, owner: string): void {
     db.close()
   }
   rmSync(manifestPath(root, owner), { force: true })
+  return counts
 }
 

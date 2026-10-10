@@ -1,7 +1,8 @@
 import { join } from 'node:path'
 import * as vscode from 'vscode'
-import { ensureShims, type ShimEntry } from '@simple-code/core'
+import { ensureShims, logRun, type ShimEntry } from '@simple-code/core'
 import { startLspBridge } from './lsp-bridge.ts'
+import { watchLoopLag } from './loop-lag.ts'
 import { ChatPanel } from './panel.ts'
 
 /**
@@ -55,7 +56,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const lspServer = startLspBridge()
 
   // 双注册互斥的开关，两个条件取或，任一命中走活动栏兜底：
-  // ① 引擎 < 1.106（secondarySidebar 正式可用的下限，CC 同款判定）
+  // ① 引擎 < 1.106（secondarySidebar 正式可用的下限，主流客户端同款判定）
   // ② Cursor——它拒绝第三方副栏容器的静态注册（reserved for agent UI），
   //   副栏 view 无家可归。只抄 ① 会把副栏视图藏过头：Cursor 报 3.x 恒
   //   判「支持」，但容器照样被拒，两个入口同时消失（4cc6a13 的实测教训）
@@ -73,6 +74,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     // 桥跟着扩展走：停用即关，端口随 env 消失，bin 侧明确报不可达
     { dispose: () => lspServer.close() },
+    watchLoopLag((ev) => logRun(ev)),
     ...ChatPanel.viewTypes.map((viewType) =>
       vscode.window.registerWebviewViewProvider(viewType, panel, {
       // 面板切走再切回来时不重建 webview。没有它，用户点一下别的活动栏图标

@@ -39,6 +39,7 @@ function buildRequest(req: Request, ctx: ProviderContext) {
     })),
     max_output_tokens: req.maxTokens,
     store: false,
+    ...(req.cacheKey ? { prompt_cache_key: req.cacheKey } : {}),
     ...(req.thinking === 'adaptive'
       ? {
           reasoning: {
@@ -164,7 +165,10 @@ const initial = (): State => ({
 
 function reduce(state: State, msg: SSEMessage): [State, LLMEvent[]] {
   const ev = asObject(JSON.parse(msg.data))
-  switch (msg.event) {
+  // 事件名以 data.type 为准（Responses 协议规范如此，type 是序列化名），
+  // event: 行只做兜底：某渠道 9-30 起只发 data: 行，只认 event: 的话
+  // 整条流全落进 default，EOF 时报「未收到结束标记」、界面一个字没有
+  switch (asString(ev.type) || msg.event) {
     case 'response.output_item.added':
       return onItemAdded(state, ev)
     case 'response.output_item.done':
@@ -317,7 +321,9 @@ function parseError(status: number, body: unknown, headers?: Headers): ProtocolE
 function toError(err: Record<string, unknown>, status: number): ProtocolError {
   const message = asString(err.message) || `HTTP ${status}`
   const kind = errorKind(asString(err.code) || asString(err.type), message, status)
-  return { kind, message, retryable: kind === 'rate_limit' || kind === 'server' }
+  // unknown 也重试：流内 error 事件归不上类的默认可重试，理由见
+  // anthropic-messages.ts 的 toError（2026-09-29 方案 A）
+  return { kind, message, retryable: kind === 'rate_limit' || kind === 'server' || kind === 'unknown' }
 }
 
 function errorKind(code: string, message: string, status: number): ProtocolError['kind'] {

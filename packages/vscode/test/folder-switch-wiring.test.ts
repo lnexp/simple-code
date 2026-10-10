@@ -297,6 +297,8 @@ describe('切目录恢复任务选中（B 方案：lastBranch 按目录记选中
     current: null,
     effort: null,
     effortOverridden: false,
+    presets: [],
+    imagesEnabled: false,
     contextWindow: 0,
     approvalOn: true,
   })

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { sendRequest } from '../src/llm/client.ts'
 import type { LLMEvent } from '../src/llm/events.ts'
 import { LLMStreamError, type Protocol } from '../src/llm/protocol.ts'
@@ -152,6 +152,28 @@ describe('错误响应', () => {
     await expect(drain(stream)).rejects.toMatchObject({
       detail: { kind: 'server', retryable: true },
     })
+  })
+
+  // 2026-09-30 某渠道连续 429 只剩「HTTP 429」——body 不是 JSON，safeJson 回 {}
+  // 把原文丢了，看不出网关说了什么。兜底文案时附原文（折叠空白、前 200 字）
+  it('兜底成「HTTP n」时附上响应体原文：折叠空白、截 200 字、key 打码', async () => {
+    const protocol = resolveProtocol('anthropic-messages')
+    const body = `<html>\n  <body>Too   Many Requests key=${KEY}</body></html>` + 'x'.repeat(300)
+    const { stream } = send(protocol, new Response(body, { status: 429 }))
+    const error = await drain(stream).catch((e: LLMStreamError) => e)
+    const msg = (error as LLMStreamError).detail.message
+    expect(msg.startsWith('HTTP 429：<html> <body>Too Many Requests key=***</body></html>x')).toBe(true)
+    expect(msg).not.toContain(KEY)
+    expect(msg.length).toBeLessThanOrEqual('HTTP 429：'.length + 201)
+    expect((error as LLMStreamError).detail.kind).toBe('rate_limit')
+  })
+
+  it('协议取到了 message 就不附原文；空 body 也不附', async () => {
+    const protocol = resolveProtocol('anthropic-messages')
+    const ok = send(protocol, new Response(JSON.stringify({ error: { message: 'slow down' } }), { status: 429 }))
+    await expect(drain(ok.stream)).rejects.toMatchObject({ detail: { message: 'slow down' } })
+    const empty = send(protocol, new Response('', { status: 503 }))
+    await expect(drain(empty.stream)).rejects.toMatchObject({ detail: { message: 'HTTP 503' } })
   })
 
   it('200 但没有 body 时报可重试错误，而不是当成空回复', async () => {
@@ -359,5 +381,59 @@ describe('流空闲超时', () => {
     await expect(drain(stream)).rejects.toSatisfy(
       (error: LLMStreamError) => !error.detail.message.includes(KEY),
     )
+  })
+})
+
+describe('运行日志（2026-09-30 补观测）', () => {
+  const capture = async (run: () => Promise<unknown>) => {
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      await run().catch(() => {})
+    } finally {
+      spy.mockRestore()
+    }
+    return calls
+  }
+
+  it('流没走完就断：llm 行带上收到的事件计数与最后一条 data', async () => {
+    // 9-30 真机形态：没有 event: 行，只有 data.type，且断在结束标记之前
+    const sse =
+      'data: {"type":"response.created","response":{}}\n\n' +
+      'data: {"type":"response.in_progress","response":{}}\n\n' +
+      'data: {"type":"response.in_progress","response":{}}\n\n'
+    const protocol = resolveProtocol('openai-responses')
+    const calls = await capture(() => drain(send(protocol, new Response(bodyOf(sse), { status: 200 })).stream))
+    const llm = calls.find((c) => c.ev === 'llm')
+    expect(llm?.error).toBeDefined()
+    expect(llm?.stream).toEqual({
+      count: 3,
+      types: { 'response.created': 1, 'response.in_progress': 2 },
+      last: '{"type":"response.in_progress","response":{}}',
+    })
+  })
+
+  it('对照组：成功的流不记 stream（不落内容）', async () => {
+    const protocol = resolveProtocol('anthropic-messages')
+    const calls = await capture(() => drain(send(protocol, new Response(bodyOf(ANTHROPIC_SSE), { status: 200 })).stream))
+    const llm = calls.find((c) => c.ev === 'llm')
+    expect(llm).toBeDefined()
+    expect(llm?.error).toBeUndefined()
+    expect(llm?.stream).toBeUndefined()
+  })
+
+  it('llm_req 记网关路由参数（extraBody）', async () => {
+    const calls = await capture(() =>
+      drain(
+        sendRequest(REQ, {
+          protocol: resolveProtocol('anthropic-messages'),
+          provider: { ...PROVIDER, extraBody: { providerId: 97 } },
+          signal: new AbortController().signal,
+          fetchImpl: stubFetch(new Response(bodyOf(ANTHROPIC_SSE), { status: 200 })).impl,
+        }),
+      ),
+    )
+    expect(calls.find((c) => c.ev === 'llm_req')?.extra).toEqual({ providerId: 97 })
   })
 })

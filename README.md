@@ -82,7 +82,7 @@ export ZHIPU_API_KEY=...
 - 支持三种协议：`anthropic-messages`、`openai-responses`、`openai-chat`
 - 每个模型必须声明 `contextWindow`，上下文卸载的触发点由该值推算
 
-完整示例（含推理档位、超时、审批白名单、MCP）见 [`settings.example.json`](settings.example.json)，文件顶部的 `$comment` 逐项说明了各配置项的含义与取舍。
+完整示例（含推理档位、超时、记忆参数）见 [`settings.example.json`](settings.example.json)，文件顶部的 `$comment` 逐项说明了各配置项的含义与取舍。审批白名单在 `~/.simple-code/approval.json`，MCP server 在 `~/.simple-code/mcp.json`，都不进 settings.json。
 
 ## 终端用法
 

@@ -196,6 +196,31 @@ describe('同一段 loop 在三种协议下都能跑', () => {
     }
     expect(urls.size).toBe(3)
   })
+
+  it('openai-responses 每次调用带同一个 prompt_cache_key，换项目目录就换 key', async () => {
+    const bytes = await readFixture('openai-responses.tool-call.sse')
+    const keys: unknown[][] = []
+    for (let i = 0; i < 2; i++) {
+      const { dir, globalPath } = await workspace('openai-responses')
+      const { impl, calls } = replayThenStop('openai-responses', bytes)
+      const session = await getSession(dir, {
+        globalPath,
+        env: { TEST_KEY: KEY },
+        skipLock: true,
+        fetchImpl: impl,
+      })
+      for await (const _ev of session.send('列出当前目录')) {
+        // 消费完
+      }
+      await session.close()
+      keys.push(calls.map((c) => (c.body as { prompt_cache_key?: string }).prompt_cache_key))
+    }
+    const [a, b] = keys
+    expect(a).toHaveLength(2)
+    expect(a?.[0]).toMatch(/^[0-9a-f-]{36}$/)
+    expect(a?.[1]).toBe(a?.[0])
+    expect(b?.[0]).not.toBe(a?.[0])
+  })
 })
 
 // ---------------------------------------------------------------- 异常路径

@@ -97,7 +97,7 @@ async function runOnce(options: {
       lastResponseAt: () => null,
       markResponded: () => {},
       stubTokens: 1e9,
-      stubTurns: 1e9,
+      stubSteps: 1e9,
         floorTokens: 1,
       // 0 是为了让预算就是窗口本身，用例里的数字直接可推算
       safetyMargin: 0,
@@ -113,6 +113,7 @@ async function runOnce(options: {
       hotLeaves: 2,
       demoteBatch: 10,
       markCold: () => {},
+      markStubs: () => {},
       activateSummary: () => false,
       summaries: () => options.summaries,
       applyMerges: () => new Set<number>(),

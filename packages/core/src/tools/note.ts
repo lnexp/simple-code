@@ -4,9 +4,10 @@
  * **与 lesson 的本质差异：lesson 是事件史（append-only，踩坑经过写完
  * 就是历史）；note 是活文档（结论会演进，必须跟着改）**——索引里躺着
  * 过时描述比没有更糟，模型会按旧结论行事。所以结论演进是常态操作：
- * 同名 write 整条重写（created 重新起算）或 $SIMPLE_CODE_APPLY_PATCH
- * 局部改（front matter 不动，created 跨修改保留——「这条结论多老了」
- * 的信息不因改写丢失）。update/patch 子命令 2026-09-27 退役（拍板：
+ * $SIMPLE_CODE_APPLY_PATCH 改文件（front matter 不动，created 跨修改
+ * 保留——「这条结论多老了」的信息不因改写丢失）；write 撞同名拒绝
+ * （fd87db6：静默覆盖会丢旧结论，notes 不进 git 找不回；2026-09-30
+ * 确认保留）。update/patch 子命令 2026-09-27 退役（拍板：
  * 编辑方言收敛到 APPLY_PATCH 一个，通道豁免见 approval.ts）。
  *
  * 与 lesson 的关键差异——**有 LRU**：描述索引是 system 常驻区的一部分，
@@ -30,7 +31,16 @@ const notesDir = (root: string) => join(root, '.simple-code', 'notes')
 const slug = (name: string) =>
   name.toLowerCase().trim().replace(/[\s_]+/g, '-').replace(/[^a-z0-9-\u4e00-\u9fff]/g, '')
 
-export type NoteMeta = { name?: string; description?: string; created?: string; lastRead?: string }
+/** status: superseded = 作废（2026-09-30 拍板：不删文件，头里加 status + by）——
+ *  不进索引与 recall 候选，list/read/search 照常可达并标注。by = 接替者（可空） */
+export type NoteMeta = {
+  name?: string
+  description?: string
+  created?: string
+  lastRead?: string
+  status?: string
+  by?: string
+}
 
 /** 手写解析 yaml 头（与 lesson 的 front matter 同款思路，不引库） */
 export function parseNoteMeta(text: string): NoteMeta {
@@ -38,14 +48,21 @@ export function parseNoteMeta(text: string): NoteMeta {
   if (!m) return {}
   const out: NoteMeta = {}
   for (const line of m[1]?.split('\n') ?? []) {
-    const kv = line.match(/^(name|description|created|lastRead):\s*(.*)$/)
+    const kv = line.match(/^(name|description|created|lastRead|status|by):\s*(.*)$/)
     if (kv?.[1] === 'name' && kv[2]) out.name = kv[2].trim()
     if (kv?.[1] === 'description' && kv[2]) out.description = kv[2].trim()
     if (kv?.[1] === 'created' && kv[2]) out.created = kv[2].trim()
     if (kv?.[1] === 'lastRead' && kv[2]) out.lastRead = kv[2].trim()
+    if (kv?.[1] === 'status' && kv[2]) out.status = kv[2].trim()
+    if (kv?.[1] === 'by' && kv[2]) out.by = kv[2].trim()
   }
   return out
 }
+
+const superseded = (meta: NoteMeta): boolean => meta.status === 'superseded'
+
+/** 「（已作废，现行见 x）」——list/search 行尾、read 顶部共用一个说法 */
+const supersededMark = (meta: NoteMeta): string => `已作废${meta.by ? `，现行见 ${meta.by}` : ''}`
 
 /** yaml 头之后的首个 `# 标题`。只是给人看的门面——索引用的是 front matter
  *  的 description，# 标题不进 system（对齐 lesson 的双字段分工） */
@@ -89,6 +106,11 @@ export function listNoteCards(root: string): NoteCard[] {
   return loadNotes(root)
 }
 
+/** 未作废的，LRU 序。索引（前 NOTES_INDEX_LIMIT 条）与 recall 候选（其余）都从这里切 */
+export function activeNoteCards(root: string): NoteCard[] {
+  return loadNotes(root).filter((c) => !superseded(c.meta))
+}
+
 export function writeNote(
   root: string,
   input: { name: string; title: string; description: string; body: string },
@@ -106,7 +128,7 @@ export function writeNote(
       return false
     }
   }
-  if (exists()) throw new Error(`${name} 已存在。note 是活文档：改内容用同名 write 整条重写，或 $SIMPLE_CODE_APPLY_PATCH 局部改（.simple-code/notes/${name}.md）`)
+  if (exists()) throw new Error(`${name} 已存在，write 不覆盖（旧结论会丢）。改内容用 $SIMPLE_CODE_APPLY_PATCH 改 .simple-code/notes/${name}.md（免审批）`)
   const text =
     `---\nname: ${name}\ndescription: ${description}\ncreated: ${localStamp()}\n---\n\n` +
     `# ${input.title.trim()}\n\n${input.body.trim()}\n`
@@ -131,11 +153,13 @@ export function readNote(root: string, name: string): string {
   const now = localStamp()
   const updated = /^---\s*\n[\s\S]*?\n---/.test(text)
     ? text.replace(/^(---\s*\n[\s\S]*?\n---)/, (fm) =>
-        /\nlastRead:/.test(fm) ? fm.replace(/\nlastRead:.*$/, `\nlastRead: ${now}`) : fm.replace(/\n---$/, `\nlastRead: ${now}\n---`),
+        // m 必须带：不带时 $ 只认串尾，fm 以 --- 收尾，已有 lastRead 永远换不掉（9-30 修）
+        /\nlastRead:/.test(fm) ? fm.replace(/\nlastRead:.*$/m, `\nlastRead: ${now}`) : fm.replace(/\n---$/, `\nlastRead: ${now}\n---`),
       )
     : `---\ncreated: ${now}\nlastRead: ${now}\n---\n\n${text}` // 裸文件补头——旧格式迁移
   writeFileSync(path, updated, 'utf8')
-  return updated
+  const meta = parseNoteMeta(updated)
+  return superseded(meta) ? `【${supersededMark(meta)}】\n${updated}` : updated
 }
 
 /** 全量清单（含被挤出索引的）。人看 + agent 兜底检索两用 */
@@ -143,7 +167,7 @@ export function listNotes(root: string): string {
   const cards = loadNotes(root)
   if (cards.length === 0) return '（还没有 note。写："$SIMPLE_CODE_NOTE" write，决策/约定/一次性结论，一笔记一事）'
   return cards
-    .map((c) => `- ${c.name}${c.description ? ` — ${c.description}` : ''}`)
+    .map((c) => `- ${c.name}${c.description ? ` — ${c.description}` : ''}${superseded(c.meta) ? `（${supersededMark(c.meta)}）` : ''}`)
     .join('\n')
 }
 
@@ -161,9 +185,11 @@ export function searchNotes(root: string, query: string): string {
     const at = text.toLowerCase().indexOf(q)
     if (at === -1) continue
     const name = f.replace('.md', '')
+    const meta = parseNoteMeta(text)
+    const mark = superseded(meta) ? `（${supersededMark(meta)}）` : ''
     const desc = /^description:\s*(.+)$/m.exec(text)?.[1]?.trim() ?? ''
     const window = text.slice(Math.max(0, at - 40), at + 80).replace(/\s+/g, ' ')
-    hits.push(`  ${name}${desc ? `  —  ${desc}` : ''}\n    …${window}…`)
+    hits.push(`  ${name}${mark}${desc ? `  —  ${desc}` : ''}\n    …${window}…`)
   }
   return hits.length === 0 ? `没有 note 命中「${query}」。` : `${hits.length} 条命中：\n${hits.join('\n')}`
 }

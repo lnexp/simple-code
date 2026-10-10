@@ -4,8 +4,21 @@ import { tmpdir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import type { ToolDefinition } from '../llm/types.ts'
 import type { ApprovalConfig } from './approval.ts'
-import { classify, DEFAULT_HIDDEN_ALLOW, DEFAULT_NETWORK_ALLOW } from './approval.ts'
-import { appendLead, appendNonPathFrom, appendPath, dirHint, loadAlways } from './approval-always.ts'
+import {
+  classify,
+  DEFAULT_ASK_COMMANDS,
+  DEFAULT_HIDDEN_ALLOW,
+  DEFAULT_NETWORK_ALLOW,
+} from './approval.ts'
+import {
+  appendHidden,
+  appendLead,
+  appendNonPathFrom,
+  appendPath,
+  dirHint,
+  loadAlways,
+  loadUserApproval,
+} from './approval-always.ts'
 import { LOG_DEFAULT_LINES } from './memory.ts'
 import { truncateOutput } from './truncate.ts'
 import type { Tool, ToolContext, ToolOutput } from './types.ts'
@@ -18,8 +31,6 @@ export type BashConfig = {
   killGraceMs: number
   /** 传给子进程的环境变量白名单。不在表里的一律不传（§12） */
   envPassthrough: string[]
-  /** 审批判定的白名单（approval.md §6）。undefined = 内置默认 */
-  approval?: ApprovalConfig
 }
 
 /** 工具定义按配置生成——描述里的默认/上限秒数必须与实际行为一致
@@ -37,14 +48,15 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
     '裸 `cmd &` 的输出没人接会在写满管道后卡住。调试用 curl，回看输出 `cat /tmp/sc.log`，收尾 `kill $(cat /tmp/sc.pid)`。' +
     '后台进程在用户界面显示、由用户决定是否关闭，agent 结束任务前应收尾自己的服务。\n' +
     '【审批】路径出工作区（读放行仅限 .simple-code 子树，其余读也拦）、进隐藏目录（.env、.ssh 类）、' +
-    '网络命令（curl 等）、含 $()/解释器的命令——执行前会请用户放行；被拒时如实转告用户、说明需要什么，不要换写法绕。\n' +
+    '网络命令（curl 等）、发布类命令（git push、gh）、approval.json 里 askCommands 配的自定义命令（用户级 ~/.simple-code/ 与项目级 .simple-code/，含私有 CLI，如 appctl workloads apply）、含 $()/解释器的命令——执行前会请用户放行；被拒时如实转告用户、说明需要什么，不要换写法绕。\n' +
     '【网络】"$SIMPLE_CODE_WEBFETCH" <url>（HTML 转 markdown，可接管道）；"$SIMPLE_CODE_WEBSEARCH" <query>。\n' +
     '【自查】查 SC 自身运作（上下文分区/记忆/审批/排障）：grep "<关键词>" "$SIMPLE_CODE_DOC"。\n' +
     // LSP 命令格式按注入条件拼（2026-09-17 两次拍板）：env 里有桥才写这段——
     // 描述与实际能力永远一致。分工与 APPLY_PATCH 对齐（v2）：system prompt
     // 的工具约定管「该用哪个」（分流句+语言无关在那边），这里只留命令格式
     (env.SIMPLE_CODE_LSP !== undefined
-      ? '【符号检索】"$SIMPLE_CODE_LSP" refs <file>:<行>[:<列>]（查符号引用）；definition（跳定义）；symbols <file>（文件符号表）；' +
+      ? '【符号检索】"$SIMPLE_CODE_LSP" refs <file>:<行>:<列>（查符号引用；列须落在符号名上，先 grep -n 定位行再数列）；' +
+        'definition（跳定义）；symbols <file>（文件符号表）；' +
         'hover（类型信息）；calls-in/calls-out（谁调用这里/这里调用谁）。报「无 LSP 桥」= 桥已不在（宿主窗口关闭），回落 grep。\n'
       : '') +
     '【补丁】改既有文件用 "$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n' +
@@ -59,8 +71,10 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
     'search 用于定位格式与渲染续接；' +
     `log [-n ${LOG_DEFAULT_LINES}]（每 turn 一行总览，先扫再下钻）。\n` +
     '【note】"$SIMPLE_CODE_NOTE" list（全量清单，含被挤出索引的）| read <name>（全文+喂 LRU 心跳）| ' +
-    'search <关键词> | write <<\'MD\'（heredoc 四段：name/title/description/正文，新结论当场记一条）。' +
-    '改内容：同名 write 整条重写，或 "$SIMPLE_CODE_APPLY_PATCH" 局部改（.simple-code/notes/，免审批）。\n' +
+    'search <关键词> | write <<\'MD\'（heredoc 逐行写 name: <名>、title: <标题>、description: <单行描述>，' +
+    '再一行 ---，其后是正文；新结论当场记一条）。' +
+    '改内容用 "$SIMPLE_CODE_APPLY_PATCH"（.simple-code/notes/，免审批；write 撞同名拒绝，不覆盖）；' +
+    '结论被推翻时不删，头里加 status: superseded 与 by: <接替的 note 名>，从此不进索引。\n' +
     '【教训】"$SIMPLE_CODE_LESSON" list | read <name> | search <关键词> | ' +
     'write（五段 heredoc JSON 走 stdin，字段 name/title/description/symptom/misjudged/rootCause/fix/verified，格式自动组装）。' +
     '调试一轮没修好先查教训，失败 ≥2 次后成功用 write 记一条。局部改走 "$SIMPLE_CODE_APPLY_PATCH"（.simple-code/lessons/，免审批）。\n' +
@@ -69,6 +83,15 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
   parameters: {
     type: 'object',
     properties: {
+      // desc 排在 command 前（2026-09-28 拍板）：模型大体按 schema 顺序
+      // 生成参数，desc 先流出来，webview 就能在长命令还在生成时先显示标题
+      // （webview/events.ts 的 tool_input_delta 分支）
+      desc: {
+        type: 'string',
+        description:
+          '4-10 字短语说明这条命令在干什么（如「跑全量测试」「迁移 mcp 配置」），' +
+          'UI 标题位展示用。只写短语，不写句子。先于 command 写。',
+      },
       command: { type: 'string', description: '要执行的 shell 命令' },
       cwd: {
         type: 'string',
@@ -85,11 +108,33 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
           '判定卡死就 kill。长任务（全量测试、构建）可放心直接跑',
       },
     },
-    required: ['command'],
+    // desc 标必填（2026-09-28 拍板）：可选时模型把它当建议，历史里没人填
+    // 的项目就一直不填（另两个项目分别 0 条 vs 本项目 34/35）。parseArgs
+    // 不因缺 desc 拒绝执行——漏填就是少个标题，不值得让模型白跑一轮重试；
+    // 漏了在结果末尾提醒一句（见 MISSING_DESC）
+    required: ['desc', 'command'],
   },
 })
 
 type Args = { command: string; cwd: string; timeoutMs: number }
+
+/**
+ * 漏 desc 时追加在结果末尾（2026-09-29 用户拍板方案 B）。schema 必填挡不住
+ * glm-5.3：9-28 改必填后某项目 0/554、另一项目当天 0/247，
+ * opus 483/483。漏的根子是模仿——历史里满是不带 desc 的调用（含它自己刚写
+ * 的），模型照抄。提醒留在上下文里才打得断这个循环；照常执行不白跑，
+ * 纠正过来就不再出现，一次约 30 token
+ */
+export const MISSING_DESC =
+  '\n[提醒] 这次调用漏了必填参数 desc（4-10 字短语说明命令在干什么，先于 command 写，界面标题位靠它）——后续 bash 调用请带上。'
+
+/** description 同样算数：glm 照官方 Bash 工具的参数名写 description（9-28 起
+ * 另两个项目 358/388 次），内容是填了的，只是
+ * 键名不同——提醒「漏了 desc」它看不懂，164 次提醒 0 次改正 */
+function hasDesc(input: unknown): boolean {
+  const { desc, description } = input as Record<string, unknown>
+  return [desc, description].some((d) => typeof d === 'string' && d.trim() !== '')
+}
 
 export function createBashTool(config: BashConfig, env: NodeJS.ProcessEnv = {}): Tool {
   return {
@@ -102,9 +147,8 @@ export function createBashTool(config: BashConfig, env: NodeJS.ProcessEnv = {}):
         // 前者模型会重新组织参数再试，后者通常只会重复同样的错（CLAUDE.md §4.2）
         return { output: parsed, exitCode: -1, isError: true }
       }
-      const denied = await checkApproval(parsed, config, ctx)
-      if (denied) return denied
-      return run(parsed, config, ctx)
+      const out = (await checkApproval(parsed, config, ctx)) ?? (await run(parsed, config, ctx))
+      return hasDesc(input) ? out : { ...out, output: out.output + MISSING_DESC }
     },
   }
 }
@@ -122,19 +166,33 @@ async function checkApproval(
   // always 白名单每条命令读一次盘：判定要拿它（allow 路径也走这），
   // 文件几十字节，频率可忽略
   const always = loadAlways(ctx.root)
-  // 合并而非二选一：schema 的 approval 段 prefault({})，config.approval
-  // 永远是对象——`config.approval ?? { …alwaysLeads… }` 的右边从未执行，
-  // approval.json 的白名单从未进过判定（真机 python3 批了还弹的根因）。
-  // 用户配置（settings）与运行时 always（approval.json）两个来源在这里
-  // 汇成一份判定输入
-  // nonPathFrom 两个来源：settings（手写）+ approval.json（卡上采集）。
-  // 同键时 approval.json 覆盖——它是用户在卡上后拍的板，新决定盖旧的
+  // 审批配置的三源组装（2026-09-27 拍板：settings 里不再出现 approval，
+  // 只住用户级 ~/.simple-code/approval.json + 项目级 .simple-code/
+  // approval.json 两个文件）：内置默认 ← 用户级（手写）← 项目级（手写
+  // + 卡上采集）。例外面（hiddenAllow/networkAllow/askCommands）取并集
+  // ——加是日常，减是拍板级变更，删行或卡上不点即是；nonPathFrom 同键
+  // 项目级覆盖——卡上后拍的板是新决定，新决定盖旧的
+  const user = loadUserApproval()
   const verdict = classify(args.command, ctx.root, {
-    hiddenAllow: config.approval?.hiddenAllow ?? DEFAULT_HIDDEN_ALLOW,
-    networkAllow: config.approval?.networkAllow ?? DEFAULT_NETWORK_ALLOW,
-    nonPathFrom: { ...config.approval?.nonPathFrom, ...always.nonPathFrom },
+    hiddenAllow: [
+      ...new Set([...DEFAULT_HIDDEN_ALLOW, ...user.hiddenAllow, ...(always.hiddenAllow ?? [])]),
+    ],
+    networkAllow: [
+      ...new Set([...DEFAULT_NETWORK_ALLOW, ...user.networkAllow, ...(always.networkAllow ?? [])]),
+    ],
+    // askCommands 三源：内置默认（发布闸 git push/gh）∪ 两级文件。想撤
+    // 兜底条目，卡上对该命令点「始终允许」（进 leads）
+    askCommands: [
+      ...new Set([...DEFAULT_ASK_COMMANDS, ...user.askCommands, ...(always.askCommands ?? [])]),
+    ],
+    nonPathFrom: { ...user.nonPathFrom, ...always.nonPathFrom },
     alwaysLeads: always.leads,
     alwaysPaths: always.paths,
+    hiddenRead: always.hiddenRead,
+    hiddenWrite: always.hiddenWrite,
+    // 第 2 层算真实路径：$VAR 按 spawn 的同一份环境替换，相对路径从 cwd 起算
+    env: spawnEnv(config, ctx),
+    cwd: args.cwd,
   })
   // cwd 越界：命令字符串按 root 锚定判定，实际却在 cwd 下执行——
   // 两个锚点被劈开即是绕过（cwd=家目录时 `echo > Desktop/foo` 判成
@@ -153,9 +211,11 @@ async function checkApproval(
     verdict.kind === 'ask'
       ? verdict.alwaysLead !== undefined
         ? { kind: 'lead' as const, lead: verdict.alwaysLead }
-        : verdict.nonPathFrom !== undefined
-          ? { kind: 'nonpath' as const, ...verdict.nonPathFrom }
-          : verdict.alwaysPaths !== undefined
+        : verdict.alwaysHidden !== undefined
+          ? { kind: 'hidden' as const, ...verdict.alwaysHidden }
+          : verdict.nonPathFrom !== undefined
+            ? { kind: 'nonpath' as const, ...verdict.nonPathFrom }
+            : verdict.alwaysPaths !== undefined
             ? { kind: 'paths' as const, dirs: verdict.alwaysPaths }
             : verdict.category === 'external_dir'
               ? (() => {
@@ -186,6 +246,7 @@ async function checkApproval(
   if (decision === 'always' && alwaysHint) {
     try {
       if (alwaysHint.kind === 'lead') appendLead(ctx.root, alwaysHint.lead)
+      else if (alwaysHint.kind === 'hidden') appendHidden(ctx.root, alwaysHint.path, alwaysHint.write)
       else if (alwaysHint.kind === 'nonpath') appendNonPathFrom(ctx.root, alwaysHint.lead, alwaysHint.from)
       else if ('dir' in alwaysHint) appendPath(ctx.root, alwaysHint.dir)
       else for (const d of alwaysHint.dirs) appendPath(ctx.root, d)
@@ -284,13 +345,7 @@ function run(args: Args, config: BashConfig, ctx: ToolContext): Promise<ToolOutp
       // 独立进程组。少了它 kill 只能杀掉 bash 自己，它派生的子进程会变成孤儿
       // 继续跑
       detached: true,
-      env: {
-        ...buildEnv(config.envPassthrough),
-        SIMPLE_CODE_ROOTS: JSON.stringify([ctx.root, ...loadAlways(ctx.root).paths]),
-        // 记忆库实际位置：分身任务的 $SIMPLE_CODE_MEMORY 靠它查自己的库
-        // （cwd 冒泡会找到主干的——分身 cwd 就是主 folder）
-        SIMPLE_CODE_MEMORY_DIR: ctx.memoryRoot ?? ctx.root,
-      },
+      env: spawnEnv(config, ctx),
       stdio: ['ignore', 'pipe', 'pipe'],
     })
 
@@ -455,4 +510,16 @@ function buildEnv(passthrough: string[]): Record<string, string> {
     if (value !== undefined) env[name] = value
   }
   return env
+}
+
+/** bash 子进程的环境。审批判定用同一份替换 $VAR（hidden-path.ts），
+ * 两边必须一致——判定时替换出的路径就是执行时的路径 */
+function spawnEnv(config: BashConfig, ctx: ToolContext): Record<string, string> {
+  return {
+    ...buildEnv(config.envPassthrough),
+    SIMPLE_CODE_ROOTS: JSON.stringify([ctx.root, ...loadAlways(ctx.root).paths]),
+    // 记忆库实际位置：分身任务的 $SIMPLE_CODE_MEMORY 靠它查自己的库
+    // （cwd 冒泡会找到主干的——分身 cwd 就是主 folder）
+    SIMPLE_CODE_MEMORY_DIR: ctx.memoryRoot ?? ctx.root,
+  }
 }

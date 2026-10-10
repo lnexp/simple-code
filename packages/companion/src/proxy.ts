@@ -16,7 +16,8 @@
  */
 
 import { createServer, type Server } from 'node:http'
-import { expandEnv, LLM_PROXY_PORT } from '@simple-code/core'
+import { LLM_PROXY_PORT } from '@simple-code/core/src/remote.ts'
+import { expandEnv } from '@simple-code/core/src/config/env.ts'
 
 /** 远端扩展拉配置的只读端点（主扩展 remote.ts 的 syncRemoteSettings 对接这里） */
 export const SETTINGS_PATH = '/simplecode/settings'

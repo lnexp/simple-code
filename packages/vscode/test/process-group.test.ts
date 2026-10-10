@@ -15,6 +15,7 @@ import type { ActivityItem } from '../webview/events.ts'
 const tool = (id: string): ActivityItem => ({
   kind: 'tool',
   id,
+  desc: '',
   name: 'bash',
   command: 'ls',
   output: '',

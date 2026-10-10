@@ -382,7 +382,7 @@ describe('前缀不变式（真 session 端到端）', () => {
 
 describe('发出去的必须先在库里（checkpoint）', () => {
   it('工具结果在下一次请求发出前已落库——此时 reload，重启后前缀接得上', async () => {
-    // 2026-09-23 ai-legal-advisor 真机：工具结果只在下一个 step_finish 落盘，
+    // 2026-09-23 某项目真机：工具结果只在下一个 step_finish 落盘，
     // 请求在途时 reload，重启后工具调用被补成「中断」占位，前缀对不上
     const { dir, globalPath } = await workspace()
     let call = 0

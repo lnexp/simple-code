@@ -82,7 +82,7 @@ The configuration file is `~/.simple-code/settings.json`. **There is no default 
 - Three protocols are supported: `anthropic-messages`, `openai-responses`, `openai-chat`
 - Every model must declare `contextWindow`; the offload threshold is derived from it
 
-A complete example (reasoning effort, timeouts, approval allowlists, MCP) is provided in [`settings.example.json`](settings.example.json), whose leading `$comment` documents each option and the reasoning behind it.
+A complete example (reasoning effort, timeouts, memory tuning) is provided in [`settings.example.json`](settings.example.json), whose leading `$comment` documents each option and the reasoning behind it. Approval allowlists live in `~/.simple-code/approval.json` and MCP servers in `~/.simple-code/mcp.json`, not in settings.json.
 
 ## Terminal usage
 

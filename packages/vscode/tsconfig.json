@@ -6,6 +6,7 @@
     "test/toolrow.test.ts",
     "test/stream-spacing.test.ts",
     "test/footer-wiring.test.ts",
+    "test/continue-wiring.test.ts",
     "test/model-picker.test.ts",
     "test/menu.test.ts",
     "test/history-wiring.test.ts",

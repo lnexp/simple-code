@@ -14,7 +14,7 @@ import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import * as vscode from 'vscode'
-import { LLM_PROXY_PORT } from '@simple-code/core'
+import { LLM_PROXY_PORT } from '@simple-code/core/src/remote.ts'
 import { SETTINGS_PATH, createProxyServer } from './proxy.ts'
 import { appendForwardBlock, forwardLine, hasForwardForHost, sshConfigPath } from './ssh-config.ts'
 

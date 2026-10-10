@@ -46,7 +46,7 @@ function runTurn(store: Store, live: Message[], user: string, reply: string): nu
   const t = store.beginTurn({ model: 'p/m', effort: null })
   live.push(userSays(user), assistantSays(reply))
   store.save(live)
-  store.finishTurn(t, 111)
+  store.finishTurn(t, 111, 'done')
   return t
 }
 
@@ -239,6 +239,31 @@ describe('写域隔离', () => {
       .map((msg) => (msg.parts[0] as { type: string; text: string }).text)
     expect(texts).toEqual(['u1', 'r1', 'q', 'a'])
     back.close()
+  })
+
+  it('剪掉继承段之后库的 live 仍与内存逐条对齐（2026-10-08 PrefixBroken 实锤）', async () => {
+    // 某项目任务：合并收编继承段 → 内存剪掉那些消息，库里的复制
+    // 行却按「继承的不删」留着 live → liveTurnModels 比内存长、下标错位，
+    // 刚由 opus 签的 reasoning 被认成更早 glm 轮的、当别家签名剥掉，改写前缀
+    const dir = await workspace()
+    const main = openStore(dir)
+    const mainLive: Message[] = []
+    runTurn(main, mainLive, 'u1', 'r1')
+    runTurn(main, mainLive, 'u2', 'r2')
+    main.close()
+    const m = forkTask(dir, 't')
+    const task = openStore(dir, { task: scopeOf(m) })
+    const live: Message[] = [...task.load()]
+    const t = task.beginTurn({ model: 'p/opus', effort: null })
+    live.push(userSays('q'), assistantSays('a'))
+    task.save(live)
+    task.finishTurn(t, 1, 'done')
+    // applyPendingMerges：继承的第一轮被合并收编，内存剪掉并通知 store
+    live.splice(0, 2)
+    task.pruneMessages([0, 1])
+    expect(task.liveTurnModels()).toEqual(['p/m', 'p/m', 'p/opus', 'p/opus'])
+    expect(task.load().length).toBe(live.length)
+    task.close()
   })
 })
 
@@ -446,6 +471,26 @@ describe('私有摘要（任务压缩继承段）', () => {
     main.close()
   })
 
+  it('flip/finalize 回报各步改动行数（task_close 的对账数据，2026-09-30 补观测）', async () => {
+    const { dir, m } = await setup()
+    compressInherited(dir, m)
+    const n = (sql: string, ...p: (string | number)[]): number => query<{ c: number }>(dir, sql, ...p)[0]!.c
+    const own = `(SELECT id FROM turns WHERE owner = '${m.owner}')`
+    const liveOwn = n(`SELECT COUNT(*) AS c FROM messages WHERE state = 'live' AND turn_id IN ${own}`)
+    expect(liveOwn).toBeGreaterThan(0)
+    expect(flipTaskLive(dir, m.owner)).toBe(liveOwn)
+    // finalize 前按同一判据数一遍，回报必须逐项对上
+    const want = {
+      sumDeleted: n(`SELECT COUNT(*) AS c FROM summaries WHERE owner = ? AND covers_from <= ?`, m.owner, m.stepFloor),
+      sumPromoted: n(`SELECT COUNT(*) AS c FROM summaries WHERE owner = ? AND covers_from > ?`, m.owner, m.stepFloor),
+      msgDeleted: n(`SELECT COUNT(*) AS c FROM messages WHERE owner = ? AND turn_id NOT IN ${own}`, m.owner),
+      msgPromoted: n(`SELECT COUNT(*) AS c FROM messages WHERE owner = ? AND turn_id IN ${own}`, m.owner),
+      turnsPromoted: n(`SELECT COUNT(*) AS c FROM turns WHERE owner = ?`, m.owner),
+    }
+    expect(want.sumDeleted + want.msgPromoted + want.turnsPromoted).toBeGreaterThan(0)
+    expect(finalizeTask(dir, m.owner)).toEqual(want)
+  })
+
   it('合并不越界：对话的 L0 和任务的私有 L0 连续也不合并', async () => {
     const { pickMergeGroup } = await import('../src/loop/summarize.ts')
     const mk = (owner: string | null, coversFrom: number): Parameters<typeof pickMergeGroup>[0][number] =>
@@ -471,6 +516,47 @@ describe('私有摘要（任务压缩继承段）', () => {
     expect(group2?.members.every((s) => s.owner === null)).toBe(true)
   })
 
+  it('关闭任务留下的尾巴：原文全卸、摘要不在场 → 主任务下一次压缩就进场（2026-09-24/25 两个任务的孤儿段）', async () => {
+    const { activateBeyondStubZone } = await import('../src/loop/summarize.ts')
+    const { dir, m } = await setup()
+    // 任务跑了一轮，关闭时这一轮还是原文——它的 L0 写好了但没进过场
+    const task = openStore(dir, { task: scopeOf(m) })
+    const live: Message[] = [...task.load()]
+    const t = runTurn(task, live, '尾巴的问题', '尾巴的回答')
+    const steps = query<{ id: number }>(dir, 'SELECT id FROM steps WHERE turn_id = ? ORDER BY id', t)
+    task.addSummary({
+      level: 0,
+      coversFrom: steps[0]!.id,
+      coversTo: steps[steps.length - 1]!.id,
+      name: '',
+      text: '任务尾巴的摘要',
+      status: 'ready',
+      inContext: false,
+      supersededBy: null,
+      head: null,
+      archivePath: null,
+    })
+    task.close()
+    flipTaskLive(dir, m.owner)
+    finalizeTask(dir, m.owner)
+
+    // 主任务压缩点：存根区给得很宽（装得下全部 live）——旧规则下尾巴段
+    // 没有 live 可判，永远不进场；孤儿通道不看存根区
+    const main = openStore(dir)
+    const mainLive = main.liveWithTurns()
+    activateBeyondStubZone({
+      live: mainLive,
+      floorStart: mainLive.length,
+      stubSteps: 1000,
+      stubTokens: 1_000_000,
+      summaries: () => main.summaries(),
+      activateSummary: (stepId) => main.activateSummary(stepId),
+    })
+    const text = JSON.stringify(assembleContext(main.liveWithTurns(), main.summaries()))
+    expect(text).toContain('任务尾巴的摘要')
+    main.close()
+  })
+
   it('进场走真实闸：activateBeyondStubZone 的区外含继承段，私有 L0 自动进场', async () => {
     const { activateBeyondStubZone } = await import('../src/loop/summarize.ts')
     const { dir, m } = await setup()
@@ -486,7 +572,7 @@ describe('私有摘要（任务压缩继承段）', () => {
     activateBeyondStubZone({
       live: liveBefore,
       floorStart: liveBefore.length - 1,
-      stubTurns: 1,
+      stubSteps: 1,
       stubTokens: 1,
       summaries: () => task.summaries(),
       activateSummary: (stepId) => task.activateSummary(stepId),

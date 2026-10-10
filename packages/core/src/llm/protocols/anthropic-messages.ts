@@ -28,6 +28,9 @@ function buildRequest(req: Request, ctx: ProviderContext) {
   const body = {
     model: req.model,
     max_tokens: req.maxTokens,
+    // 官方客户端每个请求都带（metadata: getAPIMetadata()）。
+    // 网关多账号池按它粘性路由；没有它 prompt cache 在池里随机 miss
+    ...(req.userId ? { metadata: { user_id: req.userId } } : {}),
     stream: true,
     // 断点覆盖它**之前的全部内容**，而前缀按 tools → system → messages 的
     // 顺序累积——所以这一个断点已经把 tools 一起缓存了，不必给 tools 再打。
@@ -83,23 +86,15 @@ const toWireMessage = (msg: Message): WireMessage => ({
 const CACHE_CONTROL = { type: 'ephemeral' } as const
 
 /**
- * 从后往前**最多三条**消息，各在末尾打一个断点（加 system 一个，正好用满
- * 四个断点的硬上限）。
+ * 只在**末条**消息打一个断点（加 system 一个，共两个）——官方客户端
+ * 同款（markerIndex = messages.length - 1）。
  *
- * 末条是本请求的写入点；倒数第二、三条钉住**上一请求的断点位置**。官方
- * 文档的读取规则是从断点往回找既有条目（lookback window 20 个 block），
- * 所以真 API 上末条一个断点就够；但中转网关未必实现回看——只认「断点
- * 位置精确相同」的条目，断点随尾前移就每轮全量 miss（2026-09-23 实测
- * modelbest 网关：内容前缀逐字段一致、增量 4 个 block，仍 cache miss）。
- * 把上一请求的断点位置钉住，命中就不再依赖回看。
- *
- * 钉倒数第三条就够了：请求 = 上一请求 + assistant + user（一轮模型调用
- * 恰好追加这两条——工具轮是 tool_use/tool_result 对，收尾轮是回答/下一
- * 句），所以上一请求的末条恒为本次的倒数第三条。倒数第二条覆盖只追加
- * 一条的插话轮。实测锚点：请求 b 末条 468 → 请求 a 的 468 正是倒数第三条。
- *
- * 多写不亏：缓存写入按断点间的**增量段**计价，前面的断点命中走读、
- * 未命中也只是把该段写一遍——总写入量恒等于整个前缀一遍，不会翻倍。
+ * 历史：2026-09-23（d2fcc4d）曾改为尾 3 条各一个，理由是「无回看网关
+ * 只认断点位置精确相同的条目，钉住上一请求的断点位置才能命中」。该改动
+ * 没有经过真机验证；2026-09-28 网关侧缓存写入爆炸（82/18 恒定重写、
+ * 乃至双倍全量写入），用户拍板回退官方客户端同款单断点——与最大客户端的
+ * 打法一致，也是所有中转链测试覆盖最多的形态。真 API 上靠官方回看
+ * （每断点 20 块窗口）找上一请求写入的条目，单断点足够。
  *
  * thinking 块不能直接打（官方明列的例外），所以每条消息里从后往前找
  * 第一个不是 thinking 的块。整条消息都是 thinking 就跳过它——少一个钉子
@@ -107,16 +102,16 @@ const CACHE_CONTROL = { type: 'ephemeral' } as const
  */
 function withCacheBreakpoint(wire: WireMessage[]): WireMessage[] {
   const out = [...wire]
-  for (let i = wire.length - 1; i >= 0 && i >= wire.length - 3; i--) {
-    const m = out[i]
-    if (!m) continue
-    const at = m.content.findLastIndex((block) => block.type !== 'thinking')
-    if (at === -1) continue
-    out[i] = {
-      ...m,
-      content: m.content.map((block, j) =>
-        j === at ? { ...block, cache_control: CACHE_CONTROL } : block,
-      ),
+  const last = out[wire.length - 1]
+  if (last) {
+    const at = last.content.findLastIndex((block) => block.type !== 'thinking')
+    if (at !== -1) {
+      out[wire.length - 1] = {
+        ...last,
+        content: last.content.map((block, j) =>
+          j === at ? { ...block, cache_control: CACHE_CONTROL } : block,
+        ),
+      }
     }
   }
   return out
@@ -390,7 +385,14 @@ function parseError(status: number, body: unknown, headers?: Headers): ProtocolE
 function toError(err: Record<string, unknown>, status: number): ProtocolError {
   const message = asString(err.message) || `HTTP ${status}`
   const kind = errorKind(asString(err.type), message, status)
-  return { kind, message, retryable: kind === 'rate_limit' || kind === 'server' }
+  // unknown 也重试（2026-09-29 用户拍板方案 A，参照 Responses 客户端惯例：流错误默认可重试、
+  // 只列不该重试的）。unknown 只在没有 HTTP 错误码时出现——status ≥ 400 上面
+  // 全归了类——实际就是 HTTP 200 流里夹的 error 事件（status 传 0）。网关把
+  // 上游 5xx/握手超时包成这种事件，type 是 bad_response_status_code、<nil>
+  // 或空：9-16 起 13 次全被判 unknown、首次失败即放弃。代价：真不可恢复的
+  // （如「渠道未启用」）多等一轮退避（默认约 30 秒）才报错。kind 保持
+  // unknown 不改，日志里分类照实
+  return { kind, message, retryable: kind === 'rate_limit' || kind === 'server' || kind === 'unknown' }
 }
 
 function errorKind(type: string, message: string, status: number): ProtocolError['kind'] {

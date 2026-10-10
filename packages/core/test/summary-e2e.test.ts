@@ -69,7 +69,9 @@ const CONFIG = {
   // 见 merge-e2e 里同一处的说明：夹具太短，用生产默认阈值裁不动
   memory: {
     unloadTargetRatio: 0.001,
-        stubTurns: 1,
+    // 原 stubTurns: 1（存根区装 1 轮）。按 step 数（2026-09-28）等价写法：本夹具
+    // 第 1 轮是 2 个 step（user 一条 + assistant 一条），装满它就是 2
+    stubSteps: 2,
     keepHeadChars: 40,
     idleSummarizeDelayMs: 0,
     clipThresholdChars: 0,

@@ -67,6 +67,7 @@ export type ToolContext = {
       | { kind: 'path'; dir: string }
       | { kind: 'nonpath'; lead: string; from: number }
       | { kind: 'paths'; dirs: string[] }
+      | { kind: 'hidden'; path: string; write: boolean }
   }) => Promise<'allow' | 'always' | 'deny' | { deny: string }>
   /**
    * 视觉转述（vision relay）：主模型无视觉且配置了 visionModel 时由 session

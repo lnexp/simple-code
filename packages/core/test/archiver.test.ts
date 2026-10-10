@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runEventArchive } from '../src/loop/archiver.ts'
+import { queueEventArchive } from '../src/session/session.ts'
 import { loadConfig } from '../src/config/load.ts'
 import { appendProgress, createEvent } from '../src/tools/events.ts'
 
@@ -235,5 +236,40 @@ describe('appendProgress 段尾定位', () => {
     expect(prog).toBeGreaterThan(-1)
     expect(note).toBeGreaterThan(prog)
     expect(text.indexOf('附注')).toBeGreaterThan(prog)
+  })
+})
+
+// 2026-09-26~30 runlog：archiver ~2661 批里 LLM 出错 10 次（server 6 / network 3 /
+// unknown 1），原来「本批跳过，不重试」——那段 steps 永远不进事件档案
+describe('queueEventArchive（失败重排一次）', () => {
+  const until = async (ok: () => boolean) => {
+    for (let i = 0; i < 100 && !ok(); i++) await new Promise((r) => setTimeout(r, 10))
+  }
+
+  it('第一次调用失败 → 排回队尾重试，第二次成功照常落盘', async () => {
+    createEvent(root, { name: 'events-mechanism', description: '事件机制', firstProgress: '落地', stepRange: '1–2' })
+    let calls = 0
+    const ok = fakeFetch('{"match": "events-mechanism", "progress": "重试后归上"}')
+    const flaky = (async (...args: Parameters<typeof fetch>) => {
+      calls++
+      return calls === 1 ? new Response('boom', { status: 500 }) : ok(...args)
+    }) as typeof fetch
+    queueEventArchive(root, SUMMARY, await loaded(), flaky)
+    const file = join(root, '.simple-code/events/events-mechanism.md')
+    await until(() => readFileSync(file, 'utf8').includes('重试后归上'))
+    expect(calls).toBe(2)
+    expect(readFileSync(file, 'utf8')).toContain('重试后归上')
+  })
+
+  it('一直失败 → 只重试一次，不无限重排', async () => {
+    let calls = 0
+    const down = (async () => {
+      calls++
+      return new Response('boom', { status: 500 })
+    }) as typeof fetch
+    queueEventArchive(root, SUMMARY, await loaded(), down)
+    await until(() => calls >= 2)
+    await new Promise((r) => setTimeout(r, 100))
+    expect(calls).toBe(2)
   })
 })

@@ -348,4 +348,74 @@ describe('预设选择器', () => {
       choice: { provider: 'p', model: 'only-here' },
     })
   })
+
+  it('任务标签用任务模型自己的 presets 与 preset（2026-10-08：主任务 glm 没配、任务 opus 配了，任务里控件消失）', () => {
+    const ui = mount()
+    // 主任务：有选中的预设，但下面断言任务标签不许借它
+    ui.send(state({ presets: [], preset: '主任务的线路' }))
+    ui.send({
+      type: 'tasks',
+      folder: '/tmp/x',
+      limit: 3,
+      tasks: [
+        {
+          name: '分支',
+          status: 'idle',
+          lastText: '',
+          current: { provider: 'p', model: 'both-sides' },
+          effort: 'high',
+          effortOverridden: false,
+          presets: ['line-a', 'line-b'],
+          imagesEnabled: false,
+          contextWindow: 0,
+          approvalOn: true,
+        },
+      ],
+    })
+    act(() => ui.host.querySelector<HTMLButtonElement>('.branch-strip .branch-open')?.click())
+    const btn = ui.host.querySelector<HTMLButtonElement>('button.preset-picker')
+    expect(btn).not.toBeNull()
+    // 任务没选预设 = 默认，不回退成主任务的
+    expect(btn?.textContent).toContain('默认')
+    expect(ui.open('preset-picker').map((i) => i.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
+      '默认模型本体参数',
+      'line-a',
+      'line-b',
+    ])
+  })
+
+  it('任务标签的贴图门控用任务模型自己的 imagesEnabled（主干能收图、分支不能 → 分支里贴图要提示）', () => {
+    const ui = mount()
+    ui.send(state({ imagesEnabled: true }))
+    ui.send({
+      type: 'tasks',
+      folder: '/tmp/x',
+      limit: 3,
+      tasks: [
+        {
+          name: '分支',
+          status: 'idle',
+          lastText: '',
+          current: { provider: 'p', model: 'both-sides' },
+          effort: 'high',
+          effortOverridden: false,
+          presets: [],
+          imagesEnabled: false,
+          contextWindow: 0,
+          approvalOn: true,
+        },
+      ],
+    })
+    act(() => ui.host.querySelector<HTMLButtonElement>('.branch-strip .branch-open')?.click())
+    const ta = ui.host.querySelector('textarea')
+    expect(ta).not.toBeNull()
+    const ev = new Event('paste', { bubbles: true, cancelable: true })
+    Object.defineProperty(ev, 'clipboardData', {
+      value: { items: [{ type: 'image/png', kind: 'file', getAsFile: () => null }] },
+    })
+    act(() => {
+      ta?.dispatchEvent(ev)
+    })
+    expect(ui.host.textContent).toContain('当前模型不支持图片')
+  })
 })

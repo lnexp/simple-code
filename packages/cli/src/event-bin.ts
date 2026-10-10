@@ -29,6 +29,7 @@ import {
   searchEvents,
   updateDescription,
 } from '@simple-code/core/src/tools/events.ts'
+import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts'
 
 const usage = `用法：
   event list                       全量清单（name — description）
@@ -41,8 +42,10 @@ const usage = `用法：
 
 订正用 progress/describe 点状改，不重写正文——档案是活跃战役的状态板。`
 
-/** 可测入口（对齐 lsp-bin 的 lspMain）：argv 从外传，cwd 从外传 */
-export function eventMain(argv: string[], cwd = process.cwd()): number {
+/** 可测入口（对齐 lsp-bin 的 lspMain）：argv 从外传，cwd 从外传。
+ *  cwd 可能是子目录，往上找工作区根（workspace-root.ts） */
+export function eventMain(argv: string[], start = process.cwd()): number {
+  const cwd = findWorkspaceRoot(start)
   const [sub, target, flag] = argv
   try {
     if (sub === 'list') {

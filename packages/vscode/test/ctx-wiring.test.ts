@@ -96,13 +96,8 @@ const info: Extract<ToWebview, { type: 'regions' }>['info'] = {
   stub: 0,
   floor: 2_625,
   live: 44_007,
-  ranges: null,
+  real: null,
 }
-
-const infoWithRanges: typeof info = { ...info, ranges: {
-  cold: { from: 1, to: 811 }, warm: null, hot: { from: 871, to: 871 },
-  stub: null, floor: { from: 2306, to: 2311 }, live: { from: 872, to: 2311 },
-} }
 
 describe('上下文分析面板接线', () => {
   it('step_finish 出数 → 按钮出现；点击发 get_regions；regions 回来渲染；Esc 关', () => {
@@ -137,24 +132,14 @@ describe('上下文分析面板接线', () => {
     expect(app.html()).toContain('还没有记录')
   })
 
-  it('范围列：带 ranges 渲染纯数字区间，老记录没有 ranges 列为空不炸', () => {
+  it('范围列已删（2026-09-30）：行里只剩标签、token、占比', () => {
     const app = mount()
     app.send(state)
     app.send(finish)
     app.clickCtx()
-    app.send({ type: 'regions', info: infoWithRanges })
-    const html = app.html()
-    expect(html).toContain('1–811')
-    expect(html).toContain('871') // 单值不显示区间符
-    expect(html).toContain('2306–2311')
-    expect(html).toContain('>0<') // system+tools 恒为消息 0
-
-    const old = mount()
-    old.send(state)
-    old.send(finish)
-    old.clickCtx()
-    old.send({ type: 'regions', info })
-    expect(old.html()).toContain('上下文分析') // 老记录（无 ranges）照常出表
+    app.send({ type: 'regions', info })
+    expect(app.html()).not.toContain('ctx-range')
+    expect(app.html()).toContain('上下文分析')
   })
 })
 
@@ -186,5 +171,28 @@ describe('上下文面板 V2 版式', () => {
     expect(html).not.toContain('ctx-table')
     // 每行一个色点
     expect(html.match(/ctx-dot/g)?.length).toBe(9)
+  })
+
+  it('有真实 usage：各区按 real/估算和 同比例缩放，输出预留不缩；没有就标估算值', () => {
+    // 估算和 3283+6974+2273+2625+44007 = 59,162；real 取两倍 → 系数正好 2。
+    // live 44,007×2 = 88,014 / 256,000 = 34.38%；输出预留 16k 仍是 6.25%
+    const app = mount()
+    app.send(state)
+    app.send(finish)
+    app.clickCtx()
+    app.send({ type: 'regions', info: { ...info, real: 118_324 } })
+    const html = app.html()
+    const segs = html.split('ctx-stack')[1]?.split('</div>')[0] ?? ''
+    expect(segs).toContain('width: 34.38')
+    expect(segs).toContain('width: 6.25')
+    expect(html).not.toContain('（估算）') // 校准过是常态：不加任何标注
+
+    const raw = mount()
+    raw.send(state)
+    raw.send(finish)
+    raw.clickCtx()
+    raw.send({ type: 'regions', info })
+    expect(raw.html()).toContain('width: 17.19') // 没 real：原样估算
+    expect(raw.html()).toContain('（估算）')
   })
 })

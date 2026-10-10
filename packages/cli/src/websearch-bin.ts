@@ -3,29 +3,33 @@
  * websearch 的 CLI 形态（web-tools §10）。与 webfetch-bin 同款理由：
  * 工具版撤掉，模型经 bash 调用，结果可直接接管道（grep 站点、wc 计数）。
  *
- * exaApiKey 从全局 settings.json 读——工具版走 session config 是历史；
- * bin 是独立进程，全局配置是它唯一的常识来源。只读 websearch 段，不整份
- * loadConfig（那要求完整 model/provider，会挡住没配置过的环境）。
+ * 配置从 ~/.simple-code/websearch.json 读（对齐 mcp.json：凭据类配置单独
+ * 文件）。bin 经 bash 白名单 env 运行，宿主变量不在里面，key 只能落明文
+ * 进文件。文件不存在 = 匿名层；不整份 loadConfig（那会挡住没配置过的环境）。
  */
 import { readFile } from 'node:fs/promises'
-import { GLOBAL_CONFIG_PATH } from '@simple-code/core/src/config/load.ts'
+import { WEBSEARCH_CONFIG_PATH } from '@simple-code/core/src/config/load.ts'
+import { expandEnv } from '@simple-code/core/src/config/env.ts'
 import { createWebsearchTool, type WebsearchConfig } from '@simple-code/core/src/tools/websearch.ts'
 
 /**
- * 只取全局 settings 的 websearch 段，不走 loadConfig——那要求完整的
- * model/provider（§1.2 没有默认模型），会把没有配置过的环境整个挡住。
- * websearch 的唯一配置项是 optional 的 key：文件缺失/字段缺失都等于
- * 「匿名层」，静默（AGENTS.md「可选文件缺失是正常情况」）
+ * websearch.json 缺失/字段缺失 = 匿名层，静默（AGENTS.md「可选文件缺失
+ * 是正常情况」）。文件存在但 JSON 坏了要抛——静默等于悄悄把计费路径
+ * 从网关切回免费层
  */
 async function websearchConfig(): Promise<WebsearchConfig> {
+  let ws: WebsearchConfig
   try {
-    const parsed = JSON.parse(await readFile(GLOBAL_CONFIG_PATH, 'utf8')) as {
-      websearch?: WebsearchConfig
-    }
-    return parsed.websearch ?? {}
-  } catch {
-    return {} // 读不到 = 匿名层，正常情况
+    ws = JSON.parse(await readFile(WEBSEARCH_CONFIG_PATH, 'utf8')) as WebsearchConfig
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+    return {} // 文件不存在 = 匿名层，正常情况
   }
+  const cfg = ws
+  // ${ENV} 引用照 env.ts 规则展开；白名单 env 里没有宿主变量，展开不了
+  // 让它抛（配置错误必须响），吞掉会静默降级回匿名层
+  if (cfg.exaApiKey !== undefined) cfg.exaApiKey = expandEnv(cfg.exaApiKey)
+  return cfg
 }
 
 const USAGE = `用法：websearch <query> [--num N]

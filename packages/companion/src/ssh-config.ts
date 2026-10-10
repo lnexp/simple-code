@@ -15,13 +15,13 @@
 import { appendFileSync, chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { LLM_PROXY_PORT, forwardBlock } from '@simple-code/core'
+import { LLM_PROXY_PORT, forwardBlock } from '@simple-code/core/src/remote.ts'
 
 export const sshConfigPath = (home = homedir()): string => join(home, '.ssh', 'config')
 
 /** 转发行的文本搬进了 core（remote.ts）——主扩展指引卡的「复制配置块」
  * 与这里共用同一份，两处各写一份必漂移 */
-export { forwardLine } from '@simple-code/core'
+export { forwardLine } from '@simple-code/core/src/remote.ts'
 
 /** Host 指令按行首匹配（缩进的 Host 是别的关键字的值，不算开块） */
 const HOST_LINE = /^Host\s+(.+?)\s*$/

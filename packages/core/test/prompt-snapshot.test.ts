@@ -141,6 +141,7 @@ describe('system prompt 快照沿用（缓存热不重读）', () => {
     const taskStore = openStore(w.dir, { task: scope })
     taskStore.writePromptSnapshot({
       agents: '# 约定 v2',
+      userAgents: null,
       notes: null,
       events: '- new-event',
       lessons: null,
@@ -222,5 +223,127 @@ describe('system prompt 快照沿用（缓存热不重读）', () => {
     // 要等真的压缩点（预算超线 / 响应过再隔 TTL）才由 reloadSystem 刷新
     expect(s2.seen[0]?.system).not.toContain('new-event')
     expect(s2.seen[0]?.system).toContain('old-event')
+  })
+})
+
+describe('用户级 AGENTS.md（~/.simple-code/AGENTS.md，2026-09-29）', () => {
+  /** 用户目录 = globalPath 所在目录，放在项目外的子目录里（真机 ~/.simple-code） */
+  async function withUser(userText: string | null, cacheTtlMs?: number) {
+    const dir = await mkdtemp(join(tmpdir(), 'sc-user-agents-'))
+    dirs.push(dir)
+    const project = join(dir, 'proj')
+    const home = join(dir, 'home')
+    await mkdir(project, { recursive: true })
+    await mkdir(home, { recursive: true })
+    const globalPath = join(home, 'settings.json')
+    await writeFile(globalPath, JSON.stringify(config(cacheTtlMs)), 'utf8')
+    await writeFile(join(project, 'AGENTS.md'), '# 项目约定', 'utf8')
+    if (userText !== null) await writeFile(join(home, 'AGENTS.md'), userText, 'utf8')
+    const open = async (rounds: StreamEvent[][]) => {
+      const s = scripted(rounds)
+      const session = await getSession(project, { globalPath, tools: [fakeTool()], stream: s.stream, skipLock: true })
+      return { session, ...s }
+    }
+    return { project, home, open }
+  }
+
+  it('两份都进：用户级在前、项目级在后，用户级段声明冲突以项目为准', async () => {
+    const w = await withUser('# 个人约定：结论用简体中文')
+    const s = await w.open([says('好的')])
+    await collect(s.session.send('你好'))
+    await s.session.close()
+    const system = s.seen[0]?.system ?? ''
+    const user = system.indexOf('个人约定：结论用简体中文')
+    const proj = system.indexOf('# 项目约定')
+    expect(user).toBeGreaterThan(0)
+    expect(proj).toBeGreaterThan(user)
+    expect(system).toContain('冲突时以项目约定为准')
+  })
+
+  it('没有用户级文件 = 没有这一段（可选文件缺失静默跳过）', async () => {
+    const w = await withUser(null)
+    const s = await w.open([says('好的')])
+    await collect(s.session.send('你好'))
+    await s.session.close()
+    expect(s.seen[0]?.system).not.toContain('用户的个人约定')
+    expect(s.seen[0]?.system).toContain('# 项目约定')
+  })
+
+  it('用户级超限截断：警告行点名 ~/.simple-code/AGENTS.md（两份各自截断，要知道砍哪份）', async () => {
+    const w = await withUser('约'.repeat(2400))
+    const s = await w.open([says('好的')])
+    await collect(s.session.send('你好'))
+    await s.session.close()
+    const system = s.seen[0]?.system ?? ''
+    expect(system).toContain('⚠ ~/.simple-code/AGENTS.md 超过')
+    expect(system).not.toContain('约'.repeat(2400))
+    expect(system).not.toContain('⚠ AGENTS.md 超过')
+  })
+
+  it('升级前的快照（user_agents 为 NULL）热重建不加段——前缀接得上；压缩点才读进来并回写', async () => {
+    const w = await withUser(null) // 默认 TTL 3 小时：马上重建必然热
+    const s1 = await w.open([says('好的')])
+    await collect(s1.session.send('第一轮'))
+    await s1.session.close()
+    // 快照已落盘且 userAgents=null，等价于升级前的老库。此时用户才写文件
+    await writeFile(join(w.home, 'AGENTS.md'), '# 个人约定 新写的', 'utf8')
+
+    const s2 = await w.open([says('好')])
+    await collect(s2.session.send('第二轮'))
+    await s2.session.close()
+    expect(s2.seen[0]?.system).not.toContain('个人约定 新写的')
+    expect(s2.seen[0]?.system).toBe(s1.seen[0]?.system)
+
+    // TTL 改 1ms → 下一轮是 stale 压缩点，reloadSystem 读进来
+    await writeFile(join(w.home, 'settings.json'), JSON.stringify(config(1)), 'utf8')
+    await new Promise((r) => setTimeout(r, 5))
+    const s3 = await w.open([says('嗯')])
+    await collect(s3.session.send('第三轮'))
+    await s3.session.close()
+    expect(s3.seen[0]?.system).toContain('个人约定 新写的')
+    const store = openStore(w.project)
+    const snap = store.readPromptSnapshot()
+    store.close()
+    expect(snap?.userAgents).toContain('个人约定 新写的')
+  })
+
+  it('热重建沿用快照里的用户级段：磁盘改了也要等压缩点', async () => {
+    const w = await withUser('# 个人约定 v1')
+    const s1 = await w.open([says('好的')])
+    await collect(s1.session.send('第一轮'))
+    await s1.session.close()
+    await writeFile(join(w.home, 'AGENTS.md'), '# 个人约定 v2', 'utf8')
+    const s2 = await w.open([says('好')])
+    await collect(s2.session.send('第二轮'))
+    await s2.session.close()
+    expect(s2.seen[0]?.system).toContain('个人约定 v1')
+    expect(s2.seen[0]?.system).not.toContain('个人约定 v2')
+  })
+
+  it('各算各的 2048 额度：用户级变大到超限 → 保旧版，提示点名用户级文件，项目级照常刷新', async () => {
+    const w = await withUser('# 个人约定 v1', 1)
+    const s = await w.open([says('好的'), says('好')])
+    await collect(s.session.send('第一轮'))
+    await writeFile(join(w.home, 'AGENTS.md'), `# 个人约定 v2\n${'很长的一句话。'.repeat(2000)}`, 'utf8')
+    await writeFile(join(w.project, 'AGENTS.md'), '# 项目约定 v2', 'utf8')
+    await new Promise((r) => setTimeout(r, 5))
+    const events = await collect(s.session.send('第二轮'))
+    await s.session.close()
+    expect(s.seen[1]?.system).toContain('个人约定 v1')
+    expect(s.seen[1]?.system).not.toContain('个人约定 v2')
+    expect(s.seen[1]?.system).toContain('# 项目约定 v2')
+    const err = events.find((e) => e.type === 'error') as { message: string } | undefined
+    expect(err?.message).toContain(join(w.home, 'AGENTS.md'))
+    expect(err?.message).not.toContain('、AGENTS.md')
+  })
+
+  it('用户目录就是项目目录（把 ~/.simple-code 当项目开）：只算项目级，不叠两遍', async () => {
+    // 上面 workspace() 的布局正是这样：globalPath 在项目根
+    const w = await workspace()
+    const s = await w.open([says('好的')])
+    await collect(s.session.send('你好'))
+    await s.session.close()
+    expect(s.seen[0]?.system).not.toContain('用户的个人约定')
+    expect(s.seen[0]?.system.split('约定 v1').length).toBe(2)
   })
 })

@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -7,7 +7,9 @@ import { anthropicMessages } from '../src/llm/protocols/anthropic-messages.ts'
 import type { Message, Request, Usage } from '../src/llm/types.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
 import type { LoopDeps } from '../src/loop/run.ts'
+import { listBucketFiles } from '../src/session/buckets.ts'
 import { getSession } from '../src/session/session.ts'
+import { MEMORY_RELATIVE } from '../src/session/store.ts'
 import type { Tool } from '../src/tools/types.ts'
 
 /**
@@ -417,6 +419,44 @@ describe('换模型剥掉 reasoning 签名', () => {
     await drain(session.send('再来'))
     expect(sentSignatures(seen[1])).toEqual(['sig-ALPHA-xyz'])
     await session.close()
+  })
+
+  it('剥完签名的版本不重复进归档（2026-10-07 某项目 turn 54/60 实锤）', async () => {
+    // 剥签名（dropForeignSignatures）就地改写 live，归档按内容指纹去重——
+    // 签名没了指纹就变，剥完的版本被当新消息又追加一遍：同一段对话在
+    // turns/*.jsonl 里出现两次，带签名在前、剥完在后。真库规模：1824 个
+    // 归档文件里 1103 个有重复（换模型频繁的项目）
+    const { dir, globalPath } = await workspace()
+    const first = scripted([withThinking])
+    const s1 = await getSession(dir, {
+      globalPath,
+      env: ENV,
+      tools: [fakeTool()],
+      stream: first.stream,
+      skipLock: true,
+    })
+    await drain(s1.send('想一下'))
+    await s1.close()
+
+    const second = scripted([says('b 答')])
+    const s2 = await getSession(dir, {
+      globalPath,
+      env: ENV,
+      tools: [fakeTool()],
+      stream: second.stream,
+      skipLock: true,
+    })
+    s2.setModel({ provider: 'beta', model: 'b-one' })
+    await drain(s2.send('换了'))
+    await s2.close()
+
+    const lines: string[] = []
+    for (const file of listBucketFiles(join(dir, MEMORY_RELATIVE), 'turns', '.jsonl')) {
+      lines.push(...(await readFile(file, 'utf8')).trim().split('\n').filter(Boolean))
+    }
+    expect(lines.filter((l) => l.includes('想好了'))).toHaveLength(1)
+    // 留下的是带签名的原文，不是剥完的副本
+    expect(lines.some((l) => l.includes('sig-ALPHA-xyz'))).toBe(true)
   })
 
   it('重建会话恢复上次选择（配置默认 → 上次模型）：签名不剥、前缀守卫不响', async () => {

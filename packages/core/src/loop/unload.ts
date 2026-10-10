@@ -4,8 +4,15 @@ import type { Message, Part } from '../llm/types.ts'
 export type ClipOptions = {
   /** 超过这么多字符才动手。低于它原样保留，**一个通知都不加** */
   threshold: number
-  /** 动手之后留多少头部 */
+  /** 动手之后留多少头部。命令只留头；输出没配下面两个时也只留头（旧行为） */
   keepHeadChars: number
+  /**
+   * 输出留头 + 留尾（2026-09-28 用户拍板方案 C：命令留头 200，输出头 100 +
+   * 尾 100）。测试、构建、git 的结论在**尾部**（`1 failed | 424 passed`），
+   * 只留头会把它裁掉。两个都配才生效，否则退回 keepHeadChars 只留头
+   */
+  outputHeadChars?: number | undefined
+  outputTailChars?: number | undefined
   /** 归档路径，写进通知里 */
   archive: string
   /**
@@ -16,7 +23,7 @@ export type ClipOptions = {
    *
    * **当前工具轮（pending tool loop）必须传 false**：anthropic 续发
    * tool result 时要求带 thinking 的 assistant 消息原样在场（配对底线，
-   * CC `clear_thinking` 同款只保最后一轮）。调用方（run.ts）按「最后一条
+   * 官方 `clear_thinking` 策略同样只保最后一轮）。调用方（run.ts）按「最后一条
    * user 消息之后」划界
    */
   dropReasoning?: boolean
@@ -65,7 +72,7 @@ export function unloadMessage(msg: Message, opts: ClipOptions): Message {
 }
 
 function unloadPart(part: Part, opts: ClipOptions): Part {
-  if (part.type === 'tool_result') return { ...part, output: clipShell(part.output, opts) }
+  if (part.type === 'tool_result') return { ...part, output: clipOutput(part.output, opts) }
   if (part.type === 'tool_call') return { ...part, input: clipCommand(part.input, opts) }
   // text / reasoning / image 一律原样穿过，见上面的注释
   return part
@@ -109,6 +116,33 @@ function clipShell(text: string, opts: ClipOptions): string {
   const head = text.slice(0, opts.keepHeadChars)
   const lastLine = head.lastIndexOf('\n')
   const clipped = `${lastLine > 0 ? head.slice(0, lastLine) : head}\n# [已卸载，完整内容见 ${opts.archive}]`
+  return clipped.length < text.length ? clipped : text
+}
+
+/**
+ * 裁工具输出：配了头尾就「头 + 省略行 + 尾 + 通知」，否则同 clipShell 只留头。
+ *
+ * **通知必须仍在末尾**——isStubbed / regions 的 isStubPart / webview 存根
+ * 判定都按行尾锚定，尾巴放到通知后面会让这条永远被当成未裁、每趟车重裁一遍
+ * （幂等破了就是 cleanup.ts 收拾过的 10 层叠加）。省略行带 `#`，理由同 clipShell ①。
+ * 两端各自对齐行边界：头截到最后一个换行，尾从第一个换行后开始
+ */
+function clipOutput(text: string, opts: ClipOptions): string {
+  const headChars = opts.outputHeadChars
+  const tailChars = opts.outputTailChars
+  if (headChars === undefined || tailChars === undefined) return clipShell(text, opts)
+  if (text.length <= opts.threshold) return text
+  if (isStubbed(text)) return text
+  const body = text.replace(/\n+$/, '')
+  if (body.length <= headChars + tailChars) return text
+  const rawHead = body.slice(0, headChars)
+  const headEnd = rawHead.lastIndexOf('\n')
+  const head = headEnd > 0 ? rawHead.slice(0, headEnd) : rawHead
+  const rawTail = body.slice(body.length - tailChars)
+  const tailStart = rawTail.indexOf('\n')
+  const tail = tailStart >= 0 && tailStart < rawTail.length - 1 ? rawTail.slice(tailStart + 1) : rawTail
+  const omitted = body.length - head.length - tail.length
+  const clipped = `${head}\n# …（省略 ${omitted} 字符）…\n${tail}\n# [已卸载，完整内容见 ${opts.archive}]`
   return clipped.length < text.length ? clipped : text
 }
 

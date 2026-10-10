@@ -2,6 +2,8 @@ import type { BgProcessInfo } from '@simple-code/core'
 import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
+  memo,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -91,6 +93,19 @@ export function App() {
   /** 挂起中的审批（approval_request 到、approval_closed 消）多问并发时
    * 会有多条——每条一个 id，答复按钮各自对应 */
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([])
+
+  /** 审批答复。useCallback 固定引用——ToolRow 的 memo 靠它跳过重渲 */
+  const onApprovalReply = useCallback(
+    (id: number, choice: 'allow' | 'always' | 'deny', folder?: string, feedback?: string) =>
+      post({
+        type: 'approval_reply',
+        id,
+        choice,
+        ...(folder ? { folder } : {}),
+        ...(feedback ? { feedback } : {}),
+      }),
+    [],
+  )
   /** 工作区根（state 消息每次都带）。拖拽路径相对化用它，见 Composer 的 onDrop */
   const [folder, setFolder] = useState('')
   /** 多根工作区的文件夹清单（design.md §7）。length > 1 才渲染顶部下拉 */
@@ -421,21 +436,16 @@ export function App() {
             model={(branch === null ? controls.current : t?.current)?.model ?? null}
             history={branch === null ? history : { cursor: null, more: false, loading: false }}
             approvals={approvals}
-            onApprovalReply={(id, choice, f, feedback) =>
-              post({
-                type: 'approval_reply',
-                id,
-                choice,
-                ...(f ? { folder: f } : {}),
-                ...(feedback ? { feedback } : {}),
-              })
-            }
+            onApprovalReply={onApprovalReply}
             onFetchTop={() => {
               const h = historyRef.current
               if (!h.more || h.loading) return
               setHistory({ ...h, loading: true })
               post({ type: 'fetchHistory', cursor: h.cursor })
             }}
+            // 「继续」按钮 = 替用户说一句「继续」：走同一个 send（对话/任务
+            // 分流、气泡上屏都在里面），core 续进上一轮（turn-resume.md）
+            onContinue={() => send('继续')}
           />
         )
       })()}
@@ -551,16 +561,20 @@ export function App() {
         view={branch === null ? view : (taskViews[branch] ?? emptyView())}
         controls={(() => {
           // 控件区跟分支走（2026-09-22 拍板）：模型/深度/预设/窗口是分支
-          // session 自己的账（TaskState 带来）；models/presets/审批开关/
-          // 图片开关借主干——配置全 folder 一份
+          // session 自己的账（TaskState 带来），预设列表、贴图通道也是（模型级）；
+          // models 借主干——配置全 folder 一份
           const t = branch === null ? undefined : tasks.find((x) => x.name === branch)
           if (t === undefined) return controls
+          const { preset: _mainPreset, ...shared } = controls
           return {
-            ...controls,
+            ...shared,
             current: t.current,
             effort: t.effort,
             effortOverridden: t.effortOverridden,
+            // 分支没选预设 = 默认，不回退成主干的
             ...(t.preset !== undefined ? { preset: t.preset } : {}),
+            presets: t.presets,
+            imagesEnabled: t.imagesEnabled,
             contextWindow: t.contextWindow,
             // 审批开关跟分支走（2026-09-22 拍板，推翻早前 folder 级口径）
             approvalOn: t.approvalOn,
@@ -639,6 +653,7 @@ function Log({
   approvals,
   onApprovalReply,
   onFetchTop,
+  onContinue,
 }: {
   view: ChatView
   running: boolean
@@ -652,6 +667,7 @@ function Log({
     feedback?: string,
   ) => void
   onFetchTop: () => void
+  onContinue: () => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
   const pinned = useRef(true)
@@ -751,11 +767,13 @@ function Log({
         onApprovalReply={onApprovalReply}
       />
     ) : (
-      <Item
+      <MItem
         key={`b${at}`}
         item={block.item}
         streaming={running && at === blocks.length - 1}
         model={model}
+        // 只给停稳后的最后一条：之后又说过话，这个「继续」就过期了
+        {...(!running && at === blocks.length - 1 ? { onContinue } : {})}
       />
     )
 
@@ -844,10 +862,13 @@ function Item({
   item,
   streaming,
   model,
+  onContinue,
 }: {
   item: SingleItem
   streaming: boolean
   model: string | null
+  /** 有值 = 这条是停稳后的最后一条，可以给「继续」按钮 */
+  onContinue?: () => void
 }) {
   switch (item.kind) {
     case 'user':
@@ -894,18 +915,28 @@ function Item({
       )
     case 'notice':
       return (
-        <div className={`item notice${item.errorKind ? ' notice-error' : ''}`}>
+        <div
+          className={`item notice${item.errorKind ? ' notice-error' : ''}${item.resumable && onContinue ? ' notice-action' : ''}`}
+        >
           {item.errorKind && <span className="notice-kind">{item.errorKind}</span>}
           {item.text}
-          {item.retryable && (
-            <button type="button" className="notice-retry" onClick={() => post({ type: 'retry' })}>
-              重试
+          {item.resumable && onContinue && (
+            <button type="button" className="notice-continue" onClick={onContinue}>
+              继续
             </button>
           )}
         </div>
       )
   }
 }
+
+/**
+ * memo 化（2026-10-06 内存事件）：流式期间 Log 每 100ms 重渲一次，已完成
+ * 的行 props 引用稳定（events.ts 折叠只替换末条）→ 整行跳过。此前每秒
+ * 10 次对全部历史行重跑 renderMarkdown（marked+DOMPurify+hljs），垃圾以
+ * 内容千倍的量级产出，V8 提交的堆只涨不还——面板进程 24h 涨到 2.9GB
+ */
+const MItem = memo(Item)
 
 /**
  * 流式中的 markdown：节流（100ms）+ 围栏隔离。未闭合 ``` 的尾部按纯文本

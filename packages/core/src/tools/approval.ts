@@ -16,6 +16,8 @@ import { dirHint, expandTilde } from './approval-always.ts'
 import { existsSync, realpathSync } from 'node:fs'
 import { isAbsolute, resolve } from 'node:path'
 import { astSegments } from './shell-ast.ts'
+import { cdTarget, gitRevPath, hiddenVerdict, isHiddenSeg, localVarsOf, realPathOf, type RealCtx } from './hidden-path.ts'
+import { findWorkspaceRoot } from './workspace-root.ts'
 
 export type ApprovalVerdict =
   | { kind: 'allow' }
@@ -39,16 +41,26 @@ export type ApprovalVerdict =
        * 隐藏路径）不给——粒度不一的东西一键全记，等于替用户批了
        * 没细看的 */
       alwaysPaths?: string[]
+      /** 隐藏路径的始终允许预览（2026-09-29 拍板，hidden-path.md）：记到
+       * 第一个隐藏段为止、读写分开。项目内是相对路径，项目外是绝对路径 */
+      alwaysHidden?: { path: string; write: boolean }
     }
 
 /** 审批类别。UI 用它显示标签（external_dir 等），detail 是触发物 */
-export type ApprovalCategory = 'external_dir' | 'hidden_path' | 'network_cmd' | 'unparseable' | 'multi'
+export type ApprovalCategory =
+  | 'external_dir'
+  | 'hidden_path'
+  | 'network_cmd'
+  | 'ask_rule'
+  | 'unparseable'
+  | 'multi'
 
 /** 类别标签的中文名。UI 与 CLI 共用（approval.md §4.3） */
 export const CATEGORY_LABEL: Record<ApprovalCategory, string> = {
   external_dir: '项目外路径',
   hidden_path: '隐藏路径',
   network_cmd: '网络命令',
+  ask_rule: '自定义规则',
   unparseable: '无法静态判定',
   multi: '多重触发',
 }
@@ -59,7 +71,15 @@ export type ApprovalConfig = {
   /** 网络命令白名单（首 token 精确匹配）。默认那几个并不在网络命令集里，
    * 留着是「未来扩集时这些仍然放行」的声明位 */
   networkAllow: string[]
-  /** always 执行器白名单（approval.json leads，运行时追加）。命中=段放行 */
+  /** 自定义审批规则（2026-09-27 拍板，当天二次拍板移出 settings.json）：
+   *  lead / lead+子命令 / lead+子命令+子子命令（'appctl workloads apply'）
+   *  命中即弹卡。来源（bash.ts 组合并集）：内置默认（发布闸）∪ 用户级
+   *  ~/.simple-code/approval.json ∪ 项目级 .simple-code/approval.json。
+   *  例外走 alwaysLeads（卡上「始终允许」），不走 networkAllow——那是
+   *  网络命令的例外面，语义不同的东西不互相搭车 */
+  askCommands: string[]
+  /** always 执行器白名单（approval.json leads，运行时追加）。命中只免命令名
+   * 那一层，路径照判（2026-09-30：lead 与路径是 AND） */
   alwaysLeads?: string[]
   /** always 路径白名单（approval.json paths，展开后的绝对目录前缀）。
    * 命中=该 token 免审。匹配前 token 也做 ~ 展开，两侧形态一致 */
@@ -67,13 +87,27 @@ export type ApprovalConfig = {
   /** 命令名 → 从第几位位置参数起不判为路径（0 基，区间豁免）。
    * 元素寻址类的私有工具从这里配（settings），core 不内置条目 */
   nonPathFrom?: Record<string, number>
+  /** 隐藏路径始终允许（approval.json hiddenRead/hiddenWrite，卡上采集）。
+   * 条目是路径前缀：等于或以「条目/」开头即命中 */
+  hiddenRead?: string[]
+  hiddenWrite?: string[]
+  /** bash 工具 spawn 的环境——第 2 层替换 $VAR 用。缺省 = 空（变量全算不出） */
+  env?: Record<string, string>
+  /** 命令起始目录（bash 的 cwd 参数）。缺省 = root */
+  cwd?: string
+  /** 存在检查。缺省 fs.existsSync；测试在假 root 下注入 */
+  pathExists?: (abs: string) => boolean
 }
 
-/** 隐藏路径白名单。曾含 node_modules——死条目：它不以 . 开头，根本
- * 走不到隐藏组件检查（普通路径本来就放行），删掉免得误导 */
-export const DEFAULT_HIDDEN_ALLOW = ['.git']
+/** 隐藏路径默认例外：空（2026-09-29 拍板 `.git` 移出，例外只剩
+ * .simple-code 自己的四个目录，见 pathVerdict）。用户手写的 hiddenAllow
+ * 仍从两级 approval.json 并进来 */
+export const DEFAULT_HIDDEN_ALLOW: string[] = []
 export const DEFAULT_NETWORK_ALLOW = ['npm', 'pnpm', 'yarn', 'git', 'node']
-
+/** askCommands 的内置默认（发布闸兜底）。git/gh 不进 NETWORK_COMMANDS——
+ *  add/commit/diff 是一天几十次的日常刚需，全拦等于审批疲劳；真正拦的
+ *  只有出网写形态。用户级/项目级 approval.json 只往这份兜底上并 */
+export const DEFAULT_ASK_COMMANDS = ['git push', 'gh']
 /** 走网络的通用外传通道（§2 规则 2）。git/npm 不在这里——它们是刚需 */
 const NETWORK_COMMANDS = new Set([
   'curl',
@@ -134,6 +168,8 @@ const SEGMENT_SPLIT_RE = /(?:&&|\|\||[;|&])/
 
 export function classify(command: string, root: string, cfg: ApprovalConfig): ApprovalVerdict {
   const cmd = command.trim()
+  // 第 2 层的真实路径上下文（hidden-path.ts）：cwd 随顶层 cd 逐段更新
+  const real: RealCtx = { cwd: cfg.cwd ?? root, env: cfg.env ?? {}, localVars: localVarsOf(cmd) }
 
   // 规则 0：自家 bin。引号形态固定（宿主注入的就是 "$SIMPLE_CODE_X"）。
   // 例外：APPLY_PATCH 的 heredoc 里藏着任意路径的写操作（补审批闭环的
@@ -141,7 +177,7 @@ export function classify(command: string, root: string, cfg: ApprovalConfig): Ap
   // 抽出路径逐个过 pathVerdict（写意图）
   if (cmd.startsWith('"$SIMPLE_CODE_')) {
     if (cmd.startsWith('"$SIMPLE_CODE_APPLY_PATCH"')) {
-      const v = patchVerdict(cmd, root, cfg)
+      const v = patchVerdict(cmd, root, cfg, real)
       if (v) return v
       // 不带引号的分隔符要一并查：body 会被 shell 展开（反引号替换
       // tree-sitter 不解析，看不见），同一条命令前面挂个 `cd X &&` 就拦、
@@ -191,19 +227,22 @@ export function classify(command: string, root: string, cfg: ApprovalConfig): Ap
         // lead 白名单命中=段放行（judge 的同语义）：批过 python3 就是
         // 接受它的一切内联形态，heredoc 不例外。这条早退原本绕过白
         // 名单检查——同一条白名单两个行为（<<'EOF' 免审、<<EOF 照弹）
-        if (leadAllowed(s.lead, s.items, cfg)) continue
-        return {
-          kind: 'ask',
-          category: 'unparseable',
-          detail: 'unquoted heredoc',
-          reason: s.unparseable,
-          // 采集键=段 lead，与解释器卡同语义：始终允许这个命令的
-          // 一切内联形态（展开风险是批的时候自己接受的）
-          alwaysLead: unquote(s.lead),
+        // 命中后仍往下走 judge：lead 不能绕过隐藏路径（第 4 层）
+        if (!leadAllowed(s.lead, s.items, cfg)) {
+          return {
+            kind: 'ask',
+            category: 'unparseable',
+            detail: 'unquoted heredoc',
+            reason: s.unparseable,
+            // 采集键=段 lead，与解释器卡同语义：始终允许这个命令的
+            // 一切内联形态（展开风险是批的时候自己接受的）
+            alwaysLead: unquote(s.lead),
+          }
         }
       }
-      const v = judge(s.lead, s.items, root, cfg, cmd)
+      const v = judge(s.lead, s.items, root, cfg, real, cmd)
       if (v.kind === 'ask') asks.push(v)
+      trackCd(s.lead, s.items, s.nested !== true, real)
     }
     return mergeAsks(asks)
   }
@@ -228,10 +267,23 @@ export function classify(command: string, root: string, cfg: ApprovalConfig): Ap
   // alwaysLead——多处触发无法收敛成安全粒度（同隐藏路径的口径）
   const asks: Extract<ApprovalVerdict, { kind: 'ask' }>[] = []
   for (const seg of splitSegments(cmd)) {
-    const v = classifySegment(seg, root, cfg, cmd)
+    const v = classifySegment(seg, root, cfg, real, cmd)
     if (v.kind === 'ask') asks.push(v)
+    trackCd(seg[0] ?? '', seg.slice(1).map((text) => ({ text })), true, real)
   }
   return mergeAsks(asks)
+}
+
+/** 段是 cd 时更新当前目录：顶层的按目标算，非顶层的（子 shell、管道、
+ * $( )、if/for 里）效果不确定，之后一律算不出 */
+function trackCd(lead: string, items: { text: string }[], topLevel: boolean, real: RealCtx): void {
+  if (unquote(lead) !== 'cd') return
+  if (!topLevel) {
+    real.cwd = null
+    return
+  }
+  const arg = items.map((i) => unquote(i.text)).find((t) => !t.startsWith('-') || t === '-')
+  real.cwd = cdTarget(arg, real)
 }
 
 /** 多段触发的合并展示（2026-09-15 拍板）：首中即返会展示「最无害的段」——
@@ -296,6 +348,44 @@ function firstPositional(lead: string, items: { text: string }[]): string | unde
   return undefined
 }
 
+/** 位置参数序列（askCommands 规则与 alwaysLeads 豁免共用）：lead 后的
+ *  位置参数按序收集，flag 跳过。不能直接用 firstPositional——git 的
+ *  -C <path> / -c <k=v> 是带值全局 flag，值是普通 token，`git -C /tmp
+ *  push` 会被取成 /tmp → 匹配不上 'git push' → fail-open 绕过。带值
+ *  全局 flag 就 git 这两个 */
+function positionalsOf(lead: string, items: { text: string }[]): string[] {
+  const out: string[] = []
+  let skipNext = false
+  for (const it of items) {
+    const t = unquote(it.text)
+    if (skipNext) {
+      skipNext = false
+      continue
+    }
+    if (t === '' || t === '-' || t === unquote(lead)) continue
+    if (t.startsWith('-')) {
+      if (unquote(lead) === 'git' && (t === '-C' || t === '-c')) skipNext = true
+      continue
+    }
+    if (SHELL_RESERVED.has(t)) continue
+    if (/^[^/"'.]*=/.test(t)) continue // 形如 foo=bar 的赋值不是子命令
+    out.push(t)
+  }
+  return out
+}
+
+/** 命令路径匹配：条目按空格切 token，与命令的 [lead, ...位置参数] 前 N
+ *  个 token 逐个相等才命中（词级，非字符串前缀——'appctl deployx' 不
+ *  命中 'appctl deploy'）。一级=整个 CLI（'appctl'），两级=子命令
+ *  （'git push'），三级=子命令的子命令（'appctl workloads apply'——
+ *  apply/delete 弹卡、list/get 自由需要这个粒度） */
+function pathMatches(entry: string, bare: string, positionals: string[]): boolean {
+  const et = entry.split(' ')
+  const ct = [bare, ...positionals]
+  if (et.length > ct.length) return false
+  return et.every((t, i) => t === ct[i])
+}
+
 /** lead 白名单命中（=段放行）。两轮精确等值，非前缀：先查子命令级
  * 条目（lead + 第一个位置参数，如 'agent-browser eval'——批 eval
  * 子命令不放行 screenshot），再查裸 lead（批过 python3 就是接受它
@@ -304,9 +394,12 @@ function leadAllowed(lead: string, items: { text: string }[], cfg: ApprovalConfi
   const leads = cfg.alwaysLeads
   if (!leads?.length) return false
   const bare = unquote(lead)
-  const first = firstPositional(bare, items)
-  if (first !== undefined && leads.includes(`${bare} ${first}`)) return true
-  return leads.includes(bare)
+  // pathMatches 的词级匹配：'node eval'（既有形态）、'appctl workloads
+  // apply'（三级，2026-09-27）都是条目=命令前 N 个 token。比旧的
+  // `${bare} ${firstPositional}` 两级形态多罩一层，且 git -C 值跳过让
+  // `git -C /tmp push` 也能命中 'git push' 的豁免
+  const pos = positionalsOf(lead, items)
+  return leads.some((e) => pathMatches(e, bare, pos))
 }
 
 /** `&&` `;` `|` 是 shell 控制符——token 粘连时切开分段。引号内含 | 的
@@ -402,6 +495,7 @@ function judge(
   items: { text: string; write: boolean }[],
   root: string,
   cfg: ApprovalConfig,
+  real: RealCtx,
   rawCmd?: string,
 ): ApprovalVerdict {
   // 段级自家 bin（规则 0 的分段形态：`cd x && "$SIMPLE_CODE_Y" <<'H' …`）。
@@ -409,7 +503,7 @@ function judge(
   // 在冷启动窗口也能放行 apply_patch 补丁
   if (unquote(lead).startsWith('$SIMPLE_CODE_')) {
     if (unquote(lead) === '$SIMPLE_CODE_APPLY_PATCH' && rawCmd) {
-      const v = patchVerdict(rawCmd, root, cfg)
+      const v = patchVerdict(rawCmd, root, cfg, real)
       if (v) return v
     }
     return { kind: 'allow' }
@@ -430,9 +524,22 @@ function judge(
 
   // always 执行器白名单：leadAllowed（含子命令级条目，见其注释）。
   // 必须在 lead 回填**之后**（回退路径进来时 lead 是 ''，靠上面回填
-  // 成首 token）
-  if (leadAllowed(lead, items, cfg)) return { kind: 'allow' }
+  // 成首 token）。命中只免掉命令名这一层（解释器/网络/自定义规则），
+  // 路径照查——隐藏路径（2026-09-29 第 4 层）与项目外路径（2026-09-30）
+  if (!leadAllowed(lead, items, cfg)) {
+    const v = commandRules(lead, items, cfg)
+    if (v) return v
+  }
+  return pathRules(lead, items, root, cfg, real, { fromFallback, head })
+}
 
+/** 规则 1b–2：看命令名就能判的（解释器、eval、自定义规则、网络命令）。
+ * 不命中返回 null */
+function commandRules(
+  lead: string,
+  items: { text: string; write: boolean }[],
+  cfg: ApprovalConfig,
+): ApprovalVerdict | null {
   // 规则 1b/1c：解释器、裸 shell、eval
   if (INTERPRETERS.has(lead) || SHELLS.has(lead)) {
     return {
@@ -464,6 +571,34 @@ function judge(
     }
   }
 
+  // 规则 1.5：自定义审批规则（askCommands，2026-09-27 拍板）。优先于
+  // 规则 2——appctl deploy /prod 这类带项目外路径的调用，报「自定义
+  // 规则」比报「项目外路径」更接近用户配规则时的意图；且卡上的
+  // alwaysLead（appctl deploy）比路径收敛（/prod）粒度更对。类别独立
+  // （ask_rule）——appctl 不是网络命令，标签不能撒谎（用户拍板）。
+  // 条目来源：内置默认（DEFAULT_ASK_COMMANDS，发布闸）∪ 用户级
+  // ~/.simple-code/approval.json ∪ 项目级 .simple-code/approval.json
+  // （2026-09-27 二次拍板：审批规则与 settings.json 隔离，独立文件）
+  if (cfg.askCommands.length) {
+    const bare = unquote(lead)
+    const pos = positionalsOf(lead, items)
+    // 多条命中取 token 最长的（最紧的）——卡上「始终允许」按最紧粒度
+    // 收敛：'appctl workloads' 与 'appctl workloads apply' 都在时，
+    // 弹卡给后者，批 apply 不外溢到 workloads 的其他子命令
+    const hit = cfg.askCommands
+      .filter((r) => pathMatches(r, bare, pos))
+      .sort((a, b) => b.split(' ').length - a.split(' ').length)[0]
+    if (hit && !leadAllowed(lead, items, cfg)) {
+      return {
+        kind: 'ask',
+        category: 'ask_rule',
+        detail: hit,
+        reason: `${hit} 命中自定义审批规则`,
+        alwaysLead: hit,
+      }
+    }
+  }
+
   // 规则 2：网络命令
   if (NETWORK_COMMANDS.has(lead) && !cfg.networkAllow.includes(lead)) {
     return {
@@ -475,7 +610,19 @@ function judge(
     }
   }
 
-  // 规则 3/4：逐 token 查路径
+  return null
+}
+
+/** 规则 3/4：逐 token 查路径 */
+function pathRules(
+  lead: string,
+  items: { text: string; write: boolean }[],
+  root: string,
+  cfg: ApprovalConfig,
+  real: RealCtx,
+  seg: { fromFallback: boolean; head: number },
+): ApprovalVerdict {
+  const { fromFallback, head } = seg
   // 写意图 = 首动词在写表，或 sed 就地改（-i / --in-place）
   const verbWrites =
     WRITE_COMMANDS.has(lead) ||
@@ -521,7 +668,31 @@ function judge(
     }
     const at = positionalSeen
     positionalSeen++
-    const v = pathVerdict(t, root, cfg, item.write || verbWrites)
+    const write = item.write || verbWrites
+    // git 的 REV:path：冒号后是仓库历史里的路径，磁盘上不一定有——不查
+    // 存在，按第 1 层看名字（`git show HEAD:.env` 拦）
+    const revPath = unquote(lead) === 'git' ? gitRevPath(t) : null
+    if (revPath !== null) {
+      if (revPath.split('/').some(isHiddenSeg)) {
+        return { kind: 'ask', category: 'hidden_path', detail: t, reason: `要读取 git 历史里的隐藏路径：${t}` }
+      }
+      continue
+    }
+    const v = pathVerdict(t, root, cfg, write, real)
+    // 项目外的点开头路径按隐藏路径判（2026-09-30，不论有无 lead）：卡上
+    // 始终允许键收敛到隐藏段、读写分开（~/.ssh 读），不走 external_dir 记
+    // 整个目录（读写全免）。存在且已批（hiddenRead/Write）= 过；不存在 =
+    // 隐藏这层不管，落回项目外路径照弹（`echo x > ~/.newdir/f` 仍是往项目外写）。
+    // lead 与路径是 AND（2026-09-30 拍板）：lead 只免命令名那一层，走到
+    // 这里的路径判定与没批 lead 时完全相同
+    if (v.kind === 'ask' && v.category === 'external_dir') {
+      const abs = realPathOf(t, real)
+      if (abs === null || abs.split('/').some(isHiddenSeg)) {
+        const h = hiddenVerdict(t, root, cfg, write, real)
+        if (h.kind === 'ask') return h
+        if (abs !== null && !/[*?]/.test(abs) && (cfg.pathExists ?? existsSync)(abs)) continue
+      }
+    }
     // nonPathFrom 采集依据：触发位 ≥2 且是 external_dir（hidden_path 的
     // 触发物是真路径，这个选项是误导）。lead 在段首，元素寻址工具的
     // 结构必然是 verb（位0）+ 文件参数（位1）+ 元素路径（位2+）
@@ -539,6 +710,7 @@ function classifySegment(
   seg: string[],
   root: string,
   cfg: ApprovalConfig,
+  real: RealCtx,
   rawCmd?: string,
 ): ApprovalVerdict {
   const items: { text: string; write: boolean }[] = []
@@ -548,7 +720,7 @@ function classifySegment(
     pendingRedirect = /^\d*&?>>?$/.test(token)
     items.push({ text: token, write: redirectedWrite })
   }
-  return judge('', items, root, cfg, rawCmd)
+  return judge('', items, root, cfg, real, rawCmd)
 }
 
 /** 补丁标记行抽路径：Update/Add/Delete File 与 Move to（目标也是写——
@@ -558,31 +730,18 @@ function classifySegment(
  * 格式的所有内容行必带 +/-/空格前缀，行首 *** 只能是真标记 */
 const PATCH_PATH_RE = /^\*\*\* (?:Update|Add|Delete) File: (.+)$|^\*\*\* Move to: (.+)$/gm
 
-/** APPLY_PATCH 通道对 .simple-code 成长区的豁免（2026-09-27 拍板）：
- *  note/lesson/skill 的 patch 子命令退役后，编辑统一走 APPLY_PATCH。
- *  当年子命令是规则 0 的可信通道（免审），退役后通道语义由这道豁免
- *  承接——**只豁免这一个通道**，裸 shell（rm/cp/tee）写这些目录照旧
- *  走 pathVerdict 弹卡。只认成长区（notes/skills/lessons——模型自助
- *  成长的内容区，write 本就免审）；记忆档案（turns/summaries/state.db/
- *  events）不豁免，「往 turn 文件塞假记忆」的攻击面原封不动。用户级
- *  （~/.simple-code）不豁免——项目外写保留审批门槛（绝对路径不带 root
- *  前缀自然豁免不到）。已知口子（拍板时已交代）：通道豁免连带放行
- *  *** Delete File——删除动作在命令文本里全可见。 */
-const patchChannelExempt = (raw: string, root: string): boolean => {
-  let p = raw
-  const r = root.endsWith('/') ? root : `${root}/`
-  if (p.startsWith(r)) p = p.slice(r.length)
-  else if (p.startsWith('/') || p.startsWith('~')) return false
-  const seg = p.split('/').filter((x) => x !== '' && x !== '.')
-  return seg[0] === '.simple-code' && (seg[1] === 'notes' || seg[1] === 'skills' || seg[1] === 'lessons')
-}
-
-function patchVerdict(cmd: string, root: string, cfg: ApprovalConfig): ApprovalVerdict | null {
+/** 补丁相对路径的真实位置与 apply-patch-bin 同口径：从 bin 的 cwd（命令里
+ * cd 之后的目录）往上找工作区根——`cd 别的项目 && "$SIMPLE_CODE_APPLY_PATCH"`
+ * 改的是那个项目里的文件。cwd 算不出时 cwd=null，隐藏候选按原则拦。
+ * .simple-code 成长区（notes/lessons/events/skills）的免审
+ * 由 pathVerdict 统一给——2026-09-29 起裸 shell 与补丁同待遇，原
+ * patchChannelExempt 通道豁免随之删除 */
+function patchVerdict(cmd: string, root: string, cfg: ApprovalConfig, real: RealCtx): ApprovalVerdict | null {
+  const patchReal = { ...real, cwd: real.cwd === null ? null : findWorkspaceRoot(real.cwd) }
   for (const m of cmd.matchAll(PATCH_PATH_RE)) {
     const p = (m[1] ?? m[2] ?? '').trim()
     if (p === '') continue
-    if (patchChannelExempt(p, root)) continue
-    const v = pathVerdict(p, root, cfg, true)
+    const v = pathVerdict(p, root, cfg, true, patchReal)
     if (v.kind === 'ask') return v
   }
   return null
@@ -619,7 +778,8 @@ function resolveSymlinked(t: string, root: string): string {
       let real: string
       try { real = realpathSync(prefix) } catch { return t }
       const rest = segs.slice(i)
-      const out = rest.length ? `${real}/${rest.join('/')}` : real
+      // real 是 / 时直接拼会成 //x（第一级目录不存在），白名单前缀失配
+      const out = rest.length ? `${real === '/' ? '' : real}/${rest.join('/')}` : real
       return out === abs ? t : out
     }
     i--
@@ -632,6 +792,7 @@ function pathVerdict(
   root: string,
   cfg: ApprovalConfig,
   write: boolean,
+  real: RealCtx,
 ): ApprovalVerdict {
   if (PATH_ALLOWLIST.has(t)) return { kind: 'allow' }
 
@@ -645,8 +806,11 @@ function pathVerdict(
   // 判成项目内、实写 /tmp。逐级 realpath：取最长存在前缀的真实路径拼
   // 上剩余未创建部分，用真实形态继续判。不存在的新路径不受影响
   const rt = resolveSymlinked(t, rootReal)
-  if (rt !== t) return pathVerdict(rt, rootReal, cfg, write)
+  if (rt !== t) return pathVerdict(rt, rootReal, cfg, write, real)
   root = rootReal
+  // 第 2 层算真实路径用原形态（下面项目内绝对路径会被剥成相对 root 的，
+  // 而相对路径在 hiddenVerdict 里按当前目录解析）
+  const orig = t
 
   // always 路径白名单：展开 ~ 后按目录前缀匹配（d + '/' 防
   // /a/bc 沾 /a/b 的光）。读写同权——批的是「这个目录可以碰」
@@ -661,13 +825,7 @@ function pathVerdict(
     kind: 'ask',
     category: 'external_dir',
     detail: what,
-    reason: `要写项目外路径：${what}`,
-  })
-  const hidden = (what: string): ApprovalVerdict => ({
-    kind: 'ask',
-    category: 'hidden_path',
-    detail: what,
-    reason: `要触碰项目内隐藏路径：${what}`,
+    reason: `要${write ? '写' : '读'}项目外路径：${what}`,
   })
 
   // 项目外读放行的**唯一例外**（2026-09-17 用户澄清）：.simple-code 子树
@@ -704,25 +862,26 @@ function pathVerdict(
     } as const
     // settings.json：读放行、写拦——apiKey 躺在里面，改配置走用户
     if (parts[1] === 'settings.json') return write ? writeAsk : { kind: 'allow' }
-    // lessons/ 例外（用户明示允许）：教训库是模型的自助成长区，写入是
-    // 被授权的常态操作（lesson write 走 bash，不弹卡）
-    if (parts[1] === 'lessons') return { kind: 'allow' }
-    // 其余整树：读放行（对话史、notes、regions——用户拍板），写弹卡
+    // 默认例外（2026-09-29 拍板）：notes/lessons/events/skills 读写都放行
+    // ——模型自助成长与事件归档区，各自有免审的通道，裸 shell 同待遇
+    if (SC_OPEN_DIRS.has(parts[1] ?? '')) return { kind: 'allow' }
+    // 其余整树：读放行（对话史、regions——用户拍板），写弹卡
     return write ? writeAsk : { kind: 'allow' }
   }
+  if (parts.includes('..')) return write || !inSimpleCodeTree(t) ? outside(t) : { kind: 'allow' }
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i] ?? ''
-    if (p === '..') return write || !inSimpleCodeTree(t) ? outside(t) : { kind: 'allow' }
-    if (p === '.') continue
-    // 省略号形态（纯点 ≥3）：echo ... 打印分隔符的字面参数，不是路径
-    // （2026-09-14 实案：echo ... 弹「隐藏路径:...」，真报项目外路径被抢戏）
-    if (/^\.{3,}$/.test(p)) continue
-    if (p.startsWith('.')) {
-      // 白名单只认首组件（.git/hooks 整树放行）；
-      // 中段隐藏（src/.env）一律问——那正是敏感文件藏身处
+    // 省略号形态（纯点 ≥3，echo ... 的分隔符）与 `.` 不是隐藏段——isHiddenSeg
+    // 排除（2026-09-14 实案：echo ... 弹「隐藏路径:...」，真报项目外路径被抢戏）
+    if (isHiddenSeg(p)) {
+      // 手写白名单只认首组件；中段隐藏（src/.env）一律进第 2 层
       if (i === 0 && cfg.hiddenAllow.includes(p)) continue
-      return hidden(t)
+      // 第 1 层判出候选，第 2 层（hidden-path.ts）按真实路径定
+      return hiddenVerdict(orig, root, cfg, write, real)
     }
   }
   return { kind: 'allow' }
 }
+
+/** .simple-code 下读写都免审的目录（2026-09-29 拍板） */
+const SC_OPEN_DIRS = new Set(['notes', 'lessons', 'events', 'skills'])

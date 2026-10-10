@@ -224,7 +224,53 @@ describe('挑合并组', () => {
     )
     expect(group?.level).toBe(0)
   })
+  // ---- 方案 D：同层凑不满、有节点被夹住时跨层合（2026-09-28）----
+  // 时间轴一条接一条（covers 连续），层号按数组给
+  const chain = (levels: number[]) =>
+    levels.map((level, i) => s({ id: i + 1, level, coversFrom: i * 10 + 1, coversTo: i * 10 + 10 }))
+
+  it('**跨层兜底**：同层都凑不满、老的被高层夹住 → 合时间轴最老的一组，层 = 成员最高层', () => {
+    // 真库形状：L0 被夹在 L1、L3 之间，同层没有哪层连续满 3 条
+    const group = pickMergeGroup(chain([2, 1, 0, 3, 1, 0]), 3)
+    expect(group?.members.map((m) => m.id)).toEqual([1, 2, 3])
+    expect(group?.level).toBe(2) // 新节点 = 3
+  })
+
+  it('**正常金字塔在攒（层级从老到新只降不升）不跨层**：刚合出的 L1 不许和下一条 L0 合', () => {
+    // 不收窄的话每次都吞最老的，退化成滚雪球（方案 C）
+    expect(pickMergeGroup(chain([3, 2, 2, 1, 0, 0]), 3)).toBeNull()
+    expect(pickMergeGroup(chain([1, 0]), 2)).toBeNull()
+  })
+
+  it('同层能合时先同层（跨层只是兜底）', () => {
+    // 有被夹住的 L0（id 1），但 L0 id 3..5 连续满 3 条——先合它们
+    const group = pickMergeGroup(chain([0, 1, 0, 0, 0]), 3)
+    expect(group?.members.map((m) => m.id)).toEqual([3, 4, 5])
+    expect(group?.level).toBe(0)
+  })
+
+  it('跨层窗口必须含被夹住的节点：最老窗口里没有被夹者就往后挪', () => {
+    // [L3 L2 L1 | L0 L1]：只有 id 4（L0，后面有 L1）被夹住。最老窗口
+    // [1,2,3] 是正常金字塔头、不含被夹者——不动它；挪到 [2,3,4]
+    const group = pickMergeGroup(chain([3, 2, 1, 0, 1]), 3)
+    expect(group?.members.map((m) => m.id)).toEqual([2, 3, 4])
+  })
+
+  it('跨层照样不跨真断点：缝里有内容就断开', () => {
+    const levels = [2, 1, 0, 3, 1, 0]
+    const items = levels.map((level, i) => s({ id: i + 1, level, coversFrom: i * 100 + 1, coversTo: i * 100 + 10 }))
+    // 所有缝都有内容 → 每条自成一段，凑不出 3 条
+    expect(pickMergeGroup(items, 3, () => true)).toBeNull()
+    // 缝都是死缝 → 能链
+    expect(pickMergeGroup(items, 3, () => false)?.members.map((m) => m.id)).toEqual([1, 2, 3])
+  })
+
+  it('跨层不混 owner（任务私有行与对话行不同组）', () => {
+    const items = chain([2, 1, 0, 3]).map((x, i) => ({ ...x, owner: i === 1 ? 'task-x' : null }))
+    expect(pickMergeGroup(items, 3)).toBeNull()
+  })
 })
+
 
 describe('渲染与请求', () => {
   it('输入带 step 范围和归档路径——上层节点要记住原文去哪找', () => {

@@ -78,15 +78,9 @@ async function handleSlash(session: Session, sink: Sink, text: string): Promise<
       num('overhead') + num('cold') + num('warm') + num('hot') + num('stub') + num('floor') +
       num('live') + num('maxTokens')
     const pct = ((used / window_) * 100).toFixed(1)
-    const fmtRange = (k: string): string => {
-      const r = tail.ranges as Record<string, { from: number; to: number } | null> | null
-      const x = r?.[k]
-      return x ? `s${x.from}-s${x.to}` : '—'
-    }
     sink.err(
       `上下文 ${Math.round(used)}/${window_}（${pct}%）· 记录于 ${String(tail.at ?? '?')}\n` +
-        `冷 ${num('cold')} · 温 ${num('warm')} · 热 ${num('hot')} · 已卸载 ${num('stub')} · 未卸载 ${num('live')} · 保底 ${num('floor')}（token）\n` +
-        `范围  冷 ${fmtRange('cold')} · 温 ${fmtRange('warm')} · 热 ${fmtRange('hot')} · 已卸载 ${fmtRange('stub')} · 未卸载 ${fmtRange('live')}\n`,
+        `冷 ${num('cold')} · 温 ${num('warm')} · 热 ${num('hot')} · 已卸载 ${num('stub')} · 未卸载 ${num('live')} · 保底 ${num('floor')}（token）\n`,
     )
     return true
   }
@@ -270,7 +264,7 @@ function watchInterrupts(
     sink.err('\n')
 
     if (session.isRunning()) {
-      session.interrupt()
+      session.interrupt('sigint')
       // 不重新 prompt：send 的循环还在跑，它结束后主循环自己会 prompt。
       // 这里再打一个的话，屏幕上会留下两个提示符
       sink.err('（已打断，正在收尾）\n')

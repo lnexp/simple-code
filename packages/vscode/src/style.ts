@@ -212,8 +212,15 @@ body {
 .notice { color: var(--vscode-descriptionForeground); font-size: 0.9em; font-style: italic; }
 .notice-error { color: var(--vscode-errorForeground); font-style: normal; display: flex; gap: 0.5em; align-items: baseline; flex-wrap: wrap; }
 .notice-kind { font-size: 0.75em; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.8; border: 1px solid currentColor; border-radius: 3px; padding: 0 0.4em; }
-.notice-retry { margin-left: auto; font-size: 0.85em; padding: 0.1em 0.8em; cursor: pointer; background: transparent; color: var(--vscode-button-foreground, #fff); border: 1px solid var(--vscode-button-background, #0078d4); border-radius: 3px; }
-.notice-retry:hover { background: var(--vscode-button-background, #0078d4); }
+/* 「继续」：与审批卡次级按钮同一套（链接色字 + 细边框 + hover 提亮），不用实色块 */
+.notice-continue {
+  margin-left: auto; cursor: pointer; font-size: 0.85em; font-style: normal; padding: 2px 10px;
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+  background: transparent; color: var(--vscode-textLink-foreground);
+  border-radius: 3px; transition: background 0.12s;
+}
+.notice-continue:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15)); }
+.notice-action { display: flex; gap: 0.5em; align-items: baseline; flex-wrap: wrap; }
 /* 流式中未闭合围栏的尾部：纯文本态，闭合瞬间切成渲染态 */
 .markdown .stream-raw {
   margin: 0.5em 0; padding: 0.7em 0.9em; overflow-x: auto;
@@ -521,6 +528,10 @@ body {
   padding: 2px 0; cursor: pointer; min-width: 0;
 }
 .ctl.trigger:disabled { opacity: 0.5; cursor: default; }
+/* 触发器本身是 .bar 里的 <button>：.bar button:hover (0,2,1) 压过 .ctl.trigger
+   (0,2,0)，悬停时铺上主按钮蓝、盖住外层 .ctl-group 的工具栏灰，跟审批开关
+   悬停颜色不一致（2026-10-08）。这里解掉，hover 反馈只由 .ctl-group 给 */
+.bar .ctl.trigger:hover { background: transparent; }
 .trigger .codicon-chevron-down, .trigger .codicon-chevron-up {
   font-size: 12px; opacity: 0.8;
 }
@@ -601,8 +612,9 @@ body {
 }
 .ctx-panel {
   /* **不设 min-width**：侧栏能拖到 300px 以下，固定宽度会横向溢出被裁掉
-     右半边（时间戳和占比列首当其冲）。宽度跟着遮罩走、上限 480 */
-  width: 100%; max-width: 480px; min-width: 0;
+     右半边（时间戳和占比列首当其冲）。宽度跟着遮罩走、上限 300——范围列
+     删除后（2026-09-30）480 宽里标签与数字隔得太远，对行费眼 */
+  width: 100%; max-width: 300px; min-width: 0;
   padding: 10px 14px;
   border: 1px solid var(--vscode-panel-border);
   border-radius: ${RADIUS.md};
@@ -649,14 +661,8 @@ body {
 }
 .ctx-row:hover { background: color-mix(in srgb, var(--vscode-foreground) 6%, transparent); }
 .ctx-dot { width: 7px; height: 7px; border-radius: 2px; flex: none; }
-.ctx-label { width: 5.6em; flex: none; white-space: nowrap; }
-/* 范围（step 闭区间）：占住中间的伸缩位、右贴，弱化成最浅的一档 */
-.ctx-range {
-  flex: 1; text-align: right; white-space: nowrap;
-  font-size: 0.92em; opacity: 0.6;
-  color: var(--vscode-descriptionForeground);
-  font-variant-numeric: tabular-nums;
-}
+/* 标签占住中间的伸缩位，把数字列推到右边（2026-09-30 范围列删除前由它占） */
+.ctx-label { flex: 1; white-space: nowrap; }
 .ctx-num {
   width: 4.2em; text-align: right; white-space: nowrap;
   font-variant-numeric: tabular-nums;
@@ -942,7 +948,7 @@ code a[data-open-path]:hover {
 /* 弹层左对齐触发器 + 按内容撑宽。**根因**：.menu 通用规则是 right:0——右缘
    对齐触发器右缘，而 folder 弹层（8 项最长的 basename 撑到 ~230px）比触发器
    （一个 basename 宽）宽得多，右对齐会把弹层左缘推出视口（实测 left=-61px），
-   每项从左被视口裁掉几个字符、只露尾巴（"ai-doc-agent-app" → "oc-agent-app"）。
+   每项从左被视口裁掉几个字符、只露尾巴（"sample-web-app" → "le-web-app"）。
    folder 在面板左上角，向右展开（left:0）永远在视口内；底栏的 model/effort
    靠右、继续用 right:0 向左展开。无头 Chrome 复刻页验证：-61px → +11px */
 .menu.folder-overflow { left: 0; right: auto; width: max-content; max-width: none; }

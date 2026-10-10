@@ -245,6 +245,11 @@ describe('fmtMs / fmtTok', () => {
     expect(fmtTok(45200)).toBe('45.2k')
     expect(fmtTok(96000)).toBe('96k')
     expect(fmtTok(1000)).toBe('1k')
+    // 上下文面板的分区数是估算（带 .5/.75）× usage 校准系数，<1000 时曾原样
+    // 显示成 315.77238625893915（2026-09-30 实测）
+    expect(fmtTok(315.77238625893915)).toBe('316')
+    expect(fmtTok(838.5)).toBe('839')
+    expect(fmtTok(999.6)).toBe('1k') // 先取整再分档，不出「1000」
   })
 })
 
@@ -306,15 +311,36 @@ describe('thinking 块墙钟', () => {
     expect(r2?.kind === 'reasoning' && typeof r2.endedAt).toBe('number')
   })
 
-  it('reasoning_end 落到最后一块上，不会改到旧块', () => {
+  it('紧挨着的两块思考并成一行：文字空行相接，时长从第一块开始、到第二块结束', () => {
+    // Opus 5.5 在工具调用前另发一个 progress update 的 thinking 块（真机
+    // 某项目消息 2782582：英文思考 + 中文进度两段），分开画就是
+    // 一次调用两行「已思考」
+    const reduceAt = (v: ChatView, e: AgentEvent, t: number) => reduce(v, e, t)
+    let view = emptyView()
+    view = reduceAt(view, { type: 'reasoning_start' }, 1000)
+    view = reduceAt(view, { type: 'reasoning_delta', text: "I'm noticing" }, 1100)
+    view = reduceAt(view, { type: 'reasoning_end' }, 18000)
+    view = reduceAt(view, { type: 'reasoning_start' }, 18010)
+    const mid = view.items.at(-1)
+    // 第二块在流：合并行回到「思考中」
+    expect(mid?.kind === 'reasoning' && mid.endedAt).toBeUndefined()
+    view = reduceAt(view, { type: 'reasoning_delta', text: '继续核对几项' }, 18100)
+    view = reduceAt(view, { type: 'reasoning_end' }, 18400)
+    expect(view.items).toEqual([
+      { kind: 'reasoning', text: "I'm noticing\n\n继续核对几项", startedAt: 1000, endedAt: 18400 },
+    ])
+  })
+
+  it('被工具隔开的思考不合并', () => {
     const view = feed(
       { type: 'reasoning_start' },
       { type: 'reasoning_end' },
+      { type: 'tool_input_start', id: 't1', name: 'bash' },
       { type: 'reasoning_start' }, // 第二块，还没 end
     )
     const items = view.items.filter((i) => i.kind === 'reasoning')
-    const first = items[0]
-    const second = items[1]
+    expect(items).toHaveLength(2)
+    const [first, second] = items
     expect(first?.kind === 'reasoning' && typeof first.endedAt).toBe('number')
     expect(second?.kind === 'reasoning' && second.endedAt).toBeUndefined()
   })
@@ -456,6 +482,24 @@ describe('历史回放（hydrateItems）', () => {
     expect(footers[1]).toEqual([undefined, undefined, undefined])
   })
 
+  it('一条消息里相邻的两段思考回放成一行，与实时流同口径', () => {
+    const items = hydrateItems(
+      msgs({
+        role: 'assistant',
+        parts: [
+          { type: 'reasoning', text: "I'm noticing", encrypted: 's1' },
+          { type: 'reasoning', text: '继续核对几项', encrypted: 's2' },
+          { type: 'tool_call', id: 't1', name: 'bash', input: { command: 'ls' } },
+          { type: 'reasoning', text: '看完了', encrypted: 's3' },
+        ],
+      }),
+    )
+    expect(items.filter((i) => i.kind === 'reasoning').map((i) => (i.kind === 'reasoning' ? i.text : ''))).toEqual([
+      "I'm noticing\n\n继续核对几项",
+      '看完了',
+    ])
+  })
+
   it('user/assistant/text 各成一个气泡，图片随 user 气泡', () => {
     const items = hydrateItems(
       msgs(
@@ -489,7 +533,7 @@ describe('历史回放（hydrateItems）', () => {
       ),
     )
     expect(items).toEqual([
-      { kind: 'tool', id: 't1', name: 'bash', command: 'ls', output: 'a\nb', failed: false },
+      { kind: 'tool', id: 't1', name: 'bash', desc: '', command: 'ls', output: 'a\nb', failed: false },
     ])
   })
 
@@ -501,7 +545,7 @@ describe('历史回放（hydrateItems）', () => {
       }),
     )
     expect(items).toEqual([
-      { kind: 'tool', id: 't9', name: 'bash', command: '', output: 'x', failed: true },
+      { kind: 'tool', id: 't9', name: 'bash', desc: '', command: '', output: 'x', failed: true },
     ])
   })
 
@@ -671,9 +715,11 @@ describe('第三层折叠（splitTurns）', () => {
   it('**报错时那条 notice 留在外面**——错误绝不能被折进去', () => {
     const view = asked(feed(tool('t1'), { type: 'error', message: '网关挂了', retryable: false }))
     expect(shape(view)).toEqual(['user', 'process(1)', 'notice'])
+    // 不可重试的错也给「继续」：用户可能改完配置再接着做（渠道未启用）
+    expect(view.items.at(-1)).toMatchObject({ kind: 'notice', resumable: true })
   })
 
-  it('协议层错误带 kind/retryable 到 notice——UI 据此给重试按钮', () => {
+  it('报错 notice 带 kind 与 resumable——UI 据此标色、停稳后给「继续」按钮（不论可否重试：自动重试已在 core 做完）', () => {
     const view = asked(
       feed(tool('t1'), {
         type: 'error',
@@ -685,7 +731,7 @@ describe('第三层折叠（splitTurns）', () => {
     expect(view.items.at(-1)).toEqual({
       kind: 'notice',
       text: '渠道 500：upstream panic',
-      retryable: true,
+      resumable: true,
       errorKind: 'server',
     })
   })
@@ -693,7 +739,7 @@ describe('第三层折叠（splitTurns）', () => {
   it('中断在命令中间：保留区只剩「已中断」那行', () => {
     const view = finishTurn(asked(feed(...says('我先看看'), tool('t1'))), true)
     expect(shape(view)).toEqual(['user', 'process(1)', 'notice'])
-    expect(view.items.at(-1)).toEqual({ kind: 'notice', text: '已中断' })
+    expect(view.items.at(-1)).toEqual({ kind: 'notice', text: '已中断', resumable: true })
   })
 
   it('中断在回答中间：那半截回答留在外面——用户正在读它', () => {
@@ -749,7 +795,7 @@ describe('第三层折叠（splitTurns）', () => {
 describe('中断要留下痕迹', () => {
   it('interrupted → 追加「已中断」', () => {
     const view = finishTurn(feed({ type: 'text_start' }, { type: 'text_delta', text: '答' }), true)
-    expect(view.items.at(-1)).toEqual({ kind: 'notice', text: '已中断' })
+    expect(view.items.at(-1)).toEqual({ kind: 'notice', text: '已中断', resumable: true })
   })
 
   it('**对照：正常结束不追加**，别给每一轮都盖个中断章', () => {
@@ -761,6 +807,81 @@ describe('中断要留下痕迹', () => {
     // 中断在第一个命令上：没有能挂页脚的消息，finishTurn 原来直接 return，
     // 于是这一轮在界面上一个字都没有——第三层折叠一收就是「什么都没发生」
     const view = finishTurn(feed({ type: 'tool_input_start', id: 't1', name: 'bash' }), true)
-    expect(view.items.at(-1)).toEqual({ kind: 'notice', text: '已中断' })
+    expect(view.items.at(-1)).toEqual({ kind: 'notice', text: '已中断', resumable: true })
+  })
+})
+
+describe('bash 入参 desc → 工具条标题位（2026-09-28）', () => {
+  it('tool_call 带 desc 时存进视图态，缺省留空不猜', () => {
+    const view = feed(
+      { type: 'tool_call', id: 't1', name: 'bash', input: { command: 'npx vitest run', desc: '跑全量测试' } },
+      { type: 'tool_call', id: 't2', name: 'bash', input: { command: 'ls' } },
+      { type: 'tool_call', id: 't3', name: 'bash', input: { command: 'ls', desc: 42 } },
+    )
+    const tools = view.items.filter((i) => i.kind === 'tool') as { desc: string; command: string }[]
+    expect(tools.map((t) => t.desc)).toEqual(['跑全量测试', '', ''])
+    expect(tools.map((t) => t.command)).toEqual(['npx vitest run', 'ls', 'ls'])
+  })
+
+  type Tool = { desc: string; command: string; rawInput?: string }
+  const toolOf = (view: ReturnType<typeof feed>, id = 't1') =>
+    view.items.find((i) => i.kind === 'tool' && i.id === id) as Tool
+
+  // glm 照官方 Bash 工具的参数名写 description（真实项目入参）
+  const glmInput = { command: 'grep -rn "writeChunk" knowledge-server/src/test/ | head -4', description: '定位 writeChunk 所在测试文件', timeout: 15 }
+
+  it('description 当 desc 用：tool_call、流式、历史回放三条路都认；desc 优先', () => {
+    const call = feed({ type: 'tool_call', id: 't1', name: 'bash', input: glmInput })
+    expect(toolOf(call).desc).toBe('定位 writeChunk 所在测试文件')
+    const both = feed({ type: 'tool_call', id: 't1', name: 'bash', input: { ...glmInput, desc: '短的' } })
+    expect(toolOf(both).desc).toBe('短的')
+
+    const streamed = feed(
+      { type: 'tool_input_start', id: 't1', name: 'bash' },
+      { type: 'tool_input_delta', id: 't1', partial: '{"command": "grep -rn \\"writeChunk\\" x", "description": "定位 writeChunk' },
+      { type: 'tool_input_delta', id: 't1', partial: ' 所在测试文件", "timeout' },
+    )
+    expect(toolOf(streamed).desc).toBe('定位 writeChunk 所在测试文件')
+
+    const items = hydrateItems([
+      { role: 'assistant', parts: [{ type: 'tool_call', id: 't1', name: 'bash', input: glmInput }] },
+    ])
+    expect(items.find((i) => i.kind === 'tool')).toMatchObject({ desc: '定位 writeChunk 所在测试文件' })
+  })
+
+  it('流式：desc 字符串闭合即显示，不等 tool_call；命令仍留空', () => {
+    const start = { type: 'tool_input_start', id: 't1', name: 'bash' } as const
+    const d = (partial: string) => ({ type: 'tool_input_delta', id: 't1', partial }) as const
+    const half = feed(start, d('{"desc": "跑全'))
+    expect(toolOf(half).desc).toBe('')
+    const done = feed(start, d('{"desc": "跑全'), d('量测试", "comm'), d('and": "npx vitest run --reporter'))
+    expect(toolOf(done).desc).toBe('跑全量测试')
+    expect(toolOf(done).command).toBe('')
+    // 抠到就丢中间态，后面的长命令片段不再攒
+    expect(toolOf(done).rawInput).toBeUndefined()
+  })
+
+  it('流式：转义字符按 JSON 解码；tool_call 用完整入参覆盖', () => {
+    const view = feed(
+      { type: 'tool_input_start', id: 't1', name: 'bash' },
+      { type: 'tool_input_delta', id: 't1', partial: '{"desc":"看 \\"a\\" 文件","command":"cat a"}' },
+    )
+    expect(toolOf(view).desc).toBe('看 "a" 文件')
+    const final = feed(
+      { type: 'tool_input_start', id: 't1', name: 'bash' },
+      { type: 'tool_input_delta', id: 't1', partial: '{"desc":"旧"' },
+      { type: 'tool_call', id: 't1', name: 'bash', input: { desc: '新', command: 'cat a' } },
+    )
+    expect(toolOf(final)).toMatchObject({ desc: '新', command: 'cat a' })
+    expect(toolOf(final).rawInput).toBeUndefined()
+  })
+
+  it('流式：非 bash 工具不攒片段', () => {
+    const view = feed(
+      { type: 'tool_input_start', id: 't1', name: 'view_image' },
+      { type: 'tool_input_delta', id: 't1', partial: '{"desc":"x","path":"a.png"}' },
+    )
+    expect(toolOf(view)).toMatchObject({ desc: '' })
+    expect(toolOf(view).rawInput).toBeUndefined()
   })
 })

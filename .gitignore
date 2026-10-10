@@ -20,7 +20,10 @@ scratch/package-lock.json
 
 # 不发布层（2026-09-18 发布决策）：设计文档含内部讨论与参考实现对照，
 # 探针/导出属开发杂物——都留在工作区，不进公开仓库
-docs/
+# 例外 self.md：build.mjs 要把它打进 dist（随 vsix 公开发出），不进仓库
+# 则干净克隆构建 ENOENT
+docs/*
+!docs/self.md
 scratch/
 test.md
 # agent 协作约定：含参考实现的本机路径对照与内部取舍记录，只对本机开发有意义

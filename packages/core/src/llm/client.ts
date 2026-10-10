@@ -1,4 +1,4 @@
-import type { LLMEvent } from './events.ts'
+import type { LLMEvent, SSEMessage } from './events.ts'
 import {
   LLMStreamError,
   type Protocol,
@@ -40,6 +40,7 @@ export async function* sendRequest(
   /** 流自然走完才算成功；消费者提前 break（少见）单独标记 */
   let completed = false
   let failure: { kind: string; message: string } | undefined
+  let tap: StreamTap | undefined
 
   // 卡点日志（定位宿主同步卡死用，2026-09-21）：**冻住的进程写不了日志**，
   // 所以检查点全部写在「即将进入的阶段」之前——runlog 里最后一条 ev 就是
@@ -50,6 +51,9 @@ export async function* sendRequest(
     model: request.model,
     ...(options.folder ? { folder: options.folder } : {}),
     ...(options.tag ? { tag: options.tag } : {}),
+    // 网关路由参数（providerId 这类）：同一模型走哪个渠道，只有它分得清
+    // （9-30 一次断流，三个同模型渠道在日志里无从区分）
+    ...(options.provider.extraBody ? { extra: options.provider.extraBody } : {}),
   })
   // 计时器盖住 fetch 和读流两段。fetch 那段也要盖：连上了但响应头一直不来
   // 同样是挂住，而且现象一模一样（进程不动，没有任何输出）
@@ -63,9 +67,9 @@ export async function* sendRequest(
     })
 
     if (!response.ok) {
-      throw new LLMStreamError(
-        options.protocol.parseError(response.status, await safeJson(response), response.headers),
-      )
+      const raw = await safeText(response)
+      const detail = options.protocol.parseError(response.status, safeParse(raw), response.headers)
+      throw new LLMStreamError(withRawBody(detail, response.status, raw, options.provider.apiKey))
     }
     if (!response.body) {
       throw new LLMStreamError(emptyBodyError(response.status))
@@ -77,11 +81,12 @@ export async function* sendRequest(
       ...(options.folder ? { folder: options.folder } : {}),
       ...(options.tag ? { tag: options.tag } : {}),
     })
-    const events = options.protocol.parseStream(parseSSE(clock.watch(response.body)))
+    tap = tapSSE(parseSSE(clock.watch(response.body)))
+    const events = options.protocol.parseStream(tap.messages)
     for await (const ev of events) {
       // 重置放在**内容层**（每产出一个真实事件），不放在字节层：网关心跳
       // （SSE 注释行 / ping 事件）也是字节但不是内容，按字节重置等于被
-      // 心跳无限续命——ai-legal-advisor 曾因此挂 12 分钟（2026-09-21）
+      // 心跳无限续命——某项目曾因此挂 12 分钟（2026-09-21）
       clock.touch()
       yield ev
     }
@@ -116,8 +121,55 @@ export async function* sendRequest(
       ms: Date.now() - startedAt,
       ...(failure ? { error: failure } : {}),
       ...(incomplete ? { incomplete: true } : {}),
+      // 失败/未走完时带上收到了什么：协议层对不认识的事件静默丢弃，报错只剩
+      // 「未收到结束标记」——9-30 网关去掉 event: 行，就是靠抓原始流才看出来
+      ...((failure || incomplete) && tap ? { stream: tap.summary() } : {}),
     })
   }
+}
+
+type StreamTap = {
+  messages: AsyncIterable<SSEMessage>
+  /** 条数、按类型计数、最后一条 data 的前 300 字 */
+  summary(): { count: number; types: Record<string, number>; last: string }
+}
+
+/**
+ * 旁路统计 SSE 消息，只透传不改。类型名取 event: 行，没有就取 data 里的
+ * type/object（Responses 与 Chat 的区分字段），都没有记 '?'。
+ * 只在失败时进日志——成功的流不记内容（runlog 只记元数据）
+ */
+function tapSSE(source: AsyncIterable<SSEMessage>): StreamTap {
+  let count = 0
+  let last = ''
+  const types: Record<string, number> = {}
+  return {
+    messages: (async function* () {
+      for await (const msg of source) {
+        count++
+        last = msg.data
+        const key = msg.event || sseDataType(msg.data)
+        types[key] = (types[key] ?? 0) + 1
+        yield msg
+      }
+    })(),
+    summary: () => ({ count, types, last: last.slice(0, 300) }),
+  }
+}
+
+function sseDataType(data: string): string {
+  if (data === '[DONE]') return '[DONE]'
+  try {
+    const o: unknown = JSON.parse(data)
+    if (o && typeof o === 'object') {
+      const r = o as Record<string, unknown>
+      if (typeof r.type === 'string') return r.type
+      if (typeof r.object === 'string') return r.object
+    }
+  } catch {
+    // 不是 JSON：照样计数，归 '?'
+  }
+  return '?'
 }
 
 type IdleClock = {
@@ -229,12 +281,32 @@ const idleTimeoutError = (ms: number): ProtocolError => ({
  * 错误响应体可能不是 JSON（网关的 HTML 错误页、空 body）。解析失败就交个空对象，
  * 让 parseError 落到按状态码分类——在这里抛异常会把真正的错误信息盖掉
  */
-async function safeJson(response: Response): Promise<unknown> {
+async function safeText(response: Response): Promise<string> {
   try {
-    return await response.json()
+    return await response.text()
+  } catch {
+    return ''
+  }
+}
+
+function safeParse(raw: string): unknown {
+  try {
+    return JSON.parse(raw)
   } catch {
     return {}
   }
+}
+
+/**
+ * 协议取不到 message、兜底成「HTTP n」时附上响应体原文（折叠空白、前 200 字、
+ * key 打码）——2026-09-30 某渠道连续 429 只剩「HTTP 429」，看不出网关说了什么。
+ * 这条 message 同时进界面错误条与 runlog 的 llm/llm_retry 行
+ */
+function withRawBody(detail: ProtocolError, status: number, raw: string, key: string): ProtocolError {
+  const text = raw.replace(/\s+/g, ' ').trim()
+  if (detail.message !== `HTTP ${status}` || text === '') return detail
+  const safe = key ? text.split(key).join('***') : text
+  return { ...detail, message: `HTTP ${status}：${safe.slice(0, 200)}` }
 }
 
 const emptyBodyError = (status: number): ProtocolError => ({

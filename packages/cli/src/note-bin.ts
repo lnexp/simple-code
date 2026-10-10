@@ -12,8 +12,8 @@
  *   ---
  *   正文……
  *   MD
- *   改（update/patch 子命令 2026-09-27 退役）：同名 write 整条重写，
- *   或 "$SIMPLE_CODE_APPLY_PATCH" 局部改 .simple-code/notes/<name>.md
+ *   改（update/patch 子命令 2026-09-27 退役）："$SIMPLE_CODE_APPLY_PATCH"
+ *   改 .simple-code/notes/<name>.md；write 撞同名拒绝，不覆盖
  *
  * 索引只收最近使用的 20 条 description（LRU，read 喂心跳），
  * 被挤出索引的文件永远不删——list 全量可列、read 照常。
@@ -25,6 +25,10 @@ import {
   searchNotes,
   writeNote,
 } from '@simple-code/core/src/tools/note.ts'
+import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts'
+
+// 工作区根：cwd 可能是子目录（workspace-root.ts）
+const root = findWorkspaceRoot(process.cwd())
 
 const usage = `用法：
   note list                          全量清单
@@ -35,7 +39,7 @@ const usage = `用法：
       description: 进 system 索引的一行描述
       ---
       正文……
-  改内容：同名 write 整条重写，或 "$SIMPLE_CODE_APPLY_PATCH" 局部改（免审批）`
+  改内容："$SIMPLE_CODE_APPLY_PATCH" 改 .simple-code/notes/<name>.md（免审批；write 撞同名拒绝，不覆盖）`
 
 const [sub, target] = process.argv.slice(2)
 const stdinText = () => {
@@ -48,11 +52,11 @@ const stdinText = () => {
 
 try {
   if (sub === 'list') {
-    console.log(listNotes(process.cwd()))
+    console.log(listNotes(root))
   } else if (sub === 'search' && target) {
-    console.log(searchNotes(process.cwd(), target))
+    console.log(searchNotes(root, target))
   } else if (sub === 'read' && target) {
-    console.log(readNote(process.cwd(), target))
+    console.log(readNote(root, target))
   } else if (sub === 'write') {
     const text = stdinText()
     if (!text) {
@@ -61,11 +65,11 @@ try {
     }
     const m = text.match(/^\s*name:\s*(.+)\ntitle:\s*(.+)\ndescription:\s*(.+)\n---\n?([\s\S]*)$/)
     if (!m) {
-      console.error('stdin 需要 name:/title:/description:/---/正文 五段（见 usage），开头几行是：\n' + text.split('\n').slice(0, 5).join('\n'))
+      console.error('stdin 要逐行写 name:/title:/description:（单行），再一行 ---，其后是正文（见 usage），开头几行是：\n' + text.split('\n').slice(0, 5).join('\n'))
       process.exit(2)
     }
     console.log(
-      writeNote(process.cwd(), {
+      writeNote(root, {
         name: m[1]!.trim(),
         title: m[2]!.trim(),
         description: m[3]!.trim(),

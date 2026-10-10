@@ -32,7 +32,7 @@ import {
   hydrateItems,
   reduce,
 } from '../webview/events.ts'
-import type { ApprovalRequest, RegionRanges, ToHost, ToWebview } from './protocol.ts'
+import type { ApprovalRequest, ToHost, ToWebview } from './protocol.ts'
 import { join } from 'node:path'
 import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { execFile as execFileCb } from 'node:child_process'
@@ -164,6 +164,12 @@ export function createBridge(deps: BridgeDeps): Bridge {
    */
   let ready = false
   let running = false
+  /** 等主任务这轮结束的人（任务关闭的还俗那一步）。send 的 finally 收口时放行 */
+  let idleWaiters: (() => void)[] = []
+  const waitIdle = async (): Promise<void> => {
+    // while 不是 if：放行后到这里之间主任务可能又开了一轮
+    while (running) await new Promise<void>((r) => idleWaiters.push(r))
+  }
   /** 拿 session 的那个 promise。同一个面板只建一次，重复点发送不会建两个 */
   let pending: Promise<Session> | null = null
   /**
@@ -263,6 +269,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
       | { kind: 'path'; dir: string }
       | { kind: 'nonpath'; lead: string; from: number }
       | { kind: 'paths'; dirs: string[] }
+      | { kind: 'hidden'; path: string; write: boolean }
     /** 分身任务弹的卡：任务名，卡片标注来源 */
     task?: string
   }): Promise<'allow' | 'always' | 'deny' | { deny: string }> => {
@@ -290,8 +297,6 @@ export function createBridge(deps: BridgeDeps): Bridge {
       ...(q.task !== undefined ? { task: q.task } : {}),
     }
     post(card)
-    // 后台文件夹的卡不弹到当前界面，角标是唯一的可见信号——挂上就通知
-    deps.onTurnEnd?.()
     return new Promise((resolve) => {
       const cancel = setTimer(APPROVAL_TIMEOUT_MS, () => finishApproval(id, 'deny'))
       pendingApprovals.set(id, {
@@ -301,6 +306,10 @@ export function createBridge(deps: BridgeDeps): Bridge {
         resolve(r)
         },
       })
+      // 后台文件夹的卡不弹到当前界面，角标是唯一的可见信号——挂上就通知。
+      // **必须在 set 之后**：router 的 onTurnEnd 即 postFolders，同步读
+      // pendingApprovals()；先通知会读到旧数，角标要等下一次别的重推才亮（9-30 修）
+      deps.onTurnEnd?.()
     })
   }
 
@@ -343,7 +352,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
    * 镜像不补它的话，跑着的时候重开面板会看到一段没有问题的回答。
    * 必须是数组：插话（running 时 send）会再来一条，单数槽位的话后者
    * 把前者顶掉——轮内切走再切回，第一条 user 气泡就"被改写"成插话
-   * 内容（ai-legal-advisor turn-822 实测）。fold 时随重放一起收编进
+   * 内容（某项目 turn-822 实测）。fold 时随重放一起收编进
    * 基线后清空。顺序上插话排在全部过程前面——镜像本来是近似视图，
    * 精确位置只有 fold 重读 messages() 才有
    */
@@ -404,7 +413,10 @@ export function createBridge(deps: BridgeDeps): Bridge {
   /** 关闭任务（task-v3）：不碰对话的 session——owner 还俗后对话下次装配
    *  自然看到该段。失败提示走 fatal，任务保留可重试 */
   const doCloseTask = async (name: string): Promise<void> => {
-    const r = await tasks.close(name)
+    const r = await tasks.close(name, {
+      busy: () => (running ? '主任务正在跑——等这轮跑完再关闭任务' : null),
+      waitIdle,
+    })
     if (!r.ok) post({ type: 'fatal', message: r.error ?? '关闭失败' })
   }
   let closing: Promise<void> | null = null
@@ -550,7 +562,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
   }
 
   /** 关 session 并释放文件锁。幂等：第二次调用 pending 已是 null，什么都不做 */
-  const closeSession = (): void => {
+  const closeSession = (source: 'detach' | 'reload' | 'dispose'): void => {
     baselineSynced = false
     releaseAfterTurn = false
     reloadPending = false
@@ -558,7 +570,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
     idle = null
     const session = pending
     pending = null
-    closing = session?.then((s) => s.close()) ?? null
+    closing = session?.then((s) => s.close(source)) ?? null
   }
 
   /**
@@ -602,11 +614,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
     pushState()
   }
 
-  // 失败轮重试用：send 成功发起过就记着（发不出去的没意义），retry 消息来了重发
-  let lastUser: { text: string; images?: ImageInput[] } | null = null
   const send = async (text: string, images?: ImageInput[]): Promise<void> => {
     idle?.disarm() // 用户动手了不算空闲——插话也算动手
-    lastUser = { text, ...(images && images.length > 0 ? { images } : {}) }
     if (running) {
       // 排队插话（t656 翻案）：UI 已放行 running 时输入，这层以前
       // `if (running) return` 把它静默扔掉——用户消息石沉大海（2026-09-17
@@ -671,6 +680,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
       // 所有退出路径收口到一个地方（CLAUDE.md §4.5）。散在三个 return 前面
       // 的话，早晚漏一个，现象是停止按钮一直是「运行中」
       running = false
+      const waiters = idleWaiters
+      idleWaiters = []
+      for (const w of waiters) w()
       if (session) {
         fold(session) // 定稿进基线，重放清零——下次重开从基线起
         const finishedAt = Date.now()
@@ -688,8 +700,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
       deps.onTurnEnd?.()
       // 面板已经关了：这就是约定好的「跑完自动释放」。interrupt 路径也
       // 走这里（中断后 loop 收尾同样产出定稿历史）
-      if (releaseAfterTurn) closeSession()
-      else if (reloadPending) closeSession()
+      if (releaseAfterTurn) closeSession('detach')
+      else if (reloadPending) closeSession('reload')
       else idle?.arm() // 一轮结束，从这一刻算空闲
     }
   }
@@ -728,10 +740,6 @@ export function createBridge(deps: BridgeDeps): Bridge {
         case 'send':
           void send(msg.text, msg.images)
           return
-        case 'retry':
-          // 没发过（首条就 fatal）或还在跑（不该出现——按钮只在停稳后可点）
-          if (lastUser && !running) void send(lastUser.text, lastUser.images)
-          return
         case 'setModel':
           // task：改分支 session 的（控件区跟分支走）。models 列表全
           // folder 一份，分支的合法性由同一份配置保证
@@ -746,7 +754,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
           // session 还没建就中断是空操作，不用判断
           // 审批等待也一并按拒绝收场——用户点停止时不想让任何东西挂着
           for (const id of pendingApprovals.keys()) finishApproval(id, 'deny')
-          void pending?.then((s) => s.interrupt())
+          void pending?.then((s) => s.interrupt('stop'))
           return
         case 'approval_reply':
           finishApproval(
@@ -816,9 +824,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
                     stub: Number(tail.stub ?? 0),
                     floor: Number(tail.floor ?? 0),
                     live: Number(tail.live ?? 0),
-                    // tail 是 JSON.parse 的 any（老行无 ranges）；
-                    // cast 到具体类型（索引访问 RegionsInfo['ranges'] 会带 undefined）
-                    ranges: (tail.ranges ?? null) as RegionRanges | null,
+                    real: typeof tail.real === 'number' && tail.real > 0 ? tail.real : null,
                   }
                 : null
               post({ type: 'regions', info })
@@ -877,7 +883,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         idle?.disarm()
         return
       }
-      closeSession()
+      closeSession('detach')
     },
 
     /** settings.json 变更：loadConfig 只在 session 建立时读一次，重建才能
@@ -888,7 +894,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         reloadPending = true
         return
       }
-      closeSession()
+      closeSession('reload')
     },
 
     dispose: () => {
@@ -897,9 +903,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
       ready = false
       attached = false
       for (const id of pendingApprovals.keys()) finishApproval(id, 'deny')
-      void pending?.then((s) => s.interrupt())
+      void pending?.then((s) => s.interrupt('dispose'))
       tasks.dispose()
-      closeSession()
+      closeSession('dispose')
     },
   }
 }

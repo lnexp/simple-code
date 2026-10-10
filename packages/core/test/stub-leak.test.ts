@@ -88,6 +88,8 @@ const CONFIG = {
   memory: {
     unloadTargetRatio: 0.001,
     keepHeadChars: 40,
+    // 命令留头的旋钮 2026-09-28 从 keepHeadChars 分出来（后者只管 L0 描述）
+    clipCommandChars: 40,
     summaryMinTokens: 0,
     clipThresholdChars: 0,
     // 保底区压到最小，理由和上面几个旋钮一样：生产默认 16,000 在 500 的预算
