@@ -77,8 +77,15 @@ export {
 export type { TaskScope } from './session/store.ts'
 export { SegmentFullError } from './session/store.ts'
 export { openStore } from './session/store.ts'
-export type { Session, SessionOptions } from './session/session.ts'
-export { getSession, toHydrateRows, type HydratePart, type HydrateRow } from './session/session.ts'
+export type { CompactResult, Session, SessionOptions } from './session/session.ts'
+export {
+  getSession,
+  MODEL_SWITCH_HEAD,
+  modelSwitchNotice,
+  toHydrateRows,
+  type HydratePart,
+  type HydrateRow,
+} from './session/session.ts'
 export type { Store } from './session/store.ts'
 export { type HistoryRow, lastRegionLine, MEMORY_RELATIVE } from './session/store.ts'
 export { openDbReadOnly } from './session/db.ts'

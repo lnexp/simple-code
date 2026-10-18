@@ -201,6 +201,8 @@ export function createRenderer(
               : `上下文接近上限，最早的 ${agentEv.count} 条已归档到磁盘，模型需要时会自己读回来`
         return sink.err(`\n${errPaint.dim(`（${text}）`)}\n`)
       }
+      case 'model_switch':
+        return sink.err(`${errPaint.dim(`── 模型已从 ${agentEv.from} 切换到 ${agentEv.to} ──`)}\n`)
       case 'step_finish':
         foot.inputTokens = agentEv.usage.inputTokens
         foot.outputTokens = agentEv.usage.outputTokens

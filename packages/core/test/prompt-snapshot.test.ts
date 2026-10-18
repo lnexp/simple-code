@@ -1,7 +1,8 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent } from '../src/events.ts'
 import type { Request, Usage } from '../src/llm/types.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
@@ -223,6 +224,49 @@ describe('system prompt 快照沿用（缓存热不重读）', () => {
     // 要等真的压缩点（预算超线 / 响应过再隔 TTL）才由 reloadSystem 刷新
     expect(s2.seen[0]?.system).not.toContain('new-event')
     expect(s2.seen[0]?.system).toContain('old-event')
+  })
+
+  it('prefix_break 日志带 dumpPath：现场文件从日志直查，不用翻代码找目录（2026-10-15）', async () => {
+    // 巡检 10-12 三条 break 时，日志行没有 dumpPath，排查得靠读 session.ts
+    // 才知道现场落在 prefix-breaks/。修法：dump 先写、logRun 后发带路径。
+    // 触发方式与 2026-09-25 回归同款——热重建沿用快照，直接改快照即改 system
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    const w = await workspace()
+    try {
+      const s1 = await w.open([says('好的')])
+      await collect(s1.session.send('你好'))
+      await s1.session.close()
+
+      openStore(w.dir).writePromptSnapshot({
+        agents: '# 约定 v2',
+        userAgents: null,
+        notes: null,
+        events: null,
+        lessons: null,
+      })
+
+      const s2 = await w.open([says('好')])
+      const evs = await collect(s2.session.send('再'))
+      await s2.session.close()
+      expect(evs.some((e) => e.type === 'error' && e.message.includes('前缀'))).toBe(true)
+    } finally {
+      spy.mockRestore()
+    }
+
+    const rec = calls.find((c) => c.ev === 'prefix_break')
+    expect(rec).toBeTruthy()
+    expect(typeof rec?.dumpPath).toBe('string')
+    expect(existsSync(rec?.dumpPath as string)).toBe(true)
+    const dump = JSON.parse(readFileSync(rec?.dumpPath as string, 'utf8')) as {
+      break: { part: string; index: number }
+      prev: { system: unknown } | null
+      next: { system: unknown }
+    }
+    expect(dump.break).toMatchObject({ part: 'system', index: 0 })
+    expect(dump.prev).not.toBeNull()
+    expect(dump.next.system).toBeTruthy()
   })
 })
 

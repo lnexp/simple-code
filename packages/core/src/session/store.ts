@@ -1,11 +1,10 @@
 import { appendFileSync, createWriteStream, mkdirSync, readFileSync, type WriteStream } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Message, Part } from '../llm/types.ts'
-import type { LiveMessage, Summary, SummaryStatus, UnloadedRef } from '../loop/assemble.ts'
+import type { AsyncCue, LiveMessage, Summary, SummaryStatus, UnloadedRef } from '../loop/assemble.ts'
 import type { RegionSizes } from '../loop/regions.ts'
 import { estimateMessageTokens } from '../loop/tokens.ts'
 import { takeSegment } from '../loop/turns.ts'
-import { searchable } from '../tools/memory.ts'
 import type { RawSink } from '../tools/types.ts'
 import { bucketedRel, ensureBucketFile, migrateToBuckets } from './buckets.ts'
 import { cleanupLegacyRows } from './cleanup.ts'
@@ -283,6 +282,19 @@ export type Store = {
   readPrefixBaseline(): string | null
   writePrefixBaseline(fingerprint: string): void
   /**
+   * 前缀改写放行票（prefix-guard.ts 的 ticket）：set 落票、take 读并删。
+   * 按 owner 分票——主任务和任务各压各的，谁的票只放行谁的下一次请求
+   */
+  setRewriteTicket(): void
+  takeRewriteTicket(): boolean
+  /**
+   * 本会话域最后一轮的产出模型（turns.meta.model，`provider/name`）。模型
+   * 切换告知的判据（session.ts send）：拿它跟当前模型比，不比 setModel
+   * 的调用——reload 后宿主恢复上次选择也调 setModel，按调用判会插假告知
+   * （2026-10-17 真机抓到）。没有轮或老库无 meta → null（不告知）
+   */
+  lastTurnModel(): string | null
+  /**
    * 取走「合并待压缩」标记（读并删，一次性）。finalizeTask（任务合并还俗）
    * 落的——合并改写了主任务的前缀（经历摘要进场），这个改写必须搭压缩的
    * 车才合法（前缀不变式），而合并那一刻会话多半不在手上，只能标记等
@@ -302,19 +314,24 @@ export type Store = {
   withTurns(messages: Message[]): LiveMessage[]
   /** summaries 表全部行。调用方自己按 `inContext` 过滤 */
   summaries(): Summary[]
-  /**
-   * recall 线索层（cue.ts）：本 turn 的冻结快照落库。`ON CONFLICT DO
-   * NOTHING`——cue 是一次性的（send 入口算一次），任何重写路径都是 bug
-   */
-  saveCue(turnId: number, lines: string[], names: string[]): void
   /** 全部 cue 行（turn → 成品行）。渲染是纯函数读，任务视角也读对话行——
-   *  继承轮带着它的 cue 一起被继承，语义一致 */
+   *  继承轮带着它的 cue 一起被继承，语义一致。2026-10-14 起不再写入
+   *  （cue.ts 换芯为关键词异步注入，走 async_cues），历史行继续渲染 */
   cues(): Map<number, string[]>
-  /** 最近 N 个 turn 被撞过的候选名（短窗去重） */
-  recentCuedNames(dedupTurns: number): Set<string>
-  /** 最近 N 个可见 turn 的可检索文本（旧→新）。cue 的信号源，与 memory
-   *  search 同源（searchable）——搜得到的词才谈得上撞得到 */
-  cueTurnTexts(window: number): string[]
+  /**
+   * recall 选择器的轮内注入（selector.ts）：锚在「step 的第 after 条消息之后」。
+   * 一个 turn 至多一条，`ON CONFLICT DO NOTHING`——注入后之后每个请求都要
+   * 在同一位置原样渲染，重写 = 改写已发前缀
+   */
+  saveAsyncCue(turnId: number, cue: { stepId: number; after: number; lines: string[]; names: string[] }): void
+  /** 全部轮内注入（stepId → 锚点与成品行）。同 cues()：任务视角继承对话行 */
+  asyncCues(): Map<number, AsyncCue>
+  /** 在场原文最早的 step（可见 live 消息的 MIN(step_id)），无则 null——recall 去重：
+   *  覆盖/锚在它之后的东西，原文还在上下文里。存根也算（step 已 unloaded、
+   *  工具输出换成了存根，对话文字仍在场）；卸载从最老的来，在场段是连续尾巴 */
+  liveStepFloor(): number | null
+  /** 锚点 step ≥ fromStep 的轮内注入用过的名字（kind:name） */
+  asyncCuedNamesSince(fromStep: number): Set<string>
   /** 缝 (from, to) 开区间里有没有内容痕迹（可见消息/外主 steps）——跨缝合的第②③道保险 */
   gapHasContent(from: number, to: number): boolean
   /** 建一条摘要行，返回 id。text 先存占位，ready 时再换 */
@@ -593,6 +610,8 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
   // 行的 owner 判，不按轮判——复制行的 turn_id 仍是主任务的轮
   const ownerEq = scope ? `owner = '${safeOwner(scope.owner)}'` : 'owner IS NULL'
   const msgVis = scope ? ownerEq : `${ownerEq} AND ${turnVis}`
+  // 前缀改写放行票的键（setRewriteTicket）：与 merge-rewrite-pending 同表，按 owner 分
+  const rewriteTicket = scope ? `prefix-rewrite-allowed:${scope.owner}` : 'prefix-rewrite-allowed'
   // historyPage 的 JOIN 里 turns 别名是 t
   const turnCondT = scope
     ? `(t.owner = '${safeOwner(scope.owner)}' OR (t.owner IS NULL AND t.id <= ${scope.forkTurn}))`
@@ -1065,17 +1084,6 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
 
     liveWithTurns: () => loadLiveWithTurns(db, msgVis),
 
-    saveCue: (turnId, lines, names) => {
-      db.run(
-        `INSERT INTO cues(owner, turn_id, lines, names, created_at) VALUES('', ?, ?, ?, ?)
-         ON CONFLICT(owner, turn_id) DO NOTHING`,
-        turnId,
-        JSON.stringify(lines),
-        JSON.stringify(names),
-        new Date().toISOString(),
-      )
-    },
-
     cues: () => {
       const out = new Map<number, string[]>()
       for (const r of db.all<{ turn_id: number; lines: string }>(
@@ -1085,42 +1093,38 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
       return out
     },
 
-    recentCuedNames: (dedupTurns) => {
-      const names = new Set<string>()
-      const min = db.all<{ turn_id: number }>(
-        `SELECT DISTINCT turn_id FROM messages WHERE state = 'live' AND ${msgVis}
-         ORDER BY turn_id DESC LIMIT ?`,
-        dedupTurns,
-      ).at(-1)?.turn_id
-      if (min === undefined) return names
-      for (const r of db.all<{ names: string }>(`SELECT names FROM cues WHERE owner = '' AND turn_id >= ?`, min))
-        for (const n of JSON.parse(r.names) as string[]) names.add(n)
-      return names
+    saveAsyncCue: (turnId, cue) => {
+      db.run(
+        `INSERT INTO async_cues(owner, turn_id, step_id, after, lines, names, created_at) VALUES('', ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(owner, turn_id) DO NOTHING`,
+        turnId,
+        cue.stepId,
+        cue.after,
+        JSON.stringify(cue.lines),
+        JSON.stringify(cue.names),
+        new Date().toISOString(),
+      )
     },
 
-    cueTurnTexts: (window) => {
-      // 轮龄按实际轮数（DISTINCT turn_id 的位置），不按 id 相减——fork
-      // 跳号会把 5 轮虚报成 1 万轮（proposal §4 坑①）
-      const ids = db
-        .all<{ turn_id: number }>(
-          `SELECT DISTINCT turn_id FROM messages WHERE state = 'live' AND ${msgVis}
-           ORDER BY turn_id DESC LIMIT ?`,
-          window,
-        )
-        .map((r) => r.turn_id)
-        .reverse()
-      if (ids.length === 0) return []
-      const byTurn = new Map<number, string[]>(ids.map((id) => [id, []]))
-      for (const r of db.all<{ turn_id: number; content_json: string }>(
-        `SELECT turn_id, content_json FROM messages
-          WHERE state = 'live' AND ${msgVis} AND turn_id IN (${ids.map(() => '?').join(',')})
-          ORDER BY turn_id, id`,
-        ...ids,
-      )) {
-        const line = JSON.parse(r.content_json) as { parts?: unknown[] }
-        for (const seg of searchable(line as Parameters<typeof searchable>[0])) byTurn.get(r.turn_id)?.push(seg.text)
-      }
-      return ids.map((id) => (byTurn.get(id) ?? []).join('\n'))
+    asyncCues: () => {
+      const out = new Map<number, AsyncCue>()
+      for (const r of db.all<{ step_id: number; after: number; lines: string }>(
+        `SELECT step_id, after, lines FROM async_cues WHERE owner = ''`,
+      ))
+        out.set(r.step_id, { after: r.after, lines: JSON.parse(r.lines) as string[] })
+      return out
+    },
+
+    liveStepFloor: () =>
+      db.all<{ s: number | null }>(
+        `SELECT MIN(step_id) AS s FROM messages WHERE state = 'live' AND ${msgVis} AND step_id IS NOT NULL`,
+      )[0]?.s ?? null,
+
+    asyncCuedNamesSince: (fromStep) => {
+      const names = new Set<string>()
+      for (const r of db.all<{ names: string }>(`SELECT names FROM async_cues WHERE owner = '' AND step_id >= ?`, fromStep))
+        for (const n of JSON.parse(r.names) as string[]) names.add(n)
+      return names
     },
 
     lastRespondedAt: () => {
@@ -1185,6 +1189,31 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
         fingerprint,
         new Date().toISOString(),
       )
+    },
+
+    setRewriteTicket: () => {
+      db.run(
+        `INSERT INTO migrations (name, ran_at) VALUES (?, ?)
+         ON CONFLICT(name) DO UPDATE SET ran_at = excluded.ran_at`,
+        rewriteTicket,
+        new Date().toISOString(),
+      )
+    },
+
+    takeRewriteTicket: () => {
+      const hit = db.all(`SELECT 1 FROM migrations WHERE name = ?`, rewriteTicket).length > 0
+      if (hit) db.run(`DELETE FROM migrations WHERE name = ?`, rewriteTicket)
+      return hit
+    },
+
+    lastTurnModel: () => {
+      // 跟 resumableTurn 同一个范围（turnCond：主任务跳过 reserved 行，任务
+      // 看自己的轮 + 继承上界内的主任务轮）——任务刚 fork 时最后一轮就是
+      // 主任务的，用别的模型开任务也算切换，照样告知
+      const meta = db.all<{ meta: string | null }>(
+        `SELECT meta FROM turns WHERE ${turnCond} ORDER BY id DESC LIMIT 1`,
+      )[0]?.meta
+      return meta ? ((JSON.parse(meta) as TurnMeta).model ?? null) : null
     },
 
     consumeMergePending: () => {

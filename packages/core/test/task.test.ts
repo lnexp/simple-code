@@ -1150,3 +1150,109 @@ describe('上下文隔离（note task-context-isolation）', () => {
     main2.close()
   })
 })
+
+describe('手动压缩（compactNow，2026-10-17）：主任务与任务各压各的', () => {
+  const settingsAt = async (dir: string): Promise<string> => {
+    const { writeFile } = await import('node:fs/promises')
+    const globalPath = join(dir, 'settings.json')
+    await writeFile(
+      globalPath,
+      JSON.stringify({
+        provider: 'p',
+        model: 'm',
+        providers: {
+          p: {
+            protocol: 'anthropic-messages',
+            baseUrl: 'https://example.invalid',
+            apiKey: 'k',
+            // 大窗口：自动车一趟不开，视图的变化只可能来自按钮
+            models: { m: { contextWindow: 200_000 } },
+          },
+        },
+        memory: { idleSummarizeDelayMs: 0, unloadTargetRatio: 0.001, clipThresholdChars: 0, keepHeadChars: 40 },
+      }),
+      'utf8',
+    )
+    return globalPath
+  }
+  const usage = { inputTokens: 1, outputTokens: 1, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, reasoningTokens: 0 }
+  // 每次 send = 调一次工具（大段输出，卸得动）+ 答一句
+  const open = async (dir: string, globalPath: string, m?: TaskManifest) => {
+    const { getSession } = await import('../src/session/session.ts')
+    let call = 0
+    return getSession(dir, {
+      ...(m ? { task: scopeOf(m) } : {}),
+      skipLock: true,
+      globalPath,
+      env: {},
+      tools: [
+        {
+          name: 'echo',
+          definition: { name: 'echo', description: 'd', parameters: { type: 'object' } },
+          execute: async () => ({ output: '工具的大段输出。'.repeat(200), exitCode: 0, isError: false }),
+        },
+      ],
+      stream: () => {
+        call++
+        const id = `c${call}`
+        const events =
+          call % 2 === 1
+            ? [
+                { type: 'tool_input_start', id, name: 'echo' },
+                { type: 'tool_input_delta', id, partial: '{}' },
+                { type: 'tool_input_end', id, name: 'echo', input: {} },
+                { type: 'finish', reason: 'tool-calls', usage },
+              ]
+            : [{ type: 'text_start' }, { type: 'text_delta', text: '好了' }, { type: 'text_end' }, { type: 'finish', reason: 'stop', usage }]
+        return (async function* () {
+          for (const ev of events) yield ev
+        })()
+      },
+    } as never)
+  }
+  // 发给模型的那份，逐条全量比（存根改的是工具结果，只比 text 看不出来）
+  const view = (dir: string, m?: TaskManifest): string[] => {
+    const s = m ? openStore(dir, { task: scopeOf(m) }) : openStore(dir)
+    const out = assembleContext(s.liveWithTurns(), s.summaries()).map((msg) => JSON.stringify(msg))
+    s.close()
+    return out
+  }
+  const send = async (s: { send(text: string): AsyncIterable<unknown> }, text: string): Promise<string[]> => {
+    const errors: string[] = []
+    for await (const ev of s.send(text) as AsyncIterable<{ type: string; message?: string }>)
+      if (ev.type === 'error') errors.push(ev.message ?? '')
+    return errors
+  }
+
+  it('任务压缩不动主任务的视图、主任务压缩不动任务的视图；放行票各归各的', async () => {
+    const dir = await workspace()
+    const globalPath = await settingsAt(dir)
+    const main = await open(dir, globalPath)
+    for (let i = 1; i <= 3; i++) expect(await send(main, `对话问题${i}`)).toEqual([])
+    await main.close()
+    const m = forkTask(dir, 't')
+
+    const task = await open(dir, globalPath, m)
+    for (let i = 1; i <= 3; i++) expect(await send(task, `任务问题${i}`)).toEqual([])
+    const mainBefore = view(dir)
+    const r = await task.compactNow()
+    expect(r.ok && r.unloaded).toBeGreaterThan(0) // 前提：任务这边确实压了
+    expect(view(dir)).toEqual(mainBefore)
+    const tickets = () =>
+      query<{ name: string }>(dir, "SELECT name FROM migrations WHERE name LIKE 'prefix-rewrite-allowed%'").map((x) => x.name)
+    expect(tickets()).toEqual([`prefix-rewrite-allowed:${m.owner}`])
+    expect(await send(task, '任务压完再问')).toEqual([])
+    expect(tickets()).toEqual([])
+    await task.close()
+
+    const taskBefore = view(dir, m)
+    const main2 = await open(dir, globalPath)
+    const r2 = await main2.compactNow()
+    expect(r2.ok && r2.unloaded).toBeGreaterThan(0)
+    expect(view(dir)).not.toEqual(mainBefore) // 前提：主任务这边确实压了
+    expect(view(dir, m)).toEqual(taskBefore)
+    expect(tickets()).toEqual(['prefix-rewrite-allowed'])
+    expect(await send(main2, '对话压完再问')).toEqual([])
+    await main2.close()
+  })
+})

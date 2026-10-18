@@ -17,7 +17,7 @@ import type {
   ToWebview,
 } from '../src/protocol.ts'
 import { ActivityGroup, ProcessGroup } from './activity.tsx'
-import { ContextPanel } from './ctx-panel.tsx'
+import { compactText, ContextPanel } from './ctx-panel.tsx'
 import { EffortPicker, FolderTabs, ModelPicker, PresetPicker } from './controls.tsx'
 import {
   composeWithAttachments,
@@ -90,6 +90,12 @@ export function App() {
   const [ctxOpen, setCtxOpen] = useState(false)
   const [ctxPending, setCtxPending] = useState(false)
   const [regions, setRegions] = useState<RegionsInfo | null>(null)
+  /** 手动压缩（面板按钮）。带 task：结果只在它自己那个分支的面板上显示 */
+  const [compact, setCompact] = useState<{ task: string | null; busy: boolean; text: string | null }>({
+    task: null,
+    busy: false,
+    text: null,
+  })
   /** 挂起中的审批（approval_request 到、approval_closed 消）多问并发时
    * 会有多条——每条一个 id，答复按钮各自对应 */
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([])
@@ -342,7 +348,8 @@ export function App() {
       else if (msg.type === 'regions') {
         setRegions(msg.info)
         setCtxPending(false)
-      }
+      } else if (msg.type === 'compact_result')
+        setCompact({ task: msg.task ?? null, busy: false, text: compactText(msg.result) })
     }
     window.addEventListener('message', onMessage)
     // **挂载完成才报 ready。** 扩展在收到它之前不推任何东西——VS Code 会
@@ -602,6 +609,7 @@ export function App() {
         onOpenRegions={() => {
           setCtxOpen(true)
           setCtxPending(true)
+          setCompact({ task: branch, busy: false, text: null })
           // 上下文环跟分支走：查分支的库，不拿主干的数字骗人
           post({ type: 'get_regions', ...(branch !== null ? { task: branch } : {}) })
         }}
@@ -622,7 +630,17 @@ export function App() {
         }}
       />
       {ctxOpen && (
-        <ContextPanel info={regions} pending={ctxPending} onClose={() => setCtxOpen(false)} />
+        <ContextPanel
+          info={regions}
+          pending={ctxPending}
+          running={branch === null ? running : tasks.find((x) => x.name === branch)?.status === 'running'}
+          compact={compact.task === branch ? compact : { busy: false, text: null }}
+          onCompact={() => {
+            setCompact({ task: branch, busy: true, text: null })
+            post({ type: 'compact', ...(branch !== null ? { task: branch } : {}) })
+          }}
+          onClose={() => setCtxOpen(false)}
+        />
       )}
       {zoom !== null && (
         // 点浮层任意处关闭。img 上 stopPropagation：点图本身不冒泡到
@@ -719,7 +737,10 @@ function Log({
     pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
     // 触顶拉历史：40px 内就发——等到 scrollTop === 0 才发的话最后一屏
     // 恰好填满时用户拉不动，卡在没有加载更多的死区里
-    if (el.scrollTop < 40 && history.more && !history.loading) onFetchTop()
+    // 空列表不算触顶：切目录先清空视图，scrollTop 被夹到 0 也会来一次
+    // scroll，基线还没到就抢先拉一页（真库 ai-legal 这页带图 623ms，
+    // 跟基线争宿主，「正在加载更早的消息」就是它）
+    if (el.scrollTop < 40 && view.items.length > 0 && history.more && !history.loading) onFetchTop()
   }
 
   /**
@@ -925,6 +946,13 @@ function Item({
               继续
             </button>
           )}
+        </div>
+      )
+    case 'divider':
+      // 两侧横线是 ::before/::after 的 flex:1，随面板宽度伸缩（style.ts .divider）
+      return (
+        <div className="item divider" role="separator">
+          <span>{item.text}</span>
         </div>
       )
   }

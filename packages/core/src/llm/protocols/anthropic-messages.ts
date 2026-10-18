@@ -40,12 +40,21 @@ function buildRequest(req: Request, ctx: ProviderContext) {
     // 断点**静默失效**：不报错，usage 里两个 cache 字段都是 0。实测一个
     // bash 工具加两句 system 只有 600 出头，够不着。所以真正省钱的是下面
     // 那个 messages 断点——历史长起来之后才有东西可缓存。
-    system: [{ type: 'text', text: req.system, cache_control: CACHE_CONTROL }],
-    messages: withCacheBreakpoint(req.messages.map(toWireMessage)),
-    tools: req.tools.map((t) => ({
+    system: [{ type: 'text', text: req.system, cache_control: cacheControl(req) }],
+    messages: withCacheBreakpoint(req.messages.map(toWireMessage), cacheControl(req)),
+    tools: req.tools.map((t, i) => ({
       name: t.name,
       description: t.description,
       input_schema: t.parameters,
+      // 配了 cacheTtl（1h）时给最后一个 tool 也打同档标记：网关会给
+      // tools 注入 5m 的 cache_control，而官方规定 1h 块不能排在 5m 块
+      // 之后（顺序 tools→system→messages），不打会 400（2026-10-13 真机
+      // system.0.cache_control.ttl 被拒）。自己打了网关就不注入——探针
+      // /tmp/ttlprobe/probe9：A 不打=400、B 自打 1h=200、C 5m 同款=200。
+      // 没配 cacheTtl 时不打，请求体与以前逐字节一致
+      ...(req.cacheTtl && i === req.tools.length - 1
+        ? { cache_control: cacheControl(req) }
+        : {}),
     })),
     thinking:
       req.thinking === 'adaptive'
@@ -86,6 +95,14 @@ const toWireMessage = (msg: Message): WireMessage => ({
 const CACHE_CONTROL = { type: 'ephemeral' } as const
 
 /**
+ * 两个断点同一个 TTL：官方规定混用时长 TTL 必须排在短 TTL 之前，统一一档
+ * 就不用操心。没配 cacheTtl 时返回原常量——请求体跟以前逐字节一致
+ */
+function cacheControl(req: Request): { type: 'ephemeral'; ttl?: '5m' | '1h' } {
+  return req.cacheTtl ? { ...CACHE_CONTROL, ttl: req.cacheTtl } : CACHE_CONTROL
+}
+
+/**
  * 只在**末条**消息打一个断点（加 system 一个，共两个）——官方客户端
  * 同款（markerIndex = messages.length - 1）。
  *
@@ -97,19 +114,27 @@ const CACHE_CONTROL = { type: 'ephemeral' } as const
  * （每断点 20 块窗口）找上一请求写入的条目，单断点足够。
  *
  * thinking 块不能直接打（官方明列的例外），所以每条消息里从后往前找
- * 第一个不是 thinking 的块。整条消息都是 thinking 就跳过它——少一个钉子
- * 不会更糟。
+ * 第一个不是 thinking 的块。image 块也跳过（2026-10-16）：断点打在
+ * 末尾 image 上会让上游走进「末块不是合法断点目标 → 向后回退」的
+ * 自动缓存路径，注入混档 TTL 报 400——1h 修复（71c8834）上线时没测
+ * 过图片场景，带图请求一来就触发。整条消息都是 thinking/image 就跳过
+ * 它——少一个钉子不会更糟。
  */
-function withCacheBreakpoint(wire: WireMessage[]): WireMessage[] {
+function withCacheBreakpoint(
+  wire: WireMessage[],
+  cc: ReturnType<typeof cacheControl>,
+): WireMessage[] {
   const out = [...wire]
   const last = out[wire.length - 1]
   if (last) {
-    const at = last.content.findLastIndex((block) => block.type !== 'thinking')
+    const at = last.content.findLastIndex(
+      (block) => block.type !== 'thinking' && block.type !== 'image',
+    )
     if (at !== -1) {
       out[wire.length - 1] = {
         ...last,
         content: last.content.map((block, j) =>
-          j === at ? { ...block, cache_control: CACHE_CONTROL } : block,
+          j === at ? { ...block, cache_control: cc } : block,
         ),
       }
     }

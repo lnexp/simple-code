@@ -1,8 +1,8 @@
 {
-  "name": "SimpleCode",
+  "name": "simplecode-agent",
   "displayName": "SimpleCode",
   "description": "在侧边栏里跑 simple-code agent",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "icon": "assets/marketplace-icon.png",
   "type": "module",
   "publisher": "lnexp",

@@ -26,6 +26,7 @@ import {
   assembleContext,
   emittedSummaries,
   hotSummaryIds,
+  type AsyncCue,
   type LiveMessage,
   type Summary,
   type UnloadedRef,
@@ -218,6 +219,14 @@ export type MemoryDeps = {
   /** recall 线索行（cue.ts）：turn → 成品行。装配渲染的唯一数据源，
    *  落库在 send 入口、算一次冻结——在这里现算会破前缀（重装配字节要一致） */
   cues: () => ReadonlyMap<number, readonly string[]>
+  /** recall 选择器的轮内注入：stepId → 锚点。同 cues，落库冻结、装配渲染 */
+  asyncCues?: () => ReadonlyMap<number, AsyncCue>
+  /**
+   * 发请求前问一次：选择器结果到了就锚在这里落库（每轮至多一次，没到就
+   * 等下一个 step）。只在末条是工具结果时问——模型已经开始动手，危险动作
+   * 都在这之后（recall-llm-selector.md §4）
+   */
+  offerAsyncCue?: (anchor: { turnId: number; stepId: number; after: number }) => void
   /** 这几条摘要的叶子正文，按 summary id。查不到的不在返回值里（走温区渲染） */
   leafBodies: (summaries: Summary[]) => Map<number, string>
   /** 热区留几条展开正文（§4.4）。实测取 8，账见 schema.ts 的 hotLeaves */
@@ -617,6 +626,7 @@ async function* runStep(ctx: LoopContext): AsyncIterable<AgentEvent> {
   // request1/request2 实测：113 条只命中前 18 条）
   yield* unloadIfNeeded(ctx)
 
+  offerAsyncCue(ctx)
   const acc = yield* streamWithOverflowRecovery(ctx)
 
   // 预算基线的下标在 streamWithOverflowRecovery 里记（发请求那一刻，按拼装
@@ -629,6 +639,9 @@ async function* runStep(ctx: LoopContext): AsyncIterable<AgentEvent> {
   // 字符密度估法）。usage 全 0 = 渠道没报（网关常见），照记——那本身就是信息
   logRun({
     ev: 'llm_usage',
+    // 跑着不许换模型（bridge switchModel 早退），deps.request.model 就是
+    // 这次请求的模型——原来只能靠同 pid+folder 前一条 llm 行配对
+    model: ctx.deps.request.model,
     folder: ctx.deps.root,
     input: acc.usage.inputTokens,
     cacheRead: acc.usage.cacheReadInputTokens,
@@ -769,6 +782,19 @@ async function* forceUnload(ctx: LoopContext): AsyncGenerator<AgentEvent, boolea
 }
 
 /**
+ * 手动压缩（上下文分析面板的按钮，2026-10-17 翻案）：轮外跑一次压缩点。
+ * **只在空闲时调**——session.compactNow 把关，跑着的轮自己有压缩点，轮外
+ * 再改一份历史就是两个写者。与 stale 车同一套：应用待生效的合并 → 保底区
+ * 外全卸 → 摘要进场 → 刷新 system；保底区不动（不走 force）。前缀改写的
+ * 放行靠守卫落库的票带到下一次请求，中间隔一次 reload 也认
+ */
+export async function* compactIdle(ctx: LoopContext): AsyncIterable<AgentEvent> {
+  // 同 runStep：估算要基于干净的历史
+  normalize(ctx)
+  yield* unloadIfNeeded(ctx, false, true)
+}
+
+/**
  * 连续几次「卸载后重发」还不行就放弃。
  *
  * 不设上限的话，卸到只剩保底区（`floorStartIndex`）
@@ -804,7 +830,7 @@ function assembleForRequest(ctx: LoopContext): Message[] {
   // （还没有任何摘要、cue 最该工作的时刻）永远看不到线索行
   if (summaries.length === 0)
     return stripImagesWhenUnsupported(
-      assembleContext(memory.withTurns(ctx.messages), [], new Map(), memory.cues()),
+      assembleContext(memory.withTurns(ctx.messages), [], new Map(), memory.cues(), memory.asyncCues?.()),
       ctx.deps.caps,
       ctx.relayCache,
     )
@@ -820,10 +846,25 @@ function assembleForRequest(ctx: LoopContext): Message[] {
   })
   const bodies = memory.leafBodies(emitted.filter((summary) => hot.has(summary.id)))
   return stripImagesWhenUnsupported(
-    assembleContext(memory.withTurns(ctx.messages), summaries, bodies, memory.cues()),
+    assembleContext(memory.withTurns(ctx.messages), summaries, bodies, memory.cues(), memory.asyncCues?.()),
     ctx.deps.caps,
     ctx.relayCache,
   )
+}
+
+/**
+ * 选择器注入的锚点：末条（工具结果）所在 step 的第几条之后。条数按 live
+ * 里同 stepId 的消息数——与 planContext 的 step 块同口径，渲染时 block.slice
+ * 切的就是这个位置
+ */
+function offerAsyncCue(ctx: LoopContext): void {
+  const memory = ctx.deps.memory
+  if (!memory?.offerAsyncCue) return
+  const live = memory.withTurns(ctx.messages)
+  const last = live.at(-1)
+  if (!last || last.message.role !== 'tool') return
+  const after = live.filter((entry) => entry.stepId === last.stepId).length
+  memory.offerAsyncCue({ turnId: last.turnId, stepId: last.stepId, after })
 }
 
 /**
@@ -843,7 +884,7 @@ function assembleForRequest(ctx: LoopContext): Message[] {
  * force 路径（context_overflow 自救）也走这里，apply 同样先于强卸——塌缩
  * 释放的空间可能直接把预算救回线内，那就一条都不用强卸。
  */
-async function* unloadIfNeeded(ctx: LoopContext, force = false): AsyncIterable<AgentEvent> {
+async function* unloadIfNeeded(ctx: LoopContext, force = false, manual = false): AsyncIterable<AgentEvent> {
   const memory = ctx.deps.memory
   if (!memory) return
 
@@ -860,7 +901,7 @@ async function* unloadIfNeeded(ctx: LoopContext, force = false): AsyncIterable<A
   const mergePending = memory.consumeMergePending?.() ?? false
   const stale = isCacheStale(memory)
   const over = currentUsage(ctx) > inputBudget(ctx)
-  if (!force && !mergePending && !stale && !over) return
+  if (!force && !manual && !mergePending && !stale && !over) return
   ctx.deps.prefixGuard?.allowRewrite()
 
   // 触发了：**先应用待生效的合并，再看还要卸多少**（§9.1「生效必须先于
@@ -868,7 +909,7 @@ async function* unloadIfNeeded(ctx: LoopContext, force = false): AsyncIterable<A
   // 已经在预算内，一条都不用卸——顺序反了会按「还没释放」的状态多卸一批
   yield* applyPendingMerges(ctx)
   try {
-    yield* unloadOldest(ctx, { force, stale, over, mergePending })
+    yield* unloadOldest(ctx, { force, manual, stale, over, mergePending })
   } finally {
     // 摘要进场（compaction-v2 §0.4 位置制：存根区天花板之外的段）。
     // 放 finally：卸载提前返回（挑不出可卸的）时这趟车照样要搭——原来
@@ -881,7 +922,7 @@ async function* unloadIfNeeded(ctx: LoopContext, force = false): AsyncIterable<A
 /** 卸载本体：压缩点已确认（unloadIfNeeded），合并已应用 */
 async function* unloadOldest(
   ctx: LoopContext,
-  t: { force: boolean; stale: boolean; over: boolean; mergePending: boolean },
+  t: { force: boolean; manual: boolean; stale: boolean; over: boolean; mergePending: boolean },
 ): AsyncIterable<AgentEvent> {
   const memory = ctx.deps.memory
   if (!memory) return
@@ -897,7 +938,7 @@ async function* unloadOldest(
   logRun({
     ev: 'unload_trigger',
     folder: ctx.deps.root,
-    reason: t.force ? 'force' : t.over ? 'budget' : t.stale ? 'stale' : 'merge',
+    reason: t.force ? 'force' : t.manual ? 'manual' : t.over ? 'budget' : t.stale ? 'stale' : 'merge',
     // reason 只报主因；车票同时在场会被盖掉——单列才对得上任务关闭后的那次改写
     mergePending: t.mergePending,
     nowMs: memory.now(),
@@ -909,17 +950,19 @@ async function* unloadOldest(
     usage: currentUsage(ctx),
     budget: inputBudget(ctx),
   })
-  // 归档原因主因优先（force > 预算 > 缓存过期 > 任务关闭）。只看「有没有触发」
+  // 归档原因主因优先（force > 手动 > 预算 > 缓存过期 > 任务关闭）。只看「有没有触发」
   // 不区分的话，场景间共用一条「上下文接近上限」文案：缓存过期时是假的
   // （实测 raw 14% 也这么喊）、force 时是说反了（不是「接近」，是已经超了、
   // 连保底区都卸了）
-  const reason: 'budget' | 'stale' | 'force' | 'merge' = t.force
+  const reason: 'budget' | 'stale' | 'force' | 'merge' | 'manual' = t.force
     ? 'force'
-    : t.over
-      ? 'budget'
-      : t.stale
-        ? 'stale'
-        : 'merge'
+    : t.manual
+      ? 'manual'
+      : t.over
+        ? 'budget'
+        : t.stale
+          ? 'stale'
+          : 'merge'
   // 压缩路径逐段检查点（2026-09-22 第三次卡死断口在这条路径里：unload_trigger
   // 之后连 llm_req 都没写出来）。写法同 tool_run：写在「即将进入的阶段」之前，
   // 冻住的进程写不了日志——runlog 最后一条 step 就是卡住的段

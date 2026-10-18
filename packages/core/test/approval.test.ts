@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from 'vitest'
 import { homedir, tmpdir } from 'node:os'
-import { mkdtempSync, rmSync, symlinkSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, symlinkSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   DEFAULT_ASK_COMMANDS,
@@ -311,46 +311,6 @@ describe('bash 工具接线', () => {
     await expect(access('/tmp/sc-approval-deny.txt')).rejects.toThrow()
   })
 
-  it('cwd 越界：命令字符串再干净也弹卡（锚点劈开=绕过），deny 不执行', async () => {
-    const { createBashTool } = await import('../src/tools/bash.ts')
-    const tool = createBashTool({
-      defaultTimeoutMs: 5000, maxTimeoutMs: 10_000, maxOutputChars: 1000,
-      killGraceMs: 200, envPassthrough: ['PATH'],
-    })
-    const asked: string[] = []
-    const out = await tool.execute(
-      // 相对路径本身完全干净（无绝对路径、无隐藏段）——旧版会放行，
-      // 实际却写进 cwd=/tmp/sc-cwd-escape 下的 escape-test.txt
-      { command: 'echo pwned > escape-test.txt', cwd: '/tmp/sc-cwd-escape' },
-      ctxOf({
-        requestApproval: async (q: { command: string; reason: string }) => { asked.push(q.reason); return 'deny' },
-      }),
-    )
-    expect(asked).toHaveLength(1)
-    expect(asked[0]).toContain('cwd 超出工作区')
-    expect(out.isError).toBe(true)
-    const { access } = await import('node:fs/promises')
-    await expect(access('/tmp/sc-cwd-escape/escape-test.txt')).rejects.toThrow()
-  })
-
-  it('cwd 在 root 内（子目录/根本身）：不因 cwd 弹卡', async () => {
-    const { createBashTool } = await import('../src/tools/bash.ts')
-    const tool = createBashTool({
-      defaultTimeoutMs: 5000, maxTimeoutMs: 10_000, maxOutputChars: 1000,
-      killGraceMs: 200, envPassthrough: ['PATH'],
-    })
-    const asked: string[] = []
-    const out = await tool.execute(
-      { command: 'pwd', cwd: `${LIVE_ROOT}/sub` },
-      ctxOf({
-        requestApproval: async (q: { command: string }) => { asked.push(q.command); return 'deny' },
-      }),
-    )
-    // cwd 在内：不弹（LIVE_ROOT/sub 不存在 spawn 会失败？mkdir 保底）
-    expect(asked).toHaveLength(0)
-    expect(out.isError).toBe(false)
-  })
-
   it('allow：问过之后放行执行', async () => {
     const { createBashTool } = await import('../src/tools/bash.ts')
     const tool = createBashTool({
@@ -653,6 +613,53 @@ describe('always 白名单（approval.json，两个力度）', () => {
     blockedX('xcli get deck.pptx /body > /Users/dev/Desktop/x.txt', '项目外')
   })
 
+  it('nonPathFrom 子命令级条目：批 eval 的 JS 不连带批 upload 的文件参数（2026-10-15）', () => {
+    // 真机实卡：agent-browser eval 的 JS 里 /…/ 正则字面量被 split('/')
+    // 切出 .test( 假隐藏段反复弹卡；而 agent-browser 还有 upload/screenshot/
+    // pdf/download 吃真文件路径——裸 lead 条目 {agent-browser:1} 会把
+    // `upload x ~/.ssh/id_rsa` 静默放行（窃取面）。子命令级 key 只罩 eval
+    // 真机场景配齐：leads 里的 'agent-browser eval' 罩住内置 eval 规则
+    //（那是用户当初卡上批的），这里测的是 leads 罩不住的路径层
+    const bcfg: ApprovalConfig = {
+      ...cfg,
+      nonPathFrom: { 'agent-browser eval': 0 },
+      alwaysLeads: ['agent-browser eval'],
+    }
+    const allowB = (cmd: string) => expect(classify(cmd, ROOT, bcfg)).toEqual({ kind: 'allow' })
+    const blockedB = (cmd: string) => {
+      const v = classify(cmd, ROOT, bcfg)
+      expect(v.kind).toBe('ask')
+      if (v.kind === 'ask') expect(v.reason).toContain('隐藏')
+    }
+    // eval 的 JS（含正则字面量）不再当路径判
+    allowB(`agent-browser eval "(function(){const el=[...document.querySelectorAll('*')].find(e=>e.children.length===0&&/对比分析中国劳动合同法/.test(e.textContent||''));el&&el.click();return el?'ok':'miss'})()" 2>&1 | tail -1`)
+    allowB(`agent-browser eval "(function(){const t=document.body.innerText;return t.length})()"`)
+    // 别的子命令吃真路径：key 不匹配，照常判（.env 读形态也拦）
+    blockedB('agent-browser upload input "/Users/dev/.ssh/id_rsa"')
+    blockedB('agent-browser screenshot "/Users/dev/.env"')
+    // 词级匹配：'agent-browser evaluator' 不沾 'agent-browser eval' 的光
+    blockedB('agent-browser evaluator "/Users/dev/.env"')
+  })
+
+  it('子命令级条目的偏移与优先级：from 从子命令后起数，裸 lead 条目在前优先', () => {
+    // 三段 key：'appctl workloads apply' 消耗位 0/1，from=0 → 位 2 起豁免
+    const acfg: ApprovalConfig = { ...cfg, nonPathFrom: { 'appctl workloads apply': 0 } }
+    expect(classify(`appctl workloads apply "/Users/dev/.env"`, ROOT, acfg)).toEqual({ kind: 'allow' })
+    // 位 1（apply 本身）不在豁免罩内——from=1 时 .env 仍判
+    const acfg1: ApprovalConfig = { ...cfg, nonPathFrom: { 'appctl workloads apply': 1 } }
+    const v = classify(`appctl workloads apply "/Users/dev/.env"`, ROOT, acfg1)
+    expect(v.kind).toBe('ask')
+    // 裸 lead 条目优先：写了两条时按裸的算（子命令条目被短路），
+    // bare from=2 → eval 的 JS 在位 1，不在豁免罩内，照判
+    const mcfg: ApprovalConfig = {
+      ...cfg,
+      nonPathFrom: { 'agent-browser': 2, 'agent-browser eval': 0 },
+      alwaysLeads: ['agent-browser eval'],
+    }
+    const v2 = classify(`agent-browser eval "/Users/dev/.env"`, ROOT, mcfg)
+    expect(v2.kind).toBe('ask')
+  })
+
   it('回退分词按换行分段：两行命令不粘段、豁免照常', async () => {
     // 回退分词曾把第二行命令粘进第一行末尾的管道段 → lead 换人 →
     // 豁免位整体失效 → 元素路径误弹「项目外路径」。回退路径专属，
@@ -754,15 +761,15 @@ describe('nonPathFrom 一键采集（卡上「始终允许」→ approval.json�
           return 'always' as const
         },
       }
-      await tool.execute({ command: 'xcli get f.pptx /slide[2]', cwd: root }, ctx)
+      await tool.execute({ command: 'xcli get f.pptx /slide[2]' }, ctx)
       expect(hints[0]).toEqual({ kind: 'nonpath', lead: 'xcli', from: 2 })
       const saved = JSON.parse(readFileSync(join(root, '.simple-code', 'approval.json'), 'utf8'))
       expect(saved.nonPathFrom).toEqual({ xcli: 2 })
       // 第二条：同 lead 的元素路径不再弹（approval.json 的采集进判定）
-      await tool.execute({ command: 'xcli get f.pptx /body', cwd: root }, ctx)
+      await tool.execute({ command: 'xcli get f.pptx /body' }, ctx)
       expect(hints).toHaveLength(1)
       // 写意图不在豁免罩内：重定向目标照弹
-      await tool.execute({ command: 'xcli get f.pptx /body > /Users/dev/Desktop/x.txt', cwd: root }, ctx)
+      await tool.execute({ command: 'xli get f.pptx /body > /Users/dev/Desktop/x.txt' }, ctx)
       expect(hints).toHaveLength(2)
     } finally {
       rmSync(root, { recursive: true, force: true })
@@ -810,27 +817,27 @@ describe('nonPathFrom 一键采集（卡上「始终允许」→ approval.json�
       })
 
       // 项目级手写规则进判定：appctl deploy 弹（deny 不执行）
-      await tool.execute({ command: 'zz-deployctl deploy prod', cwd: root }, ctx)
+      await tool.execute({ command: 'zz-deployctl deploy prod' }, ctx)
       expect(asked).toHaveLength(1)
       expect(asked[0]).toContain('zz-deployctl deploy')
       // 未配的子命令自由
       // 未配的子命令不弹卡（命令本身 command-not-found 无妨——测的是
       // 「不经过审批就直奔执行」，不是执行成功）
-      await tool.execute({ command: 'zz-deployctl status', cwd: root }, ctx)
+      await tool.execute({ command: 'zz-deployctl status' }, ctx)
       expect(asked).toHaveLength(1)
       // 内置默认兜底仍在：git push 弹
-      await tool.execute({ command: 'git push origin main', cwd: root }, ctx)
+      await tool.execute({ command: 'git push origin main' }, ctx)
       expect(asked).toHaveLength(2)
       expect(asked[1]).toContain('git push')
 
       // 例外面也走文件：hiddenAllow 免拦 .env 子树（settings 已无 approval，
       // 2026-09-27 拍板「审批配置只住两级 approval.json」）
-      await tool.execute({ command: 'cat .env/secret', cwd: root }, ctx)
+      await tool.execute({ command: 'cat .env/secret' }, ctx)
       expect(asked).toHaveLength(2) // 没弹新卡
 
       // 关键回归：卡上「始终允许」读改写后，手写的 askCommands 不丢
       const ctxAllow = { ...ctx, requestApproval: async () => 'always' as const }
-      await tool.execute({ command: 'xcli get f.pptx /slide[2]', cwd: root }, ctxAllow)
+      await tool.execute({ command: 'xcli get f.pptx /slide[2]' }, ctxAllow)
       const saved = JSON.parse(readFileSync(join(root, '.simple-code', 'approval.json'), 'utf8'))
       expect(saved.nonPathFrom).toEqual({ xcli: 2 })
       expect(saved.askCommands).toEqual(['zz-deployctl deploy'])

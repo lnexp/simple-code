@@ -72,9 +72,16 @@ export type AgentEvent =
       type: 'unloaded'
       count: number
       estimated: number
-      reason: 'budget' | 'stale' | 'force' | 'merge'
+      /** manual 只出现在 compactIdle 里，由 session.compactNow 消费，不进对话流 */
+      reason: 'budget' | 'stale' | 'force' | 'merge' | 'manual'
       sinceMs: number | null
     }
+  /**
+   * 这轮换了模型（上一轮谁答的 ≠ 这轮谁答，session.send 判）。流的**第一个**
+   * 事件，在任何内容之前。同时 core 往历史里插了一条〔系统〕告知给 agent 看；
+   * 这个事件是给 UI 的——面板画分割线、CLI 打一行。from/to 是 `provider/name`
+   */
+  | { type: 'model_switch'; from: string; to: string }
   /**
    * 一步结束。**这是「一步」不是「一轮」**——一轮里模型每被调用一次就有
    * 一个，调工具之后还会继续。

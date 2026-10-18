@@ -1,4 +1,4 @@
-import type { LLMEvent, SSEMessage } from './events.ts'
+import { isContentEvent, type LLMEvent, type SSEMessage } from './events.ts'
 import {
   LLMStreamError,
   type Protocol,
@@ -8,7 +8,7 @@ import {
 import { parseSSE } from './protocols/utils/sse.ts'
 import { logRun } from '../runlog.ts'
 import { describeError } from '../tools/describe.ts'
-import type { Request } from './types.ts'
+import type { FinishReason, Request } from './types.ts'
 
 export type SendOptions = {
   protocol: Protocol
@@ -39,6 +39,8 @@ export async function* sendRequest(
   const startedAt = Date.now()
   /** 流自然走完才算成功；消费者提前 break（少见）单独标记 */
   let completed = false
+  let finishReason: FinishReason | undefined
+  let sawContent = false
   let failure: { kind: string; message: string } | undefined
   let tap: StreamTap | undefined
 
@@ -88,6 +90,8 @@ export async function* sendRequest(
       // （SSE 注释行 / ping 事件）也是字节但不是内容，按字节重置等于被
       // 心跳无限续命——某项目曾因此挂 12 分钟（2026-09-21）
       clock.touch()
+      if (ev.type === 'finish') finishReason = ev.reason
+      sawContent ||= isContentEvent(ev)
       yield ev
     }
     completed = true
@@ -113,17 +117,25 @@ export async function* sendRequest(
     // 每次尝试一行（重试 3 次就是 3 行）。中断（用户 abort）不计失败——
     // 那不是模型的问题，kind 记 'aborted' 便于区分
     const incomplete = !failure && !completed
+    // 走完了却零内容：retry.ts 会在外层抛错重试，但这一层看它是成功的。
+    // 10-09 某后端项目 14 次空响应没留下收到了什么，分不清「网关真空」与
+    // 「解析器丢了不认识的块」——带上 stream 统计才能区分
+    const empty = completed && !sawContent
     logRun({
       ev: 'llm',
       model: request.model,
       ...(options.folder ? { folder: options.folder } : {}),
       ...(options.tag ? { tag: options.tag } : {}),
       ms: Date.now() - startedAt,
+      // 结束原因（stop/length/tool-calls/…）。查「为什么被截断」以前只能翻
+      // turns 归档按续写指令原文整条匹配，现在一行 llm 就有
+      ...(finishReason ? { finish: finishReason } : {}),
       ...(failure ? { error: failure } : {}),
       ...(incomplete ? { incomplete: true } : {}),
+      ...(empty ? { empty: true } : {}),
       // 失败/未走完时带上收到了什么：协议层对不认识的事件静默丢弃，报错只剩
       // 「未收到结束标记」——9-30 网关去掉 event: 行，就是靠抓原始流才看出来
-      ...((failure || incomplete) && tap ? { stream: tap.summary() } : {}),
+      ...((failure || incomplete || empty) && tap ? { stream: tap.summary() } : {}),
     })
   }
 }
@@ -137,7 +149,7 @@ type StreamTap = {
 /**
  * 旁路统计 SSE 消息，只透传不改。类型名取 event: 行，没有就取 data 里的
  * type/object（Responses 与 Chat 的区分字段），都没有记 '?'。
- * 只在失败时进日志——成功的流不记内容（runlog 只记元数据）
+ * 只在失败/零内容时进日志——成功的流不记内容（runlog 只记元数据）
  */
 function tapSSE(source: AsyncIterable<SSEMessage>): StreamTap {
   let count = 0

@@ -93,8 +93,6 @@ export type ApprovalConfig = {
   hiddenWrite?: string[]
   /** bash 工具 spawn 的环境——第 2 层替换 $VAR 用。缺省 = 空（变量全算不出） */
   env?: Record<string, string>
-  /** 命令起始目录（bash 的 cwd 参数）。缺省 = root */
-  cwd?: string
   /** 存在检查。缺省 fs.existsSync；测试在假 root 下注入 */
   pathExists?: (abs: string) => boolean
 }
@@ -169,7 +167,7 @@ const SEGMENT_SPLIT_RE = /(?:&&|\|\||[;|&])/
 export function classify(command: string, root: string, cfg: ApprovalConfig): ApprovalVerdict {
   const cmd = command.trim()
   // 第 2 层的真实路径上下文（hidden-path.ts）：cwd 随顶层 cd 逐段更新
-  const real: RealCtx = { cwd: cfg.cwd ?? root, env: cfg.env ?? {}, localVars: localVarsOf(cmd) }
+  const real: RealCtx = { cwd: root, env: cfg.env ?? {}, localVars: localVarsOf(cmd) }
 
   // 规则 0：自家 bin。引号形态固定（宿主注入的就是 "$SIMPLE_CODE_X"）。
   // 例外：APPLY_PATCH 的 heredoc 里藏着任意路径的写操作（补审批闭环的
@@ -634,7 +632,24 @@ function pathRules(
   // 路径和 flag 值——豁免是区间不是单点（flag 值会被数进位置参数，
   // 单点豁免挡不住 `--from /slide[7]/…` 这类）
   // 配置可覆盖内置（用户想收紧 echo 也行）
-  const exemptFromPosition = cfg.nonPathFrom?.[lead] ?? (NONPATH_ALL_POSITIONAL.has(lead) ? 0 : Infinity)
+  let exemptFromPosition = cfg.nonPathFrom?.[lead] ?? (NONPATH_ALL_POSITIONAL.has(lead) ? 0 : Infinity)
+  // 子命令级条目（'agent-browser eval'）：与 alwaysLeads 的 pathMatches
+  // 同款词级匹配。裸 lead 条目罩不住「同 CLI 不同子命令吃不同参数」的
+  // 形态——批 eval 的 JS 参数不能连带批 upload 的文件参数（真机实卡：
+  // agent-browser 既有 eval <js>（JS 里的 /…/ 正则字面量被切成 .test(
+  // 假隐藏段）也有 upload <sel> <files>（真文件路径，读形态）。裸 lead
+  // from=1 会让 `upload x ~/.ssh/id_rsa` 静默——窃取面，开不得。from
+  // 从匹配到的子命令之后起数；裸 lead 条目在前，优先级高于子命令条目
+  if (exemptFromPosition === Infinity && cfg.nonPathFrom) {
+    const bare = unquote(lead)
+    const posList = positionalsOf(lead, items)
+    for (const [entry, from] of Object.entries(cfg.nonPathFrom)) {
+      if (!entry.includes(' ')) continue
+      if (!pathMatches(entry, bare, posList)) continue
+      exemptFromPosition = Math.min(exemptFromPosition, entry.split(' ').length - 1 + from)
+      break // 词级前缀互斥：命中一条即停，多条命中是配置写重叠
+    }
+  }
   let positionalSeen = 0
   let skipNextValue = false
   let firstPositionalLeft = nonPathFirst

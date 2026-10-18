@@ -26,6 +26,16 @@ export type LLMEvent =
   | { type: 'finish'; reason: FinishReason; usage: Usage; refusal?: RefusalDetail }
 
 /**
+ * 「模型说过话」：文本/推理/工具调用，finish 上的 refusal 也算（拒答是回答）。
+ * message_start 与 finish 本身是元信息。retry.ts 的零内容校验与 client.ts 的
+ * 空流取证共用这一份定义——两边各写一份，漂开了日志就会说谎
+ */
+export function isContentEvent(llmEv: LLMEvent): boolean {
+  if (llmEv.type === 'finish') return !!llmEv.refusal
+  return llmEv.type !== 'message_start'
+}
+
+/**
  * content-filter 拒答的详情（Anthropic 的 stop_details）。HTTP 200、内容为空，
  * 不透传的话用户只看到模型「什么都没说」——为什么被拒全在 explanation 里
  * （2026-09-23 实测 Opus 5 的 reasoning_extraction 误报，Claude Code 官方

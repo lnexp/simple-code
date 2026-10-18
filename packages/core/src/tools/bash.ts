@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { createWriteStream } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
+import { join } from 'node:path'
 import type { ToolDefinition } from '../llm/types.ts'
 import type { ApprovalConfig } from './approval.ts'
 import {
@@ -42,7 +42,8 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
   // 让模型按需跳节——内容不变，只加结构
   description:
     '在工作区里执行一条 shell 命令：查看文件、运行构建与测试、检查 git 状态、' +
-    '装依赖等一切要动命令行的事。输出合并 stdout 与 stderr 按时序返回。\n' +
+    '装依赖等一切要动命令行的事。输出合并 stdout 与 stderr 按时序返回。' +
+    '命令固定在工作区根执行，要换目录就在 command 里写 cd <路径> && …。\n' +
     '【长任务/后台】测试/构建/install 直接跑：超时自动转后台、输出接进日志文件并给出路径，稍后 tail 回访。' +
     '主动起服务**必须重定向输出**——`(python3 -m http.server 8123 >/tmp/sc.log 2>&1 & echo $! >/tmp/sc.pid)`，' +
     '裸 `cmd &` 的输出没人接会在写满管道后卡住。调试用 curl，回看输出 `cat /tmp/sc.log`，收尾 `kill $(cat /tmp/sc.pid)`。' +
@@ -93,12 +94,6 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
           'UI 标题位展示用。只写短语，不写句子。先于 command 写。',
       },
       command: { type: 'string', description: '要执行的 shell 命令' },
-      cwd: {
-        type: 'string',
-        description:
-          '工作目录，相对于工作区根目录。默认为根目录。' +
-          '优先用本参数而不是在命令里 cd——每条命令都是独立进程，cd 不会跨调用生效。',
-      },
       timeout: {
         type: 'number',
         description:
@@ -116,7 +111,7 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
   },
 })
 
-type Args = { command: string; cwd: string; timeoutMs: number }
+type Args = { command: string; timeoutMs: number }
 
 /**
  * 漏 desc 时追加在结果末尾（2026-09-29 用户拍板方案 B）。schema 必填挡不住
@@ -141,7 +136,7 @@ export function createBashTool(config: BashConfig, env: NodeJS.ProcessEnv = {}):
     name: 'bash',
     definition: definitionOf(config, env),
     async execute(input, ctx): Promise<ToolOutput> {
-      const parsed = parseArgs(input, config, ctx.root)
+      const parsed = parseArgs(input, config)
       if (typeof parsed === 'string') {
         // 参数错误也是正常返回。写成模型读得懂的散文而不是校验器堆栈：
         // 前者模型会重新组织参数再试，后者通常只会重复同样的错（CLAUDE.md §4.2）
@@ -190,18 +185,9 @@ async function checkApproval(
     alwaysPaths: always.paths,
     hiddenRead: always.hiddenRead,
     hiddenWrite: always.hiddenWrite,
-    // 第 2 层算真实路径：$VAR 按 spawn 的同一份环境替换，相对路径从 cwd 起算
+    // 第 2 层算真实路径：$VAR 按 spawn 的同一份环境替换，相对路径从 root 起算
     env: spawnEnv(config, ctx),
-    cwd: args.cwd,
   })
-  // cwd 越界：命令字符串按 root 锚定判定，实际却在 cwd 下执行——
-  // 两个锚点被劈开即是绕过（cwd=家目录时 `echo > Desktop/foo` 判成
-  // 项目内、实写桌面）。取严合并：cwd 出 root 一律问，且不给 always
-  // 通道——越界 cwd 每次都该过目，不该被「始终允许」记忆掉
-  const rootPrefix = ctx.root.endsWith('/') ? ctx.root : `${ctx.root}/`
-  if (args.cwd !== ctx.root && !args.cwd.startsWith(rootPrefix)) {
-    return askCwdEscape(ctx, args.cwd)
-  }
   if (verdict.kind === 'allow') return null
 
   // always 预览：解释器/网络命令记命令名（verdict 直接带）；项目外
@@ -270,34 +256,10 @@ async function checkApproval(
   }
 }
 
-/** cwd 越界的弹卡：无 always 通道（越界 cwd 不该被记忆放行） */
-async function askCwdEscape(ctx: ToolContext, cwd: string): Promise<ToolOutput | null> {
-  const aborted = new Promise<'deny'>((res) => {
-    ctx.signal.addEventListener('abort', () => res('deny'), { once: true })
-  })
-  const decision = await Promise.race([
-    ctx.requestApproval!({
-      command: `(cwd=${cwd})`,
-      toolCallId: ctx.toolCallId ?? '',
-      category: 'external_dir',
-      detail: cwd,
-      reason: `cwd 超出工作区：命令将在 ${cwd} 下执行，而审批按工作区判定路径`,
-    }),
-    aborted,
-  ])
-  if (decision === 'allow' || decision === 'always') return null
-  const note = ctx.signal.aborted ? '等待审批时被用户中断' : '用户拒绝了这个 cwd'
-  return {
-    output: `审批被拒绝：cwd 超出工作区（${cwd}）。${note}。在项目内跑，或向用户说明需要这个目录的理由。`,
-    exitCode: -1,
-    isError: true,
-  }
-}
-
 // ---------------------------------------------------------------- 参数
 
 /** 返回字符串表示校验失败，内容就是给模型看的话 */
-function parseArgs(input: unknown, config: BashConfig, root: string): Args | string {
+function parseArgs(input: unknown, config: BashConfig): Args | string {
   if (typeof input !== 'object' || input === null) {
     return '参数需要是一个对象，至少包含 command 字段。请重新组织参数后再试。'
   }
@@ -307,12 +269,15 @@ function parseArgs(input: unknown, config: BashConfig, root: string): Args | str
     return '参数 command 需要是一个非空字符串，内容为要执行的 shell 命令。请重新组织参数后再试。'
   }
 
-  if (raw.cwd !== undefined && typeof raw.cwd !== 'string') {
-    return '参数 cwd 需要是字符串，表示相对于工作区根目录的路径。请重新组织参数后再试。'
+  // cwd 参数已移除（2026-10-15 拍板）：与命令里的 cd 是两套平行机制，
+  // 语义一致要靠人肉维护（94cf55e 就是两者的漂移）。响亮拒绝而不是
+  // 静默忽略——静默会让命令在工作区根执行，写错地方不报错
+  if (raw.cwd !== undefined) {
+    return (
+      '参数 cwd 已移除：每条命令都是独立进程，cd 不会跨调用生效，' +
+      '需要换目录就在 command 里写 cd <路径> && …。请重新组织参数后再试。'
+    )
   }
-  // 绝对路径原样用，相对路径基于工作区根解析。第一版没有权限边界，
-  // 这里不做越界检查——真要限制得靠沙箱，路径校验挡不住 `cd .. && ...`
-  const cwd = raw.cwd ? (isAbsolute(raw.cwd) ? raw.cwd : resolve(root, raw.cwd)) : root
 
   if (raw.timeout !== undefined && (typeof raw.timeout !== 'number' || !(raw.timeout > 0))) {
     return '参数 timeout 需要是一个正数，单位为秒。请重新组织参数后再试。'
@@ -321,7 +286,7 @@ function parseArgs(input: unknown, config: BashConfig, root: string): Args | str
     ? Math.min(raw.timeout * 1000, config.maxTimeoutMs)
     : config.defaultTimeoutMs
 
-  return { command: raw.command, cwd, timeoutMs }
+  return { command: raw.command, timeoutMs }
 }
 
 // ---------------------------------------------------------------- 执行
@@ -341,7 +306,7 @@ function run(args: Args, config: BashConfig, ctx: ToolContext): Promise<ToolOutp
     // 不走 envPassthrough：这值必须是本层的事实，从更外层继承来的值
     // 在这里被覆盖——每过一个 agent 层就收窄一次
     const child = spawn('bash', ['-c', `exec 2>&1\n${args.command}`], {
-      cwd: args.cwd,
+      cwd: ctx.root,
       // 独立进程组。少了它 kill 只能杀掉 bash 自己，它派生的子进程会变成孤儿
       // 继续跑
       detached: true,

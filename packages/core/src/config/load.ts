@@ -13,7 +13,7 @@ export const GLOBAL_CONFIG_PATH = join(homedir(), '.simple-code', 'settings.json
 /** MCP servers 的独立配置文件（2026-09-27 拍板移出 settings.json）。
  *  只认用户级——项目级不开放：MCP server 是可执行命令 + env 凭证，
  *  克隆来的仓库能塞一条就能借 agent 之手执行任意代码（settings 的
- *  workspace denylist 拦 mcp.servers 就是这个理由） */
+ *  strict schema 不认任何 mcp 键，塞了也进不来） */
 export const MCP_CONFIG_PATH = join(homedir(), '.simple-code', 'mcp.json')
 /** websearch 的独立配置文件（对齐 mcp.json：凭据类配置单独文件——bin 经
  *  bash 白名单 env 运行，宿主变量不在里面，key 只能落明文进文件） */
@@ -336,10 +336,13 @@ function applyPreset(
 function mergeRequest(config: Config, model: ModelSpec): LoadedConfig['request'] {
   const g = config.request
   const m = model.request
+  const cacheTtl = m.cacheTtl ?? g.cacheTtl
   return {
     maxTokens: m.maxTokens ?? g.maxTokens ?? 32_000,
     thinking: m.thinking ?? g.thinking ?? 'adaptive',
     effort: m.effort ?? g.effort ?? 'high',
     reasoningDisplay: m.reasoningDisplay ?? g.reasoningDisplay ?? 'summarized',
+    // 不配就不出现这个键：请求体与前缀指纹跟没有这个功能时逐字节一致
+    ...(cacheTtl ? { cacheTtl } : {}),
   }
 }

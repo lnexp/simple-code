@@ -519,6 +519,46 @@ describe('历史回放（hydrateItems）', () => {
     ])
   })
 
+  it('模型切换告知回放成分割线：不是用户气泡，文案剥掉〔系统〕和给 agent 看的末句（2026-10-17 用户定样式）', () => {
+    const items = hydrateItems(
+      msgs(
+        { role: 'user', parts: [{ type: 'text', text: '第一轮' }] },
+        { role: 'assistant', parts: [{ type: 'text', text: '答' }] },
+        {
+          role: 'user',
+          parts: [
+            {
+              type: 'text',
+              text: '〔系统〕模型已从 alpha/a-small 切换到 beta/b-one。此前的回复由上一个模型生成。',
+            },
+          ],
+        },
+        { role: 'user', parts: [{ type: 'text', text: '第二轮' }] },
+      ),
+    )
+    expect(items).toEqual([
+      { kind: 'user', text: '第一轮' },
+      { kind: 'assistant', text: '答' },
+      { kind: 'divider', text: '模型已从 alpha/a-small 切换到 beta/b-one' },
+      { kind: 'user', text: '第二轮' },
+    ])
+  })
+
+  it('〔系统〕开头但不是切换告知的（用户自己打的），照常是用户气泡', () => {
+    const items = hydrateItems(msgs({ role: 'user', parts: [{ type: 'text', text: '〔系统〕这几个字是我打的' }] }))
+    expect(items).toEqual([{ kind: 'user', text: '〔系统〕这几个字是我打的' }])
+  })
+
+  it('模型名里带「。」或「 切换到 」以外的字符也解析对（provider/name 允许含 /）', () => {
+    const items = hydrateItems(
+      msgs({
+        role: 'user',
+        parts: [{ type: 'text', text: '〔系统〕模型已从 a/org/m-1 切换到 modelbest/claude-opus-5-5。此前的回复由上一个模型生成。' }],
+      }),
+    )
+    expect(items).toEqual([{ kind: 'divider', text: '模型已从 a/org/m-1 切换到 modelbest/claude-opus-5-5' }])
+  })
+
   it('tool_call 和 tool_result 跨消息按 id 配对成一条工具条目', () => {
     const items = hydrateItems(
       msgs(
@@ -883,5 +923,40 @@ describe('bash 入参 desc → 工具条标题位（2026-09-28）', () => {
     )
     expect(toolOf(view)).toMatchObject({ desc: '' })
     expect(toolOf(view).rawInput).toBeUndefined()
+  })
+})
+
+describe('模型切换分割线（实时，model_switch 事件）', () => {
+  it('流首事件把分割线插到本轮 user 气泡前——与回放位置一致', () => {
+    // App 先本地 append 了 user 气泡，然后 model_switch 作为流首事件到达
+    let view: ChatView = {
+      ...emptyView(),
+      items: [
+        { kind: 'user', text: '第一轮' },
+        { kind: 'assistant', text: '答' },
+        { kind: 'user', text: '第二轮' },
+      ],
+    }
+    view = reduce(view, { type: 'model_switch', from: 'alpha/a-small', to: 'beta/b-one' }, Date.now())
+    view = reduce(view, { type: 'text_start' }, Date.now())
+    view = reduce(view, { type: 'text_delta', text: '新模型的回答' }, Date.now())
+    expect(view.items.map((i) => i.kind)).toEqual(['user', 'assistant', 'divider', 'user', 'assistant'])
+    expect(view.items[2]).toEqual({ kind: 'divider', text: '模型已从 alpha/a-small 切换到 beta/b-one' })
+  })
+
+  it('上一轮的过程被折叠时，分割线留在外面不被折进去', () => {
+    let view: ChatView = {
+      ...emptyView(),
+      items: [{ kind: 'user', text: '第一轮' }],
+    }
+    view = reduce(view, { type: 'tool_input_start', id: 't1', name: 'bash' }, Date.now())
+    view = reduce(view, { type: 'text_start' }, Date.now())
+    view = reduce(view, { type: 'text_delta', text: '结论' }, Date.now())
+    view = { ...view, items: [...view.items, { kind: 'user', text: '第二轮' }] }
+    view = reduce(view, { type: 'model_switch', from: 'alpha/a-small', to: 'beta/b-one' }, Date.now())
+    const shape = splitTurns(groupItems(view.items), true).map((s) =>
+      s.kind === 'process' ? 'process' : s.block.kind === 'activity' ? 'activity' : s.block.item.kind,
+    )
+    expect(shape).toEqual(['user', 'process', 'assistant', 'divider', 'user'])
   })
 })

@@ -3,13 +3,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { listModels, loadConfig, selectModel } from '../src/config/load.ts'
+import type { AgentEvent } from '../src/events.ts'
 import { anthropicMessages } from '../src/llm/protocols/anthropic-messages.ts'
 import type { Message, Request, Usage } from '../src/llm/types.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
 import type { LoopDeps } from '../src/loop/run.ts'
 import { listBucketFiles } from '../src/session/buckets.ts'
-import { getSession } from '../src/session/session.ts'
-import { MEMORY_RELATIVE } from '../src/session/store.ts'
+import { forkTask, scopeOf } from '../src/session/task.ts'
+import { getSession, MODEL_SWITCH_HEAD, modelSwitchNotice } from '../src/session/session.ts'
+import { MEMORY_RELATIVE, openStore } from '../src/session/store.ts'
 import type { Tool } from '../src/tools/types.ts'
 
 /**
@@ -513,5 +515,140 @@ describe('换模型剥掉 reasoning 签名', () => {
 
     expect(wireMessages(reasoning('sig-1'))).toContain('sig-1') // 对照：有签名就发
     expect(wireMessages(reasoning())).toBe('[{"role":"assistant","content":[]}]') // 没签名整块不见
+  })
+})
+
+/**
+ * 切换事件告知（2026-10-17 甲案；同日改判据）：send 时「上一轮谁答的 ≠ 这轮
+ * 谁答」就在用户消息前插一条〔系统〕告知，并在流首发 model_switch 事件给
+ * UI 画分割线。SC 是 agent、模型是部件——切换对 agent 是环境变更，必须作为
+ * 事件进上下文；状态行是常量，答「现在是什么」答不了「何时变的、之前是谁」。
+ * desc 英文事故的对策（lesson glm-desc-english-imitates-history）。
+ *
+ * 判据从「setModel 落票」改成「比对上一轮的 turns.meta.model」：reload 后
+ * 宿主恢复上次选择也调 setModel，按调用判插了假告知（真机抓到）。
+ *
+ * 这里不能复用上面的 open()：那个 ephemeral: true，store 为 null 没有轮可比
+ */
+const openPersisted = async (rounds: StreamEvent[][] = []) => {
+  const { dir, globalPath } = await workspace()
+  const s = scripted(rounds)
+  const session = await getSession(dir, {
+    globalPath,
+    env: ENV,
+    tools: [fakeTool()],
+    stream: s.stream,
+    skipLock: true,
+  })
+  return { dir, globalPath, session, ...s }
+}
+
+const reopen = (dir: string, globalPath: string, rounds: StreamEvent[][]) =>
+  getSession(dir, { globalPath, env: ENV, tools: [fakeTool()], stream: scripted(rounds).stream, skipLock: true })
+
+const texts = (session: { messages(): readonly Message[] }) =>
+  session.messages().flatMap((m) => m.parts.flatMap((p) => (p.type === 'text' ? [p.text] : [])))
+const notices = (session: { messages(): readonly Message[] }) =>
+  texts(session).filter((t) => t.startsWith(MODEL_SWITCH_HEAD))
+
+const collect = async (events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> => {
+  const out: AgentEvent[] = []
+  for await (const ev of events) out.push(ev)
+  return out
+}
+
+describe('切换事件告知（2026-10-17 甲案）', () => {
+  it('换模型 → 下次 send 在用户消息前插告知、流首发 model_switch，只一次', async () => {
+    const { session } = await openPersisted([says('答一'), says('答二'), says('答三')])
+    expect((await collect(session.send('第一轮'))).some((e) => e.type === 'model_switch')).toBe(false)
+    session.setModel({ provider: 'beta', model: 'b-one' })
+    const evs = await collect(session.send('第二轮'))
+    // 流首：在任何内容之前，面板据此画分割线
+    expect(evs[0]).toEqual({ type: 'model_switch', from: 'alpha/a-small', to: 'beta/b-one' })
+    expect(evs.filter((e) => e.type === 'model_switch')).toHaveLength(1)
+    const all = texts(session)
+    const at = all.indexOf(modelSwitchNotice('alpha/a-small', 'beta/b-one'))
+    expect(all[at]).toBe('〔系统〕模型已从 alpha/a-small 切换到 beta/b-one。此前的回复由上一个模型生成。')
+    // 位置：上一轮回复之后、切换后这轮的用户消息之前——agent 看得出从哪条起换的
+    expect(all[at - 1]).toBe('答一')
+    expect(all[at + 1]).toBe('第二轮')
+    // 下一轮上一轮已是 b-one：不再告知
+    expect((await collect(session.send('第三轮'))).some((e) => e.type === 'model_switch')).toBe(false)
+    expect(notices(session)).toHaveLength(1)
+    await session.close()
+  })
+
+  it('同模型（含只换预设）不告知', async () => {
+    const { session } = await openPersisted([says('答'), says('答')])
+    await drain(session.send('第一轮'))
+    session.setModel({ provider: 'alpha', model: 'a-small' })
+    await drain(session.send('第二轮'))
+    expect(notices(session)).toEqual([])
+    await session.close()
+  })
+
+  it('reload 恢复选择不是切换（真机抓到的假告知）：上一轮已是 b-one，重开后先回默认再恢复 b-one，不告知', async () => {
+    const { dir, globalPath, session } = await openPersisted([says('答'), says('答')])
+    session.setModel({ provider: 'beta', model: 'b-one' })
+    await drain(session.send('第一轮')) // 这轮 b-one 答
+    await session.close()
+    // 重开：config 是文件里的默认 a-small，宿主随即恢复上次选择 b-one
+    const reopened = await reopen(dir, globalPath, [says('答')])
+    reopened.setModel({ provider: 'beta', model: 'b-one' })
+    const evs = await collect(reopened.send('重开后的第一条'))
+    expect(evs.some((e) => e.type === 'model_switch')).toBe(false)
+    expect(notices(reopened)).toEqual([])
+    await reopened.close()
+  })
+
+  it('切完不发消息就 reload：重开恢复选择后的第一条消息仍告知，from 是上一轮真正答的模型', async () => {
+    const { dir, globalPath, session } = await openPersisted([says('答')])
+    session.setModel({ provider: 'alpha', model: 'a-big' })
+    await drain(session.send('第一轮')) // a-big 答（不是配置默认的 a-small）
+    session.setModel({ provider: 'beta', model: 'b-one' })
+    await session.close()
+    const reopened = await reopen(dir, globalPath, [says('答')])
+    reopened.setModel({ provider: 'beta', model: 'b-one' })
+    await drain(reopened.send('重开后的第一条'))
+    // 旧票方案这里 from 会错成默认的 a-small
+    expect(notices(reopened)).toEqual([modelSwitchNotice('alpha/a-big', 'beta/b-one')])
+    await reopened.close()
+  })
+
+  it('A→B→A 不发消息：没有跑过 B，不告知；A→B→C 只告知 A→C', async () => {
+    const { session } = await openPersisted([says('答'), says('答'), says('答')])
+    await drain(session.send('第一轮'))
+    session.setModel({ provider: 'beta', model: 'b-one' })
+    session.setModel({ provider: 'alpha', model: 'a-small' })
+    await drain(session.send('第二轮'))
+    expect(notices(session)).toEqual([])
+    session.setModel({ provider: 'alpha', model: 'a-big' })
+    session.setModel({ provider: 'beta', model: 'b-one' })
+    await drain(session.send('第三轮'))
+    expect(notices(session)).toEqual([modelSwitchNotice('alpha/a-small', 'beta/b-one')])
+    await session.close()
+  })
+
+  it('会话第一轮没有上一轮，不告知', async () => {
+    const { session } = await openPersisted([says('答')])
+    session.setModel({ provider: 'beta', model: 'b-one' })
+    expect((await collect(session.send('第一轮'))).some((e) => e.type === 'model_switch')).toBe(false)
+    expect(notices(session)).toEqual([])
+    await session.close()
+  })
+
+  it('lastTurnModel 按会话域：任务看自己的轮，fork 前继承主任务最后一轮；主任务跳过 reserved', async () => {
+    const { dir, session } = await openPersisted([says('答')])
+    await drain(session.send('主任务第一轮'))
+    await session.close()
+    const manifest = forkTask(dir, '试跑')
+    const main = openStore(dir)
+    const task = openStore(dir, { task: scopeOf(manifest) })
+    // fork 插的 reserved 行没有 meta——主任务不能读到它变成 null
+    expect(main.lastTurnModel()).toBe('alpha/a-small')
+    expect(task.lastTurnModel()).toBe('alpha/a-small')
+    task.beginTurn({ model: 'beta/b-one', effort: null })
+    expect(task.lastTurnModel()).toBe('beta/b-one')
+    expect(main.lastTurnModel()).toBe('alpha/a-small')
   })
 })

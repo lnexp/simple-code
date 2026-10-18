@@ -210,6 +210,11 @@ body {
 .markdown hr { border: none; border-top: 1px solid var(--vscode-panel-border); margin: 0.75em 0; }
 .markdown img { max-width: 100%; }
 .notice { color: var(--vscode-descriptionForeground); font-size: 0.9em; font-style: italic; }
+/* 模型切换分割线：文字居中，两侧横线 flex:1 吃掉剩余宽度——面板拉宽拉窄自动伸缩。
+   文字过长时允许折行（min-width:0），横线最少留 1.5em 看得出是分割线 */
+.divider { display: flex; align-items: center; gap: 0.75em; color: var(--vscode-descriptionForeground); font-size: 0.85em; }
+.divider::before, .divider::after { content: ''; flex: 1 1 1.5em; min-width: 1.5em; border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.35)); }
+.divider > span { flex: 0 1 auto; min-width: 0; text-align: center; overflow-wrap: anywhere; }
 .notice-error { color: var(--vscode-errorForeground); font-style: normal; display: flex; gap: 0.5em; align-items: baseline; flex-wrap: wrap; }
 .notice-kind { font-size: 0.75em; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.8; border: 1px solid currentColor; border-radius: 3px; padding: 0 0.4em; }
 /* 「继续」：与审批卡次级按钮同一套（链接色字 + 细边框 + hover 提亮），不用实色块 */
@@ -673,6 +678,28 @@ body {
   font-variant-numeric: tabular-nums;
 }
 .ctx-empty { color: var(--vscode-descriptionForeground); font-size: 0.9em; padding: 6px 0; }
+/* 手动压缩：标题行右侧的小按钮，扁平 + hover，同 .ctx-row / 底栏控件的反馈语言；
+   不用主按钮的实心蓝——面板是看数用的，压缩是偶尔点一下的次要动作 */
+.ctx-title-row { display: flex; align-items: center; gap: 8px; }
+.ctx-title-row .ctx-title { flex: 1; }
+.ctx-compact {
+  flex: none; padding: 1px 6px;
+  border: 1px solid var(--vscode-panel-border); border-radius: ${RADIUS.sm};
+  font: inherit; font-size: 0.78em; line-height: 1.5;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  cursor: pointer;
+}
+.ctx-compact:hover:not(:disabled) {
+  color: var(--vscode-foreground);
+  background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+}
+.ctx-compact:disabled { opacity: 0.5; cursor: default; }
+/* 结果 / 运行中提示：只在有话说时出现，可多行（结果 + AGENTS 超限提示） */
+.ctx-hint {
+  font-size: 0.8em; margin-top: 3px; white-space: pre-line;
+  color: var(--vscode-descriptionForeground);
+}
 /* 点开的原图。data URL 本来就带 mime，浏览器自己渲染；这里只管居中和关闭 */
 .lightbox {
   position: fixed; inset: 0; z-index: 100;

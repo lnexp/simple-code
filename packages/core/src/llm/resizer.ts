@@ -21,6 +21,7 @@
  *   （ResizerUnavailableError → 原样）。图可能超限被 API 拒，
  *   那是看得见的错误，可修；静默吞图是不可见的错。
  */
+import { createHash } from 'node:crypto'
 import type { Capabilities, ImagePart, Message, Part } from './types'
 
 /** 长边上限（像素），Anthropic vision 的 max_dimension */
@@ -250,6 +251,15 @@ export async function resizeImageParts(messages: Message[]): Promise<Message[]> 
 const THUMB_EDGE = 256
 
 /**
+ * 缩略图缓存：原图 sha1 → data URL。切目录会关 session、切回重建基线，
+ * 同一批图每次都要 photon 同步重算（真库 ai-legal 12 张 879ms，卡宿主）。
+ * 进程级、按原图内容作键：基线/分页/live 三条路径共用，session 关了也
+ * 还在。上限 300 条（256px JPEG 每张十几 KB，≈ 几 MB），满了丢最久没用的
+ */
+const THUMB_CACHE_MAX = 300
+const thumbCache = new Map<string, string>()
+
+/**
  * 出 256px JPEG data URL 给 webview 做行内缩略图。原图几 MB 直接塞
  * 事件流会把 webview 撑爆（web-tools §8 阶段 3）。
  *
@@ -257,6 +267,27 @@ const THUMB_EDGE = 256
  * 复用同一个 photonPromise：wasm 不可用时缩略图也没有，行为一致
  */
 export async function thumbnailDataUrl(part: ImagePart): Promise<string | undefined> {
+  const key = createHash('sha1').update(part.data).digest('base64')
+  const hit = thumbCache.get(key)
+  if (hit !== undefined) {
+    // 重插到末尾 = 最近用过（Map 按插入序迭代，头部是最久没用的）
+    thumbCache.delete(key)
+    thumbCache.set(key, hit)
+    return hit
+  }
+  const url = await makeThumbnail(part)
+  // 失败不缓存：wasm 加载失败这类可能是暂时的，下次再试
+  if (url !== undefined) {
+    thumbCache.set(key, url)
+    if (thumbCache.size > THUMB_CACHE_MAX) {
+      const oldest = thumbCache.keys().next().value
+      if (oldest !== undefined) thumbCache.delete(oldest)
+    }
+  }
+  return url
+}
+
+async function makeThumbnail(part: ImagePart): Promise<string | undefined> {
   const photon = await loadPhoton()
   if (!photon) return undefined
   let decoded: PhotonImage | undefined

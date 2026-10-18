@@ -130,4 +130,20 @@ describe('历史回放接线', () => {
     app.scrollToTop()
     expect(sent.filter((m) => m.type === 'fetchHistory')).toHaveLength(1) // more=false，不再发
   })
+
+  it('切目录清空视图时的 scroll 不拉历史：基线到了再滚到顶才拉', () => {
+    const app = mount()
+    app.send(state)
+    app.send({ type: 'hydrate', items: [{ kind: 'user', text: '旧目录' }] })
+    // 切目录：state 带新 folder → swapFolder 清空视图，scrollTop 夹到 0
+    app.send({ ...state, folder: '/tmp/y' })
+    app.scrollToTop()
+    expect(sent.filter((m) => m.type === 'fetchHistory')).toEqual([])
+
+    app.send({ type: 'hydrate', items: [{ kind: 'user', text: '新目录' }] })
+    app.scrollToTop()
+    expect(sent.filter((m) => m.type === 'fetchHistory')).toEqual([
+      { type: 'fetchHistory', cursor: null },
+    ])
+  })
 })

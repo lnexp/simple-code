@@ -146,6 +146,34 @@ describe('守卫状态机', () => {
     guard.check(req(['a', 'b']))
     expect(() => guard.check(req(['完全不同'], { model: 'm2' }))).not.toThrow()
   })
+
+  it('放行票落库：压缩点之后重建守卫（reload），下一次改写照样放行、只放行一次', () => {
+    let saved: PrefixFingerprint | null = null
+    let ticket = false
+    const mk = () =>
+      createPrefixGuard({
+        baseline: { read: () => saved, write: (fp) => (saved = fp) },
+        ticket: {
+          set: () => (ticket = true),
+          take: () => {
+            const hit = ticket
+            ticket = false
+            return hit
+          },
+        },
+        dump: () => null,
+      })
+    const g1 = mk()
+    g1.check(req(['a', 'b']))
+    g1.allowRewrite()
+    const g2 = mk()
+    expect(() => g2.check(req(['摘要', 'b']))).not.toThrow()
+    expect(() => g2.check(req(['又改', 'b']))).toThrow(PrefixBrokenError)
+    // 同进程放行时票也撕掉：不然重建后的守卫会凭这张旧票再放行一回
+    g2.allowRewrite()
+    g2.check(req(['再压', 'b']))
+    expect(() => mk().check(req(['偷改', 'b']))).toThrow(PrefixBrokenError)
+  })
 })
 
 // ── 端到端 ─────────────────────────────────────────────────────
@@ -428,5 +456,113 @@ describe('发出去的必须先在库里（checkpoint）', () => {
     expect(call).toBe(2) // 前提：确实走了「工具 → 第二次请求」
     expect(evs.filter((e) => e.type === 'error')).toEqual([])
     expect(toolRowsAtSecondRequest).toBe(1)
+  })
+})
+
+describe('手动压缩（compactNow，2026-10-17）', () => {
+  // 大窗口：请求都不是压缩点，只有按钮能触发——这样「前缀变了」只可能来自手动压缩
+  const bigWindow = async () => {
+    const { dir, globalPath } = await workspace()
+    const cfg = JSON.parse(readFileSync(globalPath, 'utf8'))
+    cfg.providers.p.models.m.contextWindow = 200_000
+    await writeFile(globalPath, JSON.stringify(cfg), 'utf8')
+    return { dir, globalPath }
+  }
+  // 纯文本 step 卸载是恒等的（unloadOldest：只判冷不存根），要有大段工具
+  // 输出才卸得动、前缀才真的变——每次 send = 调一次工具 + 答一句
+  const openTool = (dir: string, globalPath: string) => {
+    let call = 0
+    return getSession(dir, {
+      globalPath,
+      env: { TEST_KEY: KEY },
+      tools: [
+        {
+          name: 'echo',
+          definition: { name: 'echo', description: 'd', parameters: { type: 'object' } },
+          execute: async () => ({ output: '工具的大段输出。'.repeat(200), exitCode: 0, isError: false }),
+        } as never,
+      ],
+      stream: (() => {
+        call++
+        const id = `c${call}`
+        const events: StreamEvent[] =
+          call % 2 === 1
+            ? [
+                { type: 'tool_input_start', id, name: 'echo' },
+                { type: 'tool_input_delta', id, partial: '{}' },
+                { type: 'tool_input_end', id, name: 'echo', input: {} },
+                { type: 'finish', reason: 'tool-calls', usage: usage() },
+              ]
+            : says('好了')
+        return (async function* () {
+          for (const ev of events) yield ev
+        })()
+      }) as LoopDeps['stream'],
+      fetchImpl: summaryFetch,
+      skipLock: true,
+    })
+  }
+  const unloadedRows = (dir: string): number => {
+    const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'), { readOnly: true })
+    const r = db.prepare("SELECT COUNT(*) AS n FROM messages WHERE state = 'unloaded'").get() as { n: number }
+    db.close()
+    return r.n
+  }
+
+  it('空闲时压缩：保底区外卸掉，下一次请求的前缀改写被放行（守卫不响）', async () => {
+    const { dir, globalPath } = await bigWindow()
+    const s = await openTool(dir, globalPath)
+    const evs: AgentEvent[] = []
+    for (let i = 1; i <= 4; i++) evs.push(...(await collect(s.send(long(`第${i}个问题`)))))
+    expect(evs.some((e) => e.type === 'unloaded')).toBe(false) // 前提：自动车一趟没开
+    expect(unloadedRows(dir)).toBe(0)
+
+    const r = await s.compactNow()
+    expect(r.ok && r.unloaded).toBeGreaterThan(0)
+    expect(unloadedRows(dir)).toBeGreaterThan(0)
+
+    const after = await collect(s.send('压完再问'))
+    await s.close()
+    expect(prefixErrors(after)).toEqual([])
+  })
+
+  it('压完没发消息就 reload：放行票在库里，重建后的第一次请求照样放行', async () => {
+    const { dir, globalPath } = await bigWindow()
+    const s1 = await openTool(dir, globalPath)
+    for (let i = 1; i <= 4; i++) await collect(s1.send(long(`第${i}个问题`)))
+    const r = await s1.compactNow()
+    expect(r.ok && r.unloaded).toBeGreaterThan(0) // 前提：前缀确实被改写了
+    await s1.close()
+
+    const s2 = await openTool(dir, globalPath)
+    const evs = await collect(s2.send('reload 后再问'))
+    const again = await collect(s2.send('再问一句'))
+    await s2.close()
+    expect(prefixErrors(evs)).toEqual([])
+    expect(prefixErrors(again)).toEqual([])
+  })
+
+  it('运行中拒绝压缩；压缩进行中来的 send 拒绝且不进历史', async () => {
+    const { dir, globalPath } = await bigWindow()
+    const s = await openTool(dir, globalPath)
+    for (let i = 1; i <= 3; i++) await collect(s.send(long(`第${i}个问题`)))
+
+    const busy = s.send('正在跑的这一轮')
+    expect(await s.compactNow()).toEqual({ ok: false, message: '正在运行，停止后才能压缩' })
+    await collect(busy)
+
+    const pending = s.compactNow()
+    const refused = await collect(s.send('压缩途中插进来的'))
+    expect((await pending).ok).toBe(true)
+    await s.close()
+    expect(refused.filter((e) => e.type === 'error').map((e) => (e as { message: string }).message)).toEqual([
+      '正在压缩上下文，稍等一两秒再发',
+    ])
+    const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'), { readOnly: true })
+    const hits = db.prepare("SELECT COUNT(*) AS n FROM messages WHERE content_json LIKE '%压缩途中插进来的%'").get() as {
+      n: number
+    }
+    db.close()
+    expect(hits.n).toBe(0)
   })
 })

@@ -21,8 +21,18 @@ import type { Effort, ImageInput, Message, Part, Request } from '../llm/types.ts
 import { hotSummaryIds, indexTokens, type Summary } from '../loop/assemble.ts'
 import { regionSizes, regionsEstimate, usageRatio } from '../loop/regions.ts'
 import { requestWithRetry, type StreamEvent } from '../loop/retry.ts'
-import { headOf, type LoopContext, type LoopDeps, run, type Task, userParts } from '../loop/run.ts'
-import { buildCues, loadCueCandidates } from './cue.ts'
+import { compactIdle, headOf, type LoopContext, type LoopDeps, run, type Task, userParts } from '../loop/run.ts'
+import { loadCueCandidates, matchSummaries } from './cue.ts'
+import {
+  buildSelectorRequest,
+  loadSelectorCandidates,
+  parseKeywords,
+  parseSelection,
+  previousReply,
+  readInContext,
+  renderSelection,
+  type SelectorCandidate,
+} from './selector.ts'
 import {
   buildMergeRequest,
   buildSummaryRequest,
@@ -205,9 +215,24 @@ export type Session = {
    *  同一判据）：原 task.ts 的 taskSummaryDebt 是同构的第二份 SQL，段选择
    *  判据演进它会悄悄漂移；合一后债 = nextSegmentToSummarize 挑不出段 */
   summaryDebt(): boolean
+  /**
+   * 手动压缩（上下文分析面板的按钮，2026-10-17 翻案）：空闲时跑一次压缩点
+   * （run.ts compactIdle）。**只在停止时能压**——loop 在跑就拒绝，不排队；
+   * 压缩期间来的 send 也拒绝（两个写者改同一份历史）。主任务和任务各压
+   * 各的：作用域就是这个 session 的 owner，碰不到别人的上下文
+   */
+  compactNow(): Promise<CompactResult>
   /** source：谁关的（bridge 传 detach / reload / dispose），只进 session_close 日志 */
   close(source?: string): Promise<void>
 }
+
+/**
+ * compactNow 的结果。estimated = 卸完之后发出去那份的估算（null = 保底区外
+ * 没有可卸的，只做了合并生效/摘要进场）；errors = 压缩途中的提示（AGENTS 超限）
+ */
+export type CompactResult =
+  | { ok: true; unloaded: number; estimated: number | null; errors: string[] }
+  | { ok: false; message: string }
 
 export type SessionOptions = LoadOptions & {
   /** 覆盖工具集，测试用。默认只有 bash（第 1 步的边界） */
@@ -391,6 +416,8 @@ export async function getSession(
             },
             write: (fp) => store.writePrefixBaseline(JSON.stringify(fp)),
           },
+          // 放行票落库：手动压缩在空闲时放行，下一次请求可能在 reload 之后
+          ticket: { set: () => store.setRewriteTicket(), take: () => store.takeRewriteTicket() },
           // 上一次请求原文：每 owner 一个文件静默覆盖。违规落现场时它就是
           // prev 的来源——没有它，会话重建后的现场只剩 prev: null
           prev: {
@@ -417,7 +444,9 @@ export async function getSession(
             },
           },
           dump: ({ break: found, prev, next }) => {
-            logRun({ ev: 'prefix_break', folder: folderPath, owner: options.task?.owner ?? null, ...found })
+            // dump 先写、日志后发：logRun 带上 dumpPath，排查时从日志直通现场
+            // 文件，不用再翻代码找目录（2026-10-15 巡检踩过）。写失败照样记日志
+            let dumpPath: string | null = null
             try {
               const dir = join(store.root, MEMORY_RELATIVE, 'prefix-breaks')
               mkdirSync(dir, { recursive: true })
@@ -440,10 +469,18 @@ export async function getSession(
                   2,
                 ),
               )
-              return file
+              dumpPath = file
             } catch {
-              return null
+              // 落不了就不落：日志照样发，dumpPath 记 null
             }
+            logRun({
+              ev: 'prefix_break',
+              folder: folderPath,
+              owner: options.task?.owner ?? null,
+              ...found,
+              dumpPath,
+            })
+            return dumpPath
           },
         })
 
@@ -567,6 +604,46 @@ export async function getSession(
             withTurns: (msgs: Message[]) => store.withTurns(msgs),
             // shadow 模式：算+落库（观察日志）但不渲染——上线与否就看这行
             cues: () => (config.config.recall.mode === 'on' ? store.cues() : new Map()),
+            asyncCues: () => (config.config.recall.mode === 'on' ? store.asyncCues() : new Map()),
+            offerAsyncCue: (anchor) => {
+              const pending = selection
+              if (!pending || pending.offered || pending.turn !== anchor.turnId || pending.picked === null || pending.summaries === null) return
+              // 结果到了就只问这一次：选了 0 条也算用掉，不再等后面的 step
+              pending.offered = true
+              // 已在场的不再注入：锚点还在场的上次注入、在场 bash 已 read 过的
+              // ——正文/提醒行就在上下文里，再来一次是重复（selector 只看得到
+              // 最新交互，不知道上下文里有什么）。skipped 留给一周评估算重复率
+              const floor = store.liveStepFloor()
+              const seen = new Set([...(floor === null ? [] : store.asyncCuedNamesSince(floor)), ...readInContext(messages)])
+              const fresh = pending.picked.filter((c) => !seen.has(`${c.kind}:${c.name}`))
+              const skipped = pending.picked.filter((c) => seen.has(`${c.kind}:${c.name}`)).map((c) => `${c.kind}:${c.name}`)
+              // 摘要行同判：入场与 matchSummaries 的排除之间可能已注入过
+              const sumNames = pending.summaries.names.filter((n) => !seen.has(`summary:${n}`))
+              const sumLines = pending.summaries.lines.filter((_, i) => !seen.has(`summary:${pending.summaries!.names[i]}`))
+              const sumSkipped = pending.summaries.names.filter((n) => seen.has(`summary:${n}`)).map((n) => `summary:${n}`)
+              const names = [...fresh.map((c) => `${c.kind}:${c.name}`), ...sumNames.map((n) => `summary:${n}`)]
+              const allSkipped = [...skipped, ...sumSkipped]
+              // 轮内被改成非 on（settings 热重载）：照样不注入
+              if (config.config.recall.mode !== 'on') return
+              if (names.length === 0) {
+                logRun({ ev: 'recall_inject', folder: folderPath, turn: anchor.turnId, step: anchor.stepId, names, skipped: allSkipped })
+                return
+              }
+              store.saveAsyncCue(anchor.turnId, {
+                stepId: anchor.stepId,
+                after: anchor.after,
+                lines: [...renderSelection(fresh), ...sumLines],
+                names,
+              })
+              logRun({
+                ev: 'recall_inject',
+                folder: folderPath,
+                turn: anchor.turnId,
+                step: anchor.stepId,
+                names,
+                ...(allSkipped.length > 0 ? { skipped: allSkipped } : {}),
+              })
+            },
             recordRegions: (sizes, budget, real) => {
               store.recordRegions(sizes, budget, real)
               tokenRatio = usageRatio(regionsEstimate(sizes), real) ?? tokenRatio
@@ -638,6 +715,8 @@ export async function getSession(
   let deps = buildDeps()
 
   let running: AbortController | null = null
+  /** 手动压缩进行中（compactNow）。与 running 分开：它不是一轮，UI 不该显示「运行中」 */
+  let compacting = false
   /**
    * 正在跑的后台摘要。**非 null 就是闸落下**——同一时刻最多一个（§9.7）。
    *
@@ -656,6 +735,20 @@ export async function getSession(
    * loop 结束时清回 null，空闲摘要才够得着最新那一轮——那正是最该摘的一轮。
    */
   let activeTurn: number | null = null
+
+  /**
+   * recall 选择器（selector.ts）的本轮结果：send 入口与主请求并行发出，
+   * 结果挂在这里，runStep 在模型开始动手后取用（offerAsyncCue）。picked
+   * = 选中的经验条目，summaries = 关键词撞出的摘要行（cue.ts），null =
+   * 还没回来；单步轮结束时没人取，随轮作废——单步轮不采取动作，
+   * 「自信的改动跳过经验」没有发生面（recall-llm-selector.md §4）
+   */
+  let selection: {
+    turn: number
+    picked: SelectorCandidate[] | null
+    summaries: { lines: string[]; names: string[] } | null
+    offered: boolean
+  } | null = null
 
   /**
    * 上次模型响应结束的时刻（提案 §12 缓存过期判断的计时起点）。
@@ -735,23 +828,64 @@ export async function getSession(
     return task
   }
 
-  /** recall 线索层：send 入口算一次、冻结落 cues 表（proposal §5）。
-   *  增益件——任何失败都不许打断 send，吞掉并留 runlog 现场即可 */
-  const computeCue = (): void => {
+  /** recall 选择器：与主请求并行，不 await。增益件——任何
+   *  失败都只留 runlog，不打断 send；结果没到 = 本轮没有提醒，不重试。
+   *  只在 mode=on 时发（选择 + 关键词撞摘要同一次请求）：shadow 是 recall
+   *  的**默认值**，shadow 下零请求；没配 summaryModel 的用户 on 模式花的是
+   *  主模型的钱 */
+  const startSelector = (text: string): void => {
+    selection = null
     const recall = config.config.recall
-    if (recall.mode === 'off' || store === null || activeTurn === null || options.task !== undefined) return
-    try {
-      const turnTexts = store.cueTurnTexts(recall.window)
-      const candidates = loadCueCandidates(folderPath, store.summaries())
-      const { lines, names } = buildCues(candidates, turnTexts, {
-        halfLife: recall.halfLife,
-        topK: recall.topK,
-        excludeNames: store.recentCuedNames(recall.dedupTurns),
-      })
-      if (lines.length > 0) store.saveCue(activeTurn, lines, names)
-    } catch (e) {
-      logRun({ ev: 'cue_error', folder: folderPath, owner: null, message: String(e) })
+    if (recall.mode !== 'on' || store === null || activeTurn === null || options.task !== undefined) return
+    const pending = {
+      turn: activeTurn,
+      picked: null as SelectorCandidate[] | null,
+      summaries: null as { lines: string[]; names: string[] } | null,
+      offered: false,
     }
+    selection = pending
+    // 同步取：messages 之后会被 loop 改写
+    const previous = previousReply(messages)
+    const startedAt = Date.now()
+    const log = { ev: 'recall_select', folder: folderPath, turn: pending.turn }
+    void (async () => {
+      const candidates = loadSelectorCandidates(folderPath)
+      if (candidates.length === 0) return
+      const request = buildSelectorRequest(
+        candidates,
+        { user: text, previous },
+        { ...config.summary.request, model: config.summary.name },
+      )
+      const raw = await collectText(request, { config, fetchImpl: options.fetchImpl, folder: folderPath, tag: 'recall' })
+      // 关键词行剥出来再给名字解析：关键词可能恰好等于某索引名，不剥会
+      // 被当成选择
+      const { body, keywords } = parseKeywords(raw)
+      pending.picked = parseSelection(body, candidates)
+      // 关键词撞摘要（cue.ts 换芯后的引擎）：去重排除本轮在场段里已注入
+      // 过的摘要——不排的话 top-K 名额被重复占掉，offer 时再滤就晚了
+      const st = store
+      const floor = st.liveStepFloor()
+      const exclude = new Set<string>()
+      for (const n of floor === null ? [] : st.asyncCuedNamesSince(floor))
+        if (n.startsWith('summary:')) exclude.add(n.slice('summary:'.length))
+      pending.summaries = matchSummaries(loadCueCandidates(st.summaries(), floor), keywords, {
+        topK: recall.topK,
+        excludeNames: exclude,
+      })
+      // 不记原文（runlog 只记元数据）；unparsed = 回了东西却一个名字都没认出
+      // 来——格式不听话的信号，与正常的「无」分开。判 body 不判 raw：经验库
+      // 没相关的时模型只回关键词行（没写「无」），raw 非空会把它误报成
+      // unparsed（2026-10-14 实测上线后 5/35 全是这种假阳性）
+      const unparsed = pending.picked.length === 0 && body.trim() !== '' && body.trim() !== '无'
+      logRun({
+        ...log,
+        ms: Date.now() - startedAt,
+        candidates: candidates.length,
+        names: pending.picked.map((c) => `${c.kind}:${c.name}`),
+        keywords,
+        ...(unparsed ? { unparsed } : {}),
+      })
+    })().catch((e: unknown) => logRun({ ...log, ms: Date.now() - startedAt, error: String(e) }))
   }
 
   return {
@@ -806,6 +940,16 @@ export async function getSession(
       if (sameModel && choice.preset === currentPreset) return
       // 先解析再改状态：模型名/预设名写错时抛异常，会话保持原样可用
       const next = selectModel(config, choice, options.env ?? process.env)
+      // 切换告知不在这里落（send 比对 lastTurnModel，见那里）。日志照记：
+      // 排查「哪轮起换的模型」按分钟对齐 runlog 用。reload 后宿主的恢复
+      // 选择也走这里，日志会多一条——那条不代表真切换
+      logRun({
+        ev: 'model_switch',
+        folder: folderPath,
+        owner,
+        from: sameModel ? null : modelId(config),
+        to: modelId(next),
+      })
       config = next
       currentPreset = choice.preset
       if (!sameModel) effortOverride = null
@@ -840,6 +984,40 @@ export async function getSession(
     summaryDebt: () =>
       store !== null &&
       store.nextSegmentToSummarize(config.config.memory.segmentTokens, activeTurn) !== null,
+
+    compactNow: async () => {
+      if (running) return { ok: false, message: '正在运行，停止后才能压缩' }
+      if (compacting) return { ok: false, message: '已经在压缩了' }
+      if (!store) return { ok: false, message: '这个会话不落盘，没有可压缩的内容' }
+      compacting = true
+      const ctx: LoopContext = { messages, tasks, deps, signal: new AbortController().signal, relayCache }
+      let unloaded = 0
+      let estimated: number | null = null
+      const errors: string[] = []
+      try {
+        for await (const ev of compactIdle(ctx)) {
+          if (ev.type === 'unloaded') {
+            unloaded += ev.count
+            estimated = ev.estimated
+          } else if (ev.type === 'error') errors.push(ev.message)
+        }
+        logRun({ ev: 'compact_manual', folder: folderPath, owner, unloaded, estimated })
+        return { ok: true, unloaded, estimated, errors }
+      } catch (error) {
+        logRun({ ev: 'compact_manual', folder: folderPath, owner, error: String(error) })
+        return { ok: false, message: `压缩失败：${String(error)}` }
+      } finally {
+        // 同 send 的 persist：卸载已在库里标了 unloaded，内存历史不写回的话
+        // 两边对不上。失败中途也要写——改了一半的状态照实落盘
+        messages.splice(0, messages.length, ...ctx.messages)
+        try {
+          store.save(messages)
+        } catch {
+          /* store 已关（压缩途中 close） */
+        }
+        compacting = false
+      }
+    },
 
     close: async (source?: string) => {
       // 谁、何时关的库（2026-09-30 补观测）：exthost 里 `database is not open`
@@ -878,6 +1056,7 @@ export async function getSession(
       // 之前就写 turns 表，等 loop 顶再查就晚了一行
       const overflow = deps.taskOverflow?.()
       if (overflow !== undefined && overflow !== null) return errorOnce(overflow)
+      if (compacting) return errorOnce('正在压缩上下文，稍等一两秒再发')
       if (running) {
         // 已经在跑了。入队而不是新起一个 loop——两个 loop 同时改一份历史，
         // 谁也不会报错，只是历史乱掉
@@ -910,6 +1089,16 @@ export async function getSession(
         store?.save(messages)
       }
       lastSendModel = current
+      // 模型切换告知（2026-10-17 甲案，同日改判据）：SC 是 agent、模型是
+      // 部件，切换对 agent 是环境变更——历史里的回复是谁写的、从哪条起
+      // 换了模型，agent 自己推不出来（状态行是常量，答「现在是什么」不
+      // 答「何时变的」）。判据是「上一轮谁答的 ≠ 这轮谁答」，**必须在
+      // beginTurn 之前读**（之后最后一轮就是这轮自己）。不按 setModel 调用
+      // 落票：reload 恢复选择也调 setModel，按调用判插了假告知；A→B→A
+      // 不发消息按轮判也天然不告知。续接轮模型必然相同（resumableTurn 的
+      // 条件），不用特判
+      const prevModel = store?.lastTurnModel() ?? null
+      const switchFrom = prevModel !== null && prevModel !== current ? prevModel : null
       // turn 续接（docs/proposals/turn-resume.md，2026-09-29 拍板）：上一轮被
       // 中断或报错结束的，这条消息续进那一轮，不开新轮——与排队插话同形。
       // SC 的摘要/归档/检索/cue 都按 turn，「继续」另起一轮会把一件事拆成
@@ -926,6 +1115,14 @@ export async function getSession(
           }) ?? null
       }
       const userMessage: Message = { role: 'user', parts: userParts(text, images) }
+      // 告知插在这轮用户消息前，正好落在切换点上。webview 回放按「〔系统〕
+      // 模型已从」前缀渲染成分割线（events.ts hydrateItems），实时由下面
+      // 流首的 model_switch 事件画——两处文案格式成对
+      if (switchFrom !== null)
+        messages.push({
+          role: 'user',
+          parts: userParts(modelSwitchNotice(switchFrom, current)),
+        })
       // 防重复：上一轮停在一条没被回复的用户消息上（如 PrefixBroken 拦在
       // 请求前），用户原话重发——不再追加第二遍，直接跑（官方客户端同款：
       // 「so the model sees it exactly once」）
@@ -933,16 +1130,15 @@ export async function getSession(
       // 先落盘再发请求。反过来的话，请求发出去了但用户这条消息没记下来，
       // 崩溃重启后模型的回答在历史里成了没有来由的一段话
       store?.save(messages)
-      // recall 线索层（docs/proposals/recall.md §5）：send 入口算一次、
-      // 冻结落 cues 表，之后装配期纯函数渲染——在这里现算渲染会破前缀
-      // （重装配字节要一致）。任务会话不算（v1）：任务短命、上下文有继承
-      // 语义，语料撞出主任务的线索对任务是噪声；排队插话的轮也拿不到
-      // cue——beginTurn 在 loop 里，那是第二处接线点，痛了再接
+      // recall（选择器 + 关键词撞摘要，selector.ts/cue.ts）：send 入口与主
+      // 请求并行，结果经 offerAsyncCue 异步注入。任务会话不算（v1）：任务
+      // 短命、上下文有继承语义；排队插话的轮也拿不到——beginTurn 在 loop
+      // 里，那是第二处接线点，痛了再接
       //
-      // 续接轮不算：cue 贴在该轮**第一条**用户消息后面（assemble.ts），那条
-      // 早发出去过。原轮没落 cue（lines 为空）的话，现在补一条等于改写已发
-      // 的消息，前缀守卫必炸（turn-resume.md）
-      if (resumed === null) computeCue()
+      // 续接轮不算。async_cues 一轮一条，原轮注入过的话再选
+      // 会被 DO NOTHING 吞掉、日志却记成注入了
+      if (resumed === null) startSelector(text)
+      else selection = null
 
       const controller = new AbortController()
       running = controller
@@ -971,7 +1167,10 @@ export async function getSession(
         if (config.config.memory.idleSummarizeDelayMs > 0) void kickSummary()
       }
 
-      return finallyDo(tap(run(ctx), persist), () => {
+      // 切换事件排在流首：面板拿它在这轮用户气泡后画分割线（气泡是 App
+      // 本地 append 的，事件到时已在上屏——reduce 把线插到末条 user 前面）
+      const stream = switchFrom === null ? run(ctx) : prepend({ type: 'model_switch', from: switchFrom, to: current }, run(ctx))
+      return finallyDo(tap(stream, persist), () => {
         persist()
         // 定稿写耗时。update 的是当时的 turn 行，meta（model）也是当时的
         // 快照——之后换模型不会改写这一轮的任何记录
@@ -982,6 +1181,7 @@ export async function getSession(
         // **清在 persist 之后**：那一脚 kickSummary 还属于「turn 正在跑」，
         // 早清的话它会摘到刚结束但还没落定的这一轮。清完之后空闲摘要才够得着
         activeTurn = null
+        selection = null
         interject = null
       })
     },
@@ -1419,6 +1619,21 @@ async function collectText(
     else if (llmEv.type === 'reasoning_delta') reasoningChars += llmEv.text.length
     else if (llmEv.type === 'finish') finish = llmEv
   }
+  // 副模型请求（recall/summary/merge）的 usage 观测（2026-10-14）：此前只
+  // 记主循环的 llm_usage，选择器/摘要的缓存命中与否只能去网关控制台人工
+  // 对。folder 是多项目共logfile 的唯一区分键，主循环行没有 tag、这里有
+  // tag，同文件里天然可分
+  if (finish)
+    logRun({
+      ev: 'llm_usage',
+      model: request.model,
+      tag,
+      ...(folder ? { folder } : {}),
+      input: finish.usage.inputTokens,
+      cacheRead: finish.usage.cacheReadInputTokens,
+      cacheWrite: finish.usage.cacheCreationInputTokens,
+      output: finish.usage.outputTokens,
+    })
   // 空文本是摘要/合并失败的唯一信号（调用方 !text → llm_failed），但流是
   // 正常走完的，llm 行没有 error——9-29 某项目 4 次约 28s 的空返回看不出
   // 为什么。只记观测，不改判定：拿到真实原因再决定怎么修
@@ -1865,7 +2080,10 @@ const contextRules = (env: NodeJS.ProcessEnv): string => {
     '常驻上下文（每轮全价重发）：内建段 + 两份 AGENTS.md 全文 + notes/教训/事件的索引行；各类正文只在你主动 read 时才进上下文。放不进 AGENTS.md 的内容拆进 notes，别硬塞常驻区。' +
     // 〔recall〕线索行（recall 提案 §5）：装配期机械贴在用户消息后的碰撞
     // 结果。不说明的话模型会把它当用户的话或权威指令——它是证据不是结论
-    '用户消息尾部可能出现〔recall〕行：系统按词面撞出的记忆线索，撞到≠相关——真相关就顺着 read/search 下钻，不相关直接忽略，不要复述它。'
+    '用户消息尾部可能出现〔recall〕行：系统按词面撞出的记忆线索，撞到≠相关——真相关就顺着 read/search 下钻，不相关直接忽略，不要复述它。' +
+    // 〔recall·async〕（recall-llm-selector.md）：选择器轮内后到，另起一条
+    // user 消息出现在工具结果之后——不说明的话会被当成用户插话
+    '工具结果之后可能出现〔recall·async〕行：系统按语义为本轮挑出的经验条目（非用户发言），动手改动前先 read 相关的那条。'
   )
 }
 
@@ -1919,6 +2137,20 @@ const modelRules = (env: NodeJS.ProcessEnv): string =>
     : ''
 
 async function* empty(): AsyncIterable<AgentEvent> {}
+
+/** 流首补一个事件（模型切换告知），其余原样透传 */
+async function* prepend(first: AgentEvent, rest: AsyncIterable<AgentEvent>): AsyncIterable<AgentEvent> {
+  yield first
+  yield* rest
+}
+
+/**
+ * 模型切换告知的消息原文（进 agent 上下文）。webview 回放靠 MODEL_SWITCH_HEAD
+ * 前缀识别成分割线并剥掉末句——**改格式要同步 events.ts 的 parseModelSwitch**
+ */
+export const MODEL_SWITCH_HEAD = '〔系统〕模型已从 '
+export const modelSwitchNotice = (from: string, to: string): string =>
+  `${MODEL_SWITCH_HEAD}${from} 切换到 ${to}。此前的回复由上一个模型生成。`
 
 /** 单事件流：分支跑超拒绝（session.send 入口闸）——发一个 error 事件收口 */
 async function* errorOnce(message: string): AsyncIterable<AgentEvent> {

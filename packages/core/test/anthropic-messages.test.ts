@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { LLMEvent } from '../src/llm/events.ts'
 import { anthropicMessages } from '../src/llm/protocols/anthropic-messages.ts'
 import { parseSSE } from '../src/llm/protocols/utils/sse.ts'
-import type { Message, Request, Usage } from '../src/llm/types.ts'
+import type { Message, Request, ToolDefinition, Usage } from '../src/llm/types.ts'
 import { eventsFromFixture, readFixture, shape } from './helpers.ts'
 
 const FIXTURE = 'anthropic-messages.tool-call.sse'
@@ -408,6 +408,67 @@ describe('anthropic-messages / 缓存断点', () => {
     expect(countBreakpoints({ messages: many })).toBe(2)
     expect(countBreakpoints({ messages: [text('就一条')] })).toBe(2)
     expect(countBreakpoints({ messages: [text('甲'), text('乙')] })).toBe(2)
+  })
+
+  it('cacheTtl=1h：三个断点都带 ttl:1h（tools 末个 + system + 末条消息，同一档，不触发长短混用的顺序规则）', () => {
+    const tools = [
+      { name: 'bash', description: '跑命令', parameters: { type: 'object' } },
+      { name: 'read_file', description: '读文件', parameters: { type: 'object' } },
+    ] as ToolDefinition[]
+    const b = body({ cacheTtl: '1h', messages: [text('甲'), text('乙')], tools })
+    expect(JSON.stringify(b).split('"ttl":"1h"').length - 1).toBe(3)
+    expect((b.system as Record<string, unknown>[])[0]?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    // 只打最后一个 tool，且网关注入的 5m 会让位
+    const wireTools = b.tools as Record<string, unknown>[]
+    expect(wireTools[0]).not.toHaveProperty('cache_control')
+    expect(wireTools.at(-1)?.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+    expect(messagesOf({ cacheTtl: '1h', messages: [text('甲')] })[0]?.content[0]?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+  })
+
+  it('没配 cacheTtl：请求体里不出现 ttl，tools 上也不打标记，跟加这个功能之前逐字节一致', () => {
+    const tools = [
+      { name: 'bash', description: '跑命令', parameters: { type: 'object' } },
+    ] as ToolDefinition[]
+    const b = body({ messages: [text('甲'), text('乙')], tools })
+    expect(JSON.stringify(b)).not.toContain('"ttl"')
+    expect((b.tools as Record<string, unknown>[]).at(-1)).not.toHaveProperty('cache_control')
+    expect(countBreakpoints({ messages: [text('甲'), text('乙')] })).toBe(2)
+  })
+
+  it('末消息带图：断点落在 text 上，不打在 image 上（2026-10-16 修复）', () => {
+    // 1h 断点打在末尾 image 上会触发上游自动缓存的回退路径，混档 400
+    const withImage: Message[] = [
+      text('甲'),
+      {
+        role: 'user',
+        parts: [
+          { type: 'text', text: '看下这张截图' },
+          { type: 'image', mimeType: 'image/png', data: 'QUJD' },
+        ],
+      },
+    ]
+    const b = body({ cacheTtl: '1h', messages: withImage })
+    const last = (b.messages as { content: Record<string, unknown>[] }[]).at(-1)
+    expect(last?.content[0]).toMatchObject({ type: 'text', cache_control: { ttl: '1h' } })
+    expect(last?.content[1]).toMatchObject({ type: 'image' })
+    expect(last?.content[1]).not.toHaveProperty('cache_control')
+  })
+
+  it('末消息纯图：不打消息断点（只剩 system 一个），不硬塞到 image 上', () => {
+    const onlyImage: Message[] = [
+      text('甲'),
+      {
+        role: 'user',
+        parts: [{ type: 'image', mimeType: 'image/png', data: 'QUJD' }],
+      },
+    ]
+    expect(countBreakpoints({ messages: onlyImage })).toBe(1)
   })
 
   it('断点只落在末条消息上，其余一个都没有', () => {

@@ -2,6 +2,7 @@ import type {
   AgentEvent,
   ApprovalCategory,
   BgProcessInfo,
+  CompactResult,
   Effort,
   ImageInput,
   ModelRef,
@@ -79,6 +80,9 @@ export type ToHost =
   /** 要一份上下文分区快照（点状态行「上下文 X」弹出面板）。响应是 regions。
    *  task：查分支的库——上下文环跟着分支走，不拿主干的数字骗人 */
   | { type: 'get_regions'; task?: string }
+  /** 手动压缩（上下文分析面板的按钮，2026-10-17）。task：压分支；缺省 = 主任务。
+   *  响应是 compact_result。只在停止时能压，跑着的 session 由 core 拒绝 */
+  | { type: 'compact'; task?: string }
   /**
    * 往上拉到顶了，要更早的历史。cursor = 上一页返回的 `next`（第一次
    * null——从最新的归档行起）。响应是一条 historyPage
@@ -224,6 +228,8 @@ export type ToWebview =
    * 还没有任何记录（新装/从未跑过一轮）
    */
   | { type: 'regions'; info: RegionsInfo | null }
+  /** compact 的结果。task 原样带回：面板只认自己那个分支的结果 */
+  | { type: 'compact_result'; result: CompactResult; task?: string }
   /**
    * 多根工作区的文件夹清单（design.md §7）。宿主在切换、增删文件夹、
    * 后台轮结束时推送。UI 只在 `folders.length > 1` 时渲染顶部下拉——

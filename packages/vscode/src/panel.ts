@@ -1,4 +1,4 @@
-import { forwardBlock, forwardLine, getSession, scopeOf } from '@simple-code/core'
+import { forwardBlock, forwardLine, getSession, logRun, scopeOf } from '@simple-code/core'
 import { existsSync, readFileSync, statSync as fsStatSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -194,6 +194,13 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       this.router.seed(folder)
     }
 
+    // 热重载监听：router 建好后立刻装一次。原来只在 setFolders（文件夹
+    // 增删）里装——正常启动从不增删文件夹，dc07929（9-14）起一个 watcher
+    // 都没建过，全局与项目级 settings.json 改动全不生效（2026-10-13 装了
+    // settings_change 观测才看出来：touch/写回都零触发）。面板重开会再走
+    // 这里，已装过就不重建
+    if (this.settingsWatchers.length === 0) this.watchSettings()
+
     view.webview.onDidReceiveMessage((msg: ToHost) => {
       this.router?.handle(msg)
     })
@@ -270,10 +277,13 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     for (const w of this.settingsWatchers) w.dispose()
     this.settingsWatchers = []
     if (!this.router) return
-    const reload = (): void => this.router?.requestReloadAll()
-    // 绝对路径进 FileSystemWatcher 会被当 glob：[ ] 等是保留字符，路径
-    // 里出现时套字符类转义。home 路径通常没有，但用户名说不准
-    const escapeGlob = (p: string): string => p.replace(/[[\]?*]/g, (m) => `[${m}]`)
+    // 观测：watcher 触发即记一行，与有没有活 session 无关——session_close
+    // source=reload 只在活 session 上才有，切目录频繁时验证不了 watcher
+    // 到底触发没有（2026-10-13 三次 touch 均被 detach 抢先）
+    const reload = (uri: vscode.Uri): void => {
+      logRun({ ev: 'settings_change', path: uri.fsPath })
+      this.router?.requestReloadAll()
+    }
     const wire = (w: vscode.FileSystemWatcher): void => {
       w.onDidChange(reload)
       w.onDidCreate(reload) // 保存常是 rename（临时文件替换），create/delete 也算
@@ -284,7 +294,13 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     // 拥有，同步时原子替换）——监听它；本地仍监听 settings.json
     const globalName =
       vscode.env.remoteName === undefined ? 'settings.json' : 'settings.remote.json'
-    wire(vscode.workspace.createFileSystemWatcher(escapeGlob(join(homedir(), '.simple-code', globalName))))
+    // 工作区外的文件必须用 RelativePattern(Uri, 文件名)（非递归监听）：字符串
+    // glob 只匹配已打开的工作区文件夹，工作区外的事件一律不报（@types/vscode
+    // createFileSystemWatcher 文档原文）。9-14 起用的是字符串，全局配置热重载
+    // 从没触发过——runlog 里 session_close source=reload 为 0，直到 2026-10-12
+    // 改 opus cacheTtl 后请求迟迟不带才发现
+    const globalDir = vscode.Uri.file(join(homedir(), '.simple-code'))
+    wire(vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(globalDir, globalName)))
     for (const f of vscode.workspace.workspaceFolders ?? []) {
       wire(vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(f, '.simple-code/settings.json')))
     }

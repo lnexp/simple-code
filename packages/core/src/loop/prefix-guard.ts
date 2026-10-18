@@ -9,9 +9,11 @@
  * 前 18 条命中缓存。靠人看 diff 发现一次算一次，守卫把它变成当场报错。
  *
  * 合法的改写点只有一种：压缩点（卸载触发——预算超线、缓存过期、context
- * 超限自救）。那一刻缓存横竖要破，前缀的所有改写（卸载、合并生效、摘要
- * 进场、system 重读）都在那儿搭车。压缩点调 `allowRewrite`，下一次 check
- * 放行一次。
+ * 超限自救、手动压缩）。那一刻缓存横竖要破，前缀的所有改写（卸载、合并
+ * 生效、摘要进场、system 重读）都在那儿搭车。压缩点调 `allowRewrite`，
+ * 下一次 check 放行一次。放行票可以落库（`ticket`）：手动压缩发生在空闲
+ * 时，离下一次 check 可能隔着一次 reload，只记在内存里的话重建后的守卫
+ * 不认这次改写
  *
  * 另一种不算违规：请求参数变了（换模型、换推理档位、改 maxTokens）——这是
  * 用户的选择，缓存本来就按这些分桶，基线静默重置。
@@ -74,7 +76,7 @@ export class PrefixBrokenError extends Error {
 }
 
 export type PrefixGuard = {
-  /** 压缩点：下一次 check 允许改写前缀（只放行一次） */
+  /** 压缩点：下一次 check 允许改写前缀（只放行一次；有 ticket 时跨重建） */
   allowRewrite(): void
   /**
    * 发请求前核对。违规抛 `PrefixBrokenError`。**过不过都把这次记为新基线**：
@@ -115,6 +117,8 @@ export function createPrefixGuard(deps: {
   baseline: PrefixBaselineStore
   /** 上一次请求原文的持久化。没传 = 违规现场里 prev 可能是 null（只剩指纹） */
   prev?: PrevRequestStore
+  /** 放行票的持久化（set 落票、take 读并删）。没传 = 只在内存，重建即丢 */
+  ticket?: { set(): void; take(): boolean }
   /** 违规现场落盘（前后两次请求）。返回文件路径；null = 没落成 */
   dump: (info: { break: PrefixBreak; prev: Request | null; next: Request }) => string | null
 }): PrefixGuard {
@@ -124,6 +128,7 @@ export function createPrefixGuard(deps: {
   return {
     allowRewrite: () => {
       allowed = true
+      deps.ticket?.set()
     },
     check: (request, configKey) => {
       const next = fingerprint(request, configKey)
@@ -133,7 +138,9 @@ export function createPrefixGuard(deps: {
       deps.baseline.write(next)
       deps.prev?.write(request)
       prevRequest = request
-      const pass = allowed
+      // 票每次都取：内存放行时同一张票也要撕掉，否则留到下一次又放行一回
+      const ticket = deps.ticket?.take() ?? false
+      const pass = allowed || ticket
       allowed = false
       if (prev === null || pass || prev.params !== next.params) return
       const found = findBreak(prev, next)

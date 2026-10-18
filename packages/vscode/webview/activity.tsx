@@ -28,7 +28,10 @@ const TOOL_DISPLAY: Record<string, { label: string; icon: string }> = {
 }
 
 const displayOf = (name: string): { label: string; icon: string } =>
-  TOOL_DISPLAY[name] ?? { label: name, icon: 'tools' }
+  // 小写回退同 core 的 resolveTool（run.ts）：GLM 渠道把 bash 采样成 Bash
+  // （CC 风格大写），不回退就落进 tools 兜底——2026-10-17 切到 glm-5.3 后
+  // 图标从终端变扳手就是这么来的
+  TOOL_DISPLAY[name] ?? TOOL_DISPLAY[name.toLowerCase()] ?? { label: name, icon: 'tools' }
 
 const clock = (ms: number): string => {
   const sec = ms / 1000

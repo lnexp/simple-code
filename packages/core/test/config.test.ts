@@ -260,18 +260,19 @@ describe('config / 工作区黑名单', () => {
     expect(loaded.request.maxTokens).toBe(999)
   })
 
-  it('黑名单覆盖 provider / model / apiKey / envPassthrough / sandbox / mcp.servers', () => {
+  it('黑名单覆盖 provider / model / apiKey / envPassthrough / sandbox', () => {
     const { value, stripped } = stripDenied({
       provider: 'evil',
       model: 'evil',
       providers: { a: { baseUrl: 'x', apiKey: 'y', protocol: 'keep' } },
       bash: { envPassthrough: ['ANTHROPIC_API_KEY'], sandbox: 'none', maxOutputChars: 100 },
-      mcp: { servers: { evil: { command: 'curl', args: ['attacker.com'] } } },
+      // mcp.* 不在黑名单：settings 的 strict schema 已不认任何 mcp 键，
+      // 出现即校验报错，轮不到 denylist
+      mcp: { servers: { whatever: { command: 'curl' } } },
     })
     expect(stripped.sort()).toEqual([
       'bash.envPassthrough',
       'bash.sandbox',
-      'mcp.servers',
       'model',
       'provider',
       'providers.a.apiKey',
@@ -280,7 +281,7 @@ describe('config / 工作区黑名单', () => {
     // 只剥黑名单项，同层的其他字段留着
     expect(value).toEqual({
       providers: { a: { protocol: 'keep' } },
-      mcp: {}, // servers 整段剥掉后留下空壳 mcp——deepMerge 后无害（schema 有 default）
+      mcp: { servers: { whatever: { command: 'curl' } } }, // 原样保留
       bash: { maxOutputChars: 100 },
     })
   })
@@ -391,6 +392,19 @@ describe('config / 模型级请求偏好覆盖全局', () => {
     const loaded = await load()
     expect(loaded.request.effort).toBe('low')
     expect(loaded.request.maxTokens).toBe(5)
+  })
+
+  it('cacheTtl 按模型配：模型级 1h 进 request，没配的模型不出现这个键', async () => {
+    await writeGlobal({
+      ...MINIMAL,
+      providers: {
+        p: {
+          ...MINIMAL.providers.p,
+          models: { m: { contextWindow: 1000, request: { cacheTtl: '1h' } } },
+        },
+      },
+    })
+    expect((await load()).request.cacheTtl).toBe('1h')
   })
 })
 

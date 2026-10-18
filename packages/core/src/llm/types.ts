@@ -148,6 +148,8 @@ export type Request = {
   /** 'none' 只来自副模型 ref（摘要/视觉转述，config/schema.ts sideModelRef），主模型配不出 */
   effort: Effort | 'none'
   reasoningDisplay: 'omitted' | 'summarized'
+  /** Anthropic cache_control.ttl（config/schema.ts requestPreferences.cacheTtl）。缺省 = 不带 */
+  cacheTtl?: '5m' | '1h'
   system: string
   tools: ToolDefinition[]
   messages: Message[]

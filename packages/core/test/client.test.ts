@@ -407,6 +407,7 @@ describe('运行日志（2026-09-30 补观测）', () => {
     const calls = await capture(() => drain(send(protocol, new Response(bodyOf(sse), { status: 200 })).stream))
     const llm = calls.find((c) => c.ev === 'llm')
     expect(llm?.error).toBeDefined()
+    expect(llm?.finish).toBeUndefined()
     expect(llm?.stream).toEqual({
       count: 3,
       types: { 'response.created': 1, 'response.in_progress': 2 },
@@ -420,7 +421,33 @@ describe('运行日志（2026-09-30 补观测）', () => {
     const llm = calls.find((c) => c.ev === 'llm')
     expect(llm).toBeDefined()
     expect(llm?.error).toBeUndefined()
+    expect(llm?.finish).toBe('stop')
     expect(llm?.stream).toBeUndefined()
+  })
+
+  it('走完但零内容（10-09 空响应形态）：llm 行标 empty 并带 stream，分得清网关真空与解析器丢块', async () => {
+    const frame = (event: string, data: string) => `event: ${event}\ndata: ${data}\n\n`
+    const head = frame('message_start', '{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}')
+    const tail =
+      frame('message_delta', '{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}') +
+      frame('message_stop', '{"type":"message_stop"}')
+    // 甲：网关真空——只有首尾
+    // 乙：网关发了块但解析器不认识（静默丢弃）——统计里多出 content_block_*
+    const unknownBlock =
+      frame('content_block_start', '{"type":"content_block_start","index":0,"content_block":{"type":"future_block"}}') +
+      frame('content_block_stop', '{"type":"content_block_stop","index":0}')
+    const protocol = resolveProtocol('anthropic-messages')
+    const run = async (sse: string) => {
+      const calls = await capture(() => drain(send(protocol, new Response(bodyOf(sse), { status: 200 })).stream))
+      return calls.find((c) => c.ev === 'llm') as { empty?: boolean; error?: unknown; stream?: { types: Record<string, number> } }
+    }
+    const blank = await run(head + tail)
+    expect(blank.error).toBeUndefined()
+    expect(blank.empty).toBe(true)
+    expect(blank.stream?.types).toEqual({ message_start: 1, message_delta: 1, message_stop: 1 })
+    const dropped = await run(head + unknownBlock + tail)
+    expect(dropped.empty).toBe(true)
+    expect(dropped.stream?.types).toMatchObject({ content_block_start: 1, content_block_stop: 1 })
   })
 
   it('llm_req 记网关路由参数（extraBody）', async () => {

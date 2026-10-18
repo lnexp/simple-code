@@ -1,4 +1,5 @@
 import { useEffect } from 'react'
+import type { CompactResult } from '@simple-code/core'
 import { fmtTok } from './events.ts'
 import type { RegionsInfo } from '../src/protocol.ts'
 
@@ -7,16 +8,25 @@ import type { RegionsInfo } from '../src/protocol.ts'
  * 显示一次请求的分区快照。数据来自 regions.jsonl 尾行（按需拉取，不常驻）。
  *
  * 不用 Menu 组件：那是单选菜单（menuitemradio 语义），这里是纯展示面板。
- * 交互就三条：Esc 关、点遮罩关、点条目无操作。
+ * 交互就四条：Esc 关、点遮罩关、点条目无操作、「立即压缩」按钮（2026-10-17
+ * 翻案加的，只在停止时可按；放这里而不常驻，是要「看了水位再决定」两步才触达）。
  */
 export function ContextPanel({
   info: raw,
   pending,
+  running,
+  compact,
+  onCompact,
   onClose,
 }: {
   info: RegionsInfo | null
   /** 点击后、regions 消息回来前——有上一份也先标「取数中」 */
   pending: boolean
+  /** 当前看着的这条（主任务或分支）在跑——跑着不能压 */
+  running: boolean
+  /** 手动压缩：busy = 已发出等结果；text = 结果文案（null = 还没按过） */
+  compact: { busy: boolean; text: string | null }
+  onCompact: () => void
   onClose: () => void
 }) {
   useEffect(() => {
@@ -34,12 +44,27 @@ export function ContextPanel({
     ) : (
       <>
         <div className="ctx-head">
-          <div className="ctx-title">上下文分析</div>
+          {/* 标题行右侧的小按钮：说明进 title，面板里只留结果 / 运行中提示 */}
+          <div className="ctx-title-row">
+            <div className="ctx-title">上下文分析</div>
+            <button
+              type="button"
+              className="ctx-compact"
+              disabled={running || compact.busy}
+              onClick={onCompact}
+              title={running ? '运行中，停止后才能压缩' : '归档保底区外的原文、换入摘要；下次请求全价重写缓存'}
+            >
+              {compact.busy ? '压缩中…' : '立即压缩'}
+            </button>
+          </div>
           <div className="ctx-sub">
             {fmtTok(info.contextWindow)} 窗口 · 用 <b>{pct(usedOf(info), info.contextWindow)}</b>
             {raw && !isCalibrated(raw) && '（估算）'}
             <span className="ctx-at">{fmtAt(info.at)}</span>
           </div>
+          {(running || compact.text) && (
+            <div className="ctx-hint">{running ? '运行中，停止后才能压缩' : compact.text}</div>
+          )}
         </div>
         {/* 总览堆叠条：各区按**真实比例**依次排开，剩下露出的底色就是空闲。
             旧版每行一根 `min(pct,8)*4` 的短条是错的——70% 的空闲和 8.5%
@@ -76,6 +101,16 @@ export function ContextPanel({
       </div>
     </div>
   )
+}
+
+/** compact_result → 面板上的一句话。面板数字来自请求时写的 regions.jsonl，压完不会变 */
+export function compactText(r: CompactResult): string {
+  if (!r.ok) return r.message
+  const head =
+    r.unloaded > 0
+      ? `已压缩：归档 ${r.unloaded} 条${r.estimated !== null ? `，下次请求约 ${fmtTok(r.estimated)}` : ''}`
+      : '已压缩：没有可归档的原文（只做了合并生效、摘要换入）'
+  return [`${head}；面板数字在下次请求后刷新`, ...r.errors].join('\n')
 }
 
 type Row = {

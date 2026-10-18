@@ -66,6 +66,12 @@ export type SummaryStatus = 'pending' | 'generating' | 'ready'
 export type LiveMessage = { message: Message; turnId: number; stepId: number }
 
 /**
+ * recall 选择器的轮内注入（session/selector.ts）：渲染在所属 step 的第
+ * `after` 条消息之后，另起一条 user 消息。按 stepId 索引
+ */
+export type AsyncCue = { after: number; lines: readonly string[] }
+
+/**
  * 一条被卸载的消息：原文归档在哪、属于哪个 turn。
  *
  * 放在这个文件而不是 run.ts，是因为 store 要用它——分层是 session → loop，
@@ -143,17 +149,25 @@ export function assembleContext(
    *  （relay 同款：库里消息不动，装配期纯函数贴装——重装配字节一致，
    *  prefix-guard 不拦）。turn 卸载后 live 块不再出现，cue 随之自然消失 */
   cues: ReadonlyMap<number, readonly string[]> = new Map(),
+  /** 选择器的轮内注入，stepId → 锚点。同 cues：落库冻结、装配贴装 */
+  asyncCues: ReadonlyMap<number, AsyncCue> = new Map(),
 ): Message[] {
   const cuedTurns = new Set<number>()
   return planContext(live, summaries).flatMap((entry) => {
     if (entry.summary) return [toMessage(entry.summary, bodies.get(entry.summary.id))]
-    return (entry.live ?? []).map(({ message, turnId }) => {
+    const block = (entry.live ?? []).map(({ message, turnId }) => {
       const lines = cues.get(turnId)
       // 一个 turn 只贴一次（插话轮可能有第二条 user 行）；不复制消息对象
       if (message.role !== 'user' || !lines || lines.length === 0 || cuedTurns.has(turnId)) return message
       cuedTurns.add(turnId)
       return { ...message, parts: [...message.parts, { type: 'text', text: lines.join('\n') }] } satisfies Message
     })
+    // live 块恰是一个 step（planContext 按 step 分组）。块短于锚点 = 锚定的
+    // 消息不在了（不该发生：step 只追加、卸载整步走），不渲染
+    const asyncCue = asyncCues.get(entry.live?.[0]?.stepId ?? -1)
+    if (!asyncCue || asyncCue.lines.length === 0 || block.length < asyncCue.after) return block
+    const injected: Message = { role: 'user', parts: [{ type: 'text', text: asyncCue.lines.join('\n') }] }
+    return [...block.slice(0, asyncCue.after), injected, ...block.slice(asyncCue.after)]
   })
 }
 

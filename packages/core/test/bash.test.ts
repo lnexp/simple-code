@@ -83,21 +83,9 @@ describe('bash / 基本执行', () => {
     expect(naive).not.toBe('a\nb\nc\nd\ne\n')
   })
 
-  it('cwd 相对工作区根解析', async () => {
-    await execFileAsync('mkdir', ['-p', join(root, 'sub')])
-    const r = await run({ command: 'pwd -P', cwd: 'sub' })
-    expect(r.output.trim()).toBe(await realpath(join(root, 'sub')))
-  })
-
   it('默认在工作区根执行', async () => {
     const r = await run({ command: 'pwd -P' })
     expect(r.output.trim()).toBe(await realpath(root))
-  })
-
-  it('cwd 不存在时不抛，返回可读的失败', async () => {
-    const r = await run({ command: 'echo x', cwd: 'nope' })
-    expect(r.isError).toBe(true)
-    expect(r.output).toContain('无法启动')
   })
 
   it('无输出时也给模型一句话，不返回空串', async () => {
@@ -118,7 +106,7 @@ describe('bash / 参数校验', () => {
     ['缺 command', {}],
     ['command 不是字符串', { command: 123 }],
     ['command 是空串', { command: '   ' }],
-    ['cwd 不是字符串', { command: 'true', cwd: 1 }],
+    ['cwd 已移除仍传', { command: 'true', cwd: '.' }],
     ['timeout 不是正数', { command: 'true', timeout: -1 }],
   ] as const
 

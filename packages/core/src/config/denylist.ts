@@ -22,10 +22,6 @@ const DENYLIST = [
   'providers.*.models.*.extraBody',
   'bash.envPassthrough', // 可以把 API key 加回白名单，绕过 §12 的裁剪
   'bash.sandbox', // 将来有沙箱时，不能让仓库自己关掉
-  // MCP server 能起本地进程（command）也能注凭证（env）——clone 的恶意
-  // 仓库等于让你自动跑它的任意命令。MCP 配置只认全局（真发生过：项目级
-  // 配了 mcpServers 连远程端点，顺带暴露了这个口子）
-  'mcp.servers',
 ] as const
 
 export type StripResult = {

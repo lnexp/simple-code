@@ -497,11 +497,19 @@ describe('合并端到端', () => {
     expect(calls.some((c) => c.ev === 'merge' && c.action === 'stop' && c.reason === 'no_group')).toBe(true)
     expect(calls.some((c) => c.step === 'apply_merges_done' && typeof c.droppedSteps === 'number')).toBe(true)
     expect(calls.some((c) => c.step === 'activate' && typeof c.entered === 'number')).toBe(true)
-    // 同一次请求的真实 usage × 面板估算记在同一行（底栏与面板对拍用）
-    const usage = calls.filter((c) => c.ev === 'llm_usage')
+    // 同一次请求的真实 usage × 面板估算记在同一行（底栏与面板对拍用）。
+    // 只看主循环行：collectText（summary/merge 的副模型请求）也记
+    // llm_usage，但带 tag、没有 estimated（2026-10-14）
+    const usage = calls.filter((c) => c.ev === 'llm_usage' && c.tag === undefined)
     expect(usage.length).toBeGreaterThanOrEqual(7)
     expect(usage.every((c) => typeof c.input === 'number' && typeof c.cacheRead === 'number')).toBe(true)
+    expect(usage.every((c) => typeof c.model === 'string' && (c.model as string).length > 0)).toBe(true)
     expect(usage.every((c) => typeof c.estimated === 'number' && (c.estimated as number) > 0)).toBe(true)
+    // 副模型行：带 tag 与缓存读写字段，缓存命中可从日志直接判
+    const side = calls.filter((c) => c.ev === 'llm_usage' && typeof c.tag === 'string')
+    expect(side.length).toBeGreaterThanOrEqual(1)
+    expect(side.every((c) => ['summary', 'merge'].includes(c.tag as string))).toBe(true)
+    expect(side.every((c) => typeof c.input === 'number' && typeof c.cacheRead === 'number' && typeof c.cacheWrite === 'number')).toBe(true)
   })
 
   it('**停止行去重**：空闲 tick 反复停在同一原因、成员数没变，只记一行', async () => {

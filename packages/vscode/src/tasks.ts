@@ -572,6 +572,15 @@ export function createTaskCenter(deps: TaskDeps) {
     return ensureSession(r)
   }
 
+  /** 手动压缩的目标。返回字符串 = 拒绝原因。关闭中的不压：关闭流程自己在
+   *  排空摘要、owner 还俗，两边同时改这个任务的上下文 */
+  const compactTarget = async (name: string): Promise<Session | string> => {
+    const r = runs.get(name)
+    if (!r) return `任务「${name}」已关闭`
+    if (r.status === 'closing') return `任务「${name}」正在关闭，不能压缩`
+    return (await ensureSession(r)) ?? `任务「${name}」打不开`
+  }
+
   /** 关掉一个任务的分身 session（含空闲摘要定时器）。幂等 */
   const closeRun = async (r: Run): Promise<void> => {
     r.idle?.disarm()
@@ -674,6 +683,7 @@ export function createTaskCenter(deps: TaskDeps) {
     send,
     open,
     sessionOf,
+    compactTarget,
     approvalOnOf,
     setApprovalOn,
     setModel,

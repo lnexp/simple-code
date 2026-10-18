@@ -29,6 +29,15 @@ const requestPreferences = strictObject({
   thinking: z.enum(['adaptive', 'disabled']).optional(),
   effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
   reasoningDisplay: z.enum(['omitted', 'summarized']).optional(),
+  /**
+   * Anthropic prompt cache 的 TTL 档位（cache_control.ttl）。不配 = 不带 ttl，
+   * 走上游默认 5m。配 '1h' 时记得把同模型的 cacheTtlMs 一起调到 3600000，
+   * 否则我们这边 5 分钟后照样判过期去压缩，1h 白买。其他协议忽略此项。
+   * 2026-10-12 探针：providerId 140 认 1h（7 分钟后仍命中）；已有 5m 条目的
+   * 会话切过去是否会多次 miss，探针受网关路由噪声干扰没定论——切换时看
+   * llm_usage，详见 note anthropic-1h-cache-ttl-probe
+   */
+  cacheTtl: z.enum(['5m', '1h']).optional(),
 })
 
 /**
@@ -394,18 +403,16 @@ const memoryConfig = strictObject({
 
 const recallConfig = strictObject({
   /**
-   * off：不算（零开销）。shadow：算 + 落 cues 表但不渲染——上线前的观察
-   * 日志，直接查 cues 表看「当时撞出了什么」。on：落库 + 装配渲染。
-   * 默认 shadow（proposal §9：精度无 ground truth，先影子跑体感）
+   * off：不算（零开销）。shadow：选择器不发请求、不注入——本产品默认值。
+   * on：选择器（selector.ts）+ 关键词撞摘要（cue.ts）跑满
    */
   mode: z.enum(['off', 'shadow', 'on']).default('shadow'),
-  /** 半衰期（轮）：N 轮前碰过的词剩 2^(-N/halfLife)。记性长短的唯一旋钮 */
+  /** 以下三键 2026-10-14 起**已废弃**（n-gram 引擎退役，cue.ts 换芯为
+   *  关键词匹配）：接受不再使用——删掉会让存量配置 strict 校验失败 */
   halfLife: z.number().positive().default(10),
-  /** 信号窗口：回看最近多少轮的文本切词 */
   window: z.number().int().positive().default(30),
-  /** 每轮线索行上限（噪声预算） */
+  /** 每轮摘要线索行上限（噪声预算）——唯一还在用的 */
   topK: z.number().int().positive().default(2),
-  /** 同一候选多少轮内不重撞（狼来了防放大） */
   dedupTurns: z.number().int().positive().default(5),
 })
 

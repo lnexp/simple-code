@@ -81,6 +81,9 @@ export type ChatItem =
    * errorKind——UI 据此标色。resumable：报错/中断落下的那条，停稳后是最后一条
    * 时给「继续」按钮（发一条「继续」，core 续进上一轮，turn-resume.md） */
   | { kind: 'notice'; text: string; errorKind?: string; resumable?: boolean }
+  /** 模型切换分割线（2026-10-17 用户定样式：文字居中、两侧横线自适应宽度）。
+   *  位置在切换后那轮的 user 气泡**前**——「从这条起换了模型」 */
+  | { kind: 'divider'; text: string }
 
 export type ChatView = {
   items: ChatItem[]
@@ -241,7 +244,34 @@ export function reduce(view: ChatView, agentEv: AgentEvent, now: number): ChatVi
 
     case 'tool_input_delta':
       return earlyDesc(view, agentEv.id, agentEv.partial)
+
+    case 'model_switch':
+      return insertBeforeLastUser(view, { kind: 'divider', text: switchText(agentEv.from, agentEv.to) })
   }
+}
+
+/** 分割线文案。只说事实，不带给 agent 看的末句「此前的回复由上一个模型生成」 */
+const switchText = (from: string, to: string): string => `模型已从 ${from} 切换到 ${to}`
+
+/**
+ * core 插进历史的告知原文 → 分割线文案；不是告知 → null。前缀与格式和
+ * core session.ts 的 MODEL_SWITCH_HEAD / modelSwitchNotice 成对（webview
+ * 只 import core 的类型，值引进来会把 Node 依赖带进 bundle，所以抄一份）
+ */
+export function parseModelSwitch(text: string): string | null {
+  const m = /^〔系统〕模型已从 (.+) 切换到 (.+?)。/.exec(text)
+  return m ? switchText(m[1] as string, m[2] as string) : null
+}
+
+/**
+ * model_switch 是流首事件，到达时这轮的 user 气泡已由 App 本地 append 上屏
+ * ——插到末条 user 前面，跟回放（告知消息在 user 消息前）位置一致。找不到
+ * user（镜像近似视图的边角）就追加在末尾，不丢
+ */
+function insertBeforeLastUser(view: ChatView, item: ChatItem): ChatView {
+  const at = view.items.findLastIndex((i) => i.kind === 'user')
+  if (at === -1) return append(view, item)
+  return { ...view, items: [...view.items.slice(0, at), item, ...view.items.slice(at)] }
 }
 
 /**
@@ -513,7 +543,7 @@ export type Section =
 
 const isUserBlock = (block: Block): boolean => block.kind === 'single' && block.item.kind === 'user'
 const isNoticeBlock = (block: Block): boolean =>
-  block.kind === 'single' && block.item.kind === 'notice'
+  block.kind === 'single' && (block.item.kind === 'notice' || block.item.kind === 'divider')
 const isAssistantBlock = (block: Block): boolean =>
   block.kind === 'single' && block.item.kind === 'assistant'
 
@@ -672,6 +702,13 @@ export function hydrateItems(
       }
       if (isStub(text)) continue // 存根：全文在上方历史里
       if (text === '' && images.length === 0) continue
+      // 模型切换告知（core 的 send 插入，甲案 2026-10-17）：渲染成分割线
+      // ——用户没打过这句话，不该显示成用户气泡
+      const divider = images.length === 0 ? parseModelSwitch(text) : null
+      if (divider !== null) {
+        items.push({ kind: 'divider', text: divider })
+        continue
+      }
       items.push({ kind: 'user', text, ...(images.length > 0 ? { images } : {}) })
       continue
     }

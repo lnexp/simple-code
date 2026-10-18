@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { type Photon, resizeImageParts, stripImagesWhenUnsupported, thumbnailDataUrl } from '../src/llm/resizer'
 import type { ImagePart, Message, Part } from '../src/llm/types'
 import { makePng, mulberry32 } from './make-png'
@@ -85,6 +85,25 @@ describe('thumbnailDataUrl', () => {
       mimeType: 'image/png',
     })
     expect(url).toBeUndefined()
+  })
+
+  it('同一张图第二次走缓存，不再解码（切目录重建基线不重算）', async () => {
+    const photon = (await import('@silvia-odwyer/photon-node')) as unknown as Photon
+    const decode = vi.spyOn(photon.PhotonImage, 'new_from_byteslice')
+    try {
+      const data = makePng(640, 480, mulberry32(11)).toString('base64')
+      const first = await thumbnailDataUrl({ type: 'image', data, mimeType: 'image/png' })
+      const second = await thumbnailDataUrl({ type: 'image', data, mimeType: 'image/png' })
+      expect(first).toBeDefined()
+      expect(second).toBe(first)
+      expect(decode).toHaveBeenCalledTimes(1)
+      // 不同的图照常解码
+      const other = makePng(640, 480, mulberry32(12)).toString('base64')
+      await thumbnailDataUrl({ type: 'image', data: other, mimeType: 'image/png' })
+      expect(decode).toHaveBeenCalledTimes(2)
+    } finally {
+      decode.mockRestore()
+    }
   })
 })
 

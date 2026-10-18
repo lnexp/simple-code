@@ -8,9 +8,11 @@
  * 三个力度（用户拍板）：
  * - leads：执行器白名单，粒度到命令名（python3），不做 arity 分档
  * - paths：路径白名单，展开后的绝对目录前缀
- * - nonPathFrom：命令名 → 位置参数起始位（0 基），该位起不当路径判
- *   （元素寻址工具「此参数位不是路径」的一键采集；settings 的
- *   bash.approval.nonPathFrom 是手写源，这里是卡上采集源，判定时合并）
+ * - nonPathFrom：命令名（或 'lead 子命令'）→ 位置参数起始位（0 基，子命令
+ *   条目从子命令之后起数），该位起不当路径判（元素寻址工具「此参数位不是
+ *   路径」的一键采集；settings 的 bash.approval.nonPathFrom 是手写源，
+ *   这里是卡上采集源，判定时合并。子命令级 key 只罩该子命令——批 eval 的
+ *   JS 不连带批 upload 的文件参数，2026-10-15）
  * - hiddenRead / hiddenWrite：隐藏路径前缀，读写分开记（2026-09-29 拍板，
  *   docs/proposals/hidden-path.md）。记到第一个隐藏段为止：卡上是
  *   `.idea/encodings.xml` 记 `.idea`；项目内存相对路径，项目外存绝对路径

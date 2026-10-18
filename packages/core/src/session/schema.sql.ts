@@ -137,6 +137,23 @@ CREATE TABLE IF NOT EXISTS cues (
   created_at TEXT NOT NULL,
   PRIMARY KEY (owner, turn_id)
 );
+
+-- recall 选择器的轮内注入（docs/proposals/recall-llm-selector.md §4）：
+-- 一个 turn 至多一条，注入后**永不变**。锚点是 (step_id, after)——渲染在
+-- 该 step 第 after 条消息之后另起一条 user 消息（tool 消息在 openai-chat/
+-- Responses 只装 tool_result，塞文本会丢）。不锚「step 末尾」：续接轮的新
+-- user 消息会并进同一 step，末尾一挪渲染位置就漂、前缀守卫必炸。其余同
+-- cues：装配期纯函数贴装，step 卸载后自然消失
+CREATE TABLE IF NOT EXISTS async_cues (
+  owner      TEXT NOT NULL DEFAULT '',
+  turn_id    INTEGER NOT NULL,
+  step_id    INTEGER NOT NULL,
+  after      INTEGER NOT NULL,
+  lines      TEXT NOT NULL,
+  names      TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (owner, turn_id)
+);
 `
 
 /**

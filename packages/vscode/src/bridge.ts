@@ -1,5 +1,6 @@
 import {
   type AgentEvent,
+  type CompactResult,
   type Effort,
   type ImageInput,
   lastRegionLine,
@@ -283,6 +284,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
       id,
       category: q.category,
       command: q.command.slice(0, 300),
+      // reason 是「为什么弹」的人话（要触碰隐藏路径：X / 命令含 eval…）。
+      // 2026-10-16 审批审计发现只记 category 没记 reason，误弹归因只能靠猜
+      reason: q.reason.slice(0, 200),
     })
     const card: ApprovalRequest = {
       type: 'approval_request',
@@ -831,6 +835,21 @@ export function createBridge(deps: BridgeDeps): Bridge {
             } catch {
               post({ type: 'regions', info: null })
             }
+          })()
+          return
+        }
+        case 'compact': {
+          void (async () => {
+            const task = msg.task
+            let result: CompactResult
+            try {
+              // 不学 get_regions 找不到任务就退回主任务：那样按的是分支、压的是主任务
+              const target = task !== undefined ? await tasks.compactTarget(task) : await getSession()
+              result = typeof target === 'string' ? { ok: false, message: target } : await target.compactNow()
+            } catch (error) {
+              result = { ok: false, message: `压缩失败：${String(error)}` }
+            }
+            post({ type: 'compact_result', result, ...(task !== undefined ? { task } : {}) })
           })()
           return
         }
