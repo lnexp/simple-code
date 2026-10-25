@@ -695,6 +695,8 @@ body {
   background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
 }
 .ctx-compact:disabled { opacity: 0.5; cursor: default; }
+/* 记忆面板（memory-panel.tsx）：双选项并排 + 四元组数字弱化 */
+.mem-choice { display: flex; gap: 6px; }
 /* 结果 / 运行中提示：只在有话说时出现，可多行（结果 + AGENTS 超限提示） */
 .ctx-hint {
   font-size: 0.8em; margin-top: 3px; white-space: pre-line;

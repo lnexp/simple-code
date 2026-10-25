@@ -1,6 +1,6 @@
 import { join } from 'node:path'
 import * as vscode from 'vscode'
-import { ensureShims, logRun, type ShimEntry } from '@simple-code/core'
+import { ensureShims, logRun, startCredentialProxy, type ShimEntry } from '@simple-code/core'
 import { startLspBridge } from './lsp-bridge.ts'
 import { watchLoopLag } from './loop-lag.ts'
 import { ChatPanel } from './panel.ts'
@@ -13,7 +13,7 @@ import { ChatPanel } from './panel.ts'
  */
 const BINS = [
   'WEBFETCH', 'WEBSEARCH', 'MCP', 'APPLY_PATCH', 'MEMORY', 'LESSON',
-  'NOTE', 'EVENT', 'SKILL', 'LSP',
+  'NOTE', 'EVENT', 'SKILL', 'LSP', 'IMAGEGEN',
 ] as const
 
 /**
@@ -54,6 +54,13 @@ async function wireBins(): Promise<void> {
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   await wireBins()
   const lspServer = startLspBridge()
+  // 凭据代理（docs/proposals/credential-proxy.md）：url 型 MCP server 的密钥
+  // 只在本进程展开，bin 经 127.0.0.1 访问。起不来不挡激活——只影响 url 型
+  // server（bin 报无代理），记一行留证
+  const proxy = await startCredentialProxy((ev) => logRun(ev)).catch((e: unknown) => {
+    logRun({ ev: 'proxy_start_failed', error: e instanceof Error ? e.message : String(e) })
+    return undefined
+  })
 
   // 双注册互斥的开关，两个条件取或，任一命中走活动栏兜底：
   // ① 引擎 < 1.106（secondarySidebar 正式可用的下限，主流客户端同款判定）
@@ -74,6 +81,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     // 桥跟着扩展走：停用即关，端口随 env 消失，bin 侧明确报不可达
     { dispose: () => lspServer.close() },
+    { dispose: () => proxy?.close() },
     watchLoopLag((ev) => logRun(ev)),
     ...ChatPanel.viewTypes.map((viewType) =>
       vscode.window.registerWebviewViewProvider(viewType, panel, {

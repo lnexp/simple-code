@@ -15,15 +15,20 @@
  * 这比「选得准」更重要：大多数轮本就不该浮出任何经验，n-gram 被迫填满
  * K 个名额的噪声（狼来了）从根上没了。
  */
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Message, Request } from '../llm/types.ts'
-import { loadEvents } from '../tools/events.ts'
-import { lessonsDir, parseLessonFrontMatter } from '../tools/lesson.ts'
+import { decayCutoff, parseStamp } from '../tools/decay.ts'
+import { eventSignal, loadEvents } from '../tools/events.ts'
+import { lessonSignal, lessonsDir, parseLessonFrontMatter } from '../tools/lesson.ts'
 import { activeNoteCards } from '../tools/note.ts'
 import { listSkills } from '../tools/skill.ts'
 
-export type SelectorCandidate = { kind: 'lesson' | 'note' | 'skill' | 'event'; name: string; text: string }
+export type SelectorCandidate = {
+  kind: 'lesson' | 'note' | 'skill' | 'event'
+  name: string
+  text: string
+}
 
 /** 每轮最多浮出几条。可以是 0 */
 export const SELECTOR_TOP_K = 3
@@ -63,7 +68,8 @@ export function readInContext(messages: Message[]): Set<string> {
       if (p.type !== 'tool_call' || p.name !== 'bash') continue
       const command = (p.input as { command?: unknown } | null)?.command
       if (typeof command !== 'string') continue
-      for (const [, kind, name] of command.matchAll(READ_CMD)) out.add(`${kind!.toLowerCase()}:${name}`)
+      for (const [, kind, name] of command.matchAll(READ_CMD))
+        out.add(`${kind!.toLowerCase()}:${name}`)
     }
   return out
 }
@@ -88,15 +94,24 @@ export function loadSelectorCandidates(root: string): SelectorCandidate[] {
       .sort((a, b) => a.born - b.born || a.x.localeCompare(b.x))
       .map((y) => y.x)) {
       const name = f.replace('.md', '')
+      // 时间衰减（memory-time-decay ②）：超期不进候选——冷注入是注意力税
+      const lsig = lessonSignal(join(lessons, f))
+      if (lsig !== null && lsig < decayCutoff()) continue
       const fm = parseLessonFrontMatter(readFileSync(join(lessons, f), 'utf8'))
       out.push({ kind: 'lesson', name, text: fm.description ?? '' })
     }
-  const byCreated = (a: { name: string; created?: string | undefined }, b: { name: string; created?: string | undefined }) =>
-    (a.created ?? '').localeCompare(b.created ?? '') || a.name.localeCompare(b.name)
+  const byCreated = (
+    a: { name: string; created?: string | undefined },
+    b: { name: string; created?: string | undefined },
+  ) => (a.created ?? '').localeCompare(b.created ?? '') || a.name.localeCompare(b.name)
   for (const c of activeNoteCards(root)
     .map((n) => ({ ...n, created: n.meta.created }))
-    .sort(byCreated))
+    .sort(byCreated)) {
+    // 时间衰减：超期 note 不进候选（superseded 已被 activeNoteCards 挡）
+    const nsig = parseStamp(c.meta.lastRead ?? c.meta.created ?? '')
+    if (nsig !== null && nsig < decayCutoff()) continue
     out.push({ kind: 'note', name: c.name, text: c.description ?? '' })
+  }
   for (const line of listSkills(root)) {
     // 只认「name  [项目|用户]  描述」行（与 searchSkills 同判据）：空库提示
     // 和尾行「可选组件（未随包）…」不是 skill——曾被拆成名为
@@ -104,7 +119,11 @@ export function loadSelectorCandidates(root: string): SelectorCandidate[] {
     const m = line.match(/^(\S+) {2}\[(?:项目|用户)\] {2}(.*)$/)
     if (m) out.push({ kind: 'skill', name: m[1]!, text: m[2]! })
   }
-  for (const c of loadEvents(root).sort(byCreated)) out.push({ kind: 'event', name: c.name, text: c.description })
+  for (const c of loadEvents(root).sort(byCreated)) {
+    const esig = eventSignal(c)
+    if (esig !== null && esig < decayCutoff()) continue
+    out.push({ kind: 'event', name: c.name, text: c.description })
+  }
   return out
 }
 
@@ -122,7 +141,12 @@ const SELECTOR_SYSTEM = `你是经验库的检索选择器。第一条消息是�
 
 两个任务独立：经验库没有相关的输出「无」也要给关键词；经验库有相关的也要给关键词。`
 
-const SECTION_HEAD = { lesson: '【lesson 教训】', note: '【note 结论】', skill: '【skill 技能】', event: '【event 事件档案】' } as const
+const SECTION_HEAD = {
+  lesson: '【lesson 教训】',
+  note: '【note 结论】',
+  skill: '【skill 技能】',
+  event: '【event 事件档案】',
+} as const
 
 /**
  * 两条 user 消息：索引一条（跨轮稳定前缀，走副模型的 prompt cache）、交互
@@ -139,14 +163,23 @@ export function buildSelectorRequest(
     .map((kind) => {
       const lines = candidates
         .filter((c) => c.kind === kind)
-        .map((c) => (kind === 'lesson' || kind === 'note' ? `${c.name} — ${c.text.replace(/\s+/g, ' ').trim()}` : c.name))
+        .map((c) =>
+          kind === 'lesson' || kind === 'note'
+            ? `${c.name} — ${c.text.replace(/\s+/g, ' ').trim()}`
+            : c.name,
+        )
       return lines.length === 0 ? '' : `${SECTION_HEAD[kind]}\n${lines.join('\n')}`
     })
     .filter(Boolean)
     .join('\n\n')
   const previous =
-    query.previous.length > SELECTOR_CONTEXT_CHARS ? `…${query.previous.slice(-SELECTOR_CONTEXT_CHARS)}` : query.previous
-  const turn = [previous ? `【上一条助手回复（末尾）】\n${previous}` : '', `【用户新消息】\n${query.user}`]
+    query.previous.length > SELECTOR_CONTEXT_CHARS
+      ? `…${query.previous.slice(-SELECTOR_CONTEXT_CHARS)}`
+      : query.previous
+  const turn = [
+    previous ? `【上一条助手回复（末尾）】\n${previous}` : '',
+    `【用户新消息】\n${query.user}`,
+  ]
     .filter(Boolean)
     .join('\n\n')
   return {
@@ -154,7 +187,10 @@ export function buildSelectorRequest(
     system: SELECTOR_SYSTEM,
     tools: [],
     thinking: 'disabled',
-    messages: [index, turn].map((text) => ({ role: 'user' as const, parts: [{ type: 'text' as const, text }] })),
+    messages: [index, turn].map((text) => ({
+      role: 'user' as const,
+      parts: [{ type: 'text' as const, text }],
+    })),
   }
 }
 
@@ -171,10 +207,13 @@ export function parseSelection(raw: string, candidates: SelectorCandidate[]): Se
       .replace(/^\s*(?:[-•]|\d+[.、)])\s*/, '')
       .trim()
       .split(/\s+/)
-    const kindWord = words.find((w) => w === 'lesson' || w === 'note' || w === 'skill' || w === 'event')
+    const kindWord = words.find(
+      (w) => w === 'lesson' || w === 'note' || w === 'skill' || w === 'event',
+    )
     for (const word of words) {
       const hit =
-        candidates.find((c) => c.name === word && c.kind === kindWord) ?? candidates.find((c) => c.name === word)
+        candidates.find((c) => c.name === word && c.kind === kindWord) ??
+        candidates.find((c) => c.name === word)
       if (hit && !out.includes(hit)) out.push(hit)
     }
   }
@@ -185,7 +224,9 @@ const clip = (s: string, n: number): string => (s.length <= n ? s : `${s.slice(0
 
 /** 成品行。标记与 n-gram 的〔recall〕区分：模型要知道这是轮内后到的、另一种来源 */
 export function renderSelection(picked: SelectorCandidate[]): string[] {
-  return picked.map((c) => `〔recall·async〕${c.kind} ${c.name} — ${clip(c.text.replace(/\s+/g, ' ').trim(), 80)}`)
+  return picked.map(
+    (c) => `〔recall·async〕${c.kind} ${c.name} — ${clip(c.text.replace(/\s+/g, ' ').trim(), 80)}`,
+  )
 }
 
 /** 解析「关键词:」行。body 是剥掉该行后的剩余——关键词可能恰好等于某个

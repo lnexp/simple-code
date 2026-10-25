@@ -424,6 +424,9 @@ describe('AGENTS.md', () => {
     expect(withAll).toContain('重命名、改签名前查全部引用用 "$SIMPLE_CODE_LSP" refs')
     expect(withAll).not.toContain('优先于 grep')
     expect(withAll).toContain('④事件归档：压缩点由 archiver 自动按事归档')
+    // 2026-10-22 两条日常纪律（reflection 首跑产出）：撞到即订正、做完即闭环
+    expect(withAll).toContain('recall/search 撞到内容与现实矛盾的条目')
+    expect(withAll).toContain('完成某 event 挂账的下一步时，当场 progress 闭环一行')
     expect(withAll).toContain('查教训用 "$SIMPLE_CODE_LESSON" read <name>')
     expect(withAll).toContain('读结论记忆用 "$SIMPLE_CODE_NOTE" read <name>')
     expect(withAll).toContain('以 git、notes 与 events 为准')

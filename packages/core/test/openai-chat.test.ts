@@ -27,10 +27,12 @@ const wireMessages = (messages: Message[]) =>
   body({ messages }).messages as Record<string, unknown>[]
 
 describe('openai-chat / 序列化', () => {
-  it('纯 reasoning 的 assistant 消息整条跳过——DeepSeek 官方 API 对 content:null 且无 tool_calls 的 assistant 报 400', () => {
+  it('纯 reasoning 的 assistant 消息带 content:"" 回放——不能是 null，也不能整条跳过', () => {
     // finish=length 掐在推理段中间就会存出这种消息（远程工作区
-    // turn-000178 实证）。续写请求原样回放它 → Invalid assistant
-    // message: content or tool_calls must be set，且 invalid_request 不可重试
+    // turn-000178 实证）。content:null 回放 → DeepSeek 官方 API 报 Invalid
+    // assistant message: content or tool_calls must be set（不可重试）；
+    // 整条跳过（e35d16c）→ 续写看不到截断前的推理，每次从头想、再被截断
+    // （2026-10-24 Terminal-Bench 实测 4×32k 空转）
     const out = body({
       system: '',
       messages: [
@@ -38,8 +40,19 @@ describe('openai-chat / 序列化', () => {
       { role: 'assistant', parts: [{ type: 'reasoning', text: '想了 12k 字被截断' }], at: 't' } as Message,
       ],
     }).messages as Record<string, unknown>[]
+    expect(out).toHaveLength(2)
+    expect(out[1]).toEqual({ role: 'assistant', content: '', reasoning_content: '想了 12k 字被截断' })
+  })
+
+  it('什么都没有的 assistant 消息仍整条跳过', () => {
+    const out = body({
+      system: '',
+      messages: [
+        { role: 'user', parts: [{ type: 'text', text: '继续' }], at: 't' } as Message,
+        { role: 'assistant', parts: [], at: 't' } as Message,
+      ],
+    }).messages as Record<string, unknown>[]
     expect(out).toHaveLength(1)
-    expect(out[0]?.role).toBe('user')
   })
 
   it('文本 + reasoning 的 assistant 照常带 reasoning_content——回传瘦身不在本修复范围', () => {

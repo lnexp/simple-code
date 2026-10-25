@@ -34,6 +34,8 @@ import {
   reduce,
 } from '../webview/events.ts'
 import type { ApprovalRequest, ToHost, ToWebview } from './protocol.ts'
+import { computeMemoryStats } from '@simple-code/core'
+import { REFLECT_TASK_BOOK } from './reflect.ts'
 import { join } from 'node:path'
 import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { execFile as execFileCb } from 'node:child_process'
@@ -783,6 +785,43 @@ export function createBridge(deps: BridgeDeps): Bridge {
         case 'task_dispatch':
           dispatchTask(msg.brief)
           return
+        case 'reflect_panel':
+          // 计数是纯 fs 扫描，同步算即可；folder 记忆库按目录（FolderPicker 切换后重取）
+          post({ type: 'memory_data', stats: computeMemoryStats(deps.folder) })
+          return
+        case 'reflect_start': {
+          const busy = (): string | null => (running ? '主任务正在跑——等这轮跑完再开任务' : null)
+          void tasks.dispatch(REFLECT_TASK_BOOK, busy).then((error) => {
+            post({
+              type: 'reflect_result',
+              ok: error === null,
+              ...(error !== null ? { reason: error } : {}),
+            })
+          })
+          return
+        }
+        case 'reflect_reopen': {
+          // 关旧 + 起新，ext 侧串行保证顺序。非原子：关成功、开失败 → 报错，
+          // 旧任务已随关闭归档不丢（reflect-trigger.md §5，接受不做事务）
+          const busy = (): string | null => (running ? '主任务正在跑——等这轮跑完再关闭任务' : null)
+          void (async () => {
+            const r = await tasks.close('反思', { busy, waitIdle })
+            if (!r.ok) {
+              post({ type: 'reflect_result', ok: false, reason: r.error ?? '关闭失败' })
+              return
+            }
+            const error = await tasks.dispatch(
+              REFLECT_TASK_BOOK,
+              () => (running ? '主任务正在跑——等这轮跑完再开任务' : null),
+            )
+            post({
+              type: 'reflect_result',
+              ok: error === null,
+              ...(error !== null ? { reason: error } : {}),
+            })
+          })()
+          return
+        }
         case 'task_send': {
           const error = tasks.send(msg.task, msg.text)
           if (error !== null) post({ type: 'fatal', message: error })

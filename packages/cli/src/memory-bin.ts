@@ -14,6 +14,8 @@
  * 输出定位格式 turn-000012:step4 与 show 的 step 号同口径，可二跳。
  */
 import { runLog, runSearch, runShow } from '@simple-code/core/src/tools/memory.ts'
+import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts'
+import { logSearch } from './search-log.ts'
 
 const usage = `用法：
   memory show <turn> [--steps 3|-5] [--full]   读某个 turn（step 分组、裁剪长内容）
@@ -44,6 +46,7 @@ if (sub === 'show' && target) {
       max: arg('-n') === undefined ? undefined : Number(arg('-n')),
       ctx: process.argv.includes('--ctx'),
     })
+    logSearch('memory', findWorkspaceRoot(process.cwd()), target, hits.length)
     if (hits.length === 0) {
       process.stderr.write(`没有命中「${target}」\n`)
       process.exit(1)

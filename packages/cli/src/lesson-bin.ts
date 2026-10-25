@@ -26,8 +26,16 @@
  * （目标 .simple-code/lessons/<name>.md，免审批）。
  */
 import { readFileSync } from 'node:fs'
-import { type LessonWriteInput, listLessons, parseStdinLessonInput, readLesson, searchLessons, writeLesson } from '@simple-code/core/src/tools/lesson.ts'
+import {
+  type LessonWriteInput,
+  listLessons,
+  parseStdinLessonInput,
+  readLesson,
+  searchLessons,
+  writeLesson,
+} from '@simple-code/core/src/tools/lesson.ts'
 import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts'
+import { logSearchText } from './search-log.ts'
 
 // 工作区根：cwd 可能是子目录（workspace-root.ts）
 const root = findWorkspaceRoot(process.cwd())
@@ -47,14 +55,17 @@ function arg(name: string): string | undefined {
 }
 
 const [sub, target] = process.argv.slice(2)
+const all = process.argv.includes('--all')
 
 try {
   if (sub === 'list') {
-    console.log(listLessons(root))
+    console.log(listLessons(root, all))
   } else if (sub === 'read' && target) {
     console.log(readLesson(root, target))
   } else if (sub === 'search' && target) {
-    console.log(searchLessons(root, target))
+    const out = searchLessons(root, target, all)
+    logSearchText('lesson', root, target, out)
+    console.log(out)
   } else if (sub === 'write') {
     const fromStdin = stdinJsonInput() as Partial<LessonWriteInput> | null
     console.log(

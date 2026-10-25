@@ -121,4 +121,18 @@ describe('note 库', () => {
     expect(searchNotes(root, '不存在词')).toContain('没有 note 命中')
     expect(() => searchNotes(root, '')).toThrow('search 需要 query')
   })
+
+  it('search：OR 候选组与多词排序——照 memory search 用法带 OR 不再静默 0 命中', () => {
+    const root = dir()
+    writeNote(root, { name: 'cache-ttl', title: '缓存', description: '缓存时长', body: '正文 cache_control 断点' })
+    writeNote(root, { name: 'unrelated', title: '无关', description: '别的', body: 'only for or-ing English words' })
+    // OR 组：任一候选词命中即候选（此前整串 indexOf 必 0 命中——2026-10-19 真实日志 23 次全落空）
+    expect(searchNotes(root, 'ttl OR 1h OR cache_control')).toContain('cache-ttl')
+    // 命中词多的排前：两个候选都命中的排在只中一词的前面
+    writeNote(root, { name: 'both-hit', title: '双中', description: 'ttl 与 cache_control 都有', body: 'ttl cache_control' })
+    const out = searchNotes(root, 'ttl OR cache_control')
+    expect(out.indexOf('both-hit')).toBeLessThan(out.indexOf('cache-ttl'))
+    // 反向：OR 分隔符不参与匹配，纯 OR 查不出东西
+    expect(searchNotes(root, '不存在甲 OR 不存在乙')).toContain('没有 note 命中')
+  })
 })

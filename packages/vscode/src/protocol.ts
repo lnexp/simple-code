@@ -5,6 +5,7 @@ import type {
   CompactResult,
   Effort,
   ImageInput,
+  MemoryStats,
   ModelRef,
 } from '@simple-code/core'
 // 只取类型（import type，编译后消失）：ChatItem 定义在 webview 侧的事件层，
@@ -91,6 +92,12 @@ export type ToHost =
   /** 分支：从最新回答 fork（`/task` 或分支条 + 按钮都走这）。主干在跑会被拒
    *  （fork 要拷记忆库）。brief 是分支的第一条消息 */
   | { type: 'task_dispatch'; brief: string }
+  /** 记忆面板：取计数四元组 + 上次反思，响应一条 memory_data（reflect-trigger.md） */
+  | { type: 'reflect_panel' }
+  /** 点「反思」：以产品内置指令任务书开任务（不读文件、无 skill） */
+  | { type: 'reflect_start' }
+  /** 双选项的「关闭并重开」：关掉挂着的反思任务、起新的一次 */
+  | { type: 'reflect_reopen' }
   /** 分支：往分支发消息（切换分支后输入框的目标）。分支跑着 = 插话入队
    *  （core 的 newInput 语义），空闲 = 起新一轮 */
   | { type: 'task_send'; task: string; text: string; images?: ImageInput[] }
@@ -241,6 +248,10 @@ export type ToWebview =
    * 任务跟目录走，切走即清、切回由宿主镜像补发
    */
   | { type: 'tasks'; tasks: TaskState[]; folder?: string; /** 分支上限（+ 入口的显隐判据，宿主是唯一真相） */ limit: number }
+  /** 记忆面板的计数（reflect_panel 的响应） */
+  | { type: 'memory_data'; stats: MemoryStats }
+  /** 反思开任务的结果：ok = 受理（面板自动关）；失败留 reason 在面板里 */
+  | { type: 'reflect_result'; ok: boolean; reason?: string }
   /** 分身任务的流事件（task_agent → 任务面板的增量）。只在 active 直发 */
   | { type: 'task_agent'; name: string; event: AgentEvent; at: number; folder?: string }
   /** 分身任务面板的基线（切回/重开时补发，整体替换该任务的 items） */

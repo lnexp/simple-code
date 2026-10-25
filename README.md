@@ -84,6 +84,44 @@ export ZHIPU_API_KEY=...
 
 完整示例（含推理档位、超时、记忆参数）见 [`settings.example.json`](settings.example.json)，文件顶部的 `$comment` 逐项说明了各配置项的含义与取舍。审批白名单在 `~/.simple-code/approval.json`，MCP server 在 `~/.simple-code/mcp.json`，都不进 settings.json。
 
+### 可选 Claude Agent SDK 适配（macOS）
+
+可用于本机主对话和任务，仍使用 `anthropic-messages` 协议。普通模型无需安装，
+SDK 和原生程序不随扩展打包。需要时先在独立目录安装固定版本并保留锁文件：
+
+```bash
+npm install --prefix "$HOME/.simple-code/claude-agent-sdk" --save-exact @anthropic-ai/claude-agent-sdk@0.3.308
+```
+
+升级到支持此功能的 SC 版本后，在用户级 `~/.simple-code/settings.json`
+设置 `claudeAgentSdkPath`，值为上述安装根目录的**绝对路径**（不是 node_modules
+或可执行文件）。再在目标模型或 preset 下设 `claudeAgentSdk: true`；preset
+设为 `false` 可恢复普通 HTTP。原有 `headers` / `extraBody` 路由配置照常使用。
+
+例如已有模型 `opus` 使用 SDK、同 provider 的 `summary` 可直连时，合并以下字段
+到现有配置，保留各模型原有的 contextWindow、路由和连接配置：
+
+```json
+{
+  "claudeAgentSdkPath": "/Users/your-name/.simple-code/claude-agent-sdk",
+  "memory": { "summaryModel": "summary" },
+  "providers": {
+    "your-provider": {
+      "models": {
+        "opus": { "claudeAgentSdk": true }
+      }
+    }
+  }
+}
+```
+
+这些字段只是配置片段，不是完整配置；路径和启用开关不接受工作区覆盖。
+摘要、合并、recall 和视觉副模型不使用 SDK，必须显式指定可直连的
+`memory.summaryModel`。首版不支持 Remote-SSH、非 macOS、纯图片首条用户消息；
+图文混合可用。安装缺失、版本不符或不支持的使用方式会报错，不静默切回 HTTP。
+实际运行约需额外 220MiB 内存/请求；临时运行目录在项目 `.simple-code/tmp/`
+下隔离，结束后删除。适配依赖固定 SDK 的请求格式，渠道长期兼容不作保证。
+
 ## 终端用法
 
 ```bash

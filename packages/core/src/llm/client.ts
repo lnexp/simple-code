@@ -1,4 +1,4 @@
-import { isContentEvent, type LLMEvent, type SSEMessage } from './events.ts'
+import { isContentEvent, type LLMEvent, type RefusalDetail, type SSEMessage } from './events.ts'
 import {
   LLMStreamError,
   type Protocol,
@@ -7,6 +7,7 @@ import {
 } from './protocol.ts'
 import { parseSSE } from './protocols/utils/sse.ts'
 import { logRun } from '../runlog.ts'
+import { saveRefusalSnapshot } from './refusal-snapshot.ts'
 import { describeError } from '../tools/describe.ts'
 import type { FinishReason, Request } from './types.ts'
 
@@ -34,12 +35,16 @@ export async function* sendRequest(
   request: Request,
   options: SendOptions,
 ): AsyncIterable<LLMEvent> {
+  // 检查原信号，不能等 idle clock 换成新信号后再交给 fetch。
+  options.signal.throwIfAborted()
   const { url, headers, body } = options.protocol.buildRequest(request, options.provider)
+  const bodyText = JSON.stringify(body)
   const doFetch = options.fetchImpl ?? fetch
   const startedAt = Date.now()
   /** 流自然走完才算成功；消费者提前 break（少见）单独标记 */
   let completed = false
   let finishReason: FinishReason | undefined
+  let refusal: RefusalDetail | undefined
   let sawContent = false
   let failure: { kind: string; message: string } | undefined
   let tap: StreamTap | undefined
@@ -64,7 +69,7 @@ export async function* sendRequest(
     const response = await doFetch(url, {
       method: 'POST',
       headers,
-      body: JSON.stringify(body),
+      body: bodyText,
       signal: clock.signal,
     })
 
@@ -90,7 +95,10 @@ export async function* sendRequest(
       // （SSE 注释行 / ping 事件）也是字节但不是内容，按字节重置等于被
       // 心跳无限续命——某项目曾因此挂 12 分钟（2026-09-21）
       clock.touch()
-      if (ev.type === 'finish') finishReason = ev.reason
+      if (ev.type === 'finish') {
+        finishReason = ev.reason
+        refusal = ev.refusal
+      }
       sawContent ||= isContentEvent(ev)
       yield ev
     }
@@ -114,6 +122,15 @@ export async function* sendRequest(
     throw error
   } finally {
     clock.stop()
+    const ms = Date.now() - startedAt
+    const refusalLog = finishReason === 'content-filter'
+      ? await saveRefusalSnapshot({
+          ...(options.folder ? { folder: options.folder } : {}),
+          ...(options.tag ? { tag: options.tag } : {}), model: request.model,
+          protocol: options.protocol.name, provider: options.provider,
+          body: bodyText, startedAt, ...(refusal ? { refusal } : {}),
+        })
+      : {}
     // 每次尝试一行（重试 3 次就是 3 行）。中断（用户 abort）不计失败——
     // 那不是模型的问题，kind 记 'aborted' 便于区分
     const incomplete = !failure && !completed
@@ -126,10 +143,11 @@ export async function* sendRequest(
       model: request.model,
       ...(options.folder ? { folder: options.folder } : {}),
       ...(options.tag ? { tag: options.tag } : {}),
-      ms: Date.now() - startedAt,
+      ms,
       // 结束原因（stop/length/tool-calls/…）。查「为什么被截断」以前只能翻
       // turns 归档按续写指令原文整条匹配，现在一行 llm 就有
       ...(finishReason ? { finish: finishReason } : {}),
+      ...refusalLog,
       ...(failure ? { error: failure } : {}),
       ...(incomplete ? { incomplete: true } : {}),
       ...(empty ? { empty: true } : {}),
@@ -241,7 +259,7 @@ function startIdleClock(timeoutMs: number | undefined, outer: AbortSignal): Idle
         }
       } finally {
         // cancel 而不是 releaseLock：超时时底层连接还开着，不 cancel 就漏一条
-        void reader.cancel().catch(() => {})
+        await reader.cancel().catch(() => {})
       }
     },
     // fetch 阶段（响应头之前）没有事件可 touch，靠创建时的初始 arm 覆盖：
@@ -278,6 +296,7 @@ async function* readAll(body: ReadableStream<Uint8Array>): AsyncIterable<Uint8Ar
       if (value) yield value
     }
   } finally {
+    await reader.cancel().catch(() => {})
     reader.releaseLock()
   }
 }

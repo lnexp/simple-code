@@ -78,6 +78,38 @@ const send = (protocol: Protocol, response: Response) => {
 }
 
 describe('sendRequest', () => {
+  it.each([undefined, 1000])('消费者提前停止时取消底层流（idle=%s）', async (idleTimeoutMs) => {
+    let cancelled = false
+    const body = new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(new TextEncoder().encode(ANTHROPIC_SSE)) },
+      cancel() { cancelled = true },
+    })
+    const stream = sendRequest(REQ, {
+      protocol: resolveProtocol('anthropic-messages'), provider: PROVIDER,
+      signal: new AbortController().signal,
+      fetchImpl: stubFetch(new Response(body)).impl,
+      ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs }),
+    })
+    for await (const _ of stream) break
+    expect(cancelled).toBe(true)
+  })
+
+  it.each([undefined, 1000])('调用前取消不发送请求（idle=%s）', async (idleTimeoutMs) => {
+    const controller = new AbortController()
+    const reason = new Error('already stopped')
+    controller.abort(reason)
+    const { impl, calls } = stubFetch(new Response(bodyOf(ANTHROPIC_SSE)))
+    const stream = sendRequest(REQ, {
+      protocol: resolveProtocol('anthropic-messages'),
+      provider: PROVIDER,
+      signal: controller.signal,
+      fetchImpl: impl,
+      ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs }),
+    })
+    await expect(drain(stream)).rejects.toBe(reason)
+    expect(calls).toHaveLength(0)
+  })
+
   it('把 SSE 流交给协议解析，产出 LLMEvent', async () => {
     const protocol = resolveProtocol('anthropic-messages')
     const { stream } = send(protocol, new Response(bodyOf(ANTHROPIC_SSE), { status: 200 }))

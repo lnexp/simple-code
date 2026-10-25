@@ -27,11 +27,18 @@ const TOOL_DISPLAY: Record<string, { label: string; icon: string }> = {
   bash: { label: 'Shell 命令', icon: 'terminal' },
 }
 
-const displayOf = (name: string): { label: string; icon: string } =>
-  // 小写回退同 core 的 resolveTool（run.ts）：GLM 渠道把 bash 采样成 Bash
-  // （CC 风格大写），不回退就落进 tools 兜底——2026-10-17 切到 glm-5.3 后
-  // 图标从终端变扳手就是这么来的
-  TOOL_DISPLAY[name] ?? TOOL_DISPLAY[name.toLowerCase()] ?? { label: name, icon: 'tools' }
+const displayOf = (name: string): { label: string; icon: string } => {
+  // 回退链同 core 的 resolveTool（run.ts）：大小写 → 剥 mcp__<server>__ 前缀。
+  // GLM 渠道把 bash 采样成 Bash（2026-10-17 图标从终端变扳手）；
+  // claude-opus-5-5 网关包成 mcp__client__bash（2026-10-22 同症状）。流式行
+  // 是 tool_input_start 用渠道原名建的，库里老轮次也存着原名，只能在这里回退
+  const stripped = name.replace(/^mcp__[a-z0-9-]+__/i, '')
+  return (
+    TOOL_DISPLAY[name] ??
+    TOOL_DISPLAY[name.toLowerCase()] ??
+    TOOL_DISPLAY[stripped.toLowerCase()] ?? { label: name, icon: 'tools' }
+  )
+}
 
 const clock = (ms: number): string => {
   const sec = ms / 1000

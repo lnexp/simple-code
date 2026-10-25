@@ -19,13 +19,9 @@
  * 被挤出索引的文件永远不删——list 全量可列、read 照常。
  */
 import { readFileSync } from 'node:fs'
-import {
-  listNotes,
-  readNote,
-  searchNotes,
-  writeNote,
-} from '@simple-code/core/src/tools/note.ts'
+import { listNotes, readNote, searchNotes, writeNote } from '@simple-code/core/src/tools/note.ts'
 import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts'
+import { logSearchText } from './search-log.ts'
 
 // 工作区根：cwd 可能是子目录（workspace-root.ts）
 const root = findWorkspaceRoot(process.cwd())
@@ -42,6 +38,7 @@ const usage = `用法：
   改内容："$SIMPLE_CODE_APPLY_PATCH" 改 .simple-code/notes/<name>.md（免审批；write 撞同名拒绝，不覆盖）`
 
 const [sub, target] = process.argv.slice(2)
+const all = process.argv.includes('--all')
 const stdinText = () => {
   try {
     return process.stdin.isTTY ? '' : readFileSync(0, 'utf8')
@@ -52,9 +49,11 @@ const stdinText = () => {
 
 try {
   if (sub === 'list') {
-    console.log(listNotes(root))
+    console.log(listNotes(root, all))
   } else if (sub === 'search' && target) {
-    console.log(searchNotes(root, target))
+    const out = searchNotes(root, target, all)
+    logSearchText('note', root, target, out)
+    console.log(out)
   } else if (sub === 'read' && target) {
     console.log(readNote(root, target))
   } else if (sub === 'write') {
@@ -65,7 +64,10 @@ try {
     }
     const m = text.match(/^\s*name:\s*(.+)\ntitle:\s*(.+)\ndescription:\s*(.+)\n---\n?([\s\S]*)$/)
     if (!m) {
-      console.error('stdin 要逐行写 name:/title:/description:（单行），再一行 ---，其后是正文（见 usage），开头几行是：\n' + text.split('\n').slice(0, 5).join('\n'))
+      console.error(
+        'stdin 要逐行写 name:/title:/description:（单行），再一行 ---，其后是正文（见 usage），开头几行是：\n' +
+          text.split('\n').slice(0, 5).join('\n'),
+      )
       process.exit(2)
     }
     console.log(

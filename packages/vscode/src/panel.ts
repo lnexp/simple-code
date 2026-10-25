@@ -240,7 +240,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
    * 文件就用旧的，没有才会在建会话时炸（那时指引卡已经弹过）。失败只弹
    * 一次卡：同一实例里每个文件夹的工厂都会走到这，隧道通不通不会变
    */
-  private async remoteGlobalPath(): Promise<{ globalPath?: string }> {
+  private async remoteGlobalPath(): Promise<{ globalPath?: string; remote?: boolean }> {
     if (vscode.env.remoteName === undefined) return {}
     this.remoteSync ??= syncRemoteSettings()
     const result = await this.remoteSync
@@ -271,7 +271,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
           if (choice === '复制隧道配置块') void vscode.env.clipboard.writeText(block)
         })
     }
-    return { globalPath: result.path }
+    return { globalPath: result.path, remote: true }
   }
   private watchSettings(): void {
     for (const w of this.settingsWatchers) w.dispose()

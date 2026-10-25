@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { ToolContext } from '../src/tools/types.ts'
-import { createWebsearchTool, parseSseData } from '../src/tools/websearch.ts'
+import { mkdtemp, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createWebsearchTool, parseSseData, readWebsearchConfig, websearchEndpoint } from '../src/tools/websearch.ts'
 
 const ctx: ToolContext = { root: '/tmp', signal: new AbortController().signal }
 
@@ -157,5 +160,44 @@ describe('websearch / 网络', () => {
     } finally {
       vi.unstubAllGlobals()
     }
+  })
+})
+
+describe('经凭据代理（2026-10-23 websearch 迁代理）', () => {
+  it('headers 透传；非 200 带响应原文前 200 字（代理 500 的原因要能看到）', async () => {
+    const seen: Array<Record<string, string>> = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: unknown, init?: RequestInit) => {
+        seen.push(init?.headers as Record<string, string>)
+        return new Response('凭据代理：配置引用了环境变量 EXA_API_KEY，但它没有设置', { status: 500 })
+      }),
+    )
+    try {
+      const out = await createWebsearchTool({ url: 'http://127.0.0.1:1/websearch', headers: { 'x-sc-token': 't' } }).execute({ query: 'q' }, ctx)
+      expect(seen[0]?.['x-sc-token']).toBe('t')
+      expect(seen[0]?.authorization).toBeUndefined()
+      expect(out.output).toContain('HTTP 500')
+      expect(out.output).toContain('EXA_API_KEY')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('websearchEndpoint：匿名 / key 进 URL / 自定义 url 走 Bearer', () => {
+    expect(websearchEndpoint({})).toEqual({ url: 'https://mcp.exa.ai/mcp', headers: {} })
+    expect(websearchEndpoint({ exaApiKey: 'k&y' })).toEqual({ url: 'https://mcp.exa.ai/mcp?exaApiKey=k%26y', headers: {} })
+    expect(websearchEndpoint({ url: 'https://gw/x', exaApiKey: 'g' })).toEqual({ url: 'https://gw/x', headers: { authorization: 'Bearer g' } })
+  })
+
+  it('readWebsearchConfig：缺文件 = 匿名；${VAR} 展开；缺变量抛；坏 JSON 抛', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ws-'))
+    const p = join(dir, 'websearch.json')
+    expect(await readWebsearchConfig(p, {})).toEqual({})
+    await writeFile(p, '{"exaApiKey":"${EXA_API_KEY}"}')
+    expect(await readWebsearchConfig(p, { EXA_API_KEY: 'k' })).toEqual({ exaApiKey: 'k' })
+    await expect(readWebsearchConfig(p, {})).rejects.toThrow(/EXA_API_KEY/)
+    await writeFile(p, '{bad')
+    await expect(readWebsearchConfig(p, {})).rejects.toThrow()
   })
 })

@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises'
+import { expandEnv } from '../config/env.ts'
 import type { ToolDefinition } from '../llm/types.ts'
 import { describeError } from './describe.ts'
 import type { Tool, ToolContext, ToolOutput } from './types.ts'
@@ -19,6 +21,35 @@ export type WebsearchConfig = {
   exaApiKey?: string | undefined
   /** 可选。自定义 MCP 端点，须与 mcp.exa.ai 同形状（web_search_exa） */
   url?: string | undefined
+  /** 可选。附加请求头——bin 经宿主凭据代理时带 x-sc-token */
+  headers?: Record<string, string> | undefined
+}
+
+/**
+ * 上游端点与认证头：官方端点 key 在 URL 上；自定义端点（url）key 走
+ * Bearer 头；都没有 = 匿名层。直连（bin 无代理）与凭据代理共用这一套
+ */
+export function websearchEndpoint(config: WebsearchConfig): { url: string; headers: Record<string, string> } {
+  if (config.url) return { url: config.url, headers: config.exaApiKey ? { authorization: `Bearer ${config.exaApiKey}` } : {} }
+  if (config.exaApiKey) return { url: `https://mcp.exa.ai/mcp?exaApiKey=${encodeURIComponent(config.exaApiKey)}`, headers: {} }
+  return { url: 'https://mcp.exa.ai/mcp', headers: {} }
+}
+
+/**
+ * 读 websearch.json。缺失 = 匿名层 {}，静默（AGENTS.md「可选文件缺失是正常
+ * 情况」）；文件存在但 JSON 坏了抛——静默等于悄悄把计费路径切回免费层。
+ * exaApiKey 的 ${VAR} 按 env 展开，变量缺失抛（同理不能静默降级）
+ */
+export async function readWebsearchConfig(path: string, env: NodeJS.ProcessEnv = process.env): Promise<WebsearchConfig> {
+  let cfg: WebsearchConfig
+  try {
+    cfg = JSON.parse(await readFile(path, 'utf8')) as WebsearchConfig
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+    return {}
+  }
+  if (cfg.exaApiKey !== undefined) cfg.exaApiKey = expandEnv(cfg.exaApiKey, env)
+  return cfg
 }
 
 /** 超时 25 秒 */
@@ -92,11 +123,7 @@ export function createWebsearchTool(config: WebsearchConfig): Tool {
       const args = parseArgs(input)
       if (typeof args === 'string') return { output: args, exitCode: -1, isError: true }
 
-      const url =
-        config.url ??
-        (config.exaApiKey
-          ? `https://mcp.exa.ai/mcp?exaApiKey=${encodeURIComponent(config.exaApiKey)}`
-          : 'https://mcp.exa.ai/mcp')
+      const { url, headers } = websearchEndpoint(config)
 
       let body: string
       let status: number
@@ -107,10 +134,8 @@ export function createWebsearchTool(config: WebsearchConfig): Tool {
           headers: {
             'content-type': 'application/json',
             accept: 'application/json, text/event-stream',
-            // 自定义端点（url）时 key 走 Bearer 头；官方端点 key 在 URL 上
-            ...(config.url && config.exaApiKey
-              ? { authorization: `Bearer ${config.exaApiKey}` }
-              : {}),
+            ...headers,
+            ...config.headers,
           },
           body: JSON.stringify({
             jsonrpc: '2.0',
@@ -129,8 +154,10 @@ export function createWebsearchTool(config: WebsearchConfig): Tool {
         }
       }
       if (status !== 200) {
+        // 带响应原文：经代理时 500 的原因（如 EXA_API_KEY 没进宿主）在 body 里
+        const detail = body.trim() ? `：${body.trim().slice(0, 200)}` : ''
         return {
-          output: `Exa 返回 HTTP ${status}。可改用 webfetch 直接抓已知站点`,
+          output: `Exa 返回 HTTP ${status}${detail}。可改用 webfetch 直接抓已知站点`,
           exitCode: status,
           isError: true,
         }

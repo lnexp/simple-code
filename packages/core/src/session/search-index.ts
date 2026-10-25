@@ -13,7 +13,7 @@
  * 搜不到）。解法是经典 bigram 预处理：索引和查询两侧都用 `toFtsText`
  * 把 CJK 连续段切成两字词（「卸载机制」→「卸载 载机 机制」），查询侧
  * 再按 token 顺序组成 phrase——phrase 要求相邻，等价于原文含连续子串，
- * 语义与老的 indexOf 对齐。单字查询（「图」）用前缀匹配（`图*`）兜住。
+ * 语义与老的 indexOf 对齐。单字查询（「图」）与奇数段尾单字用前缀匹配（`"图" *`）兜住。
  *
  * 游标：steps 表的行从不删除（DELETE 只打 messages），所以 last_step_id
  * 是安全的增量游标。宿主在 save 尾部同步；CLI（$SIMPLE_MEMORY search）
@@ -57,11 +57,12 @@ export function matchExpr(query: string): string | null {
       if (terms.length === 0) return null
       return terms
         .map((term) => {
-          const toks = toFtsText(term)
-            .split(/\s+/)
-            .filter(Boolean)
-            .map((t) => (IS_CJK.test(t) ? `${t}*` : t))
-          return `"${toks.join(' ')}"`
+          const toks = toFtsText(term).split(/\s+/).filter(Boolean)
+          // 奇数段尾的单字要前缀匹配（原文里它多半是「雀发」这种 bigram 的
+          // 头）。FTS5 的前缀只能写在引号外：`"a b c" *`；写进引号里的 *
+          // 会被分词器当分隔符丢掉，只剩精确匹配（2026-10-23 实测）
+          const prefix = IS_CJK.test(toks[toks.length - 1] ?? '') ? ' *' : ''
+          return `"${toks.join(' ')}"${prefix}`
         })
         .join(' AND ')
     })
@@ -71,56 +72,100 @@ export function matchExpr(query: string): string | null {
 }
 
 const META_LAST_STEP = 'last_step_id'
+// 游标 step 那一行的 rowid：save 时 step 可能只落了 assistant（工具结果
+// 随后才落库），下次同步按 rowid 删掉重做游标 step，否则工具输出永远
+// 搜不到（2026-10-23 库副本比对：上次全量重灌后 118+ 行缺工具输出）
+const META_LAST_ROWID = 'last_rowid'
 
-/** 增量同步：把 > 游标的新 step 聚合进 FTS。宿主 save 尾部调用。 */
+const readMeta = (db: Db, k: string): string | undefined =>
+  (db.all<{ v: string }>(`SELECT v FROM search_fts_meta WHERE k = ?`, k)[0] as { v: string } | undefined)?.v
+
+const writeMeta = (db: Db, k: string, v: number): void =>
+  db.run(
+    `INSERT INTO search_fts_meta(k, v) VALUES(?, ?)
+     ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+    k,
+    String(v),
+  )
+
+/** 一个 step 聚合入倒排表，返回新行 rowid；step 还没有消息返回 null */
+function indexStep(db: Db, s: { id: number; turn_id: number }): number | null {
+  const msgs = db.all<{ content_json: string }>(
+    // 排除任务的复制行（同 store.ts NOT_COPY；这里不 import 是为了不跟
+    // store 成环）——否则 fork 前的 step 在任务存活期间读成双份
+    `SELECT content_json FROM messages WHERE step_id = ?
+       AND messages.owner IS (SELECT t.owner FROM turns t WHERE t.id = messages.turn_id) ORDER BY id`,
+    s.id,
+  )
+  if (msgs.length === 0) return null
+  const parts: string[] = []
+  for (const m of msgs) {
+    const line = JSON.parse(m.content_json) as { parts?: unknown[] }
+    for (const seg of searchable(line as Parameters<typeof searchable>[0])) parts.push(seg.text)
+  }
+  const stepNo = (
+    db.all<{ c: number }>(
+      `SELECT COUNT(*) c FROM steps WHERE turn_id = ? AND id <= ?`,
+      s.turn_id,
+      s.id,
+    )[0] as { c: number }
+  ).c
+  // 入库前必须过 toFtsText：原文的连续 CJK 在 unicode61 下是一整个 token，
+  // 2 字词全断链（「卸载」永远搜不到）。查询侧 matchExpr 做同一变换
+  db.run(
+    `INSERT INTO search_fts(text, turn_no, step_no) VALUES(?, ?, ?)`,
+    toFtsText(parts.join('\n')),
+    s.turn_id,
+    stepNo,
+  )
+  return (db.all<{ r: number }>(`SELECT last_insert_rowid() r`)[0] as { r: number }).r
+}
+
+/** 增量同步：重做游标 step（它可能后补了工具结果）+ 聚合 > 游标的新
+ * step。宿主 save 尾部调用。 */
 export function syncSearchIndex(db: Db): void {
   db.exec(`CREATE TABLE IF NOT EXISTS search_fts_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`)
-  const last = Number(
-    (
-      db.all<{ v: string }>(`SELECT v FROM search_fts_meta WHERE k = ?`, META_LAST_STEP)[0] as
-        | { v: string }
-        | undefined
-    )?.v ?? 0,
-  )
+  const last = Number(readMeta(db, META_LAST_STEP) ?? 0)
+  const lastRowid = readMeta(db, META_LAST_ROWID)
+  // 老库没有 last_rowid：游标 step 那行找不到，只能照旧从 > 游标开始
+  if (lastRowid !== undefined) {
+    db.run(`DELETE FROM search_fts WHERE rowid = ?`, Number(lastRowid))
+    // 先清掉指针：删掉的 rowid 可能被下一行复用，没重新插入就不能留着
+    db.run(`DELETE FROM search_fts_meta WHERE k = ?`, META_LAST_ROWID)
+  }
   const steps = db.all<{ id: number; turn_id: number }>(
-    `SELECT id, turn_id FROM steps WHERE id > ? ORDER BY id`,
+    `SELECT id, turn_id FROM steps WHERE id ${lastRowid !== undefined ? '>=' : '>'} ? ORDER BY id`,
     last,
   )
   for (const s of steps) {
-    const msgs = db.all<{ content_json: string }>(
-      // 排除任务的复制行（同 store.ts NOT_COPY；这里不 import 是为了不跟
-      // store 成环）——否则 fork 前的 step 在任务存活期间全量重灌时读成双份
-      `SELECT content_json FROM messages WHERE step_id = ?
-         AND messages.owner IS (SELECT t.owner FROM turns t WHERE t.id = messages.turn_id) ORDER BY id`,
-      s.id,
-    )
-    if (msgs.length === 0) continue
-    const parts: string[] = []
-    for (const m of msgs) {
-      const line = JSON.parse(m.content_json) as { parts?: unknown[] }
-      for (const seg of searchable(line as Parameters<typeof searchable>[0])) parts.push(seg.text)
-    }
-    const stepNo = (
-      db.all<{ c: number }>(
-        `SELECT COUNT(*) c FROM steps WHERE turn_id = ? AND id <= ?`,
-        s.turn_id,
-        s.id,
-      )[0] as { c: number }
-    ).c
-    // 入库前必须过 toFtsText：原文的连续 CJK 在 unicode61 下是一整个 token，
-    // 2 字词全断链（「卸载」永远搜不到）。查询侧 matchExpr 做同一变换
-    db.run(
-      `INSERT INTO search_fts(text, turn_no, step_no) VALUES(?, ?, ?)`,
-      toFtsText(parts.join('\n')),
-      s.turn_id,
-      stepNo,
-    )
-    db.run(
-      `INSERT INTO search_fts_meta(k, v) VALUES(?, ?)
-       ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
-      META_LAST_STEP,
-      String(s.id),
-    )
+    const rowid = indexStep(db, s)
+    if (rowid === null) continue
+    writeMeta(db, META_LAST_STEP, s.id)
+    writeMeta(db, META_LAST_ROWID, rowid)
+  }
+}
+
+/**
+ * 只重做指定 turn 的索引行（先删后灌，可重入）。关闭任务用：任务段的
+ * step 号在对话游标之下，增量同步收不到；以前在这里全量重灌，大库
+ * 冻宿主十几秒（2026-10-23 某真库 2.8 万 step 12.8s）。
+ * 游标不动；游标 step 恰在这些 turn 里时，last_rowid 跟到新行。
+ */
+export function reindexTurns(db: Db, turnIds: number[]): void {
+  if (turnIds.length === 0) return
+  db.exec(`CREATE TABLE IF NOT EXISTS search_fts_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`)
+  const marks = turnIds.map(() => '?').join(',')
+  db.run(`DELETE FROM search_fts WHERE turn_no IN (${marks})`, ...turnIds)
+  const last = Number(readMeta(db, META_LAST_STEP) ?? 0)
+  const steps = db.all<{ id: number; turn_id: number }>(
+    `SELECT id, turn_id FROM steps WHERE turn_id IN (${marks}) ORDER BY id`,
+    ...turnIds,
+  )
+  for (const s of steps) {
+    const rowid = indexStep(db, s)
+    if (s.id !== last) continue
+    if (rowid === null) db.run(`DELETE FROM search_fts_meta WHERE k = ?`, META_LAST_ROWID)
+    else writeMeta(db, META_LAST_ROWID, rowid)
   }
 }
 

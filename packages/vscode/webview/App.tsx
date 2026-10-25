@@ -1,4 +1,4 @@
-import type { BgProcessInfo } from '@simple-code/core'
+import type { BgProcessInfo, MemoryStats } from '@simple-code/core'
 import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
@@ -18,6 +18,7 @@ import type {
 } from '../src/protocol.ts'
 import { ActivityGroup, ProcessGroup } from './activity.tsx'
 import { compactText, ContextPanel } from './ctx-panel.tsx'
+import { MemoryPanel } from './memory-panel.tsx'
 import { EffortPicker, FolderTabs, ModelPicker, PresetPicker } from './controls.tsx'
 import {
   composeWithAttachments,
@@ -88,6 +89,9 @@ export function App() {
   const [fatal, setFatal] = useState<string | null>(null)
   /** 上下文分析面板（点底栏「上下文 X」）。数据按需拉取，不进 ChatView */
   const [ctxOpen, setCtxOpen] = useState(false)
+  const [memOpen, setMemOpen] = useState(false)
+  const [memStats, setMemStats] = useState<MemoryStats | null>(null)
+  const [memError, setMemError] = useState<string | null>(null)
   const [ctxPending, setCtxPending] = useState(false)
   const [regions, setRegions] = useState<RegionsInfo | null>(null)
   /** 手动压缩（面板按钮）。带 task：结果只在它自己那个分支的面板上显示 */
@@ -239,6 +243,14 @@ export function App() {
         // 更早的一页，prepend。滚回原来的位置由 Log 的 sticky 逻辑处理
         setView((v) => ({ ...v, items: [...msg.items, ...v.items] }))
         setHistory({ cursor: msg.next, more: msg.next !== null, loading: false })
+      } else if (msg.type === 'memory_data') {
+        setMemStats(msg.stats)
+      } else if (msg.type === 'reflect_result') {
+        // 受理成功 → 关面板回主视图看任务条；失败 → 理由留在面板里
+        if (msg.ok) {
+          setMemOpen(false)
+          setMemError(null)
+        } else setMemError(msg.reason ?? '开反思任务失败')
       } else if (msg.type === 'state') {
         setRunning(msg.running)
         swapFolder(msg.folder)
@@ -566,6 +578,13 @@ export function App() {
       <Composer
         running={branch === null ? running : tasks.find((x) => x.name === branch)?.status === 'running'}
         view={branch === null ? view : (taskViews[branch] ?? emptyView())}
+        onOpenMemory={() => {
+          // 记忆面板：开面板 + 拉计数（state 在 App，数据不进 ChatView——同 onOpenRegions）
+          setMemOpen(true)
+          setMemStats(null)
+          setMemError(null)
+          post({ type: 'reflect_panel' })
+        }}
         controls={(() => {
           // 控件区跟分支走（2026-09-22 拍板）：模型/深度/预设/窗口是分支
           // session 自己的账（TaskState 带来），预设列表、贴图通道也是（模型级）；
@@ -640,6 +659,21 @@ export function App() {
             post({ type: 'compact', ...(branch !== null ? { task: branch } : {}) })
           }}
           onClose={() => setCtxOpen(false)}
+        />
+      )}
+      {memOpen && (
+        <MemoryPanel
+          stats={memStats}
+          reflectTask={tasks.find((x) => x.name === '反思') ?? null}
+          busy={running}
+          error={memError}
+          onStart={() => post({ type: 'reflect_start' })}
+          onReopen={() => post({ type: 'reflect_reopen' })}
+          onView={() => {
+            setMemOpen(false)
+            post({ type: 'task_open', task: '反思' })
+          }}
+          onClose={() => setMemOpen(false)}
         />
       )}
       {zoom !== null && (
@@ -738,7 +772,7 @@ function Log({
     // 触顶拉历史：40px 内就发——等到 scrollTop === 0 才发的话最后一屏
     // 恰好填满时用户拉不动，卡在没有加载更多的死区里
     // 空列表不算触顶：切目录先清空视图，scrollTop 被夹到 0 也会来一次
-    // scroll，基线还没到就抢先拉一页（真库 ai-legal 这页带图 623ms，
+    // scroll，基线还没到就抢先拉一页（某真库这页带图 623ms，
     // 跟基线争宿主，「正在加载更早的消息」就是它）
     if (el.scrollTop < 40 && view.items.length > 0 && history.more && !history.loading) onFetchTop()
   }
@@ -1004,6 +1038,7 @@ function Composer({
   onStop,
   onNotice,
   onOpenRegions,
+  onOpenMemory,
 }: {
   running: boolean
   view: ChatView
@@ -1021,6 +1056,8 @@ function Composer({
   onNotice: (text: string) => void
   /** 点「上下文 X」：开面板 + 按需拉取分区快照（state 在 App，数据不进 ChatView） */
   onOpenRegions: () => void
+  /** 点「记忆」：开记忆面板 + 拉计数（同 onOpenRegions 的分工） */
+  onOpenMemory: () => void
 }) {
   const [text, setText] = useState('')
   const [images, setImages] = useState<ImageRef[]>([])
@@ -1245,6 +1282,12 @@ function Composer({
             上下文 {fmtTok(view.contextTokens)}
           </button>
         )}
+        {/* 记忆面板入口：**无条件渲染**（上下文按钮是 contextTokens > 0 条件渲染，
+            冷启动不可达——这是它进 .bar 的全部理由，reflect-trigger.md §3.1） */}
+        <button type="button" className="usage-ctx" title="记忆面板" onClick={onOpenMemory}>
+          <i className="codicon codicon-database" aria-hidden="true" />
+          记忆
+        </button>
         <div className="bar-right">
           {/* 审批两态开关（approval.md §4.2）。关 = 触发即放行；默认开。
               放在控件区最前：它是安全语义，和模型选择不是一类东西，

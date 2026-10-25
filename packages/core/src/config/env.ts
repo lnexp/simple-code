@@ -22,3 +22,16 @@ export function expandEnv(value: string, env: NodeJS.ProcessEnv = process.env): 
   }
   return resolved
 }
+
+const ENV_TEMPLATE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g
+
+/**
+ * 字符串内插版，**只给凭据代理的 headers 值用**（proxy/credential-proxy.ts）。
+ *
+ * 与 expandEnv 不内插的理由不冲突：那里「拼前缀该由协议层做」，而代理是
+ * 通用转发、没有协议层——`Authorization: Bearer ${KEY}` 的前缀只能写在
+ * 配置里。不支持转义；缺变量照样报错、只说变量名。
+ */
+export function expandEnvTemplate(value: string, env: NodeJS.ProcessEnv = process.env): string {
+  return value.replace(ENV_TEMPLATE, (_, name: string) => expandEnv(`\${${name}}`, env))
+}

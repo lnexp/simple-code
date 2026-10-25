@@ -2,7 +2,7 @@
   "name": "SimpleCode-Companion",
   "displayName": "SimpleCode Companion",
   "description": "SimpleCode 的本机伴生扩展：Remote-SSH 时模型请求走本机网络（key 不出本机），并自动配置反向隧道。",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "lnexp",
   "main": "./dist/extension.cjs",
   "engines": {

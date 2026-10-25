@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { deepMerge, stripDenied } from '../src/config/denylist.ts'
 import { expandEnv } from '../src/config/env.ts'
-import { loadConfig } from '../src/config/load.ts'
+import { loadConfig, resolveImageModel, selectModel } from '../src/config/load.ts'
 import { configSchema } from '../src/config/schema.ts'
 
 let root = ''
@@ -406,6 +406,27 @@ describe('config / 模型级请求偏好覆盖全局', () => {
     })
     expect((await load()).request.cacheTtl).toBe('1h')
   })
+
+  // 2026-10-23 实案：cacheTtlMs 是模型级、preset 改不了，选了 -1h preset
+  // 停 5 分钟照样 stale 压缩（runlog sinceMs 331426 / ttlMs 300000）
+  it('最终 cacheTtl 为 1h 时，过期判定至少 1 小时；没配 1h 的照旧', async () => {
+    await writeGlobal({
+      ...MINIMAL,
+      providers: {
+        p: {
+          ...MINIMAL.providers.p,
+          models: {
+            m: { contextWindow: 1000, cacheTtlMs: 300_000, presets: { long: { request: { cacheTtl: '1h' } } } },
+            big: { contextWindow: 1000, cacheTtlMs: 10_800_000, request: { cacheTtl: '1h' } },
+          },
+        },
+      },
+    })
+    const loaded = await load()
+    expect(loaded.model.cacheTtlMs).toBe(300_000)
+    expect(selectModel(loaded, { provider: 'p', model: 'm', preset: 'long' }, {}).model.cacheTtlMs).toBe(3_600_000)
+    expect(selectModel(loaded, { provider: 'p', model: 'big' }, {}).model.cacheTtlMs).toBe(10_800_000)
+  })
 })
 
 describe('config / deepMerge', () => {
@@ -515,3 +536,20 @@ describe('visionModel 解析', () => {
   })
 })
 
+
+describe('config / imageModel', () => {
+  it('未配置为 null；配了借 provider 的 baseUrl 与展开后的 apiKey，model 不必登记', () => {
+    expect(resolveImageModel(configSchema.parse(MINIMAL))).toBeNull()
+    const cfg = configSchema.parse({
+      ...MINIMAL,
+      providers: { p: { ...MINIMAL.providers.p, apiKey: '${IMG_KEY}' } },
+      imageModel: { provider: 'p', model: 'gpt-image-x' },
+    })
+    expect(resolveImageModel(cfg, { IMG_KEY: 'k' })).toEqual({ model: 'gpt-image-x', baseUrl: 'https://api.test', apiKey: 'k' })
+    expect(() => resolveImageModel(cfg, {})).toThrow(/环境变量 IMG_KEY/)
+  })
+  it('provider 不存在报错并列出已配置的', () => {
+    const cfg = configSchema.parse({ ...MINIMAL, imageModel: { provider: 'nope', model: 'x' } })
+    expect(() => resolveImageModel(cfg)).toThrow(/imageModel 的 provider "nope".*p/)
+  })
+})

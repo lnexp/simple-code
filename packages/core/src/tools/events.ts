@@ -13,14 +13,21 @@
  * 格式双保险：首行 `# name — description`、进展固定节标题——本模块
  * 挂了，裸 grep/head 一条命令也能用。
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { decayCutoff, decayNotice, parseStamp, splitByDecay } from './decay.ts'
+import { stampLastRead } from './last-read.ts'
+import { matchTerms, splitSearchTerms } from './search-terms.ts'
 import { localStamp } from './timestamp.ts'
 
 export const eventsDir = (root: string) => join(root, '.simple-code', 'events')
 
 const slug = (name: string) =>
-  name.toLowerCase().trim().replace(/[\s_]+/g, '-').replace(/[^a-z0-9-\u4e00-\u9fff]/g, '')
+  name
+    .toLowerCase()
+    .trim()
+    .replace(/[\s_]+/g, '-')
+    .replace(/[^a-z0-9-\u4e00-\u9fff]/g, '')
 
 export type EventCard = {
   name: string
@@ -28,6 +35,7 @@ export type EventCard = {
   description: string
   created?: string
   updated?: string
+  lastRead?: string
 }
 
 /** 手写解析 yaml 头 + 固定节（与 note 的 front matter 同款思路，不引库） */
@@ -53,6 +61,8 @@ export function parseEventMeta(text: string): EventCard {
     if (created?.[1]) out.created = created[1].trim()
     const updated = line.match(/^updated:\s*(.+)$/)
     if (updated?.[1]) out.updated = updated[1].trim()
+    const lastRead = line.match(/^lastRead:\s*(.+)$/)
+    if (lastRead?.[1]) out.lastRead = lastRead[1].trim()
   }
   return out
 }
@@ -80,26 +90,40 @@ export function loadEvents(root: string): EventCard[] {
 }
 
 /** bin 的 list：一行式 `name — description`（system prompt 索引只用名称，那边自己拼） */
-export function listEvents(root: string): string {
+/** list：一行式 name + description。默认收起超半年未用（信号
+ * max(lastRead, updated)——progress 追加算活动），--all 全量
+ * （memory-time-decay ②） */
+export function listEvents(root: string, all = false): string {
   const cards = loadEvents(root)
   if (cards.length === 0) return '（events 目录为空或不存在——尚无归档）'
-  return cards.map((c) => `- ${c.name}${c.description ? ` — ${c.description}` : ''}`).join('\n')
+  const { visible, hidden } = splitByDecay(cards, eventSignal)
+  const lines = (all ? cards : visible).map(
+    (c) => `- ${c.name}${c.description ? ` — ${c.description}` : ''}`,
+  )
+  if (!all && hidden > 0) lines.push(decayNotice(hidden))
+  return lines.join('\n')
 }
 
 /** 进 system 索引的最大条数。名称一行约 10 token，30 条封顶 ≈ 300 token
  *  常驻（与 notes 的 NOTES_INDEX_LIMIT 同一量级心智） */
 export const EVENTS_INDEX_LIMIT = 30
 
-
-export function searchEvents(root: string, keyword: string): string {
-  const kw = keyword.trim()
-  if (kw === '') return '用法：event search <关键词>（匹配 name/description；更细的词 read 全文）'
-  const hits = loadEvents(root).filter((c) => {
-    const hay = `${c.name} ${c.description}`.toLowerCase()
-    return hay.includes(kw.toLowerCase())
-  })
-  if (hits.length === 0) return `没有命中「${kw}」的事件。list 看全量，或换关键词再试`
-  return hits.map((c) => `- ${c.name}${c.description ? ` — ${c.description}` : ''}`).join('\n')
+export function searchEvents(root: string, keyword: string, all = false): string {
+  const terms = splitSearchTerms(keyword)
+  if (terms.length === 0)
+    return '用法：event search <关键词>（匹配 name/description；更细的词 read 全文）'
+  const hits = loadEvents(root)
+    .map((c) => ({ c, m: matchTerms(`${c.name} ${c.description}`, terms) }))
+    .filter((x) => x.m !== null)
+    .sort((a, b) => b.m!.count - a.m!.count || a.c.name.localeCompare(b.c.name))
+    .map((x) => x.c)
+  const { visible, hidden } = splitByDecay(hits, eventSignal)
+  const shown = all ? hits : visible
+  const body =
+    shown.length === 0
+      ? `没有命中「${keyword}」的事件。list --all 看全量，或换关键词再试`
+      : shown.map((c) => `- ${c.name}${c.description ? ` — ${c.description}` : ''}`).join('\n')
+  return !all && hidden > 0 ? `${body}\n${decayNotice(hidden)}` : body
 }
 
 /** 全文或只看一段（--desc/--refs）。找不到时返回错误文案而非抛——bin 直出 */
@@ -115,9 +139,21 @@ export function readEvent(root: string, name: string, section?: 'desc'): string 
     const meta = parseEventMeta(text)
     return `${meta.name}${meta.description ? ` — ${meta.description}` : ''}`
   }
-  return text
+  // 全文读才盖心跳（--desc 是元数据偷看，不算使用）；lastRead 独立字段，
+  // 不碰 updated（progress 时间，喂 LRU 排序）
+  const stamped = stampLastRead(text)
+  if (stamped !== null) writeFileSync(path, stamped, 'utf8')
+  return stamped ?? text
 }
 
+/** 时间衰减信号：max(lastRead, updated) ?? created——progress 追加算活动，
+ *  活跃战役不误收；无任何时间字段算可见（宁可不遗忘，不误杀） */
+export function eventSignal(c: EventCard): number | null {
+  const times = [parseStamp(c.lastRead ?? ''), parseStamp(c.updated ?? '')].filter(
+    (x): x is number => x !== null,
+  )
+  return times.length > 0 ? Math.max(...times) : parseStamp(c.created ?? '')
+}
 /**
  * 三个写入原语（v3 可控式归档）：模型只产出判断，落盘全部由这里的代码
  * 完成——没有「整文件重写」路径，就没有重写事故（丢信息/塞旧文/格式漂移）。
@@ -148,7 +184,10 @@ export function createEvent(
 /** 进展行的「日期 · step」前缀由代码拼——模型只产那一句话，不带元数据 */
 const progressLine = (_root: string, sentence: string, stepRange?: string): string => {
   const day = localStamp().slice(0, 10)
-  const one = sentence.replace(/\s+/g, ' ').trim().replace(/^[-·*]\s*/, '')
+  const one = sentence
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^[-·*]\s*/, '')
   return `- ${day}${stepRange ? ` · step ${stepRange}` : ''} · ${one}`
 }
 
@@ -165,7 +204,7 @@ export function appendProgress(
   try {
     text = readFileSync(path, 'utf8')
   } catch {
-    return `没有 ${slug(name)} 这个事件。list 看全量`
+    return `没有 ${slug(name)} 这个事件。list --all 看全量`
   }
   if (!sentence.trim()) return '进展内容为空，跳过'
   const line = progressLine(root, sentence, stepRange)
@@ -181,7 +220,12 @@ export function appendProgress(
     let end = lines.length
     for (let i = headIdx + 1; i < lines.length; i++) {
       const l = lines[i]
-      if (l !== undefined && /^##\s/.test(l)) { end = i; break }
+      // H1 也算段界：merge 后的档案正文带旧战役 H1（# name — desc），
+      // 只认 ## 会让进展插进别人的段落开头（2026-10-21 复现）
+      if (l !== undefined && /^#{1,2}\s/.test(l)) {
+        end = i
+        break
+      }
     }
     // 倒着找最后一个非空行，插在它后面
     let insert = end
@@ -201,7 +245,7 @@ export function updateDescription(root: string, name: string, description: strin
   try {
     text = readFileSync(path, 'utf8')
   } catch {
-    return `没有 ${slug(name)} 这个事件。list 看全量`
+    return `没有 ${slug(name)} 这个事件。list --all 看全量`
   }
   const desc = description.replace(/\s+/g, ' ').trim()
   if (!desc) return '描述为空，跳过'
@@ -228,7 +272,7 @@ export function renameEvent(root: string, oldName: string, newName: string): str
   try {
     text = readFileSync(from, 'utf8')
   } catch {
-    return `没有 ${slug(oldName)} 这个事件。list 看全量`
+    return `没有 ${slug(oldName)} 这个事件。list --all 看全量`
   }
   if (slug(newName) === '') return '新名为空（slug 化后无字符），跳过'
   if (existsSync(to)) return `已存在 ${slug(newName)}，不覆盖——重名请换一个`
@@ -238,6 +282,60 @@ export function renameEvent(root: string, oldName: string, newName: string): str
   writeFileSync(to, out, 'utf8')
   rmSync(from)
   return `已改名 ${slug(oldName)} → ${slug(newName)}`
+}
+
+/**
+ * 合并原语（memory-time-decay ③，2026-10-21 拍板）：同战役的事件碎片
+ * 合成一个。event 是**索引**，索引条目本可整合——与 note/lesson（条目，
+ * 不合并不删除）区别对待。正文原样拼接（含各自的 H1/进展段，grep 旧
+ * 词仍命中正文），front matter 取并集：created 最早、updated 刷新为
+ * 本次、lastRead 取最新；description 用旧描述以「；」拼接。旧文件删除。
+ * 使用场景：reflect 整理时合并同战役；roster 时间收起造成的碎片修复。
+ */
+export function mergeEvents(root: string, newName: string, oldNames: string[]): string {
+  const dir = eventsDir(root)
+  const merged = slug(newName)
+  if (!merged) return '新名为空（slug 化后无字符），跳过'
+  if (oldNames.length < 2) return 'merge 至少要两个旧事件（单个用 rename）'
+  if (oldNames.map(slug).includes(merged)) return '新名不能与旧名相同（那是改名不是合并）'
+  const olds: { name: string; text: string; meta: EventCard }[] = []
+  const seen = new Set<string>()
+  for (const raw of oldNames) {
+    const name = slug(raw)
+    if (seen.has(name)) return `旧事件重复：${name}（参数传重了？）`
+    seen.add(name)
+    let text: string
+    try {
+      text = readFileSync(join(dir, `${name}.md`), 'utf8')
+    } catch {
+      return `没有 ${name} 这个事件。list --all 看全量`
+    }
+    olds.push({ name, text, meta: parseEventMeta(text) })
+  }
+  const to = join(dir, `${merged}.md`)
+  if (existsSync(to)) return `已存在 ${merged}，不覆盖——重名请换一个`
+  const pick = (key: 'created' | 'lastRead', last: boolean): string | undefined => {
+    const vals = olds.map((o) => o.meta[key]).filter((v): v is string => !!v)
+    if (vals.length === 0) return undefined
+    vals.sort()
+    return last ? vals.at(-1) : vals[0]
+  }
+  const description = [...new Set(olds.map((o) => o.meta.description).filter(Boolean))].join('；')
+  const now = localStamp()
+  // 新→旧排：appendProgress 落笔落进第一个「## 进展」段，即最新一节
+  olds.sort((a, b) => (b.meta.updated ?? b.meta.created ?? '').localeCompare(a.meta.updated ?? a.meta.created ?? ''))
+  const head =
+    `---\nname: ${merged}\ndescription: ${description}\n` +
+    `created: ${pick('created', false) ?? now}\nupdated: ${now}\n` +
+    (pick('lastRead', true) ? `lastRead: ${pick('lastRead', true)}\n` : '') +
+    `前身: ${olds.map((o) => o.name).join('、')}\n---\n\n` +
+    `# ${merged} — ${description}\n\n`
+  const body = olds
+    .map((o) => o.text.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, '').trim())
+    .join('\n\n')
+  writeFileSync(to, head + body + '\n', 'utf8')
+  for (const o of olds) rmSync(join(dir, `${o.name}.md`))
+  return `已合并 ${olds.map((o) => o.name).join(' + ')} → ${merged}（正文全保留，旧文件已移除，前身行在文件头）`
 }
 
 /**
@@ -253,6 +351,8 @@ export function readEventsIndex(root: string): string | null {
   if (cards.length === 0) return null
   const lines = cards.slice(0, EVENTS_INDEX_LIMIT).map((c) => `- ${c.name}`)
   if (cards.length > EVENTS_INDEX_LIMIT)
-    lines.push(`- ……另有 ${cards.length - EVENTS_INDEX_LIMIT} 条较早事件（"$SIMPLE_CODE_EVENT" list 全量）`)
+    lines.push(
+      `- ……另有 ${cards.length - EVENTS_INDEX_LIMIT} 条较早事件（"$SIMPLE_CODE_EVENT" list --all 全量）`,
+    )
   return lines.join('\n')
 }

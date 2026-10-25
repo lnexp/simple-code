@@ -271,3 +271,42 @@ describe('injectLocalTools（终端裸跑自补工具路径）', () => {
     }
   })
 })
+
+describe('ensureCredentialProxy（终端 sc 自起凭据代理）', () => {
+  const KEYS = ['SIMPLE_CODE_PROXY_PORT', 'SIMPLE_CODE_PROXY_TOKEN'] as const
+  const save = () => KEYS.map((k) => process.env[k])
+  const restore = (v: Array<string | undefined>) =>
+    KEYS.forEach((k, i) => (v[i] === undefined ? delete process.env[k] : (process.env[k] = v[i])))
+
+  it('无上层代理：起一个，写入端口与 token，错 token 401', async () => {
+    const { ensureCredentialProxy } = await import('../src/run.ts')
+    const saved = save()
+    try {
+      for (const k of KEYS) delete process.env[k]
+      const server = await ensureCredentialProxy()
+      expect(server).toBeDefined()
+      const port = process.env.SIMPLE_CODE_PROXY_PORT
+      expect(port).toMatch(/^\d+$/)
+      expect(process.env.SIMPLE_CODE_PROXY_TOKEN).toMatch(/^[0-9a-f]{48}$/)
+      const res = await fetch(`http://127.0.0.1:${port}/websearch`, { method: 'POST', headers: { 'x-sc-token': 'wrong' }, body: '{}' })
+      expect(res.status).toBe(401)
+      await new Promise((r) => server?.close(r))
+    } finally {
+      restore(saved)
+    }
+  })
+
+  it('嵌套（VS Code bash 里跑 sc）：已有上层代理 → 复用，不起新的', async () => {
+    const { ensureCredentialProxy } = await import('../src/run.ts')
+    const saved = save()
+    try {
+      process.env.SIMPLE_CODE_PROXY_PORT = '12345'
+      process.env.SIMPLE_CODE_PROXY_TOKEN = 'parent'
+      expect(await ensureCredentialProxy()).toBeUndefined()
+      expect(process.env.SIMPLE_CODE_PROXY_PORT).toBe('12345')
+      expect(process.env.SIMPLE_CODE_PROXY_TOKEN).toBe('parent')
+    } finally {
+      restore(saved)
+    }
+  })
+})

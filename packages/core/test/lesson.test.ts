@@ -70,6 +70,14 @@ describe('listLessons / readLesson / searchLessons', () => {
     expect(searchLessons(root, '完全不相关xyz')).toContain('没有教训命中')
   })
 
+  it('search：OR 候选组与多词命中排序（与 note search 同款，见 search-terms.ts）', () => {
+    writeLesson(root, { ...input, name: 'sse-eof-lesson', title: 't', description: 'SSE 断流判定' })
+    // OR 组：任一候选词命中（此前整串 indexOf 必 0 命中）
+    expect(searchLessons(root, '断流 OR 空响应 OR empty')).toContain('sse-eof-lesson')
+    // 反向：候选词都不在库里
+    expect(searchLessons(root, '不存在甲 OR 不存在乙')).toContain('没有教训命中')
+  })
+
   it('read 不存在抛错给下一步指引', () => {
     expect(() => readLesson(root, 'no-such')).toThrow(/list/)
   })
@@ -102,5 +110,21 @@ describe('lessonNamesIndex（system prompt 注入清单，2026-09-17 方案 A）
       expect(lines).toHaveLength(LESSONS_INDEX_LIMIT)
       expect(lines.some((l) => l.includes('old-lesson'))).toBe(false) // 老的被挤出
     } finally { rmSync(r2, { recursive: true, force: true }) }
+  })
+})
+
+describe('readLesson 心跳（memory-time-decay ①，2026-10-21）', () => {
+  it('read 盖 lastRead；重复读是替换不是堆叠；文件里其余不动', () => {
+    writeLesson(root, { ...input, name: 'heartbeat-lesson', title: 't', description: '心跳教训' })
+    const path = join(root, '.simple-code', 'lessons', 'heartbeat-lesson.md')
+    const before = readFileSync(path, 'utf8')
+    expect(before).not.toContain('lastRead:')
+    expect(readLesson(root, 'heartbeat-lesson')).toContain('## 修法')
+    const after = readFileSync(path, 'utf8')
+    expect(after).toContain('lastRead:')
+    readLesson(root, 'heartbeat-lesson')
+    expect(readFileSync(path, 'utf8').match(/lastRead:/g)).toHaveLength(1)
+    // 正文原样（front matter 之外不碰）
+    expect(after).toContain(before.match(/^# .+$/m)?.[0] ?? '')
   })
 })

@@ -252,7 +252,7 @@ const THUMB_EDGE = 256
 
 /**
  * 缩略图缓存：原图 sha1 → data URL。切目录会关 session、切回重建基线，
- * 同一批图每次都要 photon 同步重算（真库 ai-legal 12 张 879ms，卡宿主）。
+ * 同一批图每次都要 photon 同步重算（某真库 12 张 879ms，卡宿主）。
  * 进程级、按原图内容作键：基线/分页/live 三条路径共用，session 关了也
  * 还在。上限 300 条（256px JPEG 每张十几 KB，≈ 几 MB），满了丢最久没用的
  */

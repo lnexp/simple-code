@@ -7,7 +7,7 @@
  *
  *   fork  = 一个事务：reserved 行顶高 rowid + 三轴 sequence 跳段 + manifest
  *   存活  = owner-scoped session 写同一个库（store.ts 的 TaskScope）
- *   关闭  = live→unloaded → 摘要排空 → owner 还俗 NULL → FTS 全量重灌
+ *   关闭  = live→unloaded → 摘要排空 → owner 还俗 NULL → 补任务 turn 的 FTS 行
  *
  * 语义一句话：对话流私有（live/上下文/摘要按 owner 隔离），记忆共享
  * （归档、FTS、events 不分你我）。任务关闭后它的段就是对话的历史，
@@ -17,7 +17,7 @@ import { join } from 'node:path'
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { openDb, type Db, type SqlValue } from './db.ts'
 import { MEMORY_RELATIVE } from './store.ts'
-import { syncSearchIndex } from './search-index.ts'
+import { reindexTurns } from './search-index.ts'
 import { copyMarker, ensureInheritedCopy, type TaskScope } from './store.ts'
 import { MIGRATIONS, SCHEMA } from './schema.sql.ts'
 
@@ -195,17 +195,41 @@ export function forkTask(root: string, name: string): TaskManifest {
  * 关闭第一步：任务的 live 尾巴翻成 unloaded——数据即刻成为历史。
  * 之后任务的摘要器还能继续摘它（段选择不要求 live）
  */
-/** 返回翻成 unloaded 的行数（task_close 对账用） */
+/**
+ * 返回翻成 unloaded 的行数（task_close 对账用）。
+ *
+ * 同时补 `steps.unloaded = 1`：任务自己的 step 在原文全卸后应立即标记。
+ * `activateSummary` 要求段头 step 满足 `unloaded = 1` 才进场，否则摘要停在
+ * `in_context=0`，主任务看不到这段经历（2026-10-22 反思任务 task-5s3lud 的 4 份摘要）。
+ * 开库时 `reconcileStepUnloaded` 会补，但主任务库一直开着就漏了。
+ */
 export function flipTaskLive(root: string, owner: string): number {
   const db = openTaskDb(root)
   try {
     const own = `turn_id IN (SELECT id FROM turns WHERE owner = ?)`
     const flipped = db.all<{ c: number }>(`SELECT COUNT(*) AS c FROM messages WHERE state = 'live' AND ${own}`, owner)[0]?.c ?? 0
-    db.run(
-      `UPDATE messages SET state = 'unloaded'
-       WHERE state = 'live' AND turn_id IN (SELECT id FROM turns WHERE owner = ?)`,
-      owner,
-    )
+    db.transaction(() => {
+      db.run(
+        `UPDATE messages SET state = 'unloaded'
+         WHERE state = 'live' AND ${own}`,
+        owner,
+      )
+      // 判据与 reconcileStepUnloaded 同源：该 step 有消息、且没有任何 live 消息
+      // （任务复制行不算，owner 对不上）
+      db.run(
+        `UPDATE steps SET unloaded = 1
+         WHERE unloaded = 0
+           AND EXISTS (SELECT 1 FROM messages m WHERE m.step_id = steps.id)
+           AND NOT EXISTS (
+             SELECT 1 FROM messages m WHERE m.step_id = steps.id AND m.state = 'live'
+               AND m.owner IS (SELECT t.owner FROM turns t WHERE t.id = m.turn_id)
+           )
+           AND id IN (SELECT st.id FROM steps st
+                      JOIN turns t ON st.turn_id = t.id
+                      WHERE t.owner = ?)`,
+        owner,
+      )
+    })
     return flipped
   } finally {
     db.close()
@@ -215,8 +239,8 @@ export function flipTaskLive(root: string, owner: string): number {
 /**
  * 关闭末步：owner 还俗 NULL——任务的段从此就是对话的历史，所有可见性
  * 过滤（owner IS NULL）零特殊路径地把它收进来。配额的 reserved 行不动
- * （它本来就是对话侧的路标）。最后 FTS 全量重灌：任务段的低号 step 在
- * 存活期间位于增量游标之下，从未入过倒排表
+ * （它本来就是对话侧的路标）。最后只重做任务自己 turn 的 FTS 行：任务段
+ * 的低号 step 在存活期间位于增量游标之下，增量同步收不到
  */
 /** finalizeTask 各步改动行数——task_close 对账用（关闭后 owner/manifest 都没了，事后无从反推） */
 export type FinalizeCounts = {
@@ -265,6 +289,7 @@ export function finalizeTask(root: string, owner: string): FinalizeCounts {
       db.run(`UPDATE messages SET owner = NULL WHERE owner = ?`, owner)
       db.run(`DELETE FROM migrations WHERE name = ?`, copyMarker(owner))
       counts.turnsPromoted = count(`FROM turns WHERE owner = ?`, owner)
+      const ownTurns = db.all<{ id: number }>(`SELECT id FROM turns WHERE owner = ?`, owner).map((r) => r.id)
       db.run(`UPDATE turns SET owner = NULL WHERE owner = ?`, owner)
       // 合并改写了主任务的前缀（任务的经历摘要从此渲染在主任务上下文里）。
       // 前缀不变式：合法改写只搭压缩的车——合并这一刻主任务会话多半不在手上，
@@ -276,9 +301,7 @@ export function finalizeTask(root: string, owner: string): FinalizeCounts {
          ON CONFLICT(name) DO UPDATE SET ran_at = excluded.ran_at`,
         new Date().toISOString(),
       )
-      db.run(`DELETE FROM search_fts`)
-      db.run(`DELETE FROM search_fts_meta WHERE k = 'last_step_id'`)
-      syncSearchIndex(db)
+      reindexTurns(db, ownTurns)
     })
   } finally {
     db.close()

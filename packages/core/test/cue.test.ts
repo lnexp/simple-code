@@ -32,6 +32,21 @@ describe('关键词匹配引擎（2026-10-14 换芯：n-gram → 模型关键词
     expect(names).toEqual(['t1', 't3'])
   })
 
+  it('平手时新→旧：同命中数，覆盖更晚轮次的摘要在前（时间混合第一档）', () => {
+    const aged = [
+      { kind: 'summary', name: 't100', text: 'dev 构建', turnTo: 100 },
+      { kind: 'summary', name: 't900', text: '构建发布', turnTo: 900 },
+    ]
+    const { names } = matchSummaries(aged, ['构建'], { topK: 2 })
+    expect(names).toEqual(['t900', 't100'])
+    // 无 turnTo 的候选（兼容旧夹具）：退回名字序
+    const plain = [
+      { kind: 'summary', name: 't2', text: '构建 b' },
+      { kind: 'summary', name: 't1', text: '构建 a' },
+    ]
+    expect(matchSummaries(plain, ['构建'], { topK: 2 }).names).toEqual(['t1', 't2'])
+  })
+
   it('行格式：〔recall·async〕标记 + 命中词给证据（报碰撞）', () => {
     const { lines } = matchSummaries(candidates, ['构建'], { topK: 1 })
     expect(lines[0]).toBe('〔recall·async〕summary t1 — dev 构建发布验证全绿收口（命中: 构建）')

@@ -42,7 +42,8 @@ function mount() {
       }),
     clickCtx: () =>
       act(() => {
-        const btn = host.querySelector<HTMLButtonElement>('.usage-ctx')
+        // 记忆按钮也用 .usage-ctx（常驻）——按 title 锚定上下文按钮自己
+        const btn = host.querySelector<HTMLButtonElement>('[title="上下文分区分析"]')
         if (!btn) throw new Error('「上下文 X」按钮没渲染出来')
         btn.click()
       }),
@@ -103,7 +104,9 @@ describe('上下文分析面板接线', () => {
   it('step_finish 出数 → 按钮出现；点击发 get_regions；regions 回来渲染；Esc 关', () => {
     const app = mount()
     app.send(state)
-    expect(app.html()).not.toContain('usage-ctx') // 没数据不渲染
+    // 没数据不渲染（记忆按钮常驻且共用 .usage-ctx 类，锚 title 才是
+    // 「上下文按钮」自己的标识）
+    expect(app.html()).not.toContain('title="上下文分区分析"')
 
     app.send(finish)
     app.clickCtx()

@@ -596,7 +596,7 @@ export function createTaskCenter(deps: TaskDeps) {
    *   ① 在跑则先停（普通停止语义，interrupt 当前轮）
    *   ② live→unloaded：数据即刻成为历史
    *   ③ 摘要排空：任务自己的摘要器把 owner 段全部摘完
-   *   ④ owner 还俗 NULL + FTS 全量重灌 + 删 manifest
+   *   ④ owner 还俗 NULL + 补任务 turn 的 FTS 行 + 删 manifest
    * 摘要连续失败 3 次 → 照样收尾（裸段由对话空闲摘要兜底）+ runlog 记一行
    */
   const close = async (

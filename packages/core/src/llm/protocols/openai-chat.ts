@@ -114,13 +114,16 @@ function toWireMessages(msg: Message): WireMessage[] {
     .map((p) => p.text)
     .join('')
 
-  // **content 和 tool_calls 都空就整条跳过——reasoning 不能让它例外**。
-  // finish=length 掐在推理段中间会存出「纯 reasoning 的 assistant」，原样
-  // 回放是 {content:null} 无 tool_calls——DeepSeek 官方 API 直接 400
-  // 「content or tool_calls must be set」，且 invalid_request 不可重试，
-  // 续写每撞一次死一次（2026-10-10 远程工作区实案，turn-000178）。
-  // 有 content/tool_calls 的消息照常带 reasoning_content，回传瘦身另议
-  if (content.length === 0 && toolCalls.length === 0) return []
+  // **纯 reasoning 的 assistant 发 content:""，不发 null、也不跳过**。
+  // finish=length 掐在推理段中间会存出这种消息：
+  // - 发 {content:null} 无 tool_calls → DeepSeek 官方 API 400「content or
+  //   tool_calls must be set」，不可重试，续写连死（2026-10-10 turn-000178）
+  // - 整条跳过（e35d16c）→ 续写看不到截断前的推理，每次从头想、再被截断
+  //   （2026-10-24 Terminal-Bench glm-5.3-mb 4×32k 空转）
+  // 网关 glm-5.3-mb 实测 content:"" + reasoning_content 能读到推理；
+  // DeepSeek 官方对 "" 的接受度待远程机实测。三者全空才跳过
+  const starved = content.length === 0 && toolCalls.length === 0
+  if (starved && reasoning === '') return []
 
   return [
     {
@@ -128,7 +131,7 @@ function toWireMessages(msg: Message): WireMessage[] {
       // 纯文本时发字符串而不是数组：部分实现对 content 数组的支持不完整。
       // 没有文本时发 null 而不是空串——「只调工具不说话」是最常见的
       // assistant 形态，严格的实现会区分「没有内容」和「空内容」
-      content: content.length === 0 ? null : (asPlainText(content) ?? content),
+      content: starved ? '' : content.length === 0 ? null : (asPlainText(content) ?? content),
       // 这个协议没有 signature 之类的完整性字段，推理文本原样回传即可
       ...(reasoning === '' ? {} : { reasoning_content: reasoning }),
       ...(toolCalls.length > 0

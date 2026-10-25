@@ -248,3 +248,22 @@ describe('折叠 CSS 契约（grid-auto-rows）', () => {
     expect(text).toContain('.tool-body[data-open="true"] { grid-auto-rows: auto; }')
   })
 })
+
+/**
+ * 图标按工具名查表：渠道会改写工具名（GLM 把 bash 采样成 Bash；
+ * claude-opus-5-5 网关包成 mcp__client__bash）。流式阶段的行是
+ * tool_input_start 用渠道原名建的，core 归一后的 tool_call 不改行名，
+ * 所以 displayOf 必须和 core resolveTool 同规则回退——2026-10-22 opus
+ * 会话里 bash 行图标从终端变扳手就是这么来的
+ */
+describe('工具图标：渠道改写名回退到 bash', () => {
+  for (const name of ['bash', 'Bash', 'mcp__client__bash']) {
+    it(`${name} → codicon-terminal`, () => {
+      expect(render({ name })).toContain('codicon-terminal')
+    })
+  }
+
+  it('真不认识的工具仍落扳手兜底', () => {
+    expect(render({ name: 'mcp__client__unknown' })).toContain('codicon-tools')
+  })
+})

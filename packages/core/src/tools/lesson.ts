@@ -6,8 +6,11 @@
  * lessons 写放行（用户明示允许）。lesson 格式的权威定义在这里
  * （LESSON_SECTIONS），CLI 和未来的任何入口共用这一套组装。
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { decayCutoff, decayNotice, parseStamp, splitByDecay } from './decay.ts'
+import { stampLastRead } from './last-read.ts'
+import { matchTerms, splitSearchTerms } from './search-terms.ts'
 
 /** 五段固定，顺序即展示顺序。key 是 write 参数名（连字符折成驼峰），label 是正文标题 */
 export const LESSON_SECTIONS = [
@@ -64,18 +67,28 @@ export function renderLesson(input: LessonWriteInput): string {
   return `---\nname: ${input.name}\ndescription: ${oneLine(input.description)}\n---\n\n# ${input.title.trim()}\n\n${sections}\n`
 }
 
-/** list：全部教训的 name + description（front matter 的程序化消费者） */
-export function listLessons(root: string): string {
+/** list：全部教训的 name + description（front matter 的程序化消费者）。
+ * 默认收起超半年未用，--all 全量（memory-time-decay ②） */
+export function listLessons(root: string, all = false): string {
   const dir = lessonsDir(root)
   if (!existsSync(dir)) return '还没有任何教训（.simple-code/lessons/ 不存在）。'
-  const rows = readdirSync(dir)
+  const files = readdirSync(dir)
     .filter((f) => f.endsWith('.md'))
     .sort()
-    .map((f) => {
-      const fm = parseLessonFrontMatter(readFileSync(join(dir, f), 'utf8'))
-      return `  ${f.replace('.md', '')}  —  ${fm.description ?? '(缺 front matter description)'}`
-    })
-  return rows.length === 0 ? '教训库为空。' : `${rows.length} 条教训：\n${rows.join('\n')}`
+  const { visible, hidden } = splitByDecay(files, (f) => lessonSignal(join(dir, f)))
+  const rows = (all ? files : visible).map((f) => {
+    const fm = parseLessonFrontMatter(readFileSync(join(dir, f), 'utf8'))
+    return `  ${f.replace('.md', '')}  —  ${fm.description ?? '(缺 front matter description)'}`
+  })
+  const head = rows.length === 0 ? '教训库为空。' : `${rows.length} 条教训：\n${rows.join('\n')}`
+  return !all && hidden > 0 ? `${head}\n${decayNotice(hidden)}` : head
+}
+
+/** 时间衰减信号：fm 的 lastRead（read 心跳盖的），没有则文件 mtime
+ *  （lesson 无 created 字段，写入/盖章都会推 mtime） */
+export function lessonSignal(file: string): number | null {
+  const lr = /^lastRead:\s*(.+)$/m.exec(readFileSync(file, 'utf8'))?.[1]?.trim()
+  return (lr ? parseStamp(lr) : null) ?? statSync(file).mtimeMs
 }
 
 /**
@@ -109,26 +122,51 @@ export function lessonNamesIndex(root: string): string | null {
 
 export function readLesson(root: string, name: string): string {
   const path = join(lessonsDir(root), `${slugifyLessonName(name)}.md`)
-  if (!slugifyLessonName(name)) throw new Error('read 需要 name（kebab-case 文件名），如 lesson read webview-asset-cache')
-  if (!existsSync(path)) throw new Error(`教训 ${slugifyLessonName(name)} 不存在。先 list 看全部名字。`)
-  return readFileSync(path, 'utf8')
+  if (!slugifyLessonName(name))
+    throw new Error('read 需要 name（kebab-case 文件名），如 lesson read webview-asset-cache')
+  if (!existsSync(path))
+    throw new Error(`教训 ${slugifyLessonName(name)} 不存在。先 list --all 看全部名字。`)
+  const text = readFileSync(path, 'utf8')
+  const stamped = stampLastRead(text)
+  if (stamped !== null) writeFileSync(path, stamped, 'utf8')
+  return stamped ?? text
 }
 
-export function searchLessons(root: string, query: string): string {
-  const q = query.toLowerCase().trim()
-  if (!q) throw new Error('search 需要 query，如 lesson search 缓存')
+export function searchLessons(root: string, query: string, all = false): string {
+  const terms = splitSearchTerms(query)
+  if (terms.length === 0) throw new Error('search 需要 query，如 lesson search 缓存')
   const dir = lessonsDir(root)
   if (!existsSync(dir)) return '还没有任何教训。'
-  const hits: string[] = []
-  for (const f of readdirSync(dir).filter((x) => x.endsWith('.md')).sort()) {
+  const hits: { n: number; line: string }[] = []
+  let hidden = 0
+  for (const f of readdirSync(dir)
+    .filter((x) => x.endsWith('.md'))
+    .sort()) {
     const text = readFileSync(join(dir, f), 'utf8')
-    const at = text.toLowerCase().indexOf(q)
-    if (at === -1) continue
+    const m = matchTerms(text, terms)
+    if (!m) continue
+    // 时间衰减：超期命中收起；--all 全量
+    const s = lessonSignal(join(dir, f))
+    if (!all && s !== null && s < decayCutoff()) {
+      hidden++
+      continue
+    }
     const fm = parseLessonFrontMatter(text)
-    const window = text.slice(Math.max(0, at - 40), at + 80).replace(/\s+/g, ' ')
-    hits.push(`  ${f.replace('.md', '')}  —  ${fm.description ?? ''}\n    …${window}…`)
+    const window = text.slice(Math.max(0, m.at - 40), m.at + 80).replace(/\s+/g, ' ')
+    hits.push({
+      n: m.count,
+      line: `  ${f.replace('.md', '')}  —  ${fm.description ?? ''}\n    …${window}…`,
+    })
   }
-  return hits.length === 0 ? `没有教训命中「${query}」。` : `${hits.length} 条命中：\n${hits.join('\n')}`
+  const body =
+    hits.length === 0
+      ? `没有教训命中「${query}」。`
+      : `${hits.length} 条命中：\n${hits
+          .map((h, i) => ({ h, i }))
+          .sort((a, b) => b.h.n - a.h.n || a.i - b.i)
+          .map((r) => r.h.line)
+          .join('\n')}`
+  return !all && hidden > 0 ? `${body}\n${decayNotice(hidden)}` : body
 }
 
 /** write：五段缺段抛错（缺段的教训没有复读价值）；同名覆盖=修订 */
@@ -136,9 +174,14 @@ export function writeLesson(root: string, input: LessonWriteInput): string {
   const name = slugifyLessonName(input.name)
   if (!name) throw new Error('write 需要 name。用症状导向的 kebab-case（如 webview-asset-cache）。')
   const missing = LESSON_SECTIONS.filter((s) => String(input[s.key] ?? '').trim() === '')
-  if (missing.length > 0) throw new Error(`write 五段缺：${missing.map((s) => s.key).join('、')}。每段都要有内容——缺段的教训没有复读价值。`)
+  if (missing.length > 0)
+    throw new Error(
+      `write 五段缺：${missing.map((s) => s.key).join('、')}。每段都要有内容——缺段的教训没有复读价值。`,
+    )
   if (!input.title.trim() || !input.description.trim())
-    throw new Error('write 需要 title（一句话症状总标题）和 description（front matter 一行，写清治什么症状、什么时候读）。')
+    throw new Error(
+      'write 需要 title（一句话症状总标题）和 description（front matter 一行，写清治什么症状、什么时候读）。',
+    )
   const dir = lessonsDir(root)
   const file = join(dir, `${name}.md`)
   const existed = existsSync(file)

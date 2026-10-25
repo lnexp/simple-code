@@ -64,6 +64,8 @@ import {
   type Store,
 } from './store.ts'
 import { createPrefixGuard, type PrefixFingerprint } from '../loop/prefix-guard.ts'
+import { SC_VERSION } from '../version.ts'
+import { modelFetch } from './model-fetch.ts'
 
 /**
  * hydrate 出口的行（historyPage 的返回）。tool_result.images 从原图
@@ -235,6 +237,8 @@ export type CompactResult =
   | { ok: false; message: string }
 
 export type SessionOptions = LoadOptions & {
+  /** 宿主标识远程运行，避免可选本地 SDK 在远端启动。 */
+  remote?: boolean
   /** 覆盖工具集，测试用。默认只有 bash（第 1 步的边界） */
   tools?: Tool[]
   /** 覆盖发流的方式，测试用。绕开协议层和 HTTP */
@@ -282,6 +286,12 @@ export async function getSession(
   // 只能提前加载；期间审批走正则回退，语义一致只是精度低
   void warmupShellParser()
   let config = await loadConfig(folderPath, options)
+  const fetchScope = {
+    folder: folderPath,
+    remote: options.remote ?? false,
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+  }
+  modelFetch(config, fetchScope)
   const lock = options.skipLock ? null : await acquireLock(folderPath)
   const store =
     options.ephemeral || options.task === undefined
@@ -443,6 +453,8 @@ export async function getSession(
               }
             },
           },
+          // 升级后内建段/工具描述变了是正常的，不报（2026-10-24）
+          version: SC_VERSION,
           dump: ({ break: found, prev, next }) => {
             // dump 先写、日志后发：logRun 带上 dumpPath，排查时从日志直通现场
             // 文件，不用再翻代码找目录（2026-10-15 巡检踩过）。写失败照样记日志
@@ -491,7 +503,7 @@ export async function getSession(
     // 没配 visionModel → undefined）
     const visionRelay = makeVisionRelay(config, folderPath)
     const deps: LoopDeps = {
-    stream: options.stream ?? httpStream(config, options.fetchImpl, folderPath),
+    stream: options.stream ?? httpStream(config, modelFetch(config, fetchScope), folderPath),
     tools: new Map(tools.map((t) => [t.name, t])),
     root: folderPath,
     memoryRoot: options.memoryRoot ?? folderPath,
@@ -940,6 +952,7 @@ export async function getSession(
       if (sameModel && choice.preset === currentPreset) return
       // 先解析再改状态：模型名/预设名写错时抛异常，会话保持原样可用
       const next = selectModel(config, choice, options.env ?? process.env)
+      modelFetch(next, fetchScope)
       // 切换告知不在这里落（send 比对 lastTurnModel，见那里）。日志照记：
       // 排查「哪轮起换的模型」按分钟对齐 runlog 用。reload 后宿主的恢复
       // 选择也走这里，日志会多一条——那条不代表真切换
@@ -1899,7 +1912,7 @@ async function readNotesIndex(root: string): Promise<string | null> {
     .slice(0, NOTES_INDEX_LIMIT)
     .map((c) => `- ${c.name}${c.description ? ` — ${c.description}` : ''}`)
   const rest = total - lines.length
-  if (rest > 0) lines.push(`- （另有 ${rest} 条较旧或已作废未入索引："$SIMPLE_CODE_NOTE" list 全量可查）`)
+  if (rest > 0) lines.push(`- （另有 ${rest} 条较旧或已作废未入索引："$SIMPLE_CODE_NOTE" list --all 可查）`)
   return lines.join('\n')
 }
 
@@ -2005,7 +2018,7 @@ const toolRules = (env: NodeJS.ProcessEnv): string => {
     lines.push('- 下钻历史会话用 "$SIMPLE_CODE_MEMORY" search/show（one session 全量落盘，细节随时可捞）。')
   if (env.SIMPLE_CODE_EVENT !== undefined)
     lines.push(
-      '- 历史事件档案（按事归档、跨摘要窗口完整）：查「之前那件事怎么做的」优先用 "$SIMPLE_CODE_EVENT" search <关键词> / read <name>，别拼摘要碎片。档案结论错了可点状订正：progress <name> "<一句话>"（追加进展）、describe（改描述）、rename（改名）——不重写正文。',
+      '- 历史事件档案（按事归档、跨摘要窗口完整）：查「之前那件事怎么做的」优先用 "$SIMPLE_CODE_EVENT" search <关键词> / read <name>，别拼摘要碎片。档案结论错了可点状订正：progress <name> "<一句话>"（追加进展）、describe（改描述）、rename（改名）、merge <new> <oldA> <oldB>（同战役碎片合并，正文全保留）——不重写正文。',
     )
   // LSP 分流行（2026-09-17 v2 拍板）：分流句+语言无关从 bash 描述挪到这里——
   // 与 APPLY_PATCH 分工对齐：工具约定管「该用哪个」，描述管「怎么写」
@@ -2110,7 +2123,10 @@ const growthRules = (lessons: string | null, env: NodeJS.ProcessEnv): string =>
   '目录名即名字，按 SKILL.md 内容执行；改项目级 SKILL.md 走 "$SIMPLE_CODE_APPLY_PATCH"，用户级写走 bash 审批。\n' +
   '③note：结论记忆（决策/约定/一次性事实）。' +
   '重要的结论当场 `write` 记一条（一笔记一事，格式与读法见工具约定），' +
-  '别指望对话衰减后还记得。\n' +
+  '别指望对话衰减后还记得。记/订正/superseded/merge 自己判断直接做，' +
+  '不请示用户——这几库归 agent 管，写错的代价是 superseded，可逆；' +
+  'recall/search 撞到内容与现实矛盾的条目（如过时的 note 描述），' +
+  '当场订正，不等反思周期。\n' +
   // 常驻推论（t885）：①的 name、③的 description 是索引行，每轮全价重发；
   // 正文只在 read 时才进。模型不知道这个落差时会把力气花在正文、把
   // description 写成标题的同义反复——而那行才是「将来会不会点开」的唯一依据
@@ -2118,7 +2134,7 @@ const growthRules = (lessons: string | null, env: NodeJS.ProcessEnv): string =>
   // ④机制说明非动作（2026-09-17 v2 拍板）：event 的写入是 archiver 在压缩点
   // 自动跑的，模型只读——补齐全家福（教训/技能/note/事件四层沉淀各自怎么进出）
   (env.SIMPLE_CODE_EVENT !== undefined
-    ? '④事件归档：压缩点由 archiver 自动按事归档，跨摘要窗口完整——查「之前那件事怎么做的」优先 `"$SIMPLE_CODE_EVENT" search`（详见工具约定）。'
+    ? '④事件归档：压缩点由 archiver 自动按事归档，跨摘要窗口完整——查「之前那件事怎么做的」优先 `"$SIMPLE_CODE_EVENT" search`（详见工具约定）。完成某 event 挂账的下一步时，当场 progress 闭环一行。'
  : '')
 
 /**

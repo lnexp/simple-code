@@ -553,10 +553,10 @@ describe('历史回放（hydrateItems）', () => {
     const items = hydrateItems(
       msgs({
         role: 'user',
-        parts: [{ type: 'text', text: '〔系统〕模型已从 a/org/m-1 切换到 modelbest/claude-opus-5-5。此前的回复由上一个模型生成。' }],
+        parts: [{ type: 'text', text: '〔系统〕模型已从 a/org/m-1 切换到 b/org/m-2。此前的回复由上一个模型生成。' }],
       }),
     )
-    expect(items).toEqual([{ kind: 'divider', text: '模型已从 a/org/m-1 切换到 modelbest/claude-opus-5-5' }])
+    expect(items).toEqual([{ kind: 'divider', text: '模型已从 a/org/m-1 切换到 b/org/m-2' }])
   })
 
   it('tool_call 和 tool_result 跨消息按 id 配对成一条工具条目', () => {

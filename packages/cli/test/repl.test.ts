@@ -901,6 +901,48 @@ describe('REPL 审批', () => {
     expect(stderr()).toContain('[需要审批·非交互模式自动拒绝]')
     await expect(readFile('/tmp/sc-cli-approval-once.txt', 'utf8')).rejects.toThrow()
   })
+
+  it('非交互 + approveAll（测评容器）：ask 级命令放行并真执行', async () => {
+    const { dir, globalPath } = await workspace()
+    const { mkdtemp, readFile, rm } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { runOnce } = await import('../src/run.ts')
+    // 项目外路径 → external_dir 卡；默认会被拒（上一条用例）
+    const outside = await mkdtemp(join(tmpdir(), 'sc-approve-all-'))
+    const marker = join(outside, 'marker.txt')
+    const rounds = sseToolUseThenText().map((r) => r.replace('/tmp/sc-cli-approval.txt', marker))
+    let calls = 0
+    const impl = (async () => {
+      const text = rounds[Math.min(calls++, rounds.length - 1)]
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode(text))
+            c.close()
+          },
+        }),
+        { status: 200 },
+      )
+    }) as unknown as typeof fetch
+    const { sink, stderr } = collector()
+    try {
+      const code = await runOnce({
+        cwd: dir,
+        sink,
+        globalPath,
+        fetchImpl: impl,
+        prompt: '跑一条要审批的命令',
+        env: { TEST_KEY: KEY },
+        approveAll: true,
+      })
+      expect(code).toBe(0)
+      expect(stderr()).not.toContain('自动拒绝')
+      expect(await readFile(marker, 'utf8')).toContain('sc-approval-marker')
+    } finally {
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('斜杠命令 /model /effort', () => {

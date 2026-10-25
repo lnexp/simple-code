@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { mkdtempSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentEvent } from '../src/events.ts'
@@ -58,6 +58,8 @@ async function drive(options: {
   rounds?: StreamEvent[][]
   stream?: LoopDeps['stream']
   now?: () => number
+  /** 工作区根。默认 '/tmp'；要验证落盘行为时传 mkdtempSync 的真目录 */
+  root?: string
   messages?: Message[]
   tools?: Tool[]
   signal?: AbortSignal
@@ -84,7 +86,7 @@ async function drive(options: {
     stream: options.stream ?? scripted.stream,
     now: options.now ?? (() => 0),
     tools: new Map(tools.map((t) => [t.name, t])),
-    root: '/tmp',
+    root: options.root ?? '/tmp',
     caps: CAPS,
     request: {
       model: 'm',
@@ -253,6 +255,108 @@ describe('基本回合', () => {
     })
 
     expect(hits).toEqual(['upper'])
+  })
+
+  /**
+   * 网关前缀兜底，同一族的外部输入不可靠：2026-10-22 实测某网关渠道
+   * 把工具定义全改成 mcp__client__<name>（Anthropic 的 MCP 命名三段式），
+   * 响应回去不剥前缀，逐轮 tool_fail unknown tool
+   */
+  it('**工具名带 mcp__ 前缀时剥掉再命中**（网关把 bash 包成 mcp__client__bash）', async () => {
+    let ran = 0
+    const tool = fakeTool('bash', async () => {
+      ran++
+      return { output: 'ok', exitCode: 0, isError: false }
+    })
+    const h = await drive({
+      rounds: [calls('t1', 'mcp__client__bash'), says('好了')],
+      tools: [tool],
+    })
+
+    expect(ran).toBe(1)
+    expect(h.ctx.messages[2]?.parts[0]).toMatchObject({ isError: false })
+    expect(kinds(h.events)).not.toContain('tool_error')
+  })
+
+  it('前缀兜底只在精确匹配失败后生效：真有这个三段式工具时不误剥', async () => {
+    const hits: string[] = []
+    const wrapped = fakeTool('mcp__client__bash', async () => {
+      hits.push('wrapped')
+      return { output: 'wrapped', exitCode: 0, isError: false }
+    })
+    const plain = fakeTool('bash', async () => {
+      hits.push('plain')
+      return { output: 'plain', exitCode: 0, isError: false }
+    })
+    await drive({
+      rounds: [calls('t1', 'mcp__client__bash'), says('好了')],
+      tools: [wrapped, plain],
+    })
+
+    expect(hits).toEqual(['wrapped'])
+  })
+
+  /**
+   * 名字归一要落进历史：剥前缀解析成功后，存进 ctx.messages 的
+   * tool_call 名字也改成规范名——下一轮回给模型的消息、UI 工具行、
+   * jsonl 落盘全是干净名字，前缀不在历史里繁殖（glm 会模仿历史写法）
+   */
+  it('**归一写回历史**：mcp__client__bash 执行后，历史里的调用名叫 bash', async () => {
+    let ran = 0
+    const tool = fakeTool('bash', async () => {
+      ran++
+      return { output: 'ok', exitCode: 0, isError: false }
+    })
+    const h = await drive({
+      rounds: [calls('t1', 'mcp__client__bash'), says('好了')],
+      tools: [tool],
+    })
+
+    expect(ran).toBe(1)
+    const call = h.ctx.messages
+      .flatMap((m) => m.parts)
+      .find((p) => p.type === 'tool_call')
+    expect(call).toMatchObject({ name: 'bash' })
+  })
+
+  /**
+   * 归一必须早于 step_finish：session 的 persist 挂在 step_finish 上（工具
+   * 执行之前），那一刻存进库/归档的就得是规范名。原来归一放在
+   * executeTools 里，step_finish 先落一份前缀版，归一后指纹变了归档又追加
+   * 一份——2026-10-22 真库 turn-018255.jsonl 同一 call id 两行
+   */
+  it('归一早于 step_finish：persist 那一刻历史里已是 bash', async () => {
+    const seen: string[] = []
+    await drive({
+      rounds: [calls('t1', 'mcp__client__bash'), says('好了')],
+      tools: [fakeTool('bash')],
+      onEvent: (ev, ctx) => {
+        if (ev.type !== 'step_finish') return
+        for (const p of ctx.messages.flatMap((m) => m.parts)) {
+          if (p.type === 'tool_call') seen.push(p.name)
+        }
+      },
+    })
+
+    expect(seen[0]).toBe('bash')
+  })
+
+  it('归一写回不吞真名：注册表里真有 mcp__client__bash 时保持原样', async () => {
+    const hits: string[] = []
+    const wrapped = fakeTool('mcp__client__bash', async () => {
+      hits.push('wrapped')
+      return { output: 'wrapped', exitCode: 0, isError: false }
+    })
+    const h = await drive({
+      rounds: [calls('t1', 'mcp__client__bash'), says('好了')],
+      tools: [wrapped],
+    })
+
+    expect(hits).toEqual(['wrapped'])
+    const call = h.ctx.messages
+      .flatMap((m) => m.parts)
+      .find((p) => p.type === 'tool_call')
+    expect(call).toMatchObject({ name: 'mcp__client__bash' })
   })
 })
 
@@ -651,15 +755,24 @@ describe('输出被 max_tokens 截断', () => {
     expect(second).toContain('不要复述')
   })
 
-  it('零正文被截断（预算全烧在推理上）：换指令让模型精简推理直接给答案', async () => {
-    // 「直接接着写」对这个形态是误导——模型没写过正文，无从接着写；
-    // 而且截断的推理在重放时会被丢（openai-chat 守卫 / 无签名的 thinking），
-    // 模型看不见自己想过什么，只能引导它重想时大幅精简
-    const h = await drive({ rounds: [starved('想了很多很多字'), says('答案')] })
-
-    const second = JSON.stringify(h.sent[1]?.messages)
-    expect(second).toContain('精简推理')
-    expect(second).not.toContain('直接接着写')
+  it('零正文被截断：保留原消息，不另存推理、不引导读取，提示分步推进', async () => {
+    // 2026-10-23 140+SDK 六次实测：文件续读句 2/2 reasoning_extraction，
+    // 删除该句或改成中性分步提示均 2/2 正常。只改恢复指令，不删除原始记录。
+    mkdirSync('.simple-code/tmp', { recursive: true })
+    const root = mkdtempSync('.simple-code/tmp/starved-')
+    try {
+      const h = await drive({ root, rounds: [starved('想了很多很多字'), says('答案')] })
+      const prompt = h.sent[1]?.messages.findLast((m) => m.role === 'user')
+      expect(prompt?.parts).toEqual([{
+        type: 'text',
+        text: '本次输出达到长度上限，尚未生成正文。请把任务拆成小步骤，先完成一个可验证的步骤，再根据结果继续。',
+      }])
+      expect(h.ctx.messages.some((m) => m.parts.some((p) => p.type === 'reasoning' && p.text === '想了很多很多字'))).toBe(true)
+      expect(existsSync(join(root, '.simple-code', 'tmp', 'truncated-reasoning-0.md'))).toBe(false)
+      expect(h.requests()).toBe(2)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   it('连续截断最多续 3 次，然后报错停下', async () => {
@@ -678,6 +791,28 @@ describe('输出被 max_tokens 截断', () => {
     expect(h.requests()).toBe(4) // 首轮 + 3 次续写
     expect(h.events.at(-1)).toMatchObject({ type: 'error', retryable: false })
     expect((h.events.at(-1) as { message: string }).message).toContain('maxTokens')
+  })
+
+  // 2026-10-24 Terminal-Bench 实测：resumeCount 整轮累计不归零，长任务里
+  // 截断→干活→截断→干活→截断就被判「连续 3 次」停掉。CC query.ts:1720
+  // 每进下一步都清零 maxOutputTokensRecoveryCount
+  it('截断之间有一步正常干活（跑了工具），计数归零——上限是「连续」不是「累计」', async () => {
+    const h = await drive({
+      maxIterations: 20, // 8 次请求 + 4 次续写各占一轮，默认 10 不够
+      rounds: [
+        // 命令各不相同：同参同结果连做 3 次会被 doomLoopGuard 熔断
+        starved('想'), calls('t1', 'bash', { command: 'echo 1' }),
+        starved('想'), calls('t2', 'bash', { command: 'echo 2' }),
+        starved('想'), calls('t3', 'bash', { command: 'echo 3' }),
+        starved('想'),
+        says('做完了'),
+      ],
+    })
+
+    const truncs = h.events.filter((e) => e.type === 'truncated') as { attempt: number }[]
+    expect(truncs.map((e) => e.attempt)).toEqual([1, 1, 1, 1])
+    expect(h.events.some((e) => e.type === 'error')).toBe(false)
+    expect(h.requests()).toBe(8)
   })
 
   it('对照组：finish 是 stop 时不续写', async () => {
@@ -2441,6 +2576,8 @@ describe('拒答透传（finish.refusal → error 事件，2026-09-27 欠账补�
     expect(err!.retryable).toBe(false)
     expect(err!.message).toContain('harm_category')
     expect(err!.message).toContain('涉及敏感内容')
+    expect(err!.message).toContain('未自动重试或清理历史')
+    expect(err!.message).not.toContain('通常可行')
     // 不算错误流：这轮正常结束（无 tool call），只补一条说明
     expect(kinds(h.events)).toContain('step_finish')
     expect(h.requests()).toBe(1)

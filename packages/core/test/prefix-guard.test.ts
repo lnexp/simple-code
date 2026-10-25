@@ -108,6 +108,32 @@ describe('守卫状态机', () => {
     expect(() => guard.check(req(['a', 'b'], { system: '偷改' }), 'win=200000')).toThrow(PrefixBrokenError)
   })
 
+  it('版本号变了（用户升级扩展，工具描述随之变）= 静默换基线；同版本照报', () => {
+    let saved: PrefixFingerprint | null = null
+    const mk = (version: string) =>
+      createPrefixGuard({
+        baseline: { read: () => saved, write: (fp) => (saved = fp) },
+        dump: () => null,
+        version,
+      })
+    mk('0.1.3').check(req(['a', 'b']))
+    const tools = [{ name: 't', description: '新描述', inputSchema: {} }] as never
+    expect(() => mk('0.1.4').check(req(['a', 'b'], { tools }))).not.toThrow()
+    expect(() => mk('0.1.4').check(req(['a', 'b'], { tools, system: '偷改' }))).toThrow(PrefixBrokenError)
+  })
+
+  it('旧版落的基线没有版本字段（0.1.3 升上来）= 视为版本变了，不报', () => {
+    const { system, tools, messages, params } = fingerprint(req(['a', 'b']))
+    let saved: PrefixFingerprint | null = { params, system, tools, messages }
+    const guard = createPrefixGuard({
+      baseline: { read: () => saved, write: (fp) => (saved = fp) },
+      dump: () => null,
+      version: '0.1.4',
+    })
+    expect(() => guard.check(req(['a', 'b'], { system: '新版内建段' }))).not.toThrow()
+    expect(saved?.version).toBe('0.1.4')
+  })
+
   it('会话重建后（新守卫实例）违规：现场里 prev 仍有上一条请求原文', async () => {
     // 2026-09-23 真机教训：守卫实例随会话重建而弃，内存 prev 没了，现场文件
     // 里 prev 只剩 null，两条请求没法 diff。原文必须平时就落盘（last-requests/）
@@ -321,6 +347,51 @@ describe('前缀不变式（真 session 端到端）', () => {
     const s2 = await open(dir, globalPath)
     const evs = await collect(s2.send('重启后短问'))
     await s2.close()
+    expect(prefixErrors(evs)).toEqual([])
+  })
+
+  it('升级扩展后首请求（基线是旧版落的、工具描述变了）不报错；同版本改工具照报', async () => {
+    // 2026-10-24：0.1.3→0.1.4 工具描述变了，旧基线让老用户每个项目首条
+    // 消息都报「tools 变了…是 bug」。旧版基线没有 version 字段
+    const { dir, globalPath } = await workspace()
+    const s1 = await open(dir, globalPath)
+    await collect(s1.send('短问一'))
+    await s1.close()
+    const withTool = () =>
+      getSession(dir, {
+        globalPath,
+        env: { TEST_KEY: KEY },
+        tools: [
+          {
+            name: 'echo',
+            definition: { name: 'echo', description: '新版描述', parameters: { type: 'object' } },
+            execute: async () => ({ output: '', exitCode: 0, isError: false }),
+          } as never,
+        ],
+        stream: (() =>
+          (async function* () {
+            for (const ev of says('短答')) yield ev
+          })()) as LoopDeps['stream'],
+        fetchImpl: summaryFetch,
+        skipLock: true,
+      })
+    // 对照：同版本（开发装机）改了工具描述，照报
+    const same = await withTool()
+    expect(prefixErrors(await collect(same.send('同版本')))).toHaveLength(1)
+    await same.close()
+
+    const s3 = await open(dir, globalPath)
+    await collect(s3.send('回到无工具'))
+    await s3.close()
+    const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'))
+    const row = db.prepare('SELECT owner, fingerprint FROM prefix_baseline').get() as { fingerprint: string }
+    const { version: _drop, ...legacy } = JSON.parse(row.fingerprint) as PrefixFingerprint
+    db.prepare('UPDATE prefix_baseline SET fingerprint = ?').run(JSON.stringify(legacy))
+    db.close()
+
+    const upgraded = await withTool()
+    const evs = await collect(upgraded.send('升级后首问'))
+    await upgraded.close()
     expect(prefixErrors(evs)).toEqual([])
   })
 

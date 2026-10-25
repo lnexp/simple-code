@@ -18,9 +18,12 @@ import { readFile } from 'node:fs/promises'
 import {
   listMcpTools,
   callMcpTool,
+  isHttpServer,
+  McpNoProxyError,
   type McpServers,
 } from '@simple-code/core/src/tools/mcp.ts'
 import { MCP_CONFIG_PATH } from '@simple-code/core/src/config/load.ts'
+import { mcpProxyEndpoint } from '@simple-code/core/src/proxy/endpoint.ts'
 import { describeError } from '@simple-code/core/src/tools/describe.ts'
 
 /** 读 mcp.json 的 servers 段，读不到 = 没配置，正常情况（同 websearch-bin） */
@@ -45,6 +48,9 @@ const fail = (msg: string, code = 1): void => {
   process.stderr.write(`${msg}\n`)
   process.exitCode = code
 }
+/** 无代理是环境问题不是 server 问题：退出码 2，同 LSP 的「无桥」 */
+const failCall = (prefix: string, e: unknown): void =>
+  e instanceof McpNoProxyError ? fail(e.message, 2) : fail(`${prefix}${describeError(e)}`)
 
 if (argv[0] === '--help' || argv[0] === '-h' || argv.length === 0) {
   process.stdout.write(`${USAGE}\n`)
@@ -61,7 +67,9 @@ if (argv[0] === '--help' || argv[0] === '-h' || argv.length === 0) {
     for (const n of names) {
       const s = servers[n]
       if (!s) continue
-      process.stdout.write(`${n}   ${s.command} ${(s.args ?? []).join(' ')}\n`)
+      // url 型只列地址，headers 不打（里面是 ${VAR} 引用也不必进上下文）
+      const target = isHttpServer(s) ? s.url : `${s.command} ${(s.args ?? []).join(' ')}`
+      process.stdout.write(`${n}   ${target}\n`)
     }
   }
 } else if (argv[0] === 'tools') {
@@ -74,13 +82,13 @@ if (argv[0] === '--help' || argv[0] === '-h' || argv.length === 0) {
       fail(`未配置的 server：${name}。已配置：${Object.keys(servers).join(', ') || '（无）'}`, 2)
     else {
       try {
-        const tools = await listMcpTools(cfg)
+        const tools = await listMcpTools(cfg, mcpProxyEndpoint(name))
         for (const t of tools) {
           process.stdout.write(`${t.name} — ${t.description}\n`)
           process.stdout.write(`  参数: ${JSON.stringify(t.inputSchema)}\n`)
         }
       } catch (e) {
-        fail(`连不上 ${name}：${describeError(e)}`)
+        failCall(`连不上 ${name}：`, e)
       }
     }
   }
@@ -94,11 +102,11 @@ if (argv[0] === '--help' || argv[0] === '-h' || argv.length === 0) {
       fail(`未配置的 server：${name}。已配置：${Object.keys(servers).join(', ') || '（无）'}`, 2)
     else {
       try {
-        const r = await callMcpTool(cfg, tool, json ?? '')
+        const r = await callMcpTool(cfg, tool, json ?? '', mcpProxyEndpoint(name))
         if (r.isError) fail(r.text === '' ? `工具 ${tool} 报错（无文本输出）` : r.text)
         else process.stdout.write(`${r.text}\n`)
       } catch (e) {
-        fail(describeError(e))
+        failCall('', e)
       }
     }
   }

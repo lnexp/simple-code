@@ -15,14 +15,22 @@
  */
 import type { Summary } from '../loop/assemble.ts'
 
-/** 候选头部一行：kind 标来源，name 是去重键（read/search 的入口名） */
-export type CueCandidate = { kind: string; name: string; text: string }
+/** 候选头部一行：kind 标来源，name 是去重键（read/search 的入口名）。
+ *  turnTo = 覆盖到的最后一轮（时间混合的信号，见 matchSummaries） */
+export type CueCandidate = { kind: string; name: string; text: string; turnTo?: number }
 
 /**
- * 关键词匹配：子串包含（大小写不敏感）。命中数多的排前，平手按名字序
- * （确定性——同一输入两次装配字节一致是 prefix-guard 的前提）。names 返回
+ * 关键词匹配：子串包含（大小写不敏感）。命中数多的排前，平手**新→旧**，
+ * 再平手按名字序（确定性——同一输入两次装配字节一致是 prefix-guard 的
+ * 前提）。names 返回
  * 给去重（同一摘要连轮重撞 = 狼来了放大器：线索行常驻到该轮卸载，重复
  * 行每轮都占注意力）。行带命中词——认出靠它（报碰撞给证据）。
+ *
+ * 时间混合第一档（2026-10-19，XERJ rank_by_recency 的对照）：相关性分数
+ * （命中词数）只有序数意义，不作绝对比较——命中 3 的旧摘要与命中 2 的
+ * 新摘要谁相关，分数答不了。所以只在**平手**时让新摘要排前：同等相关度
+ * 下，覆盖更晚轮次的摘要信息更新、被后续摘要顶替的概率更低。要提到
+ * 加权混合（(1-w)·score + w·recency）得先有日志证明平手场景不够用。
  */
 export function matchSummaries(
   candidates: CueCandidate[],
@@ -40,7 +48,7 @@ export function matchSummaries(
       return { c, text, hits }
     })
     .filter((x) => x.hits.length > 0)
-    .sort((a, b) => b.hits.length - a.hits.length || a.c.name.localeCompare(b.c.name))
+    .sort((a, b) => b.hits.length - a.hits.length || (b.c.turnTo ?? 0) - (a.c.turnTo ?? 0) || a.c.name.localeCompare(b.c.name))
     .slice(0, opts.topK)
   return {
     lines: ranked.map((x) => `〔recall·async〕${x.c.kind} ${clip(x.c.name, 40)} — ${clip(x.text, 70)}（命中: ${x.hits.join(', ')}）`),
@@ -69,7 +77,7 @@ export function loadCueCandidates(summaries: Summary[], liveFloor: number | null
   for (const s of summaries)
     if (!s.inContext && s.level === 0 && (liveFloor === null || s.coversTo < liveFloor)) {
       const t = s.turnFrom === s.turnTo ? `${s.turnFrom ?? '?'}` : `${s.turnFrom ?? '?'}-${s.turnTo ?? '?'}`
-      out.push({ kind: 'summary', name: `t${t}`, text: `${s.name} ${s.head ?? ''}` })
+      out.push({ kind: 'summary', name: `t${t}`, text: `${s.name} ${s.head ?? ''}`, turnTo: s.turnTo ?? 0 })
     }
   return out
 }

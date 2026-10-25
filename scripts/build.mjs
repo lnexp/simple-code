@@ -80,6 +80,14 @@ const TARGETS = [
     options: { platform: 'node', format: 'esm', target: 'node22' },
   },
   {
+    // 生图薄壳：POST 到宿主凭据代理（core proxy/）的 /image/generations，
+    // 密钥与模型都在宿主侧，这里只解码落盘
+    name: 'imagegen-bin',
+    entry: 'packages/cli/src/imagegen-bin.ts',
+    outfile: 'packages/cli/dist/imagegen.js',
+    options: { platform: 'node', format: 'esm', target: 'node22' },
+  },
+  {
     name: 'memory-bin',
     entry: 'packages/cli/src/memory-bin.ts',
     outfile: 'packages/cli/dist/memory.js',
@@ -290,7 +298,7 @@ console.log('copied README.md + LICENSE (vscode package root)')
 // extension.cjs 的 activate 注入的 $SIMPLE_CODE_* 指向这里）
 // 新增 bin 记得登记这里——构建（TARGETS）只是产出，不拷进 vscode/dist
 // vsce 就带不上，$SIMPLE_CODE_* 指向空文件静默失败（event.js 漏过一次）
-for (const bin of ['webfetch.js', 'websearch.js', 'mcp.js', 'apply-patch.js', 'memory.js', 'lesson.js', 'note.js', 'skill.js', 'sc.js', 'lsp.js', 'event.js']) {
+for (const bin of ['webfetch.js', 'websearch.js', 'mcp.js', 'apply-patch.js', 'memory.js', 'lesson.js', 'note.js', 'skill.js', 'sc.js', 'lsp.js', 'event.js', 'imagegen.js']) {
   await copyFile(`${root}packages/cli/dist/${bin}`, `${root}packages/vscode/dist/${bin}`)
 }
 console.log('copied webfetch.js + websearch.js')

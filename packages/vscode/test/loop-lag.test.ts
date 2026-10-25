@@ -19,4 +19,18 @@ describe('watchLoopLag', () => {
     vi.advanceTimersByTime(1000)
     expect(lines).toHaveLength(1) // dispose 后不再记
   })
+
+  it('≥ 600s 记 loop_nap 不记 loop_lag（OS 睡眠/节流与真卡顿分档）', () => {
+    vi.useFakeTimers()
+    const lines: Record<string, unknown>[] = []
+    const w = watchLoopLag((ev) => void lines.push(ev))
+    // 宿主被打盹 925s（本周实测典型值）
+    vi.setSystemTime(Date.now() + 925_000)
+    vi.advanceTimersByTime(1000)
+    expect(lines).toEqual([{ ev: 'loop_nap', ms: 925_000 }])
+    // 醒后正常打拍不再记
+    vi.advanceTimersByTime(3000)
+    expect(lines).toHaveLength(1)
+    w.dispose()
+  })
 })

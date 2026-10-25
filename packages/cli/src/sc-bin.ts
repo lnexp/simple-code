@@ -28,6 +28,8 @@ export const SC_USAGE = `用法：sc            交互式对话（连续多轮�
   -h, --help             这段话
 
 配置读 ~/.simple-code/settings.json，字段缺失直接报错——不猜默认模型。
+环境变量 SIMPLE_CODE_APPROVE_ALL=1：一次性模式审批一律放行（只在隔离的
+测评容器里用；被 agent 调起时拒绝启动，退出 2）。
 stdin 不是终端时读入全部内容：给了任务文本 → 作为附加上下文前置；
 没给 → stdin 整体就是任务（heredoc 任务书）。
 
@@ -207,6 +209,14 @@ export async function scMain(argv: string[], io: ScIo): Promise<number> {
     io.stderr(`${denied}\n`)
     return 2
   }
+  // 审批全放行（测评容器，2026-10-24 用户批准）。父 agent 调起时（ROOTS
+  // 在）拒绝：否则 agent 一条 `SIMPLE_CODE_APPROVE_ALL=1 sc "..."` 就绕过
+  // 自己的审批，违背「逐级只减不增」
+  const approveAll = (io.env?.SIMPLE_CODE_APPROVE_ALL ?? process.env.SIMPLE_CODE_APPROVE_ALL) === '1'
+  if (approveAll && (io.env?.SIMPLE_CODE_ROOTS ?? process.env.SIMPLE_CODE_ROOTS)) {
+    io.stderr('SIMPLE_CODE_APPROVE_ALL 不能在 agent 调起的 sc 里用（子 agent 权限只减不增），拒绝启动\n')
+    return 2
+  }
 
   // 无参数 + 真终端 → REPL（人）。放在 stdin 读取之前：REPL 要自己接管
   // stdin（readline），先读掉就没了
@@ -249,6 +259,7 @@ export async function scMain(argv: string[], io: ScIo): Promise<number> {
     ...(io.fetchImpl ? { fetchImpl: io.fetchImpl } : {}),
     ...(p.model ? { model: p.model } : {}),
     ...(p.effort ? { effort: p.effort } : {}),
+    ...(approveAll ? { approveAll } : {}),
   })
   if (p.quiet && buf) io.stdout(buf)
   return code
@@ -261,8 +272,9 @@ export async function scMain(argv: string[], io: ScIo): Promise<number> {
 const argv1base = process.argv[1]?.split('/').pop()
 if (argv1base === 'sc' || argv1base === 'sc.js' || argv1base === 'sc-bin.ts') {
   // sc 的子进程同样承诺这批工具（run.ts injectLocalTools）
-  const { injectLocalTools } = await import('./run.ts')
+  const { ensureCredentialProxy, injectLocalTools } = await import('./run.ts')
   await injectLocalTools()
+  await ensureCredentialProxy()
   const controller = new AbortController()
   let interrupted = false
   let timedOut = false

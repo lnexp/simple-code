@@ -38,6 +38,7 @@ import type { StreamEvent } from './retry.ts'
 import { inputBudget as budgetOf, contextUsage, estimateMessageTokens, totalInputTokens } from './tokens.ts'
 import { unloadMessage } from './unload.ts'
 import type { PrefixGuard } from './prefix-guard.ts'
+import { replaceLegacyResumePrompts, RESUME_STARVED_PROMPT } from './truncation-recovery.ts'
 
 /**
  * 排队的任务，**FIFO**（core-modules.md §7）。
@@ -282,7 +283,7 @@ export type LoopContext = {
    * 而 exactOptionalPropertyTypes 下可选属性不能赋 undefined
    */
   lastFinish?: FinishReason | undefined
-  /** 已经因为输出被截断而续写了几次。见 resumeAfterTruncation */
+  /** 已经**连续**因为输出被截断而续写了几次（有一步不需续写即清零）。见 resumeAfterTruncation */
   resumeCount?: number
   /**
    * 这一轮是不是报错结束的（抛异常、跑满 maxIterations、截断续写用尽）。
@@ -524,9 +525,7 @@ async function* resumeAfterTruncation(ctx: LoopContext): AsyncGenerator<AgentEve
   // needsResume 下一轮还是 true，会一路续写到上限却一个请求都不发
   ctx.lastFinish = undefined
   // 两种截断形态指令不同：「正文中途断」从断点接着写；「零正文被截断」
-  // （预算全烧在推理上，DeepSeek 2026-10-10 实证）无从接着写——截断的推理
-  // 在重放时会被各协议丢（openai-chat 守卫 / 无签名 thinking 不回传），模型
-  // 看不见自己想过什么，只能引导它重想时大幅精简，把预算留给正文
+  // 无正文可接，提示分步推进。原消息仍保留，不另存推理或引导读取（见下）。
   const lastAssistant = ctx.messages.findLast((msg) => msg.role === 'assistant')
   const wroteText =
     lastAssistant?.parts.some((part) => part.type === 'text' && part.text !== '') ?? false
@@ -551,20 +550,6 @@ async function* resumeAfterTruncation(ctx: LoopContext): AsyncGenerator<AgentEve
 const RESUME_PROMPT =
   '输出被长度上限截断了。直接接着写，不要道歉、不要复述已经说过的内容。' +
   '如果是在句子中间断的，就从断的地方继续。把剩下的工作拆成小块，避免再次被截断。'
-
-/**
- * 措辞语义：
- *
- * > Output token limit hit before any text was written — the entire budget
- * > went to reasoning. Re-think concisely (only the steps needed to reach the
- * > answer) and give the answer directly, so you don't get cut off again.
- *
- * 不说「接着写」：没有正文可接。不提「你之前的推理已丢失」：模型看不见
- * 也改变不了这一点，说了只会引它道歉复述（见 RESUME_PROMPT 同款代价考量）
- */
-const RESUME_STARVED_PROMPT =
-  '输出被长度上限截断了，正文一个字都没写出来——整个预算都花在了推理上。' +
-  '重新思考时大幅精简推理，只保留得出答案必需的步骤，然后直接给出正文答案，避免再次被截断。'
 
 /**
  * 退出条件是四个条件的合取，**不是 `toolCalls.length === 0`**。
@@ -632,8 +617,25 @@ async function* runStep(ctx: LoopContext): AsyncIterable<AgentEvent> {
   // 预算基线的下标在 streamWithOverflowRecovery 里记（发请求那一刻，按拼装
   // 后那份的长度）。这里只推回复——**它是下一轮的「新增」**，所以必须在
   // 记完基线之后进数组
+  //
+  // 工具名归一（2026-10-22 拍板）：渠道改写形（mcp__client__bash、Bash）
+  // 解析成功就改写成注册表规范名，回给模型的历史、UI 工具行、落盘全是干净
+  // 名字，模型不会从历史里学到改写形。tool 消息三个协议都只配 id 不带名，
+  // 归一 assistant 这一头即两头干净。**必须在 push 之前**：session 的
+  // persist 挂在下面的 step_finish 上（早于工具执行），晚了库和归档会先存
+  // 一份前缀版，归档按指纹去重又追加一份规范版（turn-018255 实锤）。
+  // 真有三段式同名工具时 resolveTool 精确命中，不重写
+  for (const call of pendingToolCalls(acc)) {
+    const tool = resolveTool(ctx.deps.tools, call.name)
+    if (tool && tool.name !== call.name) call.name = tool.name
+  }
   ctx.messages.push(finishAccumulator(acc))
   ctx.lastFinish = acc.finish
+  // 这一步不需要续写（正常结束或调了工具）= 有进展，续写计数清零：
+  // MAX_RESUME 管的是「连续」截断。不清的话整轮累计，长任务里
+  // 截断→干活→截断→干活→截断就被停掉（2026-10-24 Terminal-Bench 实测；
+  // CC query.ts:1720 每进下一步清零 maxOutputTokensRecoveryCount）
+  if (!needsResume(ctx)) ctx.resumeCount = 0
   ctx.lastUsage = acc.usage
   // 同一次请求：真实 usage（API 计数，底栏打底用的就是它）× 估算（面板用的
   // 字符密度估法）。usage 全 0 = 渠道没报（网关常见），照记——那本身就是信息
@@ -657,7 +659,7 @@ async function* runStep(ctx: LoopContext): AsyncIterable<AgentEvent> {
     const detail = [category, explanation].filter(Boolean).join('：')
     yield {
       type: 'error',
-      message: `模型侧安全拒答——${detail}。同样的请求换个模型重发通常可行。`,
+      message: `模型侧安全拒答——${detail}。本轮已停止，未自动重试或清理历史。切换模型后出现时，可先切回原模型继续。`,
       retryable: false,
     }
   }
@@ -818,6 +820,10 @@ const isContextOverflow = (error: unknown): boolean =>
  * 没有 memory（ephemeral session、大多数单测）就是原样发，跟卸载一个模式。
  */
 function assembleForRequest(ctx: LoopContext): Message[] {
+  return replaceLegacyResumePrompts(assembleHistory(ctx))
+}
+
+function assembleHistory(ctx: LoopContext): Message[] {
   const memory = ctx.deps.memory
   // 图片降级在出口做（resizer.ts 的 stripImagesWhenUnsupported）：这是
   // 「发出去的那份」的最后一站，之后的消费方（发请求 / 估算 / usage 基线）
@@ -1482,7 +1488,7 @@ function doomLoopGuard(
 }
 
 /**
- * 按名字取工具，**精确匹配失败时回退一次大小写不敏感匹配**。
+ * 按名字取工具，**精确匹配失败时逐级回退：大小写不敏感 → 剥 mcp__ 前缀**。
  *
  * 这不是为模型能力不足做防御，是外部输入不可靠：2026-09-20 实测某渠道
  * 在一段时间内把 `bash` 采样成了 `Bash`（同一轮里两种写法混用，日志
@@ -1491,12 +1497,18 @@ function doomLoopGuard(
  *
  * 只在精确匹配失败后才回退，正常路径零开销、零行为变化。同名不同壳
  * （真有 `bash` 和 `Bash` 两个工具）时精确匹配已经命中，轮不到这里。
+ * 前缀回退同理：2026-10-22 实测某网关渠道把工具定义全包成自家 MCP
+ * 层的三段式名（mcp__client__bash，Anthropic 的 MCP 命名），响应
+ * 回去不剥前缀，逐轮 tool_fail unknown tool。剥一层
+ * `mcp__<server>__` 再试，server 段不含下划线，剥错了走不进这里。
  */
 function resolveTool(tools: LoopContext['deps']['tools'], name: string): Tool | undefined {
   const exact = tools.get(name)
   if (exact) return exact
   const lowered = name.toLowerCase()
   for (const [key, tool] of tools) if (key.toLowerCase() === lowered) return tool
+  const stripped = name.replace(/^mcp__[a-z0-9-]+__/i, '')
+  if (stripped !== name) return resolveTool(tools, stripped)
   return undefined
 }
 

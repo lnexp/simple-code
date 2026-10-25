@@ -3,7 +3,7 @@
  *
  * - fork：一个事务写 reserved 锚 + 三轴跳段 + manifest；对话下一个 id 落段之上
  * - 域：任务 session 读写只落自己段；对话读不见任务段
- * - 关闭：flipTaskLive → 债清零判定（nextSegmentToSummarize）→ finalizeTask 还俗 + FTS 重灌
+ * - 关闭：flipTaskLive → 债清零判定（nextSegmentToSummarize）→ finalizeTask 还俗 + 补任务 turn 的 FTS 行
  * - 恢复：listTaskManifests = manifest 即真相
  */
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -24,6 +24,8 @@ import {
 } from '../src/session/task.ts'
 import { MEMORY_RELATIVE, openStore, type Store } from '../src/session/store.ts'
 import { assembleContext } from '../src/loop/assemble.ts'
+import { openDb } from '../src/session/db.ts'
+import { ftsSearch } from '../src/session/search-index.ts'
 
 const dirs: string[] = []
 afterEach(async () => {
@@ -519,6 +521,9 @@ describe('私有摘要（任务压缩继承段）', () => {
   it('关闭任务留下的尾巴：原文全卸、摘要不在场 → 主任务下一次压缩就进场（2026-09-24/25 两个任务的孤儿段）', async () => {
     const { activateBeyondStubZone } = await import('../src/loop/summarize.ts')
     const { dir, m } = await setup()
+    // 主任务库先开着（真实场景：主任务一直在跑，任务是后来 fork 出去的）
+    const main = openStore(dir)
+
     // 任务跑了一轮，关闭时这一轮还是原文——它的 L0 写好了但没进过场
     const task = openStore(dir, { task: scopeOf(m) })
     const live: Message[] = [...task.load()]
@@ -540,9 +545,8 @@ describe('私有摘要（任务压缩继承段）', () => {
     flipTaskLive(dir, m.owner)
     finalizeTask(dir, m.owner)
 
-    // 主任务压缩点：存根区给得很宽（装得下全部 live）——旧规则下尾巴段
-    // 没有 live 可判，永远不进场；孤儿通道不看存根区
-    const main = openStore(dir)
+    // 主任务压缩点调用孤儿通道：存根区给得很宽（装得下全部 live），
+    // 孤儿通道不看存根区，只要段内无 live 就进场
     const mainLive = main.liveWithTurns()
     activateBeyondStubZone({
       live: mainLive,
@@ -1254,5 +1258,41 @@ describe('手动压缩（compactNow，2026-10-17）：主任务与任务各压�
     expect(tickets()).toEqual(['prefix-rewrite-allowed'])
     expect(await send(main2, '对话压完再问')).toEqual([])
     await main2.close()
+  })
+})
+
+describe('finalizeTask 的搜索索引：只补任务自己的 turn', () => {
+  it('任务先存一半、对话越过游标、任务再存——关闭后任务内容各命中一次，对话游标不动', async () => {
+    const dir = await workspace()
+    const main = openStore(dir)
+    const mainLive: Message[] = []
+    runTurn(main, mainLive, '对话问题一', '对话回答一')
+    main.close()
+    const m = forkTask(dir, 't')
+    const task = openStore(dir, { task: scopeOf(m) })
+    const live: Message[] = [...task.load()]
+    runTurn(task, live, '任务问题甲', '任务甲的结论') // 游标还在任务段里：这轮被增量收进去
+    task.close()
+    const main2 = openStore(dir)
+    runTurn(main2, [...main2.load()], '对话问题二', '对话回答二') // 游标越过任务段
+    main2.close()
+    const task2 = openStore(dir, { task: scopeOf(m) })
+    runTurn(task2, live, '任务问题乙', '任务乙的结论') // 游标之下：增量收不到
+    task2.close()
+
+    const db = openDb(join(dir, MEMORY_RELATIVE, 'state.db'))
+    const cursor = () => db.all<{ v: string }>(`SELECT v FROM search_fts_meta WHERE k = 'last_step_id'`)[0]?.v
+    expect(ftsSearch(db, '乙的结论', 10)).toEqual([])
+    const before = cursor()
+    // 金丝雀：一行不属于任务的索引——全量重灌会把它冲掉，只补任务 turn 不会
+    db.run(`INSERT INTO search_fts(text, turn_no, step_no) VALUES(' 金丝 丝雀 雀 ', 999, 1)`)
+    flipTaskLive(dir, m.owner)
+    finalizeTask(dir, m.owner)
+    expect(ftsSearch(db, '甲的结论', 10)).toHaveLength(1)
+    expect(ftsSearch(db, '乙的结论', 10)).toHaveLength(1)
+    expect(ftsSearch(db, '回答二', 10)).toHaveLength(1)
+    expect(cursor()).toBe(before) // 不再清游标全量重灌
+    expect(ftsSearch(db, '金丝雀', 10)).toEqual([{ turn: 999, step: 1 }])
+    db.close()
   })
 })

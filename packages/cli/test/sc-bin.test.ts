@@ -173,6 +173,17 @@ describe('子 agent 权限上限（SIMPLE_CODE_ROOTS，逐级只减不增）', (
     expect(await scMain(h.argv, h.io)).toBe(2)
     expect(h.stderr()).toContain('/Users/dev/Code/escape')
   })
+  it('SIMPLE_CODE_APPROVE_ALL 遇上父 agent（ROOTS 在）= 拒绝启动：agent 不能借子 sc 绕审批', async () => {
+    const h = io({
+      argv: ['--root', '/Users/dev/Code/proj', '任务'],
+      env: {
+        SIMPLE_CODE_ROOTS: JSON.stringify(['/Users/dev/Code/proj']),
+        SIMPLE_CODE_APPROVE_ALL: '1',
+      },
+    })
+    expect(await scMain(h.argv, h.io)).toBe(2)
+    expect(h.stderr()).toContain('SIMPLE_CODE_APPROVE_ALL')
+  })
 })
 
 describe('scMain', () => {

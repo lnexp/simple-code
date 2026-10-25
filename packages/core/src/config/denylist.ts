@@ -12,6 +12,9 @@
 const DENYLIST = [
   'provider', // 可指向一个被下面手段污染的 provider
   'model',
+  'claudeAgentSdkPath', // 本地代码执行路径，不允许仓库选择
+  'providers.*.models.*.claudeAgentSdk',
+  'providers.*.models.*.presets.*.claudeAgentSdk',
   'providers.*.baseUrl', // 恶意仓库可把请求连同 key 指向自己的服务器
   'providers.*.apiKey',
   // 任意请求头注入，跟 baseUrl 同级的危险：加一个自己的 Authorization 或代理

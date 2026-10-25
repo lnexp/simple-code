@@ -53,6 +53,12 @@ describe('skill 检索与 patch（两级覆盖）', () => {
     expect(searchSkills(project, '不存在词')).toContain('没有 skill 命中')
   })
 
+  it('search：OR 候选组任一词命中（与 note/lesson search 同款，见 search-terms.ts）', async () => {
+    await put(project, 'deploy', '# deploy\n\ndescription: 打包发版\n')
+    expect(searchSkills(project, '发版 OR publish OR market')).toContain('deploy')
+    expect(searchSkills(project, '不存在甲 OR 不存在乙')).toContain('没有 skill 命中')
+  })
+
   it('list：两级合并、front matter description 提取、来源标注', async () => {
     await put(project, 'deploy', '---\nname: deploy\ndescription: 部署到测试环境\n---\n\n步骤……')
     await put(project, 'format', '第一条正文行当描述')

@@ -19,8 +19,10 @@
  * 不是文件 mtime：git checkout 会把 mtime 全部重置为检出时刻，跨机器
  * 复制后排序失真；yaml 头是文档内容，跟着文件走。
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { decayCutoff, decayNotice, parseStamp, splitByDecay } from './decay.ts'
+import { matchTerms, splitSearchTerms } from './search-terms.ts'
 import { localStamp } from './timestamp.ts'
 
 /** 进 system 索引的最大条数。30 条 × ~20 token ≈ 600 token 常驻成本 */
@@ -29,7 +31,11 @@ export const NOTES_INDEX_LIMIT = 20
 const notesDir = (root: string) => join(root, '.simple-code', 'notes')
 
 const slug = (name: string) =>
-  name.toLowerCase().trim().replace(/[\s_]+/g, '-').replace(/[^a-z0-9-\u4e00-\u9fff]/g, '')
+  name
+    .toLowerCase()
+    .trim()
+    .replace(/[\s_]+/g, '-')
+    .replace(/[^a-z0-9-\u4e00-\u9fff]/g, '')
 
 /** status: superseded = 作废（2026-09-30 拍板：不删文件，头里加 status + by）——
  *  不进索引与 recall 候选，list/read/search 照常可达并标注。by = 接替者（可空） */
@@ -68,7 +74,11 @@ const supersededMark = (meta: NoteMeta): string => `已作废${meta.by ? `，现
  *  的 description，# 标题不进 system（对齐 lesson 的双字段分工） */
 export function noteTitle(text: string): string | undefined {
   const body = text.replace(/^---\s*\n[\s\S]*?\n---/, '')
-  return body.split('\n').find((line) => line.startsWith('# '))?.slice(2).trim()
+  return body
+    .split('\n')
+    .find((line) => line.startsWith('# '))
+    ?.slice(2)
+    .trim()
 }
 
 export type NoteCard = {
@@ -128,7 +138,10 @@ export function writeNote(
       return false
     }
   }
-  if (exists()) throw new Error(`${name} 已存在，write 不覆盖（旧结论会丢）。改内容用 $SIMPLE_CODE_APPLY_PATCH 改 .simple-code/notes/${name}.md（免审批）`)
+  if (exists())
+    throw new Error(
+      `${name} 已存在，write 不覆盖（旧结论会丢）。改内容用 $SIMPLE_CODE_APPLY_PATCH 改 .simple-code/notes/${name}.md（免审批）`,
+    )
   const text =
     `---\nname: ${name}\ndescription: ${description}\ncreated: ${localStamp()}\n---\n\n` +
     `# ${input.title.trim()}\n\n${input.body.trim()}\n`
@@ -148,13 +161,15 @@ export function readNote(root: string, name: string): string {
   try {
     text = readFileSync(path, 'utf8')
   } catch {
-    throw new Error(`没有这条 note：${name}（$SIMPLE_CODE_NOTE list 看全部）`)
+    throw new Error(`没有这条 note：${name}（$SIMPLE_CODE_NOTE list --all 看全部）`)
   }
   const now = localStamp()
   const updated = /^---\s*\n[\s\S]*?\n---/.test(text)
     ? text.replace(/^(---\s*\n[\s\S]*?\n---)/, (fm) =>
         // m 必须带：不带时 $ 只认串尾，fm 以 --- 收尾，已有 lastRead 永远换不掉（9-30 修）
-        /\nlastRead:/.test(fm) ? fm.replace(/\nlastRead:.*$/m, `\nlastRead: ${now}`) : fm.replace(/\n---$/, `\nlastRead: ${now}\n---`),
+        /\nlastRead:/.test(fm)
+          ? fm.replace(/\nlastRead:.*$/m, `\nlastRead: ${now}`)
+          : fm.replace(/\n---$/, `\nlastRead: ${now}\n---`),
       )
     : `---\ncreated: ${now}\nlastRead: ${now}\n---\n\n${text}` // 裸文件补头——旧格式迁移
   writeFileSync(path, updated, 'utf8')
@@ -162,34 +177,66 @@ export function readNote(root: string, name: string): string {
   return superseded(meta) ? `【${supersededMark(meta)}】\n${updated}` : updated
 }
 
-/** 全量清单（含被挤出索引的）。人看 + agent 兜底检索两用 */
-export function listNotes(root: string): string {
+/** 清单（含被挤出索引的）。默认收起超半年未用（superseded 不收，
+ * --all 全量——memory-time-decay ②） */
+export function listNotes(root: string, all = false): string {
   const cards = loadNotes(root)
-  if (cards.length === 0) return '（还没有 note。写："$SIMPLE_CODE_NOTE" write，决策/约定/一次性结论，一笔记一事）'
-  return cards
-    .map((c) => `- ${c.name}${c.description ? ` — ${c.description}` : ''}${superseded(c.meta) ? `（${supersededMark(c.meta)}）` : ''}`)
-    .join('\n')
+  if (cards.length === 0)
+    return '（还没有 note。写："$SIMPLE_CODE_NOTE" write，决策/约定/一次性结论，一笔记一事）'
+  const { visible, hidden } = splitByDecay(cards, (c) =>
+    superseded(c.meta) ? null : parseStamp(c.meta.lastRead ?? c.meta.created ?? ''),
+  )
+  const shown = all ? cards : visible
+  const lines = shown.map(
+    (c) =>
+      `- ${c.name}${c.description ? ` — ${c.description}` : ''}${superseded(c.meta) ? `（${supersededMark(c.meta)}）` : ''}`,
+  )
+  if (!all && hidden > 0) lines.push(decayNotice(hidden))
+  return lines.join('\n')
 }
 
-/** 全文搜索（lesson search 同款格式：name + 描述行 + 命中窗口）。
+/** 全文搜索（lesson search 同款格式：name + 描述行 + 命中窗口；词法与
+ *  memory search 一致——空白分词、OR 候选组、按命中词数排序，见 search-terms.ts）。
  *  2026-09-24 补的缺口：note 曾只有 list 全量倒出（费 token）没有 search，
  *  而教训/事件都有——检索入口碎片化，note 是盲格 */
-export function searchNotes(root: string, query: string): string {
-  const q = query.toLowerCase().trim()
-  if (!q) throw new Error('search 需要 query，如 note search 压缩')
+export function searchNotes(root: string, query: string, all = false): string {
+  const terms = splitSearchTerms(query)
+  if (terms.length === 0) throw new Error('search 需要 query，如 note search 压缩')
   const dir = notesDir(root)
   if (!existsSync(dir)) return '还没有任何 note。'
-  const hits: string[] = []
-  for (const f of readdirSync(dir).filter((x) => x.endsWith('.md')).sort()) {
+  const hits: { n: number; line: string }[] = []
+  let hidden = 0
+  for (const f of readdirSync(dir)
+    .filter((x) => x.endsWith('.md'))
+    .sort()) {
     const text = readFileSync(join(dir, f), 'utf8')
-    const at = text.toLowerCase().indexOf(q)
-    if (at === -1) continue
+    const m = matchTerms(text, terms)
+    if (!m) continue
     const name = f.replace('.md', '')
     const meta = parseNoteMeta(text)
     const mark = superseded(meta) ? `（${supersededMark(meta)}）` : ''
+    // 时间衰减：超期命中收起（superseded 不收）；--all 全量
+    if (!all && !superseded(meta)) {
+      const s = parseStamp(meta.lastRead ?? meta.created ?? '')
+      if (s !== null && s < decayCutoff()) {
+        hidden++
+        continue
+      }
+    }
     const desc = /^description:\s*(.+)$/m.exec(text)?.[1]?.trim() ?? ''
-    const window = text.slice(Math.max(0, at - 40), at + 80).replace(/\s+/g, ' ')
-    hits.push(`  ${name}${mark}${desc ? `  —  ${desc}` : ''}\n    …${window}…`)
+    const window = text.slice(Math.max(0, m.at - 40), m.at + 80).replace(/\s+/g, ' ')
+    hits.push({
+      n: m.count,
+      line: `  ${name}${mark}${desc ? `  —  ${desc}` : ''}\n    …${window}…`,
+    })
   }
-  return hits.length === 0 ? `没有 note 命中「${query}」。` : `${hits.length} 条命中：\n${hits.join('\n')}`
+  const body = renderHits(hits, () => `没有 note 命中「${query}」。`)
+  return !all && hidden > 0 ? `${body}\n${decayNotice(hidden)}` : body
+}
+
+/** 命中词数降序（同分保持文件名序），统一渲染 */
+function renderHits(hits: { n: number; line: string }[], empty: () => string): string {
+  if (hits.length === 0) return empty()
+  const ranked = hits.map((h, i) => ({ h, i })).sort((a, b) => b.h.n - a.h.n || a.i - b.i)
+  return `${hits.length} 条命中：\n${ranked.map((r) => r.h.line).join('\n')}`
 }

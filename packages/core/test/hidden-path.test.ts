@@ -111,12 +111,18 @@ describe('第 2 层：只拦真实存在的点开头路径', () => {
   })
 })
 
-describe('第 3 层：默认例外只有 .simple-code 的四个目录', () => {
-  it('.simple-code：四个目录读写放行，其余读放行、写拦', () => {
+describe('第 3 层：默认例外只有 .simple-code 的五个目录', () => {
+  it('.simple-code：五个目录读写放行，其余读放行、写拦', () => {
     allow('cat >> .simple-code/notes/x.md <<\'EOF\'\nx\nEOF')
     allow('rm .simple-code/lessons/x.md')
     allow('mkdir -p .simple-code/skills/foo')
     allow('echo x > .simple-code/events/x.md')
+    // tmp：agent 临时文件的指定落点（2026-10-22 拍板，bash 工具描述【临时文件】）
+    allow('mkdir -p .simple-code/tmp/uishot')
+    allow('echo x > .simple-code/tmp/uishot/a.log')
+    allow('cat .simple-code/tmp/uishot/a.log')
+    allow('rm -rf .simple-code/tmp/uishot')
+    hidden('echo x > .simple-code/tmpx/a') // 按目录名精确匹配，不是前缀
     allow('cat .simple-code/memory/state.db')
     hidden('rm .simple-code/memory/state.db')
     hidden('cp -r .simple-code/memory /tmp/x') // 带出去仍拦（2026-09-08 拍板）

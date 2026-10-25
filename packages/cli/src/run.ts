@@ -1,10 +1,11 @@
 import { access } from 'node:fs/promises'
 import type { Interface } from 'node:readline'
 import { constants as fsConstants } from 'node:fs'
+import type { Server } from 'node:http'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Effort, ModelRef, SessionOptions } from '@simple-code/core'
-import { GLOBAL_CONFIG_PATH, ensureShims, getSession, type ShimEntry } from '@simple-code/core'
+import { GLOBAL_CONFIG_PATH, ensureShims, getSession, logRun, startCredentialProxy, type ShimEntry } from '@simple-code/core'
 import { createRenderer, type Sink } from './render.ts'
 import { type ReplOptions, runRepl } from './repl.ts'
 
@@ -24,7 +25,8 @@ export async function injectLocalTools(
 ): Promise<void> {
   const kebab = (name: string) => name.toLowerCase().replaceAll('_', '-')
   const entries: ShimEntry[] = []
-  for (const name of ['WEBFETCH', 'WEBSEARCH', 'MCP', 'APPLY_PATCH', 'MEMORY', 'LESSON', 'NOTE', 'EVENT', 'SKILL', 'SC']) {
+  // IMAGEGEN 依赖凭据代理（ensureCredentialProxy）；LSP 依赖 VS Code 桥，终端没有，不注入
+  for (const name of ['WEBFETCH', 'WEBSEARCH', 'MCP', 'APPLY_PATCH', 'MEMORY', 'LESSON', 'NOTE', 'EVENT', 'SKILL', 'SC', 'IMAGEGEN']) {
     const key = `SIMPLE_CODE_${name}`
     if (process.env[key]) continue
     const script = join(dir, `${name === 'SC' ? 'sc' : kebab(name)}.js`)
@@ -55,6 +57,27 @@ export async function injectLocalTools(
     .catch(() => {})
 }
 
+/**
+ * 终端 sc 自起凭据代理（同 VS Code extension.ts）：sc 进程从用户终端启动，
+ * 环境里有 .zshrc 的密钥；agent 的 bash 子进程只拿白名单 env（端口+token），
+ * 经代理访问远端 MCP / websearch / 生图，见不到密钥。
+ *
+ * 已有上层代理（VS Code 的 bash 里跑 sc）→ 复用，不起新的：那个 sc 是从
+ * 白名单 env 启动的，没有密钥，自己起的代理展开不了 `${VAR}`。
+ * unref：代理不拖住 sc 退出，进程结束即关。起不来不阻断 sc，报一行
+ */
+export async function ensureCredentialProxy(): Promise<Server | undefined> {
+  if (process.env.SIMPLE_CODE_PROXY_PORT && process.env.SIMPLE_CODE_PROXY_TOKEN) return undefined
+  try {
+    const server = await startCredentialProxy((ev) => logRun(ev))
+    server.unref()
+    return server
+  } catch (e) {
+    process.stderr.write(`凭据代理启动失败（远端 MCP / websearch / 生图不可用）：${e instanceof Error ? e.message : String(e)}\n`)
+    return undefined
+  }
+}
+
 /** 开一个 session 要的东西。两种运行方式共用，`start` 只认这些 */
 export type StartOptions = {
   cwd: string
@@ -74,6 +97,9 @@ export type RunOptions = StartOptions & {
   model?: ModelRef
   /** sc -e：同上 */
   effort?: Effort
+  /** 审批一律放行（SIMPLE_CODE_APPROVE_ALL，测评容器用；2026-10-24 用户批准）。
+   *  sc-bin 已保证被父 agent 调起时不会走到这里 */
+  approveAll?: boolean
 }
 
 // ── 审批问询（approval.md §4.3）────────────────────────────────
@@ -174,7 +200,10 @@ const askNonInteractive =
 
 /** 0 = 正常跑完，1 = loop 里出错，2 = 压根没起来（配置错、目录被占） */
 export async function runOnce(options: RunOptions): Promise<number> {
-  const session = await start(options, askNonInteractive(options.sink))
+  const session = await start(
+    options,
+    options.approveAll ? () => Promise.resolve('allow') : askNonInteractive(options.sink),
+  )
   if (typeof session === 'number') return session
   if (options.model) session.setModel(options.model)
   if (options.effort) session.setEffort(options.effort)

@@ -2,13 +2,15 @@
  * 前缀不变式（2026-09-23 用户定死的规则）：**除了触发上下文压缩，请求前缀
  * 绝对不能变。** 相邻两次请求，后一次必须以前一次为前缀——system、tools
  * 逐字相同，messages 逐条相同、只许在末尾追加。
+ * 2026-10-23 另批准确定的旧截断提示迁移：只允许完整旧提示换中性提示，
+ * 原档不变，守卫核对替换后的完整前缀，不放行其他改写。
  *
  * 为什么要代码守：前缀中段一改，改动点之后的缓存全作废，要全价重算。这类
  * bug 不报错、功能照常，只在账单和延迟上体现——实测 request1/request2：
  * 合并在两次卸载之间提前生效，20 条 L0 换成 2 条 L1，113 条消息里只有
  * 前 18 条命中缓存。靠人看 diff 发现一次算一次，守卫把它变成当场报错。
  *
- * 合法的改写点只有一种：压缩点（卸载触发——预算超线、缓存过期、context
+ * 常规的合法改写点只有一种：压缩点（卸载触发——预算超线、缓存过期、context
  * 超限自救、手动压缩）。那一刻缓存横竖要破，前缀的所有改写（卸载、合并
  * 生效、摘要进场、system 重读）都在那儿搭车。压缩点调 `allowRewrite`，
  * 下一次 check 放行一次。放行票可以落库（`ticket`）：手动压缩发生在空闲
@@ -17,12 +19,15 @@
  *
  * 另一种不算违规：请求参数变了（换模型、换推理档位、改 maxTokens）——这是
  * 用户的选择，缓存本来就按这些分桶，基线静默重置。
+ * 扩展版本号变了同理（2026-10-24 用户批准）：升级后内建段/工具描述本来就
+ * 会变，不重置的话老用户每个项目首条消息都报「是 bug」。同版本内照报。
  *
  * 基线跨进程持久化（每个 owner 一行）：reload 后缓存还热的话，前缀也必须
  * 接得上——这恰好能抓「落盘 → 重新 load」这条路径上的渲染差异。
  */
 import { createHash } from 'node:crypto'
 import type { Request } from '../llm/types.ts'
+import { replaceLegacyResumePrompts } from './truncation-recovery.ts'
 
 /** 一次请求的前缀指纹。只存哈希：基线每请求落盘一次，存原文是写放大 */
 export type PrefixFingerprint = {
@@ -37,6 +42,8 @@ export type PrefixFingerprint = {
   system: string
   tools: string
   messages: string[]
+  /** 落基线时的扩展版本。旧版基线没有这个字段 = 视为版本变了 */
+  version?: string
 }
 
 export type PrefixBaselineStore = {
@@ -121,6 +128,8 @@ export function createPrefixGuard(deps: {
   ticket?: { set(): void; take(): boolean }
   /** 违规现场落盘（前后两次请求）。返回文件路径；null = 没落成 */
   dump: (info: { break: PrefixBreak; prev: Request | null; next: Request }) => string | null
+  /** 当前扩展版本。与基线不同 = 升级，静默重置。没传 = 不比版本（测试） */
+  version?: string
 }): PrefixGuard {
   let allowed = false
   /** 同进程里上一次的完整请求——现场文件要用。跨进程只有指纹 */
@@ -131,7 +140,10 @@ export function createPrefixGuard(deps: {
       deps.ticket?.set()
     },
     check: (request, configKey) => {
-      const next = fingerprint(request, configKey)
+      const next: PrefixFingerprint = {
+        ...fingerprint(request, configKey),
+        ...(deps.version === undefined ? {} : { version: deps.version }),
+      }
       const prev = deps.baseline.read()
       // 先读后写：读到的才是「上一次」，写进去的是这一次
       const prevReq = prevRequest ?? deps.prev?.read() ?? null
@@ -142,9 +154,10 @@ export function createPrefixGuard(deps: {
       const ticket = deps.ticket?.take() ?? false
       const pass = allowed || ticket
       allowed = false
-      if (prev === null || pass || prev.params !== next.params) return
+      if (prev === null || pass || prev.params !== next.params || prev.version !== next.version) return
       const found = findBreak(prev, next)
       if (found === null) return
+      if (isLegacyResumeMigration(prev, prevReq, next, configKey)) return
       const dumpPath = deps.dump({ break: found, prev: prevReq, next: request })
       const where =
         found.part === 'messages'
@@ -158,4 +171,18 @@ export function createPrefixGuard(deps: {
       )
     },
   }
+}
+
+/** 确定的旧提示迁移，不发通用放行票，也不能顺带放过其他前缀改写。 */
+function isLegacyResumeMigration(
+  prev: PrefixFingerprint,
+  prevRequest: Request | null,
+  next: PrefixFingerprint,
+  configKey?: string,
+): boolean {
+  if (!prevRequest) return false
+  // 原文必须与基线完全一致，不能拿失配的 last-request 替代基线做判定。
+  if (JSON.stringify(prev) !== JSON.stringify(fingerprint(prevRequest, configKey))) return false
+  const migrated = { ...prevRequest, messages: replaceLegacyResumePrompts(prevRequest.messages) }
+  return findBreak(fingerprint(migrated, configKey), next) === null
 }

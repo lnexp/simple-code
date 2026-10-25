@@ -94,6 +94,14 @@ VS Code 多根窗口里每个 folder 是独立 session，上下文不串。
   回落 grep
 - **MCP**（`"$SIMPLE_CODE_MCP" list/tools/<server>/<tool>`）：外部工具经
   配置的 server，用前先 list
+- **生图**（`"$SIMPLE_CODE_IMAGEGEN" "<指令>" <路径>`）：
+  经宿主凭据代理调 `/v1/images/generations`，模型由全局 settings.json 的
+  `imageModel: {provider, model}` 定（未配置即报错）。图只落盘、stdout 一行；
+  路径限项目内（隐藏目录除 `.simple-code/tmp` 外不许）；同名已存在另存
+  `<名>-<新图 sha256 前 8 位>`；网关回的实际格式与扩展名不符时改扩展名再存
+  并在输出写明。无宿主时退出码 2。bin 仍接受 `--size/--quality/--n`，但
+  2026-10-23 实测所用网关全部忽略（尺寸按内容定、恒 png、恒 1 张），
+  所以不写进工具描述
 - **sc**（`"$SIMPLE_CODE_SC" --root <项目根> -q -t 600 "任务"`）：派一个
   一次性子 agent（headless 审批恒拒绝，权限边界 = --root 值）。
   `mkdir 任务目录 + AGENTS.md 任务书 + sc > result &` 即并行子 agent，
@@ -126,8 +134,15 @@ VS Code 多根窗口里每个 folder 是独立 session，上下文不串。
 | 项目 | `<root>/.simple-code/settings.json` | 只放该项目要覆盖的键 |
 
 **不在 settings.json 里、只认用户级的独立文件**：MCP server 在
-`~/.simple-code/mcp.json`（键名即 server 名）；websearch 凭据在
-`~/.simple-code/websearch.json`；审批静态规则（askCommands/hiddenAllow/
+`~/.simple-code/mcp.json`（键名即 server 名）。远端 server 写
+`{"url": "...", "headers": {"Authorization": "Bearer ${VAR}"}}`：经宿主凭据
+代理访问，`${VAR}` 只在宿主进程内展开（可内插），bin 与 bash 见不到密钥；
+宿主是 VS Code 插件或终端 sc（sc 启动时自起代理，已有上层代理则复用）；
+两者都不在（如用户在 shell 里直接敲 bin）时报无代理、退出码 2。本机 server 写
+`command/args/env`。websearch 凭据在
+`~/.simple-code/websearch.json`（`exaApiKey` 可写 `${EXA_API_KEY}`：有宿主时
+bin 经凭据代理 `POST /websearch`，key 只在宿主展开；无代理时 bin 自己读
+文件直连，`${VAR}` 从当前环境展开）；审批静态规则（askCommands/hiddenAllow/
 networkAllow/nonPathFrom）在 `~/.simple-code/approval.json`。
 
 常用键（速查，全量看 schema）：模型——`provider/model/baseUrl/apiKey/

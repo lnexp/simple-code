@@ -115,6 +115,12 @@ export {
   type NoteCard,
   type NoteMeta,
 } from './tools/note.ts'
+export {
+  computeMemoryStats,
+  type LastReflect,
+  type LibraryStat,
+  type MemoryStats,
+} from './tools/memory-stats.ts'
 export { listSkills, readSkill, searchSkills } from './tools/skill.ts'
 export type { PatchHunk, PatchChunk } from './tools/applypatch.ts'
 export type { WebfetchConfig } from './tools/webfetch.ts'
@@ -128,6 +134,7 @@ export type {
   McpCallResult,
 } from './tools/mcp.ts'
 export { listMcpTools, callMcpTool } from './tools/mcp.ts'
+export { startCredentialProxy } from './proxy/credential-proxy.ts'
 export { describeError } from './tools/describe.ts'
 export type { EnsureShimsOptions, ShimEntry } from './shims.ts'
 export { ensureShims, probeNode, resolveNodeBin } from './shims.ts'

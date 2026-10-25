@@ -24,12 +24,14 @@
 import {
   appendProgress,
   listEvents,
+  mergeEvents,
   readEvent,
   renameEvent,
   searchEvents,
   updateDescription,
 } from '@simple-code/core/src/tools/events.ts'
 import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts'
+import { logSearchText } from './search-log.ts'
 
 const usage = `用法：
   event list                       全量清单（name — description）
@@ -39,6 +41,7 @@ const usage = `用法：
   event rename <old> <new>        改名：name 与战役实质矛盾时（文件名/front matter 同步）
   event progress <name> <一句话>   追加进展/订正到进展段末尾（带日期，原文不动）
   event describe <name> <描述>     改描述：front matter 的 description 与 H1 两处同步
+  event merge <new> <oldA> <oldB> [...]  合并同战役碎片：正文全保留、旧文件移除、文件头留前身行防断链
 
 订正用 progress/describe 点状改，不重写正文——档案是活跃战役的状态板。`
 
@@ -47,11 +50,14 @@ const usage = `用法：
 export function eventMain(argv: string[], start = process.cwd()): number {
   const cwd = findWorkspaceRoot(start)
   const [sub, target, flag] = argv
+  const all = argv.includes('--all')
   try {
     if (sub === 'list') {
-      console.log(listEvents(cwd))
+      console.log(listEvents(cwd, all))
     } else if (sub === 'search' && target) {
-      console.log(searchEvents(cwd, target))
+      const out = searchEvents(cwd, target, all)
+      logSearchText('event', cwd, target, out)
+      console.log(out)
     } else if (sub === 'read' && target) {
       console.log(readEvent(cwd, target, flag === '--desc' ? 'desc' : undefined))
     } else if (sub === 'rename' && target && flag) {
@@ -62,6 +68,9 @@ export function eventMain(argv: string[], start = process.cwd()): number {
       console.log(appendProgress(cwd, target, argv.slice(2).join(' ')))
     } else if (sub === 'describe' && target && flag) {
       console.log(updateDescription(cwd, target, argv.slice(2).join(' ')))
+    } else if (sub === 'merge' && target) {
+      // 旧事件名没有空格（slug 化产物），直接取剩余 argv
+      console.log(mergeEvents(cwd, target, argv.slice(2)))
     } else {
       console.log(usage)
       return sub === 'help' || sub === '--help' ? 0 : 1

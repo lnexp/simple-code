@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import { openDb } from '../src/session/db.ts'
 import { SCHEMA } from '../src/session/schema.sql.ts'
-import { ftsSearch, matchExpr, syncSearchIndex, toFtsText } from '../src/session/search-index.ts'
+import { ftsSearch, matchExpr, reindexTurns, syncSearchIndex, toFtsText } from '../src/session/search-index.ts'
 import { runSearch } from '../src/tools/memory.ts'
 
 describe('toFtsText / matchExpr（中文分词）', () => {
@@ -17,7 +17,9 @@ describe('toFtsText / matchExpr（中文分词）', () => {
   it('matchExpr：多词 AND、token 进 phrase、单字 CJK 加前缀、剥引号', () => {
     expect(matchExpr('卸载机制')).toBe('"卸载 载机 机制"')
     expect(matchExpr('pickOldestSteps 溯源')).toBe('"pickoldeststeps" AND "溯源"')
-    expect(matchExpr('图')).toBe('"图*"')
+    // 前缀 * 必须在引号外（FTS5 引号内的 * 被分词器当分隔符丢掉）
+    expect(matchExpr('图')).toBe('"图" *')
+    expect(matchExpr('金丝雀')).toBe('"金丝 丝雀 雀" *')
     expect(matchExpr('say "hi"')).toBe('"say" AND "hi"')
     expect(matchExpr('')).toBeNull()
   })
@@ -51,6 +53,16 @@ describe('syncSearchIndex + ftsSearch（真库）', () => {
       step,
     )
   }
+  // 往已存在的 step 追加一条消息（工具结果在 assistant 之后才落库）
+  const append = (turn: number, step: number, text: string) =>
+    db.run(
+      `INSERT INTO messages(turn_id, role, content_json, state, step_id) VALUES(?, 'tool', ?, 'live', ?)`,
+      turn,
+      JSON.stringify({ role: 'tool', parts: [{ type: 'text', text }] }),
+      step,
+    )
+  const rowsOf = (turn: number) =>
+    db.all<{ c: number }>(`SELECT COUNT(*) c FROM search_fts WHERE turn_no = ?`, turn)[0]!.c
 
   afterAll(() => {
     db.close()
@@ -103,6 +115,56 @@ describe('syncSearchIndex + ftsSearch（真库）', () => {
     // 11 字，长度归一化抬分），后续顺序受它影响、不值得锁死
     expect(hits[0]).toEqual({ turn: 3, step: 2 }) // 提词 3 次的排最前
     expect(hits).toContainEqual({ turn: 3, step: 1 })
+  })
+
+  it('游标所在 step 后补的消息（工具结果）下次同步补进，不重复', () => {
+    // 实案 2026-10-23：save 时 step 只有 assistant 就入了索引、游标越过，
+    // 随后落库的工具输出永远搜不到（只有关任务的全量重灌顺手补上）
+    insert(4, 30, 'assistant', '我来跑一下命令')
+    syncSearchIndex(db)
+    append(4, 30, '输出里有端口号六万三')
+    syncSearchIndex(db)
+    expect(ftsSearch(db, '端口号六', 10)).toEqual([{ turn: 4, step: 1 }])
+    expect(ftsSearch(db, '命令', 10)).toEqual([{ turn: 4, step: 1 }])
+    expect(rowsOf(4)).toBe(1)
+    // 再同步（无新消息）仍是一行
+    syncSearchIndex(db)
+    expect(rowsOf(4)).toBe(1)
+  })
+
+  it('reindexTurns：游标之下的 turn（任务段）只重做这些 turn，先删后灌不重复', () => {
+    // 任务先存了一部分（step 40 已入索引，只有半截），之后对话写到 50、游标越过
+    insert(5, 40, 'assistant', '任务前半截')
+    syncSearchIndex(db)
+    insert(6, 50, 'user', '对话继续往前走')
+    syncSearchIndex(db)
+    append(5, 40, '任务后半截的结论')
+    insert(5, 41, 'assistant', '任务第二步发现')
+    syncSearchIndex(db) // 增量看不到游标之下的东西
+    expect(ftsSearch(db, '二步发现', 10)).toEqual([])
+    const cursor = db.all<{ v: string }>(`SELECT v FROM search_fts_meta WHERE k = 'last_step_id'`)[0]!.v
+    reindexTurns(db, [5])
+    expect(ftsSearch(db, '后半截的', 10)).toEqual([{ turn: 5, step: 1 }])
+    expect(ftsSearch(db, '二步发现', 10)).toEqual([{ turn: 5, step: 2 }])
+    expect(rowsOf(5)).toBe(2)
+    reindexTurns(db, [5])
+    expect(rowsOf(5)).toBe(2)
+    // 别的 turn 不动，游标不动
+    expect(ftsSearch(db, '继续往前', 10)).toEqual([{ turn: 6, step: 1 }])
+    expect(db.all<{ v: string }>(`SELECT v FROM search_fts_meta WHERE k = 'last_step_id'`)[0]!.v).toBe(cursor)
+    // 游标 step 恰在被重做的 turn 里：指针要跟到新行，下次同步不留双份
+    append(6, 50, '对话那步的工具输出')
+    reindexTurns(db, [6])
+    syncSearchIndex(db)
+    expect(rowsOf(6)).toBe(1)
+    expect(ftsSearch(db, '工具输出', 10)).toContainEqual({ turn: 6, step: 1 })
+  })
+
+  it('奇数字中文词在汉字段中间也能命中（2026-10-23：「金丝雀」只在段尾才中）', () => {
+    insert(7, 70, 'user', '我们讨论金丝雀发布的流程')
+    syncSearchIndex(db)
+    expect(ftsSearch(db, '金丝雀', 10)).toEqual([{ turn: 7, step: 1 }])
+    expect(ftsSearch(db, '讨论金丝雀发', 10)).toEqual([{ turn: 7, step: 1 }]) // 偶数照旧
   })
 })
 

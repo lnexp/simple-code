@@ -31,8 +31,8 @@ const requestPreferences = strictObject({
   reasoningDisplay: z.enum(['omitted', 'summarized']).optional(),
   /**
    * Anthropic prompt cache 的 TTL 档位（cache_control.ttl）。不配 = 不带 ttl，
-   * 走上游默认 5m。配 '1h' 时记得把同模型的 cacheTtlMs 一起调到 3600000，
-   * 否则我们这边 5 分钟后照样判过期去压缩，1h 白买。其他协议忽略此项。
+   * 走上游默认 5m。最终为 '1h' 时 cacheTtlMs 自动取至少 3600000（load.ts，
+   * 否则 5 分钟后照样判过期去压缩，1h 白买）。其他协议忽略此项。
    * 2026-10-12 探针：providerId 140 认 1h（7 分钟后仍命中）；已有 5m 条目的
    * 会话切过去是否会多次 miss，探针受网关路由噪声干扰没定论——切换时看
    * llm_usage，详见 note anthropic-1h-cache-ttl-probe
@@ -60,7 +60,7 @@ const passthrough = z.record(z.string(), z.union([z.string(), z.number(), z.bool
  * 某条慢了或不通就在界面上换一条——**换的是线路不是模型**，所以切预设
  * 不清 effort、不剥 reasoning 签名（两者都是 setModel 的行为，见 session.ts）。
  *
- * **只允许覆盖请求层三项**，`contextWindow` 和 `capabilities` 不在内：窗口
+ * **只允许覆盖请求参数、头、body 和可选 SDK 调用方式**，`contextWindow` 和 `capabilities` 不在内：窗口
  * 一变，预算与压缩水位全要重算，那是模型的物理属性不是线路属性；能力（是否
  * 支持图片）同理，预设切换不该让历史里的图突然非法。
  *
@@ -72,12 +72,15 @@ const passthrough = z.record(z.string(), z.union([z.string(), z.number(), z.bool
  * 已有配置。
  */
 const modelPreset = strictObject({
+  claudeAgentSdk: z.boolean().optional(),
   request: requestPreferences.prefault({}),
   headers: passthrough.prefault({}),
   extraBody: passthrough.prefault({}),
 })
 
 const modelSpec = strictObject({
+  /** 可选外置调用适配，仅主对话；不改变 anthropic-messages 协议。 */
+  claudeAgentSdk: z.boolean().optional(),
   // 必填、不猜。没有默认模型就没有默认窗口；填错的后果是某轮突然 400
   contextWindow: z.number().int().positive(),
   capabilities: capabilities.prefault({}),
@@ -152,6 +155,12 @@ export const bashConfig = strictObject({
       // 「无 LSP 桥」回落 grep——两个必须成对，只传路径不传端口是半残
       'SIMPLE_CODE_LSP',
       'SIMPLE_CODE_LSP_PORT',
+      // 凭据代理（proxy/credential-proxy.ts）：url 型 MCP server 经它访问，
+      // 缺这两个 bin 报「无代理」。token 模型可见无妨——挡的是本机其他进程
+      'SIMPLE_CODE_PROXY_PORT',
+      'SIMPLE_CODE_PROXY_TOKEN',
+      // 生图 bin（经上面的凭据代理；VS Code 与终端 sc 都会起代理并注入）
+      'SIMPLE_CODE_IMAGEGEN',
       'SIMPLE_CODE_DOC',
     ]),
 })
@@ -426,10 +435,16 @@ export const configSchema = strictObject({
   provider: z.string().min(1),
   model: z.string().min(1),
   providers: z.record(z.string(), providerSpec),
+  /** 外置 npm 安装根目录，仅用户级可信配置；未启用模型时不加载。 */
+  claudeAgentSdkPath: z.string().min(1).optional(),
   request: requestPreferences.prefault({}),
   bash: bashConfig.prefault({}),
   webfetch: webfetchConfig.prefault({}),
   visionModel: sideModelRef.nullable().default(null),
+  // 生图（$SIMPLE_CODE_IMAGEGEN，docs/proposals/imagegen.md）：写法同 visionModel
+  // 的对象形式，但 model 不必登记在 provider.models 里——它不是对话模型，没有
+  // 上下文窗口可填；provider 只借 baseUrl/apiKey。只由宿主凭据代理读（全局级）
+  imageModel: strictObject({ provider: z.string(), model: z.string() }).nullable().default(null),
   loop: loopConfig.prefault({}),
   memory: memoryConfig.prefault({}),
   // recall 线索层（docs/proposals/recall.md）：send 入口算一次 TF-IDF×

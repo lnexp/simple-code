@@ -45,9 +45,11 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
     '装依赖等一切要动命令行的事。输出合并 stdout 与 stderr 按时序返回。' +
     '命令固定在工作区根执行，要换目录就在 command 里写 cd <路径> && …。\n' +
     '【长任务/后台】测试/构建/install 直接跑：超时自动转后台、输出接进日志文件并给出路径，稍后 tail 回访。' +
-    '主动起服务**必须重定向输出**——`(python3 -m http.server 8123 >/tmp/sc.log 2>&1 & echo $! >/tmp/sc.pid)`，' +
-    '裸 `cmd &` 的输出没人接会在写满管道后卡住。调试用 curl，回看输出 `cat /tmp/sc.log`，收尾 `kill $(cat /tmp/sc.pid)`。' +
+    '主动起服务**必须重定向输出**——`mkdir -p .simple-code/tmp && (python3 -m http.server 8123 >.simple-code/tmp/sc.log 2>&1 & echo $! >.simple-code/tmp/sc.pid)`，' +
+    '裸 `cmd &` 的输出没人接会在写满管道后卡住。调试用 curl，回看输出 `cat .simple-code/tmp/sc.log`，收尾 `kill $(cat .simple-code/tmp/sc.pid)`。' +
     '后台进程在用户界面显示、由用户决定是否关闭，agent 结束任务前应收尾自己的服务。\n' +
+    '【临时文件】一律写 `.simple-code/tmp/`（项目内、随项目走、重启不丢），先 `mkdir -p`；' +
+    '不写 /tmp——macOS 的 /tmp 重启即清。\n' +
     '【审批】路径出工作区（读放行仅限 .simple-code 子树，其余读也拦）、进隐藏目录（.env、.ssh 类）、' +
     '网络命令（curl 等）、发布类命令（git push、gh）、approval.json 里 askCommands 配的自定义命令（用户级 ~/.simple-code/ 与项目级 .simple-code/，含私有 CLI，如 appctl workloads apply）、含 $()/解释器的命令——执行前会请用户放行；被拒时如实转告用户、说明需要什么，不要换写法绕。\n' +
     '【网络】"$SIMPLE_CODE_WEBFETCH" <url>（HTML 转 markdown，可接管道）；"$SIMPLE_CODE_WEBSEARCH" <query>。\n' +
@@ -60,6 +62,13 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
         'definition（跳定义）；symbols <file>（文件符号表）；' +
         'hover（类型信息）；calls-in/calls-out（谁调用这里/这里调用谁）。报「无 LSP 桥」= 桥已不在（宿主窗口关闭），回落 grep。\n'
       : '') +
+    // 生图同 LSP：宿主注入了 bin 且代理在才写，描述与实际能力一致
+    // --size/--quality/--n bin 仍接受，但不写进描述：2026-10-23 实测网关全部忽略
+    // （尺寸由模型按内容定、恒回 png、恒 1 张），写了 agent 会以为能控制；网关支持了再加回
+    (env.SIMPLE_CODE_IMAGEGEN !== undefined && env.SIMPLE_CODE_PROXY_PORT !== undefined
+      ? '【生图】"$SIMPLE_CODE_IMAGEGEN" "<指令>" <输出路径.png>（尺寸由模型按画面内容决定；图片只落盘、stdout 回一行路径；' +
+        '路径限项目内，同名已存在会另存带 hash 的文件名，实际格式与扩展名不符会改扩展名并写明；看效果另用 view_image）。\n'
+      : '') +
     '【补丁】改既有文件用 "$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n' +
     '*** Begin Patch\n*** Update File: 路径（相对工作区根）\n@@\n 照抄文件里已有的行（上下文）\n-要删的行\n+要加的行\n@@\n 另一处改动的上下文行\n-旧行\n+新行\n*** End Patch\nPATCH' +
     '（上下文与删除行须与文件逐行一致且各留一个前导空格，空行也不例外——写补丁前先用 grep -n 定位、' +
@@ -71,12 +80,13 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
     '分工：宽搜/正则/多词混合直接 grep memory 的 turns 目录（jsonl 全量落盘，不截断），' +
     'search 用于定位格式与渲染续接；' +
     `log [-n ${LOG_DEFAULT_LINES}]（每 turn 一行总览，先扫再下钻）。\n` +
-    '【note】"$SIMPLE_CODE_NOTE" list（全量清单，含被挤出索引的）| read <name>（全文+喂 LRU 心跳）| ' +
-    'search <关键词> | write <<\'MD\'（heredoc 逐行写 name: <名>、title: <标题>、description: <单行描述>，' +
+    '【note】"$SIMPLE_CODE_NOTE" list [--all]（清单，默认收起超半年未用，--all 全量含被挤出索引的）| ' +
+    'read <name>（全文+喂 LRU 心跳）| search <关键词> [--all] | ' +
+    'write <<\'MD\'（heredoc 逐行写 name: <名>、title: <标题>、description: <单行描述>，' +
     '再一行 ---，其后是正文；新结论当场记一条）。' +
     '改内容用 "$SIMPLE_CODE_APPLY_PATCH"（.simple-code/notes/，免审批；write 撞同名拒绝，不覆盖）；' +
     '结论被推翻时不删，头里加 status: superseded 与 by: <接替的 note 名>，从此不进索引。\n' +
-    '【教训】"$SIMPLE_CODE_LESSON" list | read <name> | search <关键词> | ' +
+    '【教训】"$SIMPLE_CODE_LESSON" list [--all] | read <name> | search <关键词> [--all] | ' +
     'write（五段 heredoc JSON 走 stdin，字段 name/title/description/symptom/misjudged/rootCause/fix/verified，格式自动组装）。' +
     '调试一轮没修好先查教训，失败 ≥2 次后成功用 write 记一条。局部改走 "$SIMPLE_CODE_APPLY_PATCH"（.simple-code/lessons/，免审批）。\n' +
     '【技能】（点名或不确定怎么做时查用）"$SIMPLE_CODE_SKILL" list | read <name> | search <关键词>。' +

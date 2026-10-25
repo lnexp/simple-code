@@ -11,6 +11,7 @@
  */
 import { listSkills, readSkill, searchSkills } from '@simple-code/core/src/tools/skill.ts'
 import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts'
+import { logSearchText } from './search-log.ts'
 
 // 工作区根：cwd 可能是子目录（workspace-root.ts）
 const root = findWorkspaceRoot(process.cwd())
@@ -21,7 +22,9 @@ try {
   if (sub === 'list') {
     console.log(listSkills(root).join('\n'))
   } else if (sub === 'search' && target) {
-    console.log(searchSkills(root, target))
+    const out = searchSkills(root, target)
+    logSearchText('skill', root, target, out)
+    console.log(out)
   } else if (sub === 'read' && target) {
     console.log(readSkill(root, target))
   } else {

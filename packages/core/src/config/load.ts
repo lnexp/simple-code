@@ -105,6 +105,24 @@ export function selectModel(
   return resolve(config, { env, warnings: loaded.warnings }, choice.preset)
 }
 
+/** 生图模型的连接（imageModel 解析结果）。只给宿主凭据代理用 */
+export type ImageModel = { model: string; baseUrl: string; apiKey: string }
+
+/**
+ * 解析 `imageModel`：未配置返回 null（调用方报「未配置」）；provider 不存在
+ * 抛错。model 不校验是否登记在 provider.models——生图模型不是对话模型
+ */
+export function resolveImageModel(config: Config, env: NodeJS.ProcessEnv = process.env): ImageModel | null {
+  const ref = config.imageModel
+  if (ref === null) return null
+  const provider = config.providers[ref.provider]
+  if (!provider) {
+    const known = Object.keys(config.providers).join(' / ') || '(一个都没配)'
+    throw new Error(`imageModel 的 provider "${ref.provider}" 不在 providers 里。已配置的：${known}`)
+  }
+  return { model: ref.model, baseUrl: provider.baseUrl, apiKey: expandEnv(provider.apiKey, env) }
+}
+
 /** 配置里所有可选的模型，按 provider 分组的顺序拍平。给选择器用 */
 export function listModels(config: Config): ModelRef[] {
   return Object.entries(config.providers).flatMap(([provider, spec]) =>
@@ -205,12 +223,25 @@ function resolve(
       `model "${config.model}" 不在 provider "${config.provider}" 的 models 里。已配置的：${known}`,
     )
   }
-  const model = applyPreset(base, preset, config.provider, config.model)
+  const picked = applyPreset(base, preset, config.provider, config.model)
+  const request = mergeRequest(config, picked)
+  // 买了 1h 缓存，过期判定就至少 1 小时——否则 5 分钟后照样 stale 压缩，1h 白买。
+  // cacheTtlMs 是模型级、preset 改不了，只能从最终的 cacheTtl 推（2026-10-23）
+  const model =
+    request.cacheTtl === '1h' ? { ...picked, cacheTtlMs: Math.max(picked.cacheTtlMs, 3_600_000) } : picked
 
   const protocol = resolveProtocol(provider.protocol)
+  if (model.claudeAgentSdk) {
+    if (protocol.name !== 'anthropic-messages')
+      throw new Error('claudeAgentSdk 仅支持 anthropic-messages')
+    if (!config.claudeAgentSdkPath)
+      throw new Error('启用 claudeAgentSdk 必须配置用户级 claudeAgentSdkPath')
+    if (config.memory.summaryModel === null)
+      throw new Error('启用 claudeAgentSdk 必须显式配置可直连的 memory.summaryModel')
+  }
   const baseUrl = provider.baseUrl
   const apiKey = expandEnv(provider.apiKey, ctx.env)
-  const main = { name: config.model, model, request: mergeRequest(config, model), protocol, baseUrl, apiKey }
+  const main = { name: config.model, model, request, protocol, baseUrl, apiKey }
   return {
     config,
     model,
@@ -277,6 +308,7 @@ function resolveSideModel(
       `${label} "${modelName}" 不在 provider "${providerName}" 的 models 里。已配置的：${known}`,
     )
   }
+  if (model.claudeAgentSdk) throw new Error(`${label} 不支持 claudeAgentSdk，请选择可直连模型`)
   // 请求偏好也按摘要模型自己的算：主模型若把 maxTokens 顶到 16k，一句话的
   // 摘要请求没理由跟着要 16k 的输出预算
   return {
@@ -304,8 +336,8 @@ function resolveSideModel(
  * 把预设的覆盖叠到模型本体上（t885）。**深合并、逐字段**：预设只写要改的
  * 字段，没写的承袭本体——`{maxTokens:32000}` 不会把本体的 temperature 冲掉。
  *
- * 只动 request / headers / extraBody 三项（schema 的 modelPreset 就这三个
- * 键），contextWindow 与 capabilities 原样保留：窗口变了预算与压缩水位要
+ * 只动请求参数、头、body 和可选 SDK 调用方式，contextWindow 与 capabilities
+ * 原样保留：窗口变了预算与压缩水位要
  * 重算，能力变了历史里的图会突然非法——那是模型属性不是线路属性。
  *
  * 名字找不到就抛，不静默退回默认：静默的话「切了线路其实没切」没人看得出来，
@@ -327,6 +359,7 @@ function applyPreset(
   }
   return {
     ...model,
+    claudeAgentSdk: spec.claudeAgentSdk ?? model.claudeAgentSdk,
     request: { ...model.request, ...spec.request },
     headers: { ...model.headers, ...spec.headers },
     extraBody: { ...model.extraBody, ...spec.extraBody },

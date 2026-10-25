@@ -98,7 +98,7 @@ export type ApprovalConfig = {
 }
 
 /** 隐藏路径默认例外：空（2026-09-29 拍板 `.git` 移出，例外只剩
- * .simple-code 自己的四个目录，见 pathVerdict）。用户手写的 hiddenAllow
+ * .simple-code 自己的五个目录，见 pathVerdict）。用户手写的 hiddenAllow
  * 仍从两级 approval.json 并进来 */
 export const DEFAULT_HIDDEN_ALLOW: string[] = []
 export const DEFAULT_NETWORK_ALLOW = ['npm', 'pnpm', 'yarn', 'git', 'node']
@@ -878,7 +878,9 @@ function pathVerdict(
     // settings.json：读放行、写拦——apiKey 躺在里面，改配置走用户
     if (parts[1] === 'settings.json') return write ? writeAsk : { kind: 'allow' }
     // 默认例外（2026-09-29 拍板）：notes/lessons/events/skills 读写都放行
-    // ——模型自助成长与事件归档区，各自有免审的通道，裸 shell 同待遇
+    // ——模型自助成长与事件归档区，各自有免审的通道，裸 shell 同待遇。
+    // tmp（2026-10-22 拍板）：bash 工具描述指定的临时文件落点，指了路
+    // 又拦写是自相矛盾
     if (SC_OPEN_DIRS.has(parts[1] ?? '')) return { kind: 'allow' }
     // 其余整树：读放行（对话史、regions——用户拍板），写弹卡
     return write ? writeAsk : { kind: 'allow' }
@@ -898,5 +900,5 @@ function pathVerdict(
   return { kind: 'allow' }
 }
 
-/** .simple-code 下读写都免审的目录（2026-09-29 拍板） */
-const SC_OPEN_DIRS = new Set(['notes', 'lessons', 'events', 'skills'])
+/** .simple-code 下读写都免审的目录（2026-09-29 拍板；tmp 2026-10-22 加入） */
+const SC_OPEN_DIRS = new Set(['notes', 'lessons', 'events', 'skills', 'tmp'])

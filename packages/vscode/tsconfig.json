@@ -19,6 +19,7 @@
     "test/folder-tabs.test.ts",
     "test/folder-switch-wiring.test.ts",
     "test/ctx-wiring.test.ts",
+    "test/memory-wiring.test.ts",
     "test/user-clamp.test.ts",
     "test/draft-bar-render.test.ts",
     "test/main-task-dot.test.ts"
