@@ -41,6 +41,18 @@ describe('findPathTokens 识别口径', () => {
     expect(hits('版本 1.2.3 不中')).toEqual([])
   })
 
+  it('目录名带点时不截半截当文件链接（2026-10-29 实案：.simple-code 截成 .simple-co）', () => {
+    // 扩展名上限 9 字符，「simple-co」正好 9 个：以前链接到不存在的
+    // /Users/u/proj/.simple-co
+    const dir = '/Users/u/proj/.simple-code/tmp/bottom-options/'
+    expect(hits(`全路径 ${dir}`)).toEqual([])
+    expect(findPathTokens(dir, 'abs')).toEqual([])
+    expect(hits('/Users/x/b.typescript 扩展名超长也不截')).toEqual([])
+    // 同一目录下的文件照常整条命中
+    expect(hits(`见 ${dir}final-wide.png`)).toEqual([`${dir}final-wide.png`])
+    expect(hits('看 .simple-code/notes/goal/x.md')).toEqual(['.simple-code/notes/goal/x.md'])
+  })
+
   it('URL 的内脏不中——前字符是 / 一律拒绝', () => {
     expect(hits('https://a.com/x.ts 里只有完整 URL 才是链接')).toEqual([])
     expect(hits('来源 https://raw.githubusercontent.com/x/y/main/z.md')).toEqual([])

@@ -1,31 +1,36 @@
 /**
- * 任务机制（task-v3，docs/proposals/task-v3.md）。锁定行为：
+ * 任务机制（task-trunk，docs/proposals/task-trunk.md「验证计划」）。锁定行为：
  *
- * - fork：一个事务写 reserved 锚 + 三轴跳段 + manifest；对话下一个 id 落段之上
- * - 域：任务 session 读写只落自己段；对话读不见任务段
- * - 关闭：flipTaskLive → 债清零判定（nextSegmentToSummarize）→ finalizeTask 还俗 + 补任务 turn 的 FTS 行
- * - 恢复：listTaskManifests = manifest 即真相
+ * - 号段：主任务与任务各在自己的段里取 step 号；只在轮开始切段
+ * - 合回：full 且段内 step 全被摘要覆盖才合回；关闭即合回
+ * - 拉摘要：只拉已合回、别人的、号比自己当前段低的；只在压缩点拉（前缀不变式）
+ * - 跨缝：gapHasContent 按「不是自己」判；合回拉进来后能合
+ * - 主干：段合回后拷入，超配额合并且立即生效；开任务复制主干在场行，不调模型
+ * - 迁移：老库登记段，老任务的段与「已拉」照旧
  */
-import { mkdtemp, rm } from 'node:fs/promises'
+
+import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Message } from '../src/llm/types.ts'
+import type { Summary } from '../src/loop/assemble.ts'
+import { pickMergeGroup } from '../src/loop/summarize.ts'
+import { SEGMENT_FULL_STEPS, SEGMENT_WIDTH, TRUNK } from '../src/session/segments.ts'
+import { MEMORY_RELATIVE, openStore, type Store } from '../src/session/store.ts'
 import {
-  forkTask,
+  createTask,
   finalizeTask,
   flipTaskLive,
   listTaskManifests,
+  postTaskResult,
   readTaskManifest,
   scopeOf,
   type TaskManifest,
+  taskResultText,
 } from '../src/session/task.ts'
-import { MEMORY_RELATIVE, openStore, type Store } from '../src/session/store.ts'
-import { assembleContext } from '../src/loop/assemble.ts'
-import { openDb } from '../src/session/db.ts'
-import { ftsSearch } from '../src/session/search-index.ts'
 
 const dirs: string[] = []
 afterEach(async () => {
@@ -44,6 +49,7 @@ const assistantSays = (text: string): Message => ({
   parts: [{ type: 'text', text }],
 })
 
+/** 一轮两个 step（user 一个、assistant 一个——save 按消息归属切 step） */
 function runTurn(store: Store, live: Message[], user: string, reply: string): number {
   const t = store.beginTurn({ model: 'p/m', effort: null })
   live.push(userSays(user), assistantSays(reply))
@@ -59,560 +65,448 @@ function query<T>(dir: string, sql: string, ...params: (string | number | null)[
   return rows
 }
 
-describe('forkTask', () => {
-  it('reserved 锚顶高 turns，manifest 四轴齐全', async () => {
+type Seg = { id: number; owner: string; floor: number; ceil: number; state: string; closed: number }
+const segs = (dir: string): Seg[] =>
+  query<Seg>(
+    dir,
+    `SELECT id, owner, step_floor AS floor, step_ceil AS ceil, state, closed FROM segments ORDER BY id`,
+  )
+
+/** 某会话写过的 step（有消息的），升序 */
+const stepsOf = (dir: string, owner: string | null): number[] =>
+  query<{ id: number }>(
+    dir,
+    `SELECT DISTINCT step_id AS id FROM messages WHERE owner IS ? ORDER BY step_id`,
+    owner,
+  ).map((r) => r.id)
+
+/** 每个有消息的 step 一条 ready L0（真实链路是后台摘要器写的） */
+function summarizeAll(store: Store, steps: number[], label: string, inContext = true): void {
+  for (const s of steps)
+    store.addSummary({
+      level: 0,
+      coversFrom: s,
+      coversTo: s,
+      name: `${label}${s}`,
+      text: `${label}摘要${s}`,
+      status: 'ready',
+      inContext,
+      supersededBy: null,
+      head: `${label}开头${s}`,
+      archivePath: `summaries/${s}.md`,
+    })
+}
+
+/** 当前段写满：一轮里空跑够数的 step（真实路径 beginStep），下一轮开始就切段 */
+function fillSegment(store: Store): void {
+  store.beginTurn({ model: 'p/m', effort: null })
+  for (let i = 0; i < SEGMENT_FULL_STEPS; i++) store.beginStep()
+}
+
+const texts = (rows: { text: string }[]): string[] => rows.map((r) => r.text)
+
+describe('号段（规则 1–3）', () => {
+  it('主任务与任务交错写，各自的 step 号在自己段里成块连续', async () => {
     const dir = await workspace()
     const main = openStore(dir)
-    const live: Message[] = []
-    runTurn(main, live, 'u1', 'r1')
-    runTurn(main, live, 'u2', 'r2')
+    const ml: Message[] = []
+    runTurn(main, ml, '主一', '答一')
+    const m = createTask(dir, 'A')
+    const task = openStore(dir, { task: scopeOf(m) })
+    const tl: Message[] = []
+    runTurn(task, tl, '任务一', '任答一')
+    runTurn(main, ml, '主二', '答二')
+    runTurn(task, tl, '任务二', '任答二')
     main.close()
-
-    const before = query<{ m: number }>(dir, 'SELECT MAX(id) AS m FROM turns')[0]!.m
-    const m = forkTask(dir, '试跑')
-    expect(m.forkTurn).toBe(before)
-    expect(m.turnCeil).toBe(before + 1000)
-    // 锚行存在、state=reserved、owner 还是对话侧的 NULL
-    const anchor = query<{ state: string; owner: string | null }>(
-      dir,
-      'SELECT state, owner FROM turns WHERE id = ?',
-      m.turnCeil,
-    )
-    expect(anchor[0]!).toEqual({ state: 'reserved', owner: null })
-    // 三轴 sqlite_sequence 顶到段尾
-    const seq = query<{ name: string; seq: number }>(dir, 'SELECT name, seq FROM sqlite_sequence')
-    const byName = Object.fromEntries(seq.map((r) => [r.name, r.seq]))
-    expect(byName.steps).toBe(m.stepCeil)
-    expect(byName.messages).toBe(m.msgCeil)
-    expect(byName.summaries).toBe(m.sumCeil)
-    // manifest 落盘且可回读
-    expect(existsSync(join(dir, '.simple-code/tasks', `${m.owner}.json`))).toBe(true)
-    expect(readTaskManifest(dir, m.owner).name).toBe('试跑')
+    task.close()
+    const [mainSeg, taskSeg] = segs(dir)
+    expect(mainSeg?.owner).toBe('')
+    expect(taskSeg?.owner).toBe(m.owner)
+    const ms = stepsOf(dir, null)
+    const ts = stepsOf(dir, m.owner)
+    const run = (from: number, n: number) => Array.from({ length: n }, (_, i) => from + i)
+    expect(ms).toEqual(run(ms[0] ?? 0, 4)) // 交错写也连续
+    expect(ts).toEqual(run((taskSeg?.floor ?? 0) + 1, 4))
+    for (const s of ms) expect(s > (mainSeg?.floor ?? 0) && s <= (mainSeg?.ceil ?? 0)).toBe(true)
+    expect(taskSeg?.floor).toBeGreaterThanOrEqual(mainSeg?.ceil ?? 0) // 新段落在一切已占号之上
   })
 
-  it('fork 后对话的下一个 id 自然落在任务段之上——不撞段', async () => {
+  it('只在轮开始切段：一轮写过阈值也不切（step 全在原段），下一轮开始才切', async () => {
     const dir = await workspace()
     const main = openStore(dir)
-    const live: Message[] = []
-    runTurn(main, live, 'u1', 'r1')
-    const m = forkTask(dir, 'x')
-    // fork 后对话继续跑：turn id > turnCeil，msg/step 同理
-    const t2 = runTurn(main, live, 'u2', 'r2')
-    expect(t2).toBeGreaterThan(m.turnCeil)
-    const msgs = query<{ minId: number }>(
+    fillSegment(main)
+    main.beginStep() // 同一轮里第 1001 个 step：仍在原段
+    const [first] = segs(dir)
+    expect(segs(dir)).toHaveLength(1)
+    const inFirst = query<{ n: number }>(
       dir,
-      'SELECT MIN(id) AS minId FROM messages WHERE turn_id = ?',
-      t2,
-    )
-    expect(msgs[0]!.minId).toBeGreaterThan(m.msgCeil)
+      `SELECT COUNT(*) AS n FROM steps WHERE id > ? AND id <= ?`,
+      first?.floor ?? 0,
+      first?.ceil ?? 0,
+    )[0]?.n
+    expect(inFirst).toBe(SEGMENT_FULL_STEPS + 1)
+    const ml: Message[] = []
+    runTurn(main, ml, '下一轮', '答')
     main.close()
+    const after = segs(dir)
+    expect(after.map((s) => s.state)).toEqual(['full', 'open'])
+    expect(stepsOf(dir, null)[0]).toBeGreaterThan(after[1]?.floor ?? 0)
   })
 })
 
-describe('任务会话域（TaskScope）', () => {
-  const setup = async (): Promise<{ dir: string; m: TaskManifest; mainLive: Message[] }> => {
+describe('合回（规则 4）', () => {
+  it('full 且全被摘要覆盖才合回；少一条覆盖不合（对照）；合回后主干拷入', async () => {
     const dir = await workspace()
     const main = openStore(dir)
-    const mainLive: Message[] = []
-    runTurn(main, mainLive, 'u1', 'r1')
-    main.close()
-    const m = forkTask(dir, 't')
-    return { dir, m, mainLive }
-  }
-
-  it('任务轮落在段内、owner 归任务；对话读不见它', async () => {
-    const { dir, m } = await setup()
-    const task = openStore(dir, { task: scopeOf(m) })
-    // 真实链路：session 的 ctx.messages 从 load() 起步（含继承的对话 live），
-    // save 全量对齐——不从 load() 起步会把继承消息错嫁给旧轮
-    const live: Message[] = [...task.load()]
-    const t = runTurn(task, live, '任务问题', '任务回答')
-    expect(t).toBe(m.forkTurn + 1)
-    expect(t).toBeLessThan(m.turnCeil)
-    const owner = query<{ owner: string }>(dir, 'SELECT owner FROM turns WHERE id = ?', t)
-    expect(owner[0]!.owner).toBe(m.owner)
-    // 对话视角：可见的轮（owner IS NULL 且非 reserved）仍是 fork 前的轮
-    const mainTurns = query<{ m: number }>(
-      dir,
-      "SELECT MAX(id) AS m FROM turns WHERE owner IS NULL AND state != 'reserved'",
-    )
-    expect(mainTurns[0]!.m).toBe(m.forkTurn)
-    // 任务视角：继承的对话 live + 自己的（顺序 = 先继承后自己）
-    const back = openStore(dir, { task: scopeOf(m) })
-    const mine = back.load()
-    expect(mine.length).toBe(4)
-    expect((mine[0]!.parts[0] as { type: string; text: string }).text).toBe('u1')
-    expect((mine[2]!.parts[0] as { type: string; text: string }).text).toBe('任务问题')
-    task.close()
-    back.close()
-  })
-
-  it('任务的摘要 id 落在 sum 段内', async () => {
-    const { dir, m } = await setup()
-    const task = openStore(dir, { task: scopeOf(m) })
-    const live: Message[] = [...task.load()]
-    const t = runTurn(task, live, 'q', 'a')
-    const steps = query<{ id: number }>(dir, 'SELECT id FROM steps WHERE turn_id = ?', t)
-    const su = task.addSummary({
-      level: 0,
-      coversFrom: steps[0]!.id,
-      coversTo: steps[steps.length - 1]!.id,
-      name: 'L0',
-      text: '摘要',
-      status: 'ready',
-      inContext: false,
-      supersededBy: null,
-      head: '# 摘要\n\n摘要',
-      archivePath: 'summaries/x.md',
-    })
-    expect(su).toBeGreaterThan(m.sumFloor)
-    expect(su).toBeLessThanOrEqual(m.sumCeil)
-    task.close()
-  })
-})
-
-describe('写域隔离', () => {
-  it('连开两个任务（中间主任务没说话）：B 的号段不与 A 重叠，两边并行写不撞号', async () => {
-    const dir = await workspace()
-    const main = openStore(dir)
-    runTurn(main, [], 'u1', 'r1')
-    main.close()
-    const a = forkTask(dir, 'A')
-    // A 跑一轮：A 段内写入 turn/step/message（kick 压缩还会写私有摘要）
-    const ta = openStore(dir, { task: scopeOf(a) })
-    runTurn(ta, [...ta.load()], 'A 问', 'A 答')
-    // 主任务没说话，紧接着开 B（任务条上限 3，连开是常见操作）
-    const b = forkTask(dir, 'B')
-    for (const [floor, ceil] of [
-      ['stepFloor', 'stepCeil'],
-      ['msgFloor', 'msgCeil'],
-      ['sumFloor', 'sumCeil'],
-    ] as const) {
-      // B 的段必须整体在 A 的段之上
-      expect(b[floor], `${floor} 落进了 A 的段`).toBeGreaterThanOrEqual(a[ceil])
-    }
-    // 两边接着写：不撞主键
-    const tb = openStore(dir, { task: scopeOf(b) })
-    runTurn(tb, [...tb.load()], 'B 问', 'B 答')
-    runTurn(ta, [...ta.load()], 'A 再问', 'A 再答')
-    ta.close()
-    tb.close()
-  })
-
-  it('任务的 save 不删不重插对话的 live 行；对话重存后任务视图顺序仍对', async () => {
-    const dir = await workspace()
-    const main = openStore(dir)
-    const mainLive: Message[] = []
-    runTurn(main, mainLive, 'u1', 'r1')
-    main.close()
-    const convRowsBefore = query<{ id: number; turn_id: number }>(
-      dir,
-      "SELECT id, turn_id FROM messages WHERE state = 'live'",
-    )
-    const m = forkTask(dir, 't')
-
-    // 任务跑一轮（live 从 load() 起步——真实链路）
-    const task = openStore(dir, { task: scopeOf(m) })
-    const live: Message[] = [...task.load()]
-    runTurn(task, live, 'q', 'a')
-    task.close()
-
-    // 对话的 live 行原封不动（没被删、没有被搬进任务段重插）
-    const convRowsAfter = query<{ id: number; turn_id: number }>(
-      dir,
-      "SELECT id, turn_id FROM messages WHERE state = 'live' AND owner IS NULL AND turn_id IN (SELECT id FROM turns WHERE owner IS NULL)",
-    )
-    expect(convRowsAfter).toEqual(convRowsBefore)
-
-    // 对话在任务存活期间继续跑：它重存 live（DELETE+INSERT，id 变大）
-    const main2 = openStore(dir)
-    runTurn(main2, mainLive, 'u2', 'r2')
-    main2.close()
-    const taskIds = query<{ id: number }>(
-      dir,
-      "SELECT id FROM messages WHERE turn_id IN (SELECT id FROM turns WHERE owner = ?)",
-      m.owner,
-    ).map((r) => r.id)
-    expect(taskIds.every((id) => id > m.msgFloor && id <= m.msgCeil)).toBe(true)
-    // 任务重开：视图 = 继承（u1,r1）+ 自己（q,a），顺序先继承后自己
-    const back = openStore(dir, { task: scopeOf(m) })
-    const texts = back
-      .load()
-      .map((msg) => (msg.parts[0] as { type: string; text: string }).text)
-    expect(texts).toEqual(['u1', 'r1', 'q', 'a'])
-    back.close()
-  })
-
-  it('剪掉继承段之后库的 live 仍与内存逐条对齐（2026-10-08 PrefixBroken 实锤）', async () => {
-    // 某项目任务：合并收编继承段 → 内存剪掉那些消息，库里的复制
-    // 行却按「继承的不删」留着 live → liveTurnModels 比内存长、下标错位，
-    // 刚由 opus 签的 reasoning 被认成更早 glm 轮的、当别家签名剥掉，改写前缀
-    const dir = await workspace()
-    const main = openStore(dir)
-    const mainLive: Message[] = []
-    runTurn(main, mainLive, 'u1', 'r1')
-    runTurn(main, mainLive, 'u2', 'r2')
-    main.close()
-    const m = forkTask(dir, 't')
-    const task = openStore(dir, { task: scopeOf(m) })
-    const live: Message[] = [...task.load()]
-    const t = task.beginTurn({ model: 'p/opus', effort: null })
-    live.push(userSays('q'), assistantSays('a'))
-    task.save(live)
-    task.finishTurn(t, 1, 'done')
-    // applyPendingMerges：继承的第一轮被合并收编，内存剪掉并通知 store
-    live.splice(0, 2)
-    task.pruneMessages([0, 1])
-    expect(task.liveTurnModels()).toEqual(['p/m', 'p/m', 'p/opus', 'p/opus'])
-    expect(task.load().length).toBe(live.length)
-    task.close()
-  })
-})
-
-describe('私有摘要（任务压缩继承段）', () => {
-  /** 对话跑两轮 + fork + 任务跑一轮，返回可复用的现场 */
-  const setup = async (): Promise<{ dir: string; m: TaskManifest }> => {
-    const dir = await workspace()
-    const main = openStore(dir)
-    const mainLive: Message[] = []
-    runTurn(main, mainLive, '对话问题一', '对话回答一')
-    runTurn(main, mainLive, '对话问题二', '对话回答二')
-    main.close()
-    const m = forkTask(dir, 't')
-    const task = openStore(dir, { task: scopeOf(m) })
-    const live: Message[] = [...task.load()]
-    runTurn(task, live, '任务问题', '任务回答')
-    task.close()
-    return { dir, m }
-  }
-
-  /** 任务视角给继承段写一条 ready 的私有 L0 并进场（模拟 idle 压缩走完） */
-  const compressInherited = (dir: string, m: TaskManifest, opts: { activate?: boolean } = {}): number => {
-    const task = openStore(dir, { task: scopeOf(m) })
-    // 继承段的 step：对话的 turn 1（最老优先，摘的就是它）
-    const convSteps = query<{ id: number }>(
-      dir,
-      `SELECT id FROM steps WHERE turn_id IN (SELECT id FROM turns WHERE owner IS NULL AND state != 'reserved') ORDER BY id`,
-    )
-    const id = task.addSummary({
-      level: 0,
-      coversFrom: convSteps[0]!.id,
-      coversTo: convSteps[convSteps.length - 1]!.id,
-      name: '',
-      text: '继承段摘要：对话在测试里跑了两轮',
-      status: 'ready',
-      inContext: false,
-      supersededBy: null,
-      head: null,
-      archivePath: null,
-    })
-    // 进场：私有摘要允许顶继承段（段头没卸也行——那是任务的顶替目标）。
-    // opts.activate=false 模拟「刚生成、还没过进场闸」的中间态
-    if (opts.activate !== false) expect(task.activateSummary(convSteps[0]!.id)).toBe(true)
-    task.close()
-    return id
-  }
-
-  it('私有摘要：任务视角顶替继承段原文，对话视角照发原文', async () => {
-    const { dir, m } = await setup()
-    compressInherited(dir, m)
-
-    // 任务视角组装：继承段两轮原文（4 条）被一行私有摘要顶替
-    const task = openStore(dir, { task: scopeOf(m) })
-    const out = assembleContext(task.liveWithTurns(), task.summaries())
-    // 摘要以 renderSummary 的包裹形态出现（标签 + 摘要行），判据用包含
-    const joined = out
-      .map((msg) => (msg.parts[0] as { type: string; text: string }).text)
-      .join('\n')
-    expect(joined).toContain('继承段摘要：对话在测试里跑了两轮')
-    const texts = joined.split('\n')
-    expect(texts).not.toContain('对话回答一')
-    // 自己的轮不受影响
-    expect(texts).toContain('任务回答')
-    // 行的 state 没动——继承段的 4 条还是 live（对话的账本原样）
-    const liveCount = query<{ c: number }>(
-      dir,
-      "SELECT COUNT(*) AS c FROM messages WHERE state = 'live' AND owner IS NULL AND turn_id IN (SELECT id FROM turns WHERE owner IS NULL)",
-    )[0]!.c
-    expect(liveCount).toBe(4)
-    task.close()
-
-    // 对话视角：看不见私有摘要，原文照发
-    const main = openStore(dir)
-    const mainOut = assembleContext(main.liveWithTurns(), main.summaries())
-    const mainTexts = mainOut.map((msg) => (msg.parts[0] as { type: string; text: string }).text)
-    expect(mainTexts).toContain('对话回答一')
-    expect(mainTexts).not.toContain('继承段摘要：对话在测试里跑了两轮')
+    const ml: Message[] = []
+    runTurn(main, ml, '问一', '答一')
+    runTurn(main, ml, '问二', '答二')
+    const steps = stepsOf(dir, null)
+    fillSegment(main) // 写满（空 step 不算要覆盖的内容）
+    runTurn(main, ml, '新段的问', '新段的答') // 切段：旧段 full
+    expect(segs(dir)[0]?.state).toBe('full')
+    summarizeAll(main, steps.slice(0, 1), '主')
+    expect(main.mergeSegments()).toBe(0)
+    expect(segs(dir)[0]?.state).toBe('full') // 对照：缺一条覆盖
+    summarizeAll(main, steps.slice(1), '主')
+    expect(main.mergeSegments()).toBe(steps.length)
+    expect(segs(dir)[0]?.state).toBe('merged')
+    expect(texts(main.trunk().summaries())).toEqual(steps.map((s) => `主摘要${s}`))
+    expect(main.mergeSegments()).toBe(0) // 幂等：不重复拷
+    // open 段不合回（规则 4 第一条）：新段的内容即便摘了也不进主干
+    summarizeAll(main, stepsOf(dir, null).slice(2), '主')
+    expect(main.mergeSegments()).toBe(0)
     main.close()
   })
 
-  it('fork 之后对话产生的摘要任务一律看不见；fork 时已有的摘要任务有自己的一份', async () => {
-    // 真机 2026-09-23：对话 fork 后跑了几十轮、摘出 L0/L1 并进场，任务视角
-    // 把它们当继承摘要按 covers 排在自己的轮之后，对话一进场任务前缀就变。
-    // 上下文隔离之后更严：哪怕摘的是 fork 前的 step，只要是 fork 之后才
-    // 产生/进场的，都是主任务自己的压缩动作，任务看不见
+  it('关闭：段即刻合回并标 closed，行的 owner 不变，manifest 删掉', async () => {
     const dir = await workspace()
-    const main0 = openStore(dir)
-    const live0: Message[] = []
-    runTurn(main0, live0, '对话问题一', '对话回答一')
-    const first = query<{ id: number }>(dir, `SELECT MIN(id) AS id FROM steps`)[0]!.id
-    main0.addSummary({
-      level: 0,
-      coversFrom: first,
-      coversTo: first,
-      name: '',
-      text: 'fork 时已在场的摘要',
-      status: 'ready',
-      inContext: true,
-      supersededBy: null,
-      head: null,
-      archivePath: null,
-    })
-    main0.close()
-    const m = forkTask(dir, 't')
+    const m = createTask(dir, '关闭')
+    const t = openStore(dir, { task: scopeOf(m) })
+    runTurn(t, [], '任务问', '任务答')
+    t.close()
+    expect(flipTaskLive(dir, m.owner)).toBe(2)
+    const counts = finalizeTask(dir, m.owner)
+    expect(counts.segments).toBe(1)
+    expect(segs(dir).find((s) => s.owner === m.owner)).toMatchObject({ state: 'merged', closed: 1 })
+    expect(query(dir, `SELECT 1 FROM turns WHERE owner = ?`, m.owner)).toHaveLength(1)
+    expect(query(dir, `SELECT 1 FROM messages WHERE owner = ?`, m.owner)).toHaveLength(2)
+    expect(existsSync(join(dir, '.simple-code', 'tasks', `${m.owner}.json`))).toBe(false)
+  })
 
+  it('关闭：删掉它的拉段记录（开场从主干复制的）；主干与在开任务的不动（对照）', async () => {
+    const dir = await workspace()
+    openStore(dir).close() // 建库
+    for (const id of [1, 2]) query(dir, `INSERT INTO segment_pulls VALUES(?, ?, 'x')`, TRUNK, id)
+    const m = createTask(dir, '关的')
+    const live = createTask(dir, '不关的')
+    const pulls = (owner: string): number =>
+      query(dir, `SELECT 1 FROM segment_pulls WHERE owner = ?`, owner).length
+    expect(pulls(m.owner)).toBe(2)
+    const t = openStore(dir, { task: scopeOf(m) })
+    runTurn(t, [], '任务问', '任务答')
+    t.close()
+    flipTaskLive(dir, m.owner)
+    finalizeTask(dir, m.owner)
+    expect(pulls(m.owner)).toBe(0)
+    expect(pulls(TRUNK)).toBe(2)
+    expect(pulls(live.owner)).toBe(2)
+  })
+
+  it('关闭：开场复制的主干摘要、跨着副本合出的行删掉；段内的行留下并解开收编，主干照样收到', async () => {
+    const dir = await workspace()
     const main = openStore(dir)
-    const mainLive = [...main.load()]
-    runTurn(main, mainLive, 'fork 后对话问', 'fork 后对话答')
-    const after = query<{ id: number }>(dir, 'SELECT MAX(id) AS id FROM steps')[0]!.id
-    expect(after).toBeGreaterThan(m.stepCeil) // 前提：对话跳段了
-    for (const [from, text] of [
-      [after, 'fork 后对话的摘要'],
-      [first, 'fork 后才补的 fork 前摘要'],
-    ] as const) {
-      main.addSummary({
-        level: 0,
-        coversFrom: from,
-        coversTo: from,
+    const ml: Message[] = []
+    runTurn(main, ml, '老问', '老答')
+    summarizeAll(main, stepsOf(dir, null), '老')
+    fillSegment(main)
+    runTurn(main, ml, '新段的问', '新段的答')
+    main.mergeSegments()
+    const trunkTexts = texts(main.trunk().summaries())
+    expect(trunkTexts).toEqual(['老摘要1', '老摘要2'])
+    const m = createTask(dir, '关')
+    const t = openStore(dir, { task: scopeOf(m) })
+    runTurn(t, [], '任务问', '任务答')
+    const own = stepsOf(dir, m.owner)
+    summarizeAll(t, own, '任')
+    // 任务自己的压缩跨着副本合出一条 L1，收编了段内第一条
+    const rows = t.summaries()
+    const copy = rows.find((s) => s.text === '老摘要2')
+    const first = rows.find((s) => s.text === `任摘要${own[0]}`)
+    t.recordMerge(
+      {
+        level: 1,
+        coversFrom: copy?.coversFrom ?? 0,
+        coversTo: own[0] ?? 0,
         name: '',
-        text,
+        text: '跨副本的合并',
         status: 'ready',
         inContext: true,
         supersededBy: null,
         head: null,
         archivePath: null,
-      })
-    }
-    main.close()
-
-    const task = openStore(dir, { task: scopeOf(m) })
-    const rows = task.summaries()
-    task.close()
-    expect(rows.map((x) => x.text)).toEqual(['fork 时已在场的摘要'])
-    expect(rows[0]!.owner).toBe(m.owner) // 是任务自己的副本，不是主任务那行
-  })
-
-  it('对话的 ready 摘要，任务不能替它进场（in_context 是共享列）', async () => {
-    const { dir, m } = await setup()
-    // 对话视角写一条 ready 的 L0（还没进场）
-    const main = openStore(dir)
-    const convSteps = query<{ id: number }>(
-      dir,
-      `SELECT id FROM steps WHERE turn_id IN (SELECT id FROM turns WHERE owner IS NULL AND state != 'reserved') ORDER BY id`,
+      },
+      [copy?.id ?? 0, first?.id ?? 0],
     )
-    main.addSummary({
-      level: 0,
-      coversFrom: convSteps[0]!.id,
-      coversTo: convSteps[convSteps.length - 1]!.id,
-      name: '',
-      text: '对话自己的摘要',
-      status: 'ready',
-      inContext: false,
-      supersededBy: null,
-      head: null,
-      archivePath: null,
-    })
-    main.close()
-    // 任务视角进场：candidate 是 owner=me 的行——对话的这条翻不了
-    const task = openStore(dir, { task: scopeOf(m) })
-    expect(task.activateSummary(convSteps[0]!.id)).toBe(false)
-    const row = query<{ in_context: number }>(
-      dir,
-      `SELECT in_context FROM summaries WHERE text = '对话自己的摘要'`,
-    )[0]!
-    expect(row.in_context).toBe(0)
-    task.close()
-  })
-
-  it('finalize：继承段私有摘要删掉，自己段的还俗', async () => {
-    const { dir, m } = await setup()
-    compressInherited(dir, m)
-    // 任务自己段也写一条私有摘要（模拟跑久了摘要化）
-    const task = openStore(dir, { task: scopeOf(m) })
-    const ownSteps = query<{ id: number }>(
-      dir,
-      `SELECT id FROM steps WHERE turn_id IN (SELECT id FROM turns WHERE owner = ?) ORDER BY id`,
-      m.owner,
-    )
-    task.addSummary({
-      level: 0,
-      coversFrom: ownSteps[0]!.id,
-      coversTo: ownSteps[ownSteps.length - 1]!.id,
-      name: '',
-      text: '任务自己的摘要',
-      status: 'ready',
-      inContext: false,
-      supersededBy: null,
-      head: null,
-      archivePath: null,
-    })
-    task.close()
-
+    expect(query(dir, `SELECT 1 FROM summaries WHERE owner = ?`, m.owner)).toHaveLength(5) // 对照：删前都在
+    t.close()
     flipTaskLive(dir, m.owner)
-    finalizeTask(dir, m.owner)
-    // 继承段私有摘要：删（脚手架）
-    const gone = query<{ c: number }>(
-      dir,
-      `SELECT COUNT(*) AS c FROM summaries WHERE text = '继承段摘要：对话在测试里跑了两轮'`,
-    )[0]!.c
-    expect(gone).toBe(0)
-    // 自己段摘要：还俗（owner→NULL），对话可见
-    const main = openStore(dir)
-    const texts = main.summaries().map((s) => s.text)
-    expect(texts).toContain('任务自己的摘要')
+    const counts = finalizeTask(dir, m.owner)
+    expect(counts.sumDeleted).toBe(3) // 两条副本 + 跨副本的 L1
+    expect(
+      query(
+        dir,
+        `SELECT text, superseded_by FROM summaries WHERE owner = ? ORDER BY covers_from`,
+        m.owner,
+      ),
+    ).toEqual(own.map((s) => ({ text: `任摘要${s}`, superseded_by: null })))
+    expect(main.mergeSegments()).toBe(own.length) // 段内两条都是链根，主干照收
+    expect(texts(main.trunk().summaries())).toEqual([
+      ...trunkTexts,
+      ...own.map((s) => `任摘要${s}`),
+    ])
+    main.close()
+  })
+})
+
+/** 主任务一轮 + 任务 A 一轮并关闭（A 的段 closed 合回），A 的 step 都有 L0 */
+async function closedTaskA(
+  dir: string,
+): Promise<{ main: Store; ml: Message[]; m: TaskManifest; aSteps: number[] }> {
+  const main = openStore(dir)
+  const ml: Message[] = []
+  runTurn(main, ml, '主问一', '主答一')
+  const m = createTask(dir, 'A')
+  const t = openStore(dir, { task: scopeOf(m) })
+  runTurn(t, [], 'A 问', 'A 答')
+  const aSteps = stepsOf(dir, m.owner)
+  summarizeAll(t, aSteps, 'A')
+  t.close()
+  flipTaskLive(dir, m.owner)
+  finalizeTask(dir, m.owner)
+  return { main, ml, m, aSteps }
+}
+
+describe('拉摘要（规则 5）', () => {
+  it('只拉号比自己当前段低的：A 的段在主任务段之上时不拉（对照），主任务切段后才拉', async () => {
+    const dir = await workspace()
+    const { main } = await closedTaskA(dir)
+    // A 的段开在主任务当前段之上：现在拉，主任务之后的新消息会排到它前面
+    expect(main.pullPending()).toBe(false)
+    // 关掉的段在上方等着拉 → 主任务下一轮开始就切段（segment_full reason=pull_closed）
+    main.beginTurn({ model: 'p/m', effort: null })
+    expect(
+      segs(dir)
+        .filter((s) => s.owner === '')
+        .map((s) => s.state),
+    ).toEqual(['full', 'open'])
+    expect(main.pullPending()).toBe(true)
+    expect(main.pullSegments()).toBe(2)
+    const pulled = main.summaries().filter((s) => s.text.startsWith('A摘要'))
+    expect(pulled).toHaveLength(2)
+    expect(pulled.every((s) => s.inContext && s.owner === null)).toBe(true) // 复制成自己的、在场
+    expect(main.pullPending()).toBe(false) // 拉过一次就不再拉
+    expect(main.pullSegments()).toBe(0)
     main.close()
   })
 
-  it('flip/finalize 回报各步改动行数（task_close 的对账数据，2026-09-30 补观测）', async () => {
-    const { dir, m } = await setup()
-    compressInherited(dir, m)
-    const n = (sql: string, ...p: (string | number)[]): number => query<{ c: number }>(dir, sql, ...p)[0]!.c
-    const own = `(SELECT id FROM turns WHERE owner = '${m.owner}')`
-    const liveOwn = n(`SELECT COUNT(*) AS c FROM messages WHERE state = 'live' AND turn_id IN ${own}`)
-    expect(liveOwn).toBeGreaterThan(0)
-    expect(flipTaskLive(dir, m.owner)).toBe(liveOwn)
-    // finalize 前按同一判据数一遍，回报必须逐项对上
-    const want = {
-      sumDeleted: n(`SELECT COUNT(*) AS c FROM summaries WHERE owner = ? AND covers_from <= ?`, m.owner, m.stepFloor),
-      sumPromoted: n(`SELECT COUNT(*) AS c FROM summaries WHERE owner = ? AND covers_from > ?`, m.owner, m.stepFloor),
-      msgDeleted: n(`SELECT COUNT(*) AS c FROM messages WHERE owner = ? AND turn_id NOT IN ${own}`, m.owner),
-      msgPromoted: n(`SELECT COUNT(*) AS c FROM messages WHERE owner = ? AND turn_id IN ${own}`, m.owner),
-      turnsPromoted: n(`SELECT COUNT(*) AS c FROM turns WHERE owner = ?`, m.owner),
-    }
-    expect(want.sumDeleted + want.msgPromoted + want.turnsPromoted).toBeGreaterThan(0)
-    expect(finalizeTask(dir, m.owner)).toEqual(want)
+  it('没合回的段不拉（对照）；别人的 open 段号再低也不拉', async () => {
+    const dir = await workspace()
+    const m = createTask(dir, 'A')
+    const t = openStore(dir, { task: scopeOf(m) })
+    runTurn(t, [], 'A 问', 'A 答')
+    summarizeAll(t, stepsOf(dir, m.owner), 'A')
+    const main = openStore(dir) // 主任务的段开在 A 之上
+    runTurn(main, [], '主问', '主答')
+    expect(segs(dir).map((s) => s.owner)).toEqual([m.owner, ''])
+    expect(main.pullPending()).toBe(false) // A 还 open
+    expect(main.mergeSegments()).toBe(0)
+    main.close()
+    t.close()
   })
 
-  it('合并不越界：对话的 L0 和任务的私有 L0 连续也不合并', async () => {
-    const { pickMergeGroup } = await import('../src/loop/summarize.ts')
-    const mk = (owner: string | null, coversFrom: number): Parameters<typeof pickMergeGroup>[0][number] =>
-      ({
-        id: coversFrom,
-        owner,
-        level: 0,
+  it('拉进来的行在拼装里按段的号排在两段自己的历史之间', async () => {
+    const dir = await workspace()
+    const { main, ml } = await closedTaskA(dir)
+    summarizeAll(main, stepsOf(dir, null), '主')
+    const t = main.beginTurn({ model: 'p/m', effort: null })
+    ml.push(userSays('主问二'), assistantSays('主答二'))
+    main.save(ml)
+    main.finishTurn(t, 1, 'done')
+    main.pullSegments()
+    const order = main
+      .summaries()
+      .filter((s) => s.inContext)
+      .sort((a, b) => a.coversFrom - b.coversFrom)
+      .map((s) => s.text.slice(0, 3))
+    expect(order).toEqual(['主摘要', '主摘要', 'A摘要', 'A摘要'])
+    const last = stepsOf(dir, null).at(-1) ?? 0
+    expect(last).toBeGreaterThan(
+      main.summaries().find((s) => s.text.startsWith('A'))?.coversTo ?? Infinity,
+    )
+    main.close()
+  })
+})
+
+describe('跨缝合并（规则 6）', () => {
+  const l0 = (id: number, step: number, owner: string | null = null): Summary => ({
+    id,
+    level: 0,
+    coversFrom: step,
+    coversTo: step,
+    name: '',
+    text: `s${step}`,
+    status: 'ready',
+    inContext: true,
+    supersededBy: null,
+    head: null,
+    archivePath: null,
+    owner,
+  })
+
+  it('gapHasContent 按「不是自己」判：主任务看 A 的 step、A 看主任务的 step 都挡', async () => {
+    const dir = await workspace()
+    const main = openStore(dir)
+    const ml: Message[] = [] // live 要沿用同一份：save 按下标归属轮与 step
+    runTurn(main, ml, '主一', '答')
+    const m = createTask(dir, 'A')
+    const a = openStore(dir, { task: scopeOf(m) })
+    runTurn(a, [], 'A 一', '答')
+    a.close()
+    fillSegment(main)
+    runTurn(main, ml, '主二', '答') // 主任务新段在 A 之上
+    const ms = stepsOf(dir, null)
+    const m1 = ms[1] // 第一段最后一个
+    const m2 = ms[2] // 第二段第一个
+    const [a1, a2] = stepsOf(dir, m.owner)
+    expect(main.gapHasContent(m1 ?? 0, m2 ?? 0)).toBe(true) // 缝里有 A 的 step
+    const last = ms.at(-1) ?? 0
+    expect(main.gapHasContent(last, last + 5)).toBe(false) // 死号缝（对照）
+    const aView = openStore(dir, { task: scopeOf(m) })
+    // A 的视角：缝里只有主任务的 step。原判据 `owner IS NOT NULL` 看不见主任务
+    expect(aView.gapHasContent(0, a1 ?? 0)).toBe(true)
+    aView.close()
+    // pickMergeGroup：两条主任务 L0 夹着 A 的 step → 不合
+    const gap = (f: number, t: number) => main.gapHasContent(f, t)
+    expect(pickMergeGroup([l0(1, m1 ?? 0), l0(2, m2 ?? 0)], 2, gap)).toBeNull()
+    // A 合回、拉进来后缝里是 A 的副本（盖住 A 的整段）→ 三条连成一组
+    const copy = { ...l0(3, a1 ?? 0), coversTo: a2 ?? 0 }
+    const merged = pickMergeGroup([l0(1, m1 ?? 0), copy, l0(2, m2 ?? 0)], 3, gap)
+    expect(merged?.members.map((s) => s.id)).toEqual([1, 3, 2])
+    main.close()
+  })
+})
+
+describe('开任务（规则 7）', () => {
+  it('上下文只有主干在场摘要：没有 live、看不到主任务没合回的内容；不调模型（同步完成）', async () => {
+    const dir = await workspace()
+    const main = openStore(dir)
+    const ml: Message[] = []
+    runTurn(main, ml, '老问', '老答')
+    summarizeAll(main, stepsOf(dir, null), '老')
+    fillSegment(main)
+    runTurn(main, ml, '最近在聊的', '还没合回') // 新段：open，摘了也不合回
+    summarizeAll(main, stepsOf(dir, null).slice(2), '近')
+    main.mergeSegments()
+    // 主干里一条被合并收编、离场的行：不复制（对照）
+    const trunk = main.trunk()
+    const off = trunk.summaries()[0]
+    expect(off).toBeDefined()
+    const parent = trunk.recordMerge(
+      {
+        level: 1,
+        coversFrom: off?.coversFrom ?? 0,
+        coversTo: off?.coversTo ?? 0,
         name: '',
-        coversFrom,
-        coversTo: coversFrom,
-        text: 'x',
-        status: 'ready' as const,
-        inContext: true,
+        text: '待生效的合并',
+        status: 'ready',
+        inContext: false,
         supersededBy: null,
         head: null,
         archivePath: null,
-      }) as never
-    // 三条连续：对话、对话、任务私有——最后两条不能并入对话那条的组
-    const group = pickMergeGroup([mk(null, 1), mk('task-a', 2), mk('task-a', 3)], 2)
-    expect(group?.members.map((s) => s.owner)).toEqual(['task-a', 'task-a'])
-    // 全对话：照常合并（回归）
-    const group2 = pickMergeGroup([mk(null, 1), mk(null, 2)], 2)
-    expect(group2?.members.every((s) => s.owner === null)).toBe(true)
-  })
-
-  it('关闭任务留下的尾巴：原文全卸、摘要不在场 → 主任务下一次压缩就进场（2026-09-24/25 两个任务的孤儿段）', async () => {
-    const { activateBeyondStubZone } = await import('../src/loop/summarize.ts')
-    const { dir, m } = await setup()
-    // 主任务库先开着（真实场景：主任务一直在跑，任务是后来 fork 出去的）
-    const main = openStore(dir)
-
-    // 任务跑了一轮，关闭时这一轮还是原文——它的 L0 写好了但没进过场
-    const task = openStore(dir, { task: scopeOf(m) })
-    const live: Message[] = [...task.load()]
-    const t = runTurn(task, live, '尾巴的问题', '尾巴的回答')
-    const steps = query<{ id: number }>(dir, 'SELECT id FROM steps WHERE turn_id = ? ORDER BY id', t)
-    task.addSummary({
-      level: 0,
-      coversFrom: steps[0]!.id,
-      coversTo: steps[steps.length - 1]!.id,
-      name: '',
-      text: '任务尾巴的摘要',
-      status: 'ready',
-      inContext: false,
-      supersededBy: null,
-      head: null,
-      archivePath: null,
-    })
-    task.close()
-    flipTaskLive(dir, m.owner)
-    finalizeTask(dir, m.owner)
-
-    // 主任务压缩点调用孤儿通道：存根区给得很宽（装得下全部 live），
-    // 孤儿通道不看存根区，只要段内无 live 就进场
-    const mainLive = main.liveWithTurns()
-    activateBeyondStubZone({
-      live: mainLive,
-      floorStart: mainLive.length,
-      stubSteps: 1000,
-      stubTokens: 1_000_000,
-      summaries: () => main.summaries(),
-      activateSummary: (stepId) => main.activateSummary(stepId),
-    })
-    const text = JSON.stringify(assembleContext(main.liveWithTurns(), main.summaries()))
-    expect(text).toContain('任务尾巴的摘要')
+      },
+      [off?.id ?? 0],
+    )
+    expect(parent).toBeGreaterThan(0)
+    const m = createTask(dir, '新任务') // 同步返回：开任务不经过任何模型调用
+    const t = openStore(dir, { task: scopeOf(m) })
+    expect(t.load()).toEqual([])
+    expect(texts(t.summaries())).toEqual(['老摘要1', '老摘要2'])
+    expect(t.summaries().every((s) => s.inContext && s.owner === m.owner)).toBe(true)
+    expect(t.pullPending()).toBe(false) // 主干拷过的段记为已拉，不再拉一份
+    // 新任务还没响应过：run.ts 靠它认「第一个请求」，有段可拉就拉（对照：主任务答过）
+    expect(t.lastRespondedAt()).toBeNull()
+    expect(main.lastRespondedAt()).not.toBeNull()
+    t.close()
     main.close()
   })
 
-  it('进场走真实闸：activateBeyondStubZone 的区外含继承段，私有 L0 自动进场', async () => {
-    const { activateBeyondStubZone } = await import('../src/loop/summarize.ts')
-    const { dir, m } = await setup()
-    // 私有 L0 就绪但未进场（kick 压缩刚生成的状态）
-    compressInherited(dir, m, { activate: false })
-
-    const task = openStore(dir, { task: scopeOf(m) })
-    const liveBefore = task.liveWithTurns()
-    // 激活前先量好——summaries() 读的是活库，激活后再取两边就一样了
-    const beforeAssembled = assembleContext(liveBefore, task.summaries()).length
-    // 压缩点包一层：floorStart 只圈最后一条，存根区两界压到极小——
-    // 继承段整段落在区外（它本来就在最老端）
-    activateBeyondStubZone({
-      live: liveBefore,
-      floorStart: liveBefore.length - 1,
-      stubSteps: 1,
-      stubTokens: 1,
-      summaries: () => task.summaries(),
-      activateSummary: (stepId) => task.activateSummary(stepId),
-    })
-    // 进场后：装配里继承段原文被私有摘要顶替
-    const liveAfter = task.liveWithTurns()
-    const after = assembleContext(liveAfter, task.summaries())
-    expect(after.length).toBeLessThan(beforeAssembled)
-    const activated = query<{ c: number }>(
-      dir,
-      `SELECT COUNT(*) AS c FROM summaries WHERE owner = ? AND in_context = 1`,
-      m.owner,
-    )[0]!.c
-    expect(activated).toBe(1)
-    task.close()
+  it('不等主任务静止：主任务一轮写到一半时开任务，两边的号互不干扰', async () => {
+    const dir = await workspace()
+    const main = openStore(dir)
+    const ml: Message[] = []
+    const turn = main.beginTurn({ model: 'p/m', effort: null })
+    ml.push(userSays('跑到一半'))
+    main.save(ml)
+    const m = createTask(dir, '中途开的')
+    ml.push(assistantSays('接着跑完'))
+    main.save(ml)
+    main.finishTurn(turn, 1, 'done')
+    const t = openStore(dir, { task: scopeOf(m) })
+    runTurn(t, [], '任务问', '任务答')
+    t.close()
+    const ms = stepsOf(dir, null)
+    expect(ms).toEqual([1, 2])
+    expect(stepsOf(dir, m.owner).every((s) => s > (segs(dir)[0]?.ceil ?? 0))).toBe(true)
+    main.close()
   })
 
-  it('markCold 不碰继承 step（unloaded 是对话的账本）', async () => {
-    const { dir, m } = await setup()
-    const task = openStore(dir, { task: scopeOf(m) })
-    const allSteps = query<{ id: number; turn_id: number }>(dir, `SELECT id, turn_id FROM steps`)
-    // 卸载循环的模拟：把继承 step 和自己的 step 一起交出去
-    task.markCold(allSteps.map((s) => s.id))
-    task.close()
-    const rows = query<{ id: number; unloaded: number }>(dir, `SELECT id, unloaded FROM steps`)
-    const byId = new Map(rows.map((r) => [r.id, r.unloaded]))
-    for (const s of allSteps) {
-      const isOwn = s.turn_id > m.forkTurn && s.turn_id < m.turnCeil
-      expect(byId.get(s.id)).toBe(isOwn ? 1 : 0)
+  it('登记父任务：parent + callback=pending 写进 manifest；不传就没有（对照）', async () => {
+    const dir = await workspace()
+    const a = createTask(dir, '派的', { parent: '' })
+    const b = createTask(dir, '人开的')
+    expect(readTaskManifest(dir, a.owner)).toMatchObject({ parent: '', callback: 'pending' })
+    expect(readTaskManifest(dir, b.owner).parent).toBeUndefined()
+    // 只输名称开的空任务带标记（规则 13）；不传就没有（对照）
+    const c = createTask(dir, '空的', { parent: '', awaitingFirstMessage: true })
+    expect(readTaskManifest(dir, c.owner)).toMatchObject({ awaitingFirstMessage: true, callback: 'pending' })
+    expect(readTaskManifest(dir, a.owner).awaitingFirstMessage).toBeUndefined()
+    expect(
+      listTaskManifests(dir)
+        .map((x) => x.owner)
+        .sort(),
+    ).toEqual([a.owner, b.owner, c.owner].sort())
+  })
+
+  it('owner 撞号就重抽：在开的（manifest）与关了但说过话的（turns）都不复用', async () => {
+    const dir = await workspace()
+    // 前 6 次抽到 'a'（task-aaaaaa），之后恒抽 then 对应的字母（0.5 → 's'，0.25 → 'j'）
+    const drawFirst = (then: number): void => {
+      let n = 0
+      vi.spyOn(Math, 'random').mockImplementation(() => (n++ < 6 ? 0 : then))
+    }
+    try {
+      drawFirst(0.5)
+      const open = createTask(dir, '在开')
+      expect(open.owner).toBe('task-aaaaaa')
+      drawFirst(0.5)
+      expect(createTask(dir, '撞在开的').owner).toBe('task-ssssss')
+      // 关掉 task-aaaaaa（说过话）：manifest 没了，turns 还在
+      const t = openStore(dir, { task: scopeOf(open) })
+      runTurn(t, [], '问', '答')
+      t.close()
+      flipTaskLive(dir, open.owner)
+      finalizeTask(dir, open.owner)
+      drawFirst(0.25)
+      expect(createTask(dir, '撞关了的').owner).toBe('task-jjjjjj')
+    } finally {
+      vi.restoreAllMocks()
     }
   })
 })
 
-describe('任务会话的真 session 链路（2026-09-23 真机两连炸）', () => {
+describe('真 session：前缀与主干（规则 5、10）', () => {
   const settings = async (dir: string, memory: Record<string, unknown> = {}): Promise<string> => {
-    const { writeFile } = await import('node:fs/promises')
     const globalPath = join(dir, 'settings.json')
     await writeFile(
       globalPath,
@@ -633,190 +527,36 @@ describe('任务会话的真 session 链路（2026-09-23 真机两连炸）', ()
     )
     return globalPath
   }
+  const seen: string[] = []
+  const stream = ((request: { messages: { parts: { type: string; text?: string }[] }[] }) => {
+    seen.push(
+      request.messages
+        .map((m) => m.parts.map((p) => (p.type === 'text' ? (p.text ?? '') : p.type)).join(''))
+        .join('\n'),
+    )
+    return (async function* () {
+      yield { type: 'text_start' } as never
+      yield { type: 'text_delta', text: '答' } as never
+      yield { type: 'text_end' } as never
+      yield {
+        type: 'finish',
+        reason: 'stop',
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheCreationInputTokens: 0,
+          cacheReadInputTokens: 0,
+          reasoningTokens: 0,
+        },
+      } as never
+    })()
+  }) as never
 
-  it('对话 fork 后重存（继承行 id 跳到任务段之上）→ 任务重开再存，自己的消息不被继承行顶替', async () => {
-    // 真机 2026-09-23 task-uo518x：load() 按 (turn_id, id) 排，归属数组按 id
-    // 排。对话每次 save 都 DELETE+INSERT 自己的 live 行，fork 后新 id 落在
-    // 任务段之上——任务自己的行 id 反而更小，两种排序错位：任务重开后一存，
-    // 最老的几条继承消息被当成自己的写进任务段、自己的真消息被当继承跳过
-    const dir = await workspace()
-    const main = openStore(dir)
-    const mainLive: Message[] = []
-    runTurn(main, mainLive, '老问题一', '老回答一')
-    runTurn(main, mainLive, '老问题二', '老回答二')
-    main.close()
-    const m = forkTask(dir, 't')
-    const t1 = openStore(dir, { task: scopeOf(m) })
-    const tl = [...t1.load()]
-    runTurn(t1, tl, '任务问', '任务答')
-    t1.close()
-    // 对话接着说一句：重存全部 live，继承行的 id 跳到任务段之上
-    const main2 = openStore(dir)
-    const ml = [...main2.load()]
-    runTurn(main2, ml, '对话新问', '对话新答')
-    main2.close()
-
-    const t2 = openStore(dir, { task: scopeOf(m) })
-    const live = [...t2.load()]
-    const texts = (xs: Message[]) => xs.map((x) => (x.parts[0] as { text: string }).text)
-    expect(texts(live)).toEqual(['老问题一', '老回答一', '老问题二', '老回答二', '任务问', '任务答'])
-    runTurn(t2, live, '任务再问', '任务再答')
-    t2.close()
-
-    const t3 = openStore(dir, { task: scopeOf(m) })
-    expect(texts(t3.load())).toEqual([
-      '老问题一', '老回答一', '老问题二', '老回答二', '任务问', '任务答', '任务再问', '任务再答',
-    ])
-    t3.close()
-    const own = query<{ c: string }>(
-      dir,
-      `SELECT content_json AS c FROM messages WHERE turn_id IN (SELECT id FROM turns WHERE owner = ?) ORDER BY id`,
-      m.owner,
-    ).map((r) => (JSON.parse(r.c) as Message).parts[0] as { text: string })
-    expect(own.map((p) => p.text)).toEqual(['任务问', '任务答', '任务再问', '任务再答'])
-  })
-
-  it('fork 后对话接着说话（跳到段上方）→ 任务照常能发消息，不误报「段已满」', async () => {
-    const { getSession } = await import('../src/session/session.ts')
-    const dir = await workspace()
-    const main = openStore(dir)
-    const mainLive: Message[] = []
-    runTurn(main, mainLive, '对话问题', '对话回答')
-    main.close()
-    const m = forkTask(dir, 't')
-    // 对话在 fork 后又说了一句：它的 turn 落在 turnCeil 之上
-    const main2 = openStore(dir)
-    const live2: Message[] = [...main2.load()]
-    const after = runTurn(main2, live2, 'fork 后对话又问', '又答')
-    main2.close()
-    expect(after).toBeGreaterThan(m.turnCeil)
-
-    const globalPath = await settings(dir)
-    const session = await getSession(dir, {
-      task: scopeOf(m),
-      skipLock: true,
-      globalPath,
-      env: {},
-      stream: () =>
-        (async function* () {
-          yield { type: 'text_start' } as never
-          yield { type: 'text_delta', text: '任务答' } as never
-          yield { type: 'text_end' } as never
-          yield {
-            type: 'finish',
-            reason: 'stop',
-            usage: { inputTokens: 1, outputTokens: 1, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, reasoningTokens: 0 },
-          } as never
-        })(),
-    } as never)
-    const events: { type: string; message?: string }[] = []
-    for await (const ev of session.send('任务的第一句')) events.push(ev as never)
-    await session.close()
-    expect(events.filter((e) => e.type === 'error').map((e) => e.message)).toEqual([])
-    // 任务轮落在自己段内
-    const own = query<{ id: number }>(dir, 'SELECT id FROM turns WHERE owner = ?', m.owner)
-    expect(own).toHaveLength(1)
-    expect(own[0]!.id).toBeGreaterThan(m.forkTurn)
-    expect(own[0]!.id).toBeLessThan(m.turnCeil)
-  })
-
-  it('继承段滞留超线、却无摘可摘也无摘要可顶 → summarizeIdle 收敛，不空转饿死事件循环', async () => {
-    const { getSession } = await import('../src/session/session.ts')
-    const dir = await workspace()
-    const main = openStore(dir)
-    const mainLive: Message[] = []
-    runTurn(main, mainLive, '对话问题一'.repeat(200), '对话回答一'.repeat(200))
-    runTurn(main, mainLive, '对话问题二'.repeat(200), '对话回答二'.repeat(200))
-    // 对话的已卸段 + 一条它自己的 ready 摘要（未进场）覆盖全部：任务视角
-    // 下这段滞留、没有可摘的段（已被覆盖）、那条摘要任务又没权进场——
-    // 真机上就是这个组合让 drain 与 kick 无限互踢
-    const steps = query<{ id: number }>(dir, 'SELECT id FROM steps ORDER BY id').map((r) => r.id)
-    main.markCold(steps)
-    main.addSummary({
-      level: 0,
-      coversFrom: steps[0]!,
-      coversTo: steps[steps.length - 1]!,
-      name: '',
-      text: '对话自己的摘要',
-      status: 'ready',
-      inContext: false,
-      supersededBy: null,
-      head: null,
-      archivePath: null,
-    })
-    main.close()
-    const m = forkTask(dir, 't')
-
-    const globalPath = await settings(dir, { stubTokens: 1 })
-    const session = await getSession(dir, {
-      task: scopeOf(m),
-      skipLock: true,
-      globalPath,
-      env: {},
-    } as never)
-    // 活锁是纯微任务的：summarizeIdle 本身会 resolve，空转的是 finally 里
-    // 踢出去的下一个 kick——之后任何宏任务（计时器、I/O、vitest 超时）都
-    // 永远轮不到。检测靠 SQL 调用量（每圈都查库）：微任务 watchdog 与被测
-    // 代码交替执行，量爆了就判活锁并关 store 打断（关了之后 drain 里的调用
-    // 抛错、被既有 catch 收掉）。watchdog 自己也是微任务链，按墙钟限时，
-    // 不然正常情况也会被它饿死
-    const proto = DatabaseSync.prototype as unknown as { prepare: (...a: unknown[]) => unknown }
-    const realPrepare = proto.prepare
-    let queries = 0
-    proto.prepare = function (this: unknown, ...a: unknown[]) {
-      queries += 1
-      return realPrepare.apply(this, a)
-    }
-    let livelocked = false
-    try {
-      await session.summarizeIdle()
-      const base = queries
-      const until = Date.now() + 300
-      const watchdog = (): void => {
-        if (queries - base > 5_000) {
-          livelocked = true
-          void session.close()
-          return
-        }
-        if (Date.now() < until) queueMicrotask(watchdog)
-      }
-      queueMicrotask(watchdog)
-      // 能等到这个宏任务 = 事件循环活着
-      await new Promise((r) => setTimeout(r, 20))
-    } finally {
-      proto.prepare = realPrepare
-    }
-    expect(livelocked).toBe(false)
-    await session.close()
-  })
-
-  it('合并还俗改写主任务前缀：下一次请求搭压缩车放行，不报 PrefixBrokenError（2026-09-23 真机 13:24:21）', async () => {
-    // 真机：点了合并，主任务下一句被前缀守卫拦下（messages 第 44 条起不同
-    // 295→302）——任务的经历摘要进了主任务上下文，是合法改写但没有压缩点
-    // 放行。定死规则：合法改写只搭压缩的车，合并落「压缩车票」
+  it('拉入在历史中段（主任务已在 A 之上的段里说过话）：只在压缩点拉，有段可拉不单独发车，前缀守卫不响', async () => {
     const { getSession } = await import('../src/session/session.ts')
     const dir = await workspace()
     const globalPath = await settings(dir)
-    const seen: string[] = []
-    const stream = ((request: {
-      messages: { parts: { type: string; text?: string }[] }[]
-    }) => {
-      seen.push(
-        request.messages
- .map((m) => m.parts.map((p) => (p.type === 'text' ? p.text ?? '' : p.type)).join(''))
-          .join('\n'),
-      )
-      return (async function* () {
-        yield { type: 'text_start' } as never
-        yield { type: 'text_delta', text: '答' } as never
-        yield { type: 'text_end' } as never
-        yield {
-          type: 'finish',
-          reason: 'stop',
-          usage: { inputTokens: 1, outputTokens: 1, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, reasoningTokens: 0 },
-        } as never
-      })()
-    }) as never
+    seen.length = 0
     const open = (task?: TaskManifest) =>
       getSession(dir, {
         ...(task ? { task: scopeOf(task) } : {}),
@@ -826,338 +566,142 @@ describe('任务会话的真 session 链路（2026-09-23 真机两连炸）', ()
         stream,
       } as never)
 
-    // 主任务先跑一轮：前缀基线落下来
-    const main1 = await open()
-    for await (const ev of main1.send('主问一')) void ev
-    await main1.close()
-
-    // 任务跑一轮，再挂一条已进场的私有摘要（真实链路：任务的压缩点进场）
-    const m = forkTask(dir, 't')
-    const t1 = await open(m)
-    for await (const ev of t1.send('任务第一句')) void ev
-    await t1.close()
-    const t2 = openStore(dir, { task: scopeOf(m) })
-    t2.addSummary({
-      level: 0,
-      coversFrom: m.stepFloor + 1,
-      coversTo: m.stepFloor + 1,
-      name: 'L0',
-      text: '任务经历摘要',
-      status: 'ready',
-      inContext: true,
-      supersededBy: null,
-      head: '任务第一句',
-      archivePath: `summaries/${m.stepFloor + 1}.md`,
-    })
-    t2.close()
-
-    // 合并（真实关闭末两步）
+    let main = await open()
+    for await (const ev of main.send('主问一')) void ev
+    // 任务与主任务并行：开、跑、摘，主任务 session 一直开着（不等它静止）
+    const m = createTask(dir, 't')
+    const t = await open(m)
+    for await (const ev of t.send('任务第一句')) void ev
+    await t.close()
+    const ts = openStore(dir, { task: scopeOf(m) })
+    summarizeAll(ts, stepsOf(dir, m.owner), '任务经历')
+    ts.close()
+    // 主任务段写满 → 下一轮切到 A 之上的新段，在新段里说一句
+    await main.close()
+    const filler = openStore(dir)
+    fillSegment(filler)
+    filler.close()
+    main = await open()
+    for await (const ev of main.send('主问二')) void ev
+    // A 关闭：它的段在主任务当前段之下，合回即可拉——插在「主问一」与「主问二」之间
     flipTaskLive(dir, m.owner)
     finalizeTask(dir, m.owner)
-
-    // 主任务接着说话：任务摘要进了上下文、前缀守卫不响、车票已用掉
-    const main2 = await open()
     const events: { type: string; message?: string }[] = []
-    for await (const ev of main2.send('合并后主问')) events.push(ev as never)
-    await main2.close()
-    expect(events.some((e) => e.type === 'error' && (e.message ?? '').includes('前缀'))).toBe(false)
-    const last = seen[seen.length - 1] ?? ''
-    expect(last).toContain('主问一')
-    expect(last).toContain('任务经历摘要')
-    expect(last).toContain('合并后主问')
-    const main3 = openStore(dir)
-    expect(main3.consumeMergePending()).toBe(false)
-    main3.close()
+    for await (const ev of main.send('关闭后主问')) events.push(ev as never)
+    // 有段可拉不单独触发压缩（2026-10-30 订正）：缓存没过期，这一请求不拉
+    expect(seen.at(-1) ?? '').not.toContain('任务经历摘要')
+    expect(query(dir, `SELECT 1 FROM segment_pulls WHERE owner = ''`)).toHaveLength(0)
+    // 压缩点到了才拉（这里用手动压缩；stale/预算同理）
+    expect((await main.compactNow()).ok).toBe(true)
+    for await (const ev of main.send('压缩后主问')) events.push(ev as never)
+    await main.close()
+    expect(events.filter((e) => e.type === 'error')).toEqual([])
+    const last = seen.at(-1) ?? ''
+    const at = (x: string) => last.indexOf(x)
+    expect(at('任务经历摘要')).toBeGreaterThanOrEqual(0)
+    expect(at('关闭后主问')).toBeGreaterThan(at('任务经历摘要')) // 中段插入：靠压缩点放行
+    expect(at('压缩后主问')).toBeGreaterThan(at('关闭后主问'))
+    expect(query(dir, `SELECT 1 FROM segment_pulls WHERE owner = ''`)).toHaveLength(1)
   })
-})
 
-describe('关闭', () => {
-  it('flip → 还债 → 还俗后对话自然看见任务段', async () => {
+  it('只输名称的空任务（规则 13）：建时不开段；建后别人合回的段，第一个请求就拉进来', async () => {
+    const { getSession } = await import('../src/session/session.ts')
     const dir = await workspace()
-    const main = openStore(dir)
-    const mainLive: Message[] = []
-    runTurn(main, mainLive, 'u1', 'r1')
-    main.close()
-    const m = forkTask(dir, 't')
-    const task = openStore(dir, { task: scopeOf(m) })
-    const live: Message[] = [...task.load()]
-    runTurn(task, live, 'q1', 'a1')
-    runTurn(task, live, 'q2', 'a2')
-    task.close()
+    const globalPath = await settings(dir)
+    seen.length = 0
+    const b = createTask(dir, 'B', { awaitingFirstMessage: true })
+    // 空任务零段：不留「open 却零 step」的段给别人的合并链跨过
+    expect(segs(dir).filter((s) => s.owner === b.owner)).toEqual([])
+    // B 建好、还没发第一条消息时：A 开、跑、摘、关——A 的段合回
+    const a = createTask(dir, 'A')
+    const as = openStore(dir, { task: scopeOf(a) })
+    runTurn(as, [], 'A 问', 'A 答')
+    summarizeAll(as, stepsOf(dir, a.owner), 'A经历')
+    as.close()
+    finalizeTask(dir, a.owner)
+    const t = await getSession(dir, { task: scopeOf(b), skipLock: true, globalPath, env: {}, stream } as never)
+    for await (const ev of t.send('B 第一句')) void ev
+    await t.close()
+    const segA = segs(dir).find((s) => s.owner === a.owner)
+    const segB = segs(dir).find((s) => s.owner === b.owner)
+    expect(segA?.state).toBe('merged')
+    // 第一轮才开段，落在 A 之上；A 在它之下、合回了，第一个请求就拉（firstPull）
+    expect(segB?.floor).toBeGreaterThanOrEqual(segA?.ceil ?? Number.POSITIVE_INFINITY)
+    expect(seen.at(-1) ?? '').toContain('A经历摘要')
+    expect(query(dir, `SELECT 1 FROM segment_pulls WHERE owner = ? AND segment_id = ?`, b.owner, segA?.id ?? 0)).toHaveLength(1)
+  })
 
-    // 债存在：段内 step 有消息、无摘要覆盖（债 = nextSegmentToSummarize
-    // 挑得出段——与 session.summaryDebt 同一判据，2026-09-23 合一）
-    const probe = openStore(dir, { task: scopeOf(m) })
-    let debt = probe.nextSegmentToSummarize(10_000, null) !== null
-    probe.close()
-    expect(debt).toBe(true)
-    // 还债：任务视角把段摘掉（直接用任务的 nextSegment 路径最小化）
-    flipTaskLive(dir, m.owner)
-    const t2 = openStore(dir, { task: scopeOf(m) })
-    // 真实关闭流程循环摘到没有候选（这里可能不止一段）
-    for (let i = 0; i < 10; i++) {
-      const seg = t2.nextSegmentToSummarize(10_000, null)
-      if (seg === null) break
-      t2.addSummary({
-        level: 0,
-        coversFrom: seg.from,
-        coversTo: seg.to,
-        name: 'L0-task',
-        text: '任务经历',
-        status: 'ready',
-        inContext: false,
-        supersededBy: null,
-        head: '# 任务经历\n\n任务经历',
-        archivePath: `summaries/${seg.from}.md`,
-      })
-    }
-    debt = t2.nextSegmentToSummarize(10_000, null) !== null
-    expect(debt).toBe(false)
-    t2.close()
-
-    // 还俗：owner 全 NULL、manifest 删除、对话视角看见任务轮
+  it('主干：合回的段拷进来，超配额就合并且立即生效；新任务拿到合并后的那条', async () => {
+    const { getSession } = await import('../src/session/session.ts')
+    const dir = await workspace()
+    const globalPath = await settings(dir, { mergeFactor: 2, indexRatio: 0.0001 })
+    // 合并请求走摘要连接（fetchImpl），回一条带标记的文本
+    const mergeFetch = (async () =>
+      new Response(
+        [
+          'event: message_start',
+          'data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}',
+          '',
+          'event: content_block_start',
+          'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+          '',
+          'event: content_block_delta',
+          'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"主干合并：两段任务经历"}}',
+          '',
+          'event: content_block_stop',
+          'data: {"type":"content_block_stop","index":0}',
+          '',
+          'event: message_delta',
+          'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}',
+          '',
+          'event: message_stop',
+          'data: {"type":"message_stop"}',
+          '',
+          '',
+        ].join('\n'),
+        { status: 200 },
+      )) as unknown as typeof fetch
+    // A 跑一轮、摘、关：它的段合回，主干还没拷
+    const m = createTask(dir, 'A')
+    const a = openStore(dir, { task: scopeOf(m) })
+    runTurn(a, [], 'A 问', 'A 答')
+    summarizeAll(a, stepsOf(dir, m.owner), 'A')
+    a.close()
     finalizeTask(dir, m.owner)
-    const owners = query<{ owner: string | null }>(
-      dir,
-      'SELECT DISTINCT owner FROM turns WHERE owner IS NOT NULL',
+    const main = await getSession(dir, {
+      skipLock: true,
+      globalPath,
+      env: {},
+      stream,
+      fetchImpl: mergeFetch,
+    } as never)
+    await main.summarizeIdle() // 主任务没有 L0 债 → 顺手维护主干
+    // 主干合并不挂在会话的 summarizing 上（不拖任务关闭），等它落地
+    for (
+      let i = 0;
+      i < 50 &&
+      query(dir, `SELECT 1 FROM summaries WHERE owner = 'trunk' AND level = 1`).length === 0;
+      i++
     )
-    expect(owners).toEqual([])
-    expect(existsSync(join(dir, '.simple-code/tasks', `${m.owner}.json`))).toBe(false)
-    const mainTurns2 = query<{ m: number }>(
-      dir,
-      "SELECT MAX(id) AS m FROM turns WHERE owner IS NULL AND state != 'reserved'",
-    )
-    expect(mainTurns2[0]!.m).toBeGreaterThan(m.forkTurn)
-  })
-})
-
-describe('恢复扫描', () => {
-  it('listTaskManifests = manifest 即真相', async () => {
-    const dir = await workspace()
-    expect(listTaskManifests(dir)).toEqual([])
-    const main = openStore(dir)
-    main.close()
-    const m = forkTask(dir, 'a')
-    const m2 = forkTask(dir, 'b')
-    const names = listTaskManifests(dir).map((x) => x.name)
-    expect(names).toEqual(expect.arrayContaining(['a', 'b']))
-    expect(m.owner).not.toBe(m2.owner)
-  })
-})
-
-describe('上下文隔离（note task-context-isolation）', () => {
-  // 任务视角要发给模型的那份（摘要 + live 原文），按渲染文本比
-  const taskView = (dir: string, m: TaskManifest): string[] => {
-    const s = openStore(dir, { task: scopeOf(m) })
-    const out = assembleContext(s.liveWithTurns(), s.summaries()).map((msg) =>
-      msg.parts.map((p) => (p.type === 'text' ? p.text : p.type)).join('|'),
-    )
-    s.close()
-    return out
-  }
-
-  const setup = async (): Promise<{ dir: string; m: TaskManifest; mainLive: Message[] }> => {
-    const dir = await workspace()
-    const main = openStore(dir)
-    const mainLive: Message[] = []
-    runTurn(main, mainLive, '对话问题一', '对话回答一')
-    runTurn(main, mainLive, '对话问题二', '对话回答二')
-    main.close()
-    const m = forkTask(dir, 't')
-    const task = openStore(dir, { task: scopeOf(m) })
-    runTurn(task, [...task.load()], '任务问题', '任务回答')
-    task.close()
-    return { dir, m, mainLive }
-  }
-
-  it('任务开着时主任务压缩（卸载原文 + 摘要进场 + 继续跑），任务的请求一个字不变', async () => {
-    const { dir, m, mainLive } = await setup()
-    const before = taskView(dir, m)
-    expect(before.join('\n')).toContain('对话回答一')
-
-    const main = openStore(dir)
-    const first = query<{ id: number }>(dir, 'SELECT MIN(id) AS id FROM steps')[0]!.id
-    // 卸载第一轮的两条原文、换进一条已生效摘要——主任务一次完整的压缩
-    main.unload([0, 1])
-    mainLive.splice(0, 2)
-    main.addSummary({
-      level: 0,
-      coversFrom: first,
-      coversTo: first,
-      name: '',
-      text: '主任务压缩出的摘要',
-      status: 'ready',
-      inContext: true,
-      supersededBy: null,
-      head: null,
-      archivePath: null,
-    })
-    main.save(mainLive)
-    // 再跑一轮：主任务整份重存 live，行号全换
-    runTurn(main, mainLive, '对话问题三', '对话回答三')
-    const mainOut = assembleContext(main.liveWithTurns(), main.summaries())
-      .map((msg) => (msg.parts[0] as { text: string }).text)
-      .join('\n')
-    main.close()
-    // 前提：主任务这边确实压了
-    expect(mainOut).not.toContain('对话回答一')
-    expect(mainOut).toContain('主任务压缩出的摘要')
-
-    expect(taskView(dir, m)).toEqual(before)
-  })
-
-  it('反过来：任务压缩继承段，主任务的行与摘要不受影响', async () => {
-    const { dir, m } = await setup()
-    const mainBefore = query(dir, "SELECT id, content_json, state FROM messages WHERE owner IS NULL ORDER BY id")
-    const task = openStore(dir, { task: scopeOf(m) })
-    const first = query<{ id: number }>(dir, 'SELECT MIN(id) AS id FROM steps')[0]!.id
-    const id = task.addSummary({
-      level: 0,
-      coversFrom: first,
-      coversTo: first,
-      name: '',
-      text: '任务压缩出的摘要',
-      status: 'ready',
-      inContext: false,
-      supersededBy: null,
-      head: null,
-      archivePath: null,
-    })
-    task.flipSummary(id)
-    task.close()
-    expect(query(dir, "SELECT id, content_json, state FROM messages WHERE owner IS NULL ORDER BY id")).toEqual(
-      mainBefore,
-    )
-    const main = openStore(dir)
-    expect(main.summaries().map((s) => s.text)).not.toContain('任务压缩出的摘要')
-    main.close()
-  })
-
-  it('主任务算好但未生效的合并（等压缩点）不会被任务的压缩点顺手生效', async () => {
-    // 2026-09-23 真机（35732d3 之前的代码）：主任务 idle 时合出 L1（66889/
-    // 66890，等自己下个压缩点生效），任务的 stale 压缩点 applyMerges 看得见
-    // 主任务的行，替它把 L1 翻进场、L0 翻出场——主任务下一次请求前缀第 34
-    // 条起变了（prefix-breaks/2026-09-23T12-28-49-136Z.json）
-    const dir = await workspace()
-    const main0 = openStore(dir)
-    const live0: Message[] = []
-    runTurn(main0, live0, '对话问题一', '对话回答一')
-    runTurn(main0, live0, '对话问题二', '对话回答二')
-    const steps = query<{ id: number }>(dir, 'SELECT id FROM steps ORDER BY id').map((r) => r.id)
-    const l0 = steps.map((sid) =>
-      main0.addSummary({
-        level: 0,
-        coversFrom: sid,
-        coversTo: sid,
-        name: '',
-        text: `L0-${sid}`,
-        status: 'ready',
-        inContext: true,
-        supersededBy: null,
-        head: null,
-        archivePath: null,
-      }),
-    )
-    main0.close()
-    const m = forkTask(dir, 't')
-    // fork 之后主任务合出 L1，未生效
-    const main = openStore(dir)
-    main.recordMerge(
-      {
-        level: 1,
-        coversFrom: steps[0]!,
-        coversTo: steps[steps.length - 1]!,
-        name: '',
-        text: '主任务的 L1',
-        status: 'ready',
-        inContext: false,
-        supersededBy: null,
-        head: null,
-        archivePath: null,
-      },
-      l0,
-    )
-    main.close()
-    const snapshot = (): unknown =>
-      query(dir, 'SELECT id, in_context, superseded_by FROM summaries WHERE owner IS NULL ORDER BY id')
-    const before = snapshot()
-
-    const task = openStore(dir, { task: scopeOf(m) })
-    task.applyMerges()
-    task.close()
-    expect(snapshot()).toEqual(before)
-  })
-
-  it('按 step 读原文（摘要输入）不读成双份——复制行被排除', async () => {
-    const { dir, m } = await setup()
-    const first = query<{ id: number }>(dir, 'SELECT MIN(id) AS id FROM steps')[0]!.id
-    const copies = query<{ c: number }>(dir, 'SELECT COUNT(*) AS c FROM messages WHERE step_id = ?', first)[0]!.c
-    expect(copies).toBe(2) // 前提：库里这个 step 有原行 + 副本
-    const task = openStore(dir, { task: scopeOf(m) })
-    const msgs = task.segmentMessages({ from: first, to: first, turn: 0 })
-    task.close()
-    expect(msgs).toHaveLength(1)
-  })
-
-  it('隔离之前开的老任务：开库时补一次复制，视图与之前一致', async () => {
-    const { dir, m } = await setup()
-    const before = taskView(dir, m)
-    // 退回老库形态：删副本与标记（老任务从没复制过）
-    const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'))
-    db.prepare(
-      'DELETE FROM messages WHERE owner = ? AND turn_id NOT IN (SELECT id FROM turns WHERE owner = ?)',
-    ).run(m.owner, m.owner)
-    db.prepare('DELETE FROM migrations WHERE name = ?').run(`task-context-copy:${m.owner}`)
-    db.close()
-    expect(taskView(dir, m)).toEqual(before)
-    const marks = query(dir, 'SELECT name FROM migrations WHERE name = ?', `task-context-copy:${m.owner}`)
-    expect(marks).toHaveLength(1)
-  })
-
-  it('关闭任务：副本删掉，任务自己的行还俗，库里不留 owner', async () => {
-    const { dir, m } = await setup()
-    flipTaskLive(dir, m.owner)
-    finalizeTask(dir, m.owner)
-    expect(query(dir, 'SELECT id FROM messages WHERE owner IS NOT NULL')).toEqual([])
-    expect(query(dir, 'SELECT id FROM summaries WHERE owner IS NOT NULL')).toEqual([])
-    expect(query(dir, "SELECT name FROM migrations WHERE name LIKE 'task-context-copy:%'")).toEqual([])
-    // 同一句对话在库里只剩一份
-    const dup = query<{ c: number }>(dir, "SELECT COUNT(*) AS c FROM messages WHERE content_json LIKE '%对话回答一%'")
-    expect(dup[0]!.c).toBe(1)
-  })
-
-  it('合并落「压缩车票」：主任务一次取走，任务视角不吃（2026-09-23 真机 13:24:21）', async () => {
-    const dir = await workspace()
-    const main = openStore(dir)
-    const mainLive: Message[] = []
-    runTurn(main, mainLive, 'u1', 'r1')
-    main.close()
-    const m = forkTask(dir, 't')
-    flipTaskLive(dir, m.owner)
-    finalizeTask(dir, m.owner)
-
-    expect(
-      query(dir, "SELECT 1 FROM migrations WHERE name = 'merge-rewrite-pending'"),
-    ).toHaveLength(1)
-    // 任务视角取不走——吃了就是把主任务的压缩车票撕了
-    const m2 = forkTask(dir, 't2')
-    const t = openStore(dir, { task: scopeOf(m2) })
-    expect(t.consumeMergePending()).toBe(false)
+      await new Promise((r) => setTimeout(r, 10))
+    await main.close()
+    const store = openStore(dir)
+    const inTrunk = store
+      .trunk()
+      .summaries()
+      .filter((s) => s.inContext)
+    expect(texts(inTrunk)).toEqual(['主干合并：两段任务经历']) // 合完即生效，不等压缩点
+    store.close()
+    const n = createTask(dir, '后来的')
+    const t = openStore(dir, { task: scopeOf(n) })
+    expect(texts(t.summaries())).toEqual(['主干合并：两段任务经历'])
     t.close()
-    expect(
-      query(dir, "SELECT 1 FROM migrations WHERE name = 'merge-rewrite-pending'"),
-    ).toHaveLength(1)
-    // 主任务一次取走、之后没有
-    const main2 = openStore(dir)
-    expect(main2.consumeMergePending()).toBe(true)
-    expect(main2.consumeMergePending()).toBe(false)
-    main2.close()
+    expect(query(dir, `SELECT 1 FROM summaries WHERE owner = ?`, TRUNK).length).toBe(3) // 两条副本 + 一条合并
   })
 })
 
-describe('手动压缩（compactNow，2026-10-17）：主任务与任务各压各的', () => {
-  const settingsAt = async (dir: string): Promise<string> => {
-    const { writeFile } = await import('node:fs/promises')
+describe('完成回调（规则 12）', () => {
+  const settings = async (dir: string): Promise<string> => {
     const globalPath = join(dir, 'settings.json')
     await writeFile(
       globalPath,
@@ -1169,130 +713,263 @@ describe('手动压缩（compactNow，2026-10-17）：主任务与任务各压�
             protocol: 'anthropic-messages',
             baseUrl: 'https://example.invalid',
             apiKey: 'k',
-            // 大窗口：自动车一趟不开，视图的变化只可能来自按钮
-            models: { m: { contextWindow: 200_000 } },
+            models: { m: { contextWindow: 100_000 } },
           },
         },
-        memory: { idleSummarizeDelayMs: 0, unloadTargetRatio: 0.001, clipThresholdChars: 0, keepHeadChars: 40 },
+        memory: { idleSummarizeDelayMs: 0 },
       }),
       'utf8',
     )
     return globalPath
   }
-  const usage = { inputTokens: 1, outputTokens: 1, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, reasoningTokens: 0 }
-  // 每次 send = 调一次工具（大段输出，卸得动）+ 答一句
-  const open = async (dir: string, globalPath: string, m?: TaskManifest) => {
+  const usage = {
+    inputTokens: 1,
+    outputTokens: 1,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    reasoningTokens: 0,
+  }
+  /** 第一次请求调一次 bash，之后回文字。onRequest(n) 在第 n 次请求时触发（投回调用） */
+  const scripted = (seen: string[], onRequest: (n: number) => void) =>
+    ((request: { messages: { parts: { type: string; text?: string }[] }[] }) => {
+      seen.push(
+        request.messages
+          .map((m) => m.parts.map((p) => (p.type === 'text' ? (p.text ?? '') : p.type)).join(''))
+          .join('\n'),
+      )
+      onRequest(seen.length)
+      const first = seen.length === 1
+      return (async function* () {
+        if (first) {
+          yield { type: 'tool_input_start', id: 'c1', name: 'bash' } as never
+          yield {
+            type: 'tool_input_end',
+            id: 'c1',
+            name: 'bash',
+            input: { desc: '看', command: 'echo hi' },
+          } as never
+          yield { type: 'finish', reason: 'tool-calls', usage } as never
+          return
+        }
+        yield { type: 'text_start' } as never
+        yield { type: 'text_delta', text: '答完' } as never
+        yield { type: 'text_end' } as never
+        yield { type: 'finish', reason: 'stop', usage } as never
+      })()
+    }) as never
+
+  it('登记者在跑：下一个请求前插到末尾（task_result 事件），前缀守卫不响；最后一个请求之后到的不唤醒、轮后取', async () => {
     const { getSession } = await import('../src/session/session.ts')
-    let call = 0
-    return getSession(dir, {
-      ...(m ? { task: scopeOf(m) } : {}),
-      skipLock: true,
-      globalPath,
-      env: {},
-      tools: [
-        {
-          name: 'echo',
-          definition: { name: 'echo', description: 'd', parameters: { type: 'object' } },
-          execute: async () => ({ output: '工具的大段输出。'.repeat(200), exitCode: 0, isError: false }),
-        },
-      ],
-      stream: () => {
-        call++
-        const id = `c${call}`
-        const events =
-          call % 2 === 1
-            ? [
-                { type: 'tool_input_start', id, name: 'echo' },
-                { type: 'tool_input_delta', id, partial: '{}' },
-                { type: 'tool_input_end', id, name: 'echo', input: {} },
-                { type: 'finish', reason: 'tool-calls', usage },
-              ]
-            : [{ type: 'text_start' }, { type: 'text_delta', text: '好了' }, { type: 'text_end' }, { type: 'finish', reason: 'stop', usage }]
-        return (async function* () {
-          for (const ev of events) yield ev
-        })()
-      },
-    } as never)
-  }
-  // 发给模型的那份，逐条全量比（存根改的是工具结果，只比 text 看不出来）
-  const view = (dir: string, m?: TaskManifest): string[] => {
-    const s = m ? openStore(dir, { task: scopeOf(m) }) : openStore(dir)
-    const out = assembleContext(s.liveWithTurns(), s.summaries()).map((msg) => JSON.stringify(msg))
-    s.close()
-    return out
-  }
-  const send = async (s: { send(text: string): AsyncIterable<unknown> }, text: string): Promise<string[]> => {
-    const errors: string[] = []
-    for await (const ev of s.send(text) as AsyncIterable<{ type: string; message?: string }>)
-      if (ev.type === 'error') errors.push(ev.message ?? '')
-    return errors
-  }
-
-  it('任务压缩不动主任务的视图、主任务压缩不动任务的视图；放行票各归各的', async () => {
     const dir = await workspace()
-    const globalPath = await settingsAt(dir)
-    const main = await open(dir, globalPath)
-    for (let i = 1; i <= 3; i++) expect(await send(main, `对话问题${i}`)).toEqual([])
+    const globalPath = await settings(dir)
+    const seen: string[] = []
+    const stream = scripted(seen, (n) => {
+      if (n === 1) postTaskResult(dir, '', taskResultText('调研', '完成', '甲结果'))
+      if (n === 2) postTaskResult(dir, '', taskResultText('调研二', '完成', '乙结果'))
+    })
+    const main = await getSession(dir, { skipLock: true, globalPath, env: {}, stream } as never)
+    const events: { type: string; text?: string; message?: string }[] = []
+    for await (const ev of main.send('开工')) events.push(ev as never)
+    expect(events.filter((e) => e.type === 'error')).toEqual([])
+    expect(events.filter((e) => e.type === 'task_result').map((e) => e.text)).toEqual([
+      '〔任务结果〕调研 · 完成\n甲结果',
+    ])
+    expect(seen).toHaveLength(2) // 乙没让模型多答一次（不唤醒）
+    expect(seen[1]).toContain('甲结果')
+    expect(seen[1]?.indexOf('甲结果')).toBeGreaterThan(seen[1]?.indexOf('tool_result') ?? 0)
+    // 乙在轮后取：插到末尾，只取一次
+    expect(main.takeTaskResults()).toBe(1)
+    expect(main.takeTaskResults()).toBe(0)
+    const last = main.messages().at(-1)
+    expect(last?.role).toBe('user')
+    expect(JSON.stringify(last)).toContain('乙结果')
+    // 下一轮：带着它发，前缀守卫照样不响（插在末尾 = 追加）
+    const next: { type: string }[] = []
+    for await (const ev of main.send('接着说')) next.push(ev as never)
+    expect(next.filter((e) => e.type === 'error')).toEqual([])
+    expect(seen.at(-1)).toContain('乙结果')
     await main.close()
-    const m = forkTask(dir, 't')
+    // 落盘：重开库还在（对话侧 owner NULL）
+    const store = openStore(dir)
+    expect(JSON.stringify(store.load())).toContain('乙结果')
+    store.close()
+  })
 
-    const task = await open(dir, globalPath, m)
-    for (let i = 1; i <= 3; i++) expect(await send(task, `任务问题${i}`)).toEqual([])
-    const mainBefore = view(dir)
-    const r = await task.compactNow()
-    expect(r.ok && r.unloaded).toBeGreaterThan(0) // 前提：任务这边确实压了
-    expect(view(dir)).toEqual(mainBefore)
-    const tickets = () =>
-      query<{ name: string }>(dir, "SELECT name FROM migrations WHERE name LIKE 'prefix-rewrite-allowed%'").map((x) => x.name)
-    expect(tickets()).toEqual([`prefix-rewrite-allowed:${m.owner}`])
-    expect(await send(task, '任务压完再问')).toEqual([])
-    expect(tickets()).toEqual([])
-    await task.close()
+  it('信箱积压（宿主没赶上空闲时取）：用户下一句排在回调之后，模型最后读到的是用户的话', async () => {
+    const { getSession } = await import('../src/session/session.ts')
+    const dir = await workspace()
+    const globalPath = await settings(dir)
+    const seen: string[] = []
+    postTaskResult(dir, '', taskResultText('丁', '完成', '积压的结果'))
+    const stream = scripted(seen, () => {})
+    const main = await getSession(dir, { skipLock: true, globalPath, env: {}, stream } as never)
+    const events: { type: string }[] = []
+    for await (const ev of main.send('用户的问题')) events.push(ev as never)
+    expect(events.filter((e) => e.type === 'error')).toEqual([])
+    // 第一个请求里：回调在前、用户的话在后（修前 loop 第 0 次迭代才取，排在用户的话之后）
+    expect(seen[0]?.indexOf('积压的结果')).toBeGreaterThanOrEqual(0)
+    expect(seen[0]?.indexOf('积压的结果')).toBeLessThan(seen[0]?.indexOf('用户的问题') ?? -1)
+    expect(main.takeTaskResults()).toBe(0) // 只取一次
+    await main.close()
+  })
 
-    const taskBefore = view(dir, m)
-    const main2 = await open(dir, globalPath)
-    const r2 = await main2.compactNow()
-    expect(r2.ok && r2.unloaded).toBeGreaterThan(0)
-    expect(view(dir)).not.toEqual(mainBefore) // 前提：主任务这边确实压了
-    expect(view(dir, m)).toEqual(taskBefore)
-    expect(tickets()).toEqual(['prefix-rewrite-allowed'])
-    expect(await send(main2, '对话压完再问')).toEqual([])
-    await main2.close()
+  it('信箱按 owner 分：投给任务的主任务取不到（对照）；在跑时 takeTaskResults 不插', async () => {
+    const { getSession } = await import('../src/session/session.ts')
+    const dir = await workspace()
+    const globalPath = await settings(dir)
+    const seen: string[] = []
+    const m = createTask(dir, '子')
+    postTaskResult(dir, m.owner, taskResultText('孙', '完成', '给子的'))
+    let duringRun = -1
+    let main: Awaited<ReturnType<typeof getSession>> | null = null
+    const stream = scripted(seen, (n) => {
+      if (n === 1) {
+        postTaskResult(dir, '', taskResultText('丙', '完成', '给主的'))
+        duringRun = main?.takeTaskResults() ?? -1
+      }
+    })
+    main = await getSession(dir, { skipLock: true, globalPath, env: {}, stream } as never)
+    for await (const ev of main.send('开工')) void ev
+    expect(duringRun).toBe(0) // 在跑：宿主那条路不插，留给 loop
+    expect(seen[1]).toContain('给主的')
+    expect(seen.join('\n')).not.toContain('给子的')
+    expect(main.takeTaskResults()).toBe(0)
+    await main.close()
+    const t = openStore(dir, { task: scopeOf(m) })
+    expect(t.takeTaskResults()).toEqual(['〔任务结果〕孙 · 完成\n给子的'])
+    t.close()
+  })
+
+  it('取走记 runlog（task_result_take，与投递的 task_callback 配对）；信箱空不记', async () => {
+    const dir = await workspace()
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      postTaskResult(dir, '', taskResultText('甲', '完成', '一'))
+      postTaskResult(dir, '', taskResultText('乙', '完成', '二'))
+      const s = openStore(dir)
+      expect(s.takeTaskResults()).toHaveLength(2)
+      expect(s.takeTaskResults()).toEqual([])
+      s.close()
+    } finally {
+      spy.mockRestore()
+    }
+    const takes = calls.filter((c) => c.ev === 'task_result_take')
+    expect(takes).toMatchObject([{ owner: '' }])
+    expect(takes[0]?.ids).toHaveLength(2)
   })
 })
 
-describe('finalizeTask 的搜索索引：只补任务自己的 turn', () => {
-  it('任务先存一半、对话越过游标、任务再存——关闭后任务内容各命中一次，对话游标不动', async () => {
+describe('老库迁移（task-trunk.md「旧数据迁移」）', () => {
+  it('开着的 v3 老任务：它的号段登记为它的 open 段，主任务在两侧各一段；低段记为它已拉；幂等', async () => {
+    const dir = await workspace()
+    // 造一个 v3 形态的库：主任务 step 1..3，老任务段 (3, 50003]，之后主任务 50004..
+    const main = openStore(dir)
+    const ml: Message[] = []
+    runTurn(main, ml, '老一', '答')
+    main.close()
+    const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'))
+    db.exec(
+      `DELETE FROM segments; DELETE FROM segment_pulls; DELETE FROM migrations WHERE name = 'task-trunk-segments'`,
+    )
+    db.exec(`INSERT INTO turns(id, started_at, owner) VALUES(50, '2026-10-28', 'task-legacy')`)
+    db.exec(`INSERT INTO steps(id, turn_id, started_at) VALUES(10, 50, '2026-10-28')`)
+    db.exec(
+      `INSERT INTO messages(turn_id, role, content_json, step_id, owner) VALUES(50, 'user', '{"role":"user","parts":[{"type":"text","text":"老任务的话"}]}', 10, 'task-legacy')`,
+    )
+    db.exec(`INSERT INTO turns(id, started_at, owner) VALUES(60, '2026-10-28', NULL)`)
+    db.exec(`INSERT INTO steps(id, turn_id, started_at) VALUES(50010, 60, '2026-10-28')`)
+    db.close()
+    mkdirSync(join(dir, '.simple-code', 'tasks'), { recursive: true })
+    writeFileSync(
+      join(dir, '.simple-code', 'tasks', 'task-legacy.json'),
+      JSON.stringify({
+        owner: 'task-legacy',
+        name: '老任务',
+        createdAt: '2026-10-28',
+        forkTurn: 1,
+        turnCeil: 1001,
+        stepFloor: 2,
+        stepCeil: 50002,
+        msgFloor: 0,
+        msgCeil: 1,
+        sumFloor: 0,
+        sumCeil: 1,
+      }),
+    )
+    const s1 = openStore(dir)
+    const after = segs(dir).map(({ owner, floor, ceil, state }) => ({ owner, floor, ceil, state }))
+    expect(after).toEqual([
+      { owner: '', floor: 0, ceil: 2, state: 'full' },
+      { owner: '', floor: 50002, ceil: 50010 + SEGMENT_WIDTH, state: 'open' },
+      { owner: 'task-legacy', floor: 2, ceil: 50002, state: 'open' },
+    ])
+    const low = segs(dir).find((g) => g.owner === '' && g.floor === 0)
+    expect(
+      query(dir, `SELECT segment_id AS id FROM segment_pulls WHERE owner = 'task-legacy'`),
+    ).toEqual([{ id: low?.id }])
+    s1.close()
+    const s2 = openStore(dir) // 再开：不重复登记
+    expect(segs(dir)).toHaveLength(3)
+    s2.close()
+    // 老任务的 scope：继承上界照旧，step 接着在自己的段里取
+    const legacy = readTaskManifest(dir, 'task-legacy')
+    expect(scopeOf(legacy)).toEqual({ owner: 'task-legacy', forkTurn: 1, inheritCeil: 2 })
+    const t = openStore(dir, { task: scopeOf(legacy) })
+    t.beginTurn({ model: 'p/m', effort: null })
+    expect(t.beginStep()).toBe(11)
+    t.close()
+  })
+
+  /** 一个有内容、但还没登记段的老库（同上：删段表与迁移标记） */
+  const legacyDb = async (): Promise<string> => {
     const dir = await workspace()
     const main = openStore(dir)
-    const mainLive: Message[] = []
-    runTurn(main, mainLive, '对话问题一', '对话回答一')
+    runTurn(main, [], '老一', '答')
     main.close()
-    const m = forkTask(dir, 't')
-    const task = openStore(dir, { task: scopeOf(m) })
-    const live: Message[] = [...task.load()]
-    runTurn(task, live, '任务问题甲', '任务甲的结论') // 游标还在任务段里：这轮被增量收进去
-    task.close()
-    const main2 = openStore(dir)
-    runTurn(main2, [...main2.load()], '对话问题二', '对话回答二') // 游标越过任务段
-    main2.close()
-    const task2 = openStore(dir, { task: scopeOf(m) })
-    runTurn(task2, live, '任务问题乙', '任务乙的结论') // 游标之下：增量收不到
-    task2.close()
-
-    const db = openDb(join(dir, MEMORY_RELATIVE, 'state.db'))
-    const cursor = () => db.all<{ v: string }>(`SELECT v FROM search_fts_meta WHERE k = 'last_step_id'`)[0]?.v
-    expect(ftsSearch(db, '乙的结论', 10)).toEqual([])
-    const before = cursor()
-    // 金丝雀：一行不属于任务的索引——全量重灌会把它冲掉，只补任务 turn 不会
-    db.run(`INSERT INTO search_fts(text, turn_no, step_no) VALUES(' 金丝 丝雀 雀 ', 999, 1)`)
-    flipTaskLive(dir, m.owner)
-    finalizeTask(dir, m.owner)
-    expect(ftsSearch(db, '甲的结论', 10)).toHaveLength(1)
-    expect(ftsSearch(db, '乙的结论', 10)).toHaveLength(1)
-    expect(ftsSearch(db, '回答二', 10)).toHaveLength(1)
-    expect(cursor()).toBe(before) // 不再清游标全量重灌
-    expect(ftsSearch(db, '金丝雀', 10)).toEqual([{ turn: 999, step: 1 }])
+    const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'))
+    db.exec(
+      `DELETE FROM segments; DELETE FROM segment_pulls; DELETE FROM migrations WHERE name = 'task-trunk-segments'`,
+    )
     db.close()
+    return dir
+  }
+
+  it('runlog：迁移成功记一行 segment_migrate（耗时、备份耗时、段数），再开不记', async () => {
+    const dir = await legacyDb()
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      openStore(dir).close()
+      openStore(dir).close()
+    } finally {
+      spy.mockRestore()
+    }
+    const lines = calls.filter((c) => c.ev === 'segment_migrate')
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatchObject({ legacyTasks: 0, segments: 1 })
+    expect(typeof lines[0]?.ms).toBe('number')
+    expect(typeof lines[0]?.backupMs).toBe('number')
+    expect(lines[0]?.error).toBeUndefined()
+    expect(existsSync(join(dir, MEMORY_RELATIVE, 'state.db.pre-task-trunk'))).toBe(true)
+  })
+
+  it('runlog：迁移失败（备份写不出）记 segment_migrate 带 error，照旧抛给建会话的人', async () => {
+    const dir = await legacyDb()
+    // 备份位置是个指向不存在目录的悬空链接：existsSync 认为没有，VACUUM INTO 打不开
+    symlinkSync(join(dir, 'nope', 'x.db'), join(dir, MEMORY_RELATIVE, 'state.db.pre-task-trunk'))
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      expect(() => openStore(dir)).toThrow()
+    } finally {
+      spy.mockRestore()
+    }
+    const lines = calls.filter((c) => c.ev === 'segment_migrate')
+    expect(lines).toHaveLength(1)
+    expect(typeof lines[0]?.error).toBe('string')
   })
 })

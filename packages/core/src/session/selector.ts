@@ -15,17 +15,16 @@
  * 这比「选得准」更重要：大多数轮本就不该浮出任何经验，n-gram 被迫填满
  * K 个名额的噪声（狼来了）从根上没了。
  */
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { join } from 'node:path'
 import type { Message, Request } from '../llm/types.ts'
-import { decayCutoff, parseStamp } from '../tools/decay.ts'
+import { decayCutoff } from '../tools/decay.ts'
 import { eventSignal, loadEvents } from '../tools/events.ts'
-import { lessonSignal, lessonsDir, parseLessonFrontMatter } from '../tools/lesson.ts'
-import { activeNoteCards } from '../tools/note.ts'
+import { scanNoteFiles } from '../tools/note-files.ts'
+import { noteFileSignal } from '../tools/note-library.ts'
+import { noteEligible } from './note-budget.ts'
 import { listSkills } from '../tools/skill.ts'
 
 export type SelectorCandidate = {
-  kind: 'lesson' | 'note' | 'skill' | 'event'
+  kind: 'lesson' | 'note' | 'principle' | 'goal' | 'skill' | 'event'
   name: string
   text: string
 }
@@ -55,7 +54,17 @@ export function previousReply(messages: Message[]): string {
   return ''
 }
 
-const READ_CMD = /\$\{?SIMPLE_CODE_(LESSON|NOTE|SKILL|EVENT)\}?"?\s+read\s+([^\s;|&'"]+)/g
+const READ_CMD = /\$\{?SIMPLE_CODE_(LESSON|NOTE|SKILL|EVENT)\}?"?\s+([^;|&\n]+)/g
+
+function readKey(kind: string, args: string): string | null {
+  const words = args.replace(/["']/g, '').trim().split(/\s+/)
+  const index = words.indexOf('--type')
+  const type = index >= 0 ? words[index + 1] : undefined
+  if (index >= 0) words.splice(index, 2)
+  if (words[0] !== 'read' || !words[1]) return null
+  const resolved = kind === 'NOTE' && type && type !== 'general' ? type : kind.toLowerCase()
+  return `${resolved}:${words[1]}`
+}
 
 /**
  * 在场消息里 bash 已经 read 过的条目（kind:name）——正文就在上下文里，
@@ -68,8 +77,10 @@ export function readInContext(messages: Message[]): Set<string> {
       if (p.type !== 'tool_call' || p.name !== 'bash') continue
       const command = (p.input as { command?: unknown } | null)?.command
       if (typeof command !== 'string') continue
-      for (const [, kind, name] of command.matchAll(READ_CMD))
-        out.add(`${kind!.toLowerCase()}:${name}`)
+      for (const [, kind, args] of command.matchAll(READ_CMD)) {
+        const key = readKey(kind!, args!)
+        if (key) out.add(key)
+      }
     }
   return out
 }
@@ -84,33 +95,16 @@ export function readInContext(messages: Message[]): Set<string> {
  */
 export function loadSelectorCandidates(root: string): SelectorCandidate[] {
   const out: SelectorCandidate[] = []
-  // lesson 走内部读法（readdir + front matter），不走 listLessons 的成品
-  // 字符串——那是给人看的，解析它等于把 UI 格式当 API
-  const lessons = lessonsDir(root)
-  if (existsSync(lessons))
-    for (const f of readdirSync(lessons)
-      .filter((x) => x.endsWith('.md'))
-      .map((x) => ({ x, born: statSync(join(lessons, x)).birthtimeMs }))
-      .sort((a, b) => a.born - b.born || a.x.localeCompare(b.x))
-      .map((y) => y.x)) {
-      const name = f.replace('.md', '')
-      // 时间衰减（memory-time-decay ②）：超期不进候选——冷注入是注意力税
-      const lsig = lessonSignal(join(lessons, f))
-      if (lsig !== null && lsig < decayCutoff()) continue
-      const fm = parseLessonFrontMatter(readFileSync(join(lessons, f), 'utf8'))
-      out.push({ kind: 'lesson', name, text: fm.description ?? '' })
-    }
   const byCreated = (
     a: { name: string; created?: string | undefined },
     b: { name: string; created?: string | undefined },
   ) => (a.created ?? '').localeCompare(b.created ?? '') || a.name.localeCompare(b.name)
-  for (const c of activeNoteCards(root)
+  for (const c of scanNoteFiles(root).filter(noteEligible)
     .map((n) => ({ ...n, created: n.meta.created }))
     .sort(byCreated)) {
-    // 时间衰减：超期 note 不进候选（superseded 已被 activeNoteCards 挡）
-    const nsig = parseStamp(c.meta.lastRead ?? c.meta.created ?? '')
-    if (nsig !== null && nsig < decayCutoff()) continue
-    out.push({ kind: 'note', name: c.name, text: c.description ?? '' })
+    const signal = noteFileSignal(c)
+    if ((c.type === 'general' || c.type === 'lesson') && signal !== null && signal < decayCutoff()) continue
+    out.push({ kind: c.type === 'general' ? 'note' : c.type, name: c.name, text: c.meta.description ?? '' })
   }
   for (const line of listSkills(root)) {
     // 只认「name  [项目|用户]  描述」行（与 searchSkills 同判据）：空库提示
@@ -127,21 +121,25 @@ export function loadSelectorCandidates(root: string): SelectorCandidate[] {
   return out
 }
 
-const SELECTOR_SYSTEM = `你是经验库的检索选择器。第一条消息是经验库索引，分四节：
+const SELECTOR_SYSTEM = `你是经验库的检索选择器。第一条消息是经验库索引：
 - 【lesson 教训】每行「名字 — 描述」：踩过的坑
 - 【note 结论】每行「名字 — 描述」：拍板过的决策和事实
+- 【principle 原则】判断依据与适用条件，已生效
+- 【goal 目标】正在推进或仍有效的目标，查依据不等于切换当前目标
 - 【skill 技能】每行只有名字：某类操作的做法手册
 - 【event 事件档案】每行只有名字：之前某件事的经过
 第二条消息是对话的最新交互（上一条助手回复的末尾 + 用户的新消息）。
 
 任务：挑出与助手接下来要做的事可能相关的条目，最多 ${SELECTOR_TOP_K} 条。没有相关的就只输出一个字「无」。
 
-输出格式：每行一个名字，从索引里原样照抄，不要类别、不要编号、不要解释。
+输出格式：每行一个名字，从索引里原样照抄；若不同类别同名，加类别消歧（如 principle name）。不要编号或解释。
 最后再输出一行「关键词: k1, k2, ...」：3~6 个能检索历史摘要库的关键词——具体专名、报错原文、技术名词、任务名（中英文均可），不要「类型/内容/问题」这类到处都有的泛词。用户消息是短确认语（可以/继续/提交吧）时，从上一条回复提取当前任务的主题。完全没有具体工作内容就留空：关键词: 
 
 两个任务独立：经验库没有相关的输出「无」也要给关键词；经验库有相关的也要给关键词。`
 
 const SECTION_HEAD = {
+  principle: '【principle 原则】',
+  goal: '【goal 目标】',
   lesson: '【lesson 教训】',
   note: '【note 结论】',
   skill: '【skill 技能】',
@@ -159,12 +157,12 @@ export function buildSelectorRequest(
   query: { user: string; previous: string },
   base: Omit<Request, 'messages' | 'system' | 'tools'>,
 ): Request {
-  const index = (['lesson', 'note', 'skill', 'event'] as const)
+  const index = (['lesson', 'note', 'principle', 'goal', 'skill', 'event'] as const)
     .map((kind) => {
       const lines = candidates
         .filter((c) => c.kind === kind)
         .map((c) =>
-          kind === 'lesson' || kind === 'note'
+          kind !== 'skill' && kind !== 'event'
             ? `${c.name} — ${c.text.replace(/\s+/g, ' ').trim()}`
             : c.name,
         )
@@ -208,12 +206,12 @@ export function parseSelection(raw: string, candidates: SelectorCandidate[]): Se
       .trim()
       .split(/\s+/)
     const kindWord = words.find(
-      (w) => w === 'lesson' || w === 'note' || w === 'skill' || w === 'event',
+      (w) => w in SECTION_HEAD,
     )
     for (const word of words) {
       const hit =
         candidates.find((c) => c.name === word && c.kind === kindWord) ??
-        candidates.find((c) => c.name === word)
+        (candidates.filter((c) => c.name === word).length === 1 ? candidates.find((c) => c.name === word) : undefined)
       if (hit && !out.includes(hit)) out.push(hit)
     }
   }

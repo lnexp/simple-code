@@ -8,7 +8,7 @@ function makeFakeBridgeDeps() {
   const sent: ToWebview[] = []
   const calls: Array<{
     folder: string
-    method: 'attach' | 'detach' | 'requestReload' | 'dispose' | 'rehydrateTasks'
+    method: 'attach' | 'detach' | 'requestReload' | 'dispose' | 'rehydrateTasks' | 'taskModels' | `dispatch:${string}`
   }> = []
   let folders = ['/w/a', '/w/b']
   type Fake = Bridge & {
@@ -16,6 +16,9 @@ function makeFakeBridgeDeps() {
     _turnEnd: () => void
     _running: boolean
     _pending: number
+    /** 挂着的卡的 toolCallId（allowToolCall 用）；放行的记进 _allowed */
+    _cards: string[]
+    _allowed: string[]
   }
   const made = new Map<string, Fake>()
   const deps: RouterDeps = {
@@ -28,15 +31,32 @@ function makeFakeBridgeDeps() {
         _turnEnd: onTurnEnd,
         _running: false,
         _pending: 0,
+        _cards: [] as string[],
+        _allowed: [] as string[],
         attach: () => calls.push({ folder, method: 'attach' }),
         isRunning: () => made.get(folder)?._running ?? false,
         anyRunning: () => false,
+        robotView: () => ({ tasks: [], approvals: [] }),
+        allowToolCall: (id: string) => {
+          const f = made.get(folder)
+          if (!f?._cards.includes(id)) return false
+          f._allowed.push(id)
+          return true
+        },
         pendingApprovals: () => made.get(folder)?._pending ?? 0,
         rehydrateTasks: () => calls.push({ folder, method: 'rehydrateTasks' }),
         handle: () => {},
         detach: () => calls.push({ folder, method: 'detach' }),
         requestReload: () => calls.push({ folder, method: 'requestReload' }),
         dispose: () => calls.push({ folder, method: 'dispose' }),
+        dispatchFromAgent: async (brief: string, owner: string, model?: string) => {
+          calls.push({ folder, method: `dispatch:${owner}:${brief}${model ? `:${model}` : ''}` })
+          return { ok: true as const, name: brief }
+        },
+        taskModels: async () => {
+          calls.push({ folder, method: 'taskModels' })
+          return { ok: true as const, models: [], defaultModel: 'p/m' }
+        },
       } as Fake
       made.set(folder, b)
       return b
@@ -58,6 +78,22 @@ describe('多根路由（router）', () => {
     } as ToWebview)
     const after = sent.filter((m) => m.type === 'folders').length
     expect(after).toBe(before + 1)
+  })
+
+  it('agent 派任务按 root 交给那个文件夹的 bridge（后台目录也行）；没有 bridge 的目录拒绝', async () => {
+    const { deps, calls } = makeFakeBridgeDeps()
+    const r = createRouter(deps)
+    r.handle({ type: 'ready' }) // spawn /w/a
+    r.handle({ type: 'switchFolder', folder: '/w/b' }) // a 转后台
+    expect(await r.dispatchFromAgent({ root: '/w/a', brief: '调研', owner: 'task-x1' })).toEqual({ ok: true, name: '调研' })
+    expect(calls.filter((c) => c.method.startsWith('dispatch'))).toEqual([{ folder: '/w/a', method: 'dispatch:task-x1:调研' }])
+    const miss = await r.dispatchFromAgent({ root: '/w/none', brief: '调研', owner: '' })
+    expect(miss.ok).toBe(false)
+    // --model 原文透传到那个文件夹的 bridge（规则 14）；--models 同样按 root 找
+    await r.dispatchFromAgent({ root: '/w/a', brief: '查', owner: '', model: 'm2' })
+    expect(calls.at(-1)).toEqual({ folder: '/w/a', method: 'dispatch::查:m2' })
+    expect(await r.taskModels({ root: '/w/a' })).toEqual({ ok: true, models: [], defaultModel: 'p/m' })
+    expect((await r.taskModels({ root: '/w/none' })).ok).toBe(false)
   })
 
   it('ready：spawn active=[0] 并 attach，推 folders 清单', () => {
@@ -126,7 +162,10 @@ describe('多根路由（router）', () => {
     r.handle({ type: 'ready' })
     r.handle({ type: 'switchFolder', folder: '/w/b' }) // spawn b（惰性：访问过才存在）
     r.handle({ type: 'switchFolder', folder: '/w/a' }) // b 转后台
-    made.get('/w/b')!._post({ type: 'bg_processes', items: [{ pid: 42, command: 'http.server', startedAt: 1 }] })
+    made.get('/w/b')!._post({
+      type: 'bg_processes',
+      items: [{ pgid: 42, pids: [42], label: '起服务', command: 'http.server', startedAt: 1 }],
+    })
     const snap = sent.find((m) => m.type === 'bg_processes')
     expect(snap).toMatchObject({ type: 'bg_processes', folder: '/w/b' })
   })
@@ -139,8 +178,8 @@ describe('多根路由（router）', () => {
     r.handle({ type: 'switchFolder', folder: '/w/b' }) // spawn b
     r.handle({ type: 'switchFolder', folder: '/w/a' }) // active 是 a
     ;(made.get('/w/b')! as unknown as { handle: (m: ToHost) => void }).handle = (m) => handled.push(m)
-    r.handle({ type: 'bg_kill', pid: 42, folder: '/w/b' })
-    expect(handled).toEqual([{ type: 'bg_kill', pid: 42, folder: '/w/b' }])
+    r.handle({ type: 'bg_kill', pgid: 42, folder: '/w/b' })
+    expect(handled).toEqual([{ type: 'bg_kill', pgid: 42, folder: '/w/b' }])
   })
 
   it('folders 推送带 running 状态（后台 ● 标记的数据源）', () => {
@@ -230,5 +269,72 @@ describe('settings 热重载转发', () => {
     r.requestReloadAll()
     const methods = calls.filter((c) => c.method === 'requestReload').map((c) => c.folder).sort()
     expect(methods).toEqual(['/w/a', '/w/b'])
+  })
+})
+
+describe('桌面机器人接口（desktop-robot.md §5.2、§5.5）', () => {
+  it('allow 按 toolCallId 找到卡所在目录的 bridge；没有这张卡 = false', () => {
+    const { deps, made } = makeFakeBridgeDeps()
+    const r = createRouter(deps)
+    r.handle({ type: 'ready' })
+    r.handle({ type: 'switchFolder', folder: '/w/b' })
+    made.get('/w/b')!._cards = ['toolu_b']
+    expect(r.allow('toolu_b')).toBe(true)
+    expect(made.get('/w/b')!._allowed).toEqual(['toolu_b'])
+    // 对照：a 目录的 bridge 没被放行任何东西；乱发的 id 批不了
+    expect(made.get('/w/a')!._allowed).toEqual([])
+    expect(r.allow('toolu_nope')).toBe(false)
+  })
+
+  it('focus：切到目录，select_task 排在切目录推的消息之后（不被「恢复上次选中」盖掉）', () => {
+    const { deps, sent, calls } = makeFakeBridgeDeps()
+    const r = createRouter(deps)
+    r.handle({ type: 'ready' })
+    sent.length = 0
+    r.focus('/w/b', 'DAG 运行记录')
+    expect(calls.at(-1)).toEqual({ folder: '/w/b', method: 'attach' })
+    expect(sent.map((m) => m.type)).toEqual(['folders', 'select_task'])
+    expect(sent.at(-1)).toEqual({ type: 'select_task', task: 'DAG 运行记录' })
+    // 不在工作区的目录：无操作
+    sent.length = 0
+    r.focus('/w/zzz', null)
+    expect(sent).toEqual([])
+  })
+
+  it('webview 没就绪（面板关着、被 focus 命令拉起）：等 ready 直接落到目标目录再选任务', () => {
+    const { deps, sent, calls } = makeFakeBridgeDeps()
+    const r = createRouter(deps)
+    r.handle({ type: 'ready' })
+    r.detachAll() // 面板关了
+    sent.length = 0
+    calls.length = 0
+    r.focus('/w/b', null)
+    // 前提：就绪前什么都没发（发了也会被 VS Code 丢掉）
+    expect(sent).toEqual([])
+    r.handle({ type: 'ready' })
+    expect(calls.filter((c) => c.method === 'attach')).toEqual([{ folder: '/w/b', method: 'attach' }])
+    expect(sent.at(-1)).toEqual({ type: 'select_task', task: null })
+    expect(r.showing().folder).toBe('/w/b')
+  })
+
+  it('view_task 记下面板正显示的任务并通知；目录清单重推时也通知', () => {
+    const { deps } = makeFakeBridgeDeps()
+    let changes = 0
+    const r = createRouter({ ...deps, onChange: () => changes++ })
+    r.handle({ type: 'ready' })
+    const afterReady = changes
+    expect(afterReady).toBeGreaterThan(0)
+    r.handle({ type: 'view_task', task: 'A' })
+    expect(r.showing()).toEqual({ folder: '/w/a', task: 'A' })
+    expect(changes).toBe(afterReady + 1)
+  })
+
+  it('robotFolders 只含建过 bridge 的目录，按工作区顺序', () => {
+    const { deps } = makeFakeBridgeDeps()
+    const r = createRouter(deps)
+    r.handle({ type: 'ready' })
+    expect(r.robotFolders().map((f) => f.folder)).toEqual(['/w/a'])
+    r.handle({ type: 'switchFolder', folder: '/w/b' })
+    expect(r.robotFolders().map((f) => f.folder)).toEqual(['/w/a', '/w/b'])
   })
 })

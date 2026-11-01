@@ -99,3 +99,32 @@ describe('孤儿段进场：段内无 live、摘要不在场（2026-09-28 真库
     expect(run([summary(1, 10, 10)])).toEqual([])
   })
 })
+
+describe('稀疏 step 号：链根区间按区间判，不逐号展开（task-trunk 每段跳 50000）', () => {
+  // 两条链根各跨十亿号：逐号展开要建十亿条的 Set（必然超时/爆内存）；按区间
+  // 判只比几次。live 有一条落在缝里没被盖住 → kick；都盖住 → 不 kick（对照组）
+  const run = (gapStep: number) => {
+    let kicked = 0
+    activateBeyondStubZone({
+      live: [msg(1, 5), msg(2, gapStep), msg(3, 3_000_000_000)],
+      floorStart: 2,
+      stubSteps: 0,
+      stubTokens: 0,
+      summaries: () => [
+        { ...summary(1, 1, 1_000_000_000), inContext: true },
+        { ...summary(2, 2_000_000_000, 2_999_999_999), inContext: true },
+      ],
+      activateSummary: () => false,
+      kick: () => kicked++,
+    })
+    return kicked
+  }
+
+  it('缝里的 step 没被盖住 → kick 一次', () => {
+    expect(run(1_500_000_000)).toBe(1)
+  })
+
+  it('都在区间内 → 不 kick（对照组）', () => {
+    expect(run(2_500_000_000)).toBe(0)
+  })
+})

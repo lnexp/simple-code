@@ -12,6 +12,7 @@ import {
   type SingleItem,
   splitTurns,
 } from '../webview/events.ts'
+import { buildSteps, stepStats } from '../webview/steps.ts'
 
 /**
  * 事件流 → 界面模型。**这一层的 bug 全都不抛异常，只是内容错**——
@@ -259,6 +260,33 @@ describe('用户消息', () => {
     view = { ...view, items: [...view.items, { kind: 'user', text: '你好' }] }
     view = says('你也好').reduce<ChatView>((v, e) => reduce(v, e, Date.now()), view)
     expect(view.items.map((i) => i.kind)).toEqual(['user', 'assistant'])
+  })
+
+  it('**排队的插话等 input_delivered 才进 items**：之前到的回答排在它前面', () => {
+    // 2026-10-31 真机：回答流式中插话，气泡当场进 items，这一步的回答排到
+    // 它后面；core 实际在这步之后才投进历史，reload 后气泡跑到回答后面
+    let view: ChatView = {
+      ...emptyView(),
+      items: [{ kind: 'user', text: '问' }],
+      queued: [
+        { kind: 'user', text: '插一句', interject: true },
+        { kind: 'user', text: '再插一句', interject: true },
+      ],
+    }
+    const shape = (v: ChatView): string[] =>
+      v.items.map((i) => (i.kind === 'user' ? `user:${i.text}` : i.kind))
+    view = says('先答完').reduce<ChatView>((v, e) => reduce(v, e, 0), view)
+    expect(shape(view)).toEqual(['user:问', 'assistant'])
+    view = reduce(view, { type: 'input_delivered' }, 0)
+    view = says('好的').reduce<ChatView>((v, e) => reduce(v, e, 0), view)
+    expect(shape(view)).toEqual(['user:问', 'assistant', 'user:插一句', 'assistant'])
+    expect(view.queued.map((i) => (i.kind === 'user' ? i.text : ''))).toEqual(['再插一句'])
+    expect(view.items[2]).toMatchObject({ interject: true })
+  })
+
+  it('没有排队的气泡时 input_delivered 不动视图', () => {
+    const view = { ...emptyView(), items: [{ kind: 'user', text: '问' }] as ChatView['items'] }
+    expect(reduce(view, { type: 'input_delivered' }, 0)).toBe(view)
   })
 })
 
@@ -726,7 +754,7 @@ describe('第三层折叠（splitTurns）', () => {
   const shape = (view: ChatView, foldLast = true): string[] =>
     splitTurns(groupItems(view.items), foldLast).map((s) =>
       s.kind === 'process'
-        ? `process(${s.tools})`
+        ? `process(${stepStats(buildSteps(s.blocks.map((block, at) => ({ block, at })))).tools})`
         : s.block.kind === 'activity'
           ? `activity(${s.block.items.length})`
           : s.block.item.kind,
@@ -752,11 +780,42 @@ describe('第三层折叠（splitTurns）', () => {
     expect(shape(view)).toEqual(['user', 'process(3)', 'assistant'])
   })
 
+  it('轮尾的任务回调同 notice 留在外面，最终回答也不被折进去（对照：去掉回调形状不变）', () => {
+    const base = asked(feed(tool('t1'), ...says('已派出两个任务')))
+    expect(shape(base)).toEqual(['user', 'process(1)', 'assistant'])
+    const withResult = feed(
+      { type: 'task_result', text: '〔任务结果〕A · 完成\n甲' },
+      { type: 'task_result', text: '〔任务结果〕B · 完成\n乙' },
+    )
+    const view: ChatView = { ...base, items: [...base.items, ...withResult.items] }
+    expect(shape(view)).toEqual(['user', 'process(1)', 'assistant', 'task_result', 'task_result'])
+  })
+
   it('**报错时那条 notice 留在外面**——错误绝不能被折进去', () => {
     const view = asked(feed(tool('t1'), { type: 'error', message: '网关挂了', retryable: false }))
     expect(shape(view)).toEqual(['user', 'process(1)', 'notice'])
     // 不可重试的错也给「继续」：用户可能改完配置再接着做（渠道未启用）
     expect(view.items.at(-1)).toMatchObject({ kind: 'notice', resumable: true })
+  })
+
+  it('**跑着时插话不把前面的过程折走**：插话之前那段照样展开，上一轮照折，跑完一起折', () => {
+    const prev = asked(feed(tool('t0'), ...says('上一轮结论')))
+    const live = feed(...says('我先跑一下'), tool('t1'))
+    const items = (interject: boolean): ChatView => ({
+      ...live,
+      items: [
+        ...prev.items,
+        { kind: 'user', text: '这一轮' },
+        ...live.items,
+        { kind: 'user', text: '插话', ...(interject ? { interject: true as const } : {}) },
+      ],
+    })
+    // 跑着：只折上一轮；这一轮从 query 起全部展开（插话不算新一轮的起点）
+    expect(shape(items(true), false)).toEqual(['user', 'process(1)', 'assistant', 'user', 'assistant', 'activity(1)', 'user'])
+    // 跑完：和改前一样，插话照旧是折叠的分界
+    expect(shape(items(true), true)).toEqual(['user', 'process(1)', 'assistant', 'user', 'process(1)', 'user'])
+    // 对照：不带标记的 user（历史回放、新一轮）照旧是分界，跑着时前面那段折起
+    expect(shape(items(false), false)).toEqual(['user', 'process(1)', 'assistant', 'user', 'process(1)', 'user'])
   })
 
   it('报错 notice 带 kind 与 resumable——UI 据此标色、停稳后给「继续」按钮（不论可否重试：自动重试已在 core 做完）', () => {
@@ -923,6 +982,25 @@ describe('bash 入参 desc → 工具条标题位（2026-09-28）', () => {
     )
     expect(toolOf(view)).toMatchObject({ desc: '' })
     expect(toolOf(view).rawInput).toBeUndefined()
+  })
+})
+
+describe('任务完成回调（task-trunk 规则 12）', () => {
+  it('回放：〔任务结果〕开头的 user 行渲染成一行回调，不是用户气泡；对照：普通 user 行照旧', () => {
+    const rows: Message[] = [
+      { role: 'user', parts: [{ type: 'text', text: '〔任务结果〕调研 · 完成\n第一行\n第二行' }] },
+      { role: 'user', parts: [{ type: 'text', text: '任务结果怎么样了' }] },
+    ]
+    const items = hydrateItems(rows)
+    expect(items).toEqual([
+      { kind: 'task_result', head: '调研 · 完成', body: '第一行\n第二行' },
+      { kind: 'user', text: '任务结果怎么样了' },
+    ])
+  })
+
+  it('实时：task_result 事件追加同一个条目（与回放一致）', () => {
+    const view = reduce(emptyView(), { type: 'task_result', text: '〔任务结果〕调研 · 被停止\n半截' }, Date.now())
+    expect(view.items).toEqual([{ kind: 'task_result', head: '调研 · 被停止', body: '半截' }])
   })
 })
 

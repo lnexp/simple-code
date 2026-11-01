@@ -5,7 +5,14 @@ import type { Server } from 'node:http'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Effort, ModelRef, SessionOptions } from '@simple-code/core'
-import { GLOBAL_CONFIG_PATH, ensureShims, getSession, logRun, startCredentialProxy, type ShimEntry } from '@simple-code/core'
+import {
+  ensureDocCopy,
+  ensureShims,
+  getSession,
+  logRun,
+  startCredentialProxy,
+  type ShimEntry,
+} from '@simple-code/core'
 import { createRenderer, type Sink } from './render.ts'
 import { type ReplOptions, runRepl } from './repl.ts'
 
@@ -24,9 +31,14 @@ export async function injectLocalTools(
   binDir?: string,
 ): Promise<void> {
   const kebab = (name: string) => name.toLowerCase().replaceAll('_', '-')
+  // 派任务桥只属于 VS Code 宿主里的会话：从宿主 bash 起的 sc 经 envPassthrough
+  // 继承了 bin 路径 + 端口 + token，不删的话 sc 的 bash 描述出现【派任务】、
+  // 能把任务派进宿主任务条，回调还落到宿主主任务的信箱（task-trunk 复审）
+  for (const key of ['SIMPLE_CODE_TASK', 'SIMPLE_CODE_TASK_PORT', 'SIMPLE_CODE_TASK_TOKEN'])
+    delete process.env[key]
   const entries: ShimEntry[] = []
   // IMAGEGEN 依赖凭据代理（ensureCredentialProxy）；LSP 依赖 VS Code 桥，终端没有，不注入
-  for (const name of ['WEBFETCH', 'WEBSEARCH', 'MCP', 'APPLY_PATCH', 'MEMORY', 'LESSON', 'NOTE', 'EVENT', 'SKILL', 'SC', 'IMAGEGEN']) {
+  for (const name of ['WEBFETCH', 'WEBSEARCH', 'MCP', 'APPLY_PATCH', 'MEMORY', 'NOTE', 'EVENT', 'SKILL', 'SC', 'IMAGEGEN']) {
     const key = `SIMPLE_CODE_${name}`
     if (process.env[key]) continue
     const script = join(dir, `${name === 'SC' ? 'sc' : kebab(name)}.js`)
@@ -48,11 +60,16 @@ export async function injectLocalTools(
     }
   }
   // 教程（self.md）：agent 在任何目录下查自己怎么运作。不是可执行
-  // bin，不走上面的循环（那找 .js 查 X_OK）；拷贝由 build.mjs 同步
+  // bin，不走上面的循环（那找 .js 查 X_OK）；dist 里的由 build.mjs 同步，
+  // 变量指 bin 目录下的拷贝（core ensureDocCopy），拷不进回落 dist 原件
   const selfDoc = join(dir, 'self.md')
   await access(selfDoc, fsConstants.R_OK)
     .then(() => {
-      process.env.SIMPLE_CODE_DOC = selfDoc
+      try {
+        process.env.SIMPLE_CODE_DOC = ensureDocCopy(selfDoc, binDir)
+      } catch {
+        process.env.SIMPLE_CODE_DOC = selfDoc
+      }
     })
     .catch(() => {})
 }
@@ -143,7 +160,9 @@ export const createApproval = (sink: Sink): ApprovalShared => {
               : q.always.kind === 'nonpath'
                 ? `[a]始终允许（${q.always.lead} 的第 ${q.always.from} 位参数起不是路径，今后免审）`
                 : q.always.kind === 'paths'
-                  ? `[a]始终允许（这 ${q.always.dirs.length} 个目录今后免审）`
+                  ? q.always.hidden?.length
+                    ? `[a]始终允许（这 ${q.always.dirs.length + q.always.hidden.length} 项今后免审）`
+                    : `[a]始终允许（这 ${q.always.dirs.length} 个目录今后免审）`
                   : `[a]始终允许（${q.always.dir}/ 今后免审）`
           : ''
         sink.err(
@@ -298,26 +317,7 @@ async function start(
     for (const warning of session.config.warnings) options.sink.err(`警告：${warning}\n`)
     return session
   } catch (error) {
-    options.sink.err(await explain(error, options.globalPath ?? GLOBAL_CONFIG_PATH))
+    options.sink.err(`启动失败：${error instanceof Error ? error.message : String(error)}\n`)
     return 2
   }
-}
-
-/**
- * 配置根本不存在，和配置写错了，是两种完全不同的处境。
- *
- * 不区分的话，第一次用的人看到的是一串「provider: expected string, received
- * undefined」——那说的是缺什么，没说文件该放哪、照着谁抄。
- */
-async function explain(error: unknown, globalPath: string): Promise<string> {
-  try {
-    await access(globalPath)
-  } catch {
-    return (
-      `还没有配置文件：${globalPath}\n` +
-      `照着仓库里的 packages/cli/settings.example.json 建一份。\n` +
-      `apiKey 写成 \${环境变量名} 的形式，别把 key 写进文件。\n`
-    )
-  }
-  return `启动失败：${error instanceof Error ? error.message : String(error)}\n`
 }

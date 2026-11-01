@@ -1,29 +1,28 @@
 /**
- * 任务生命周期核心（task-v3，docs/proposals/task-v3.md）。
+ * 任务生命周期核心（task-trunk，docs/proposals/task-trunk.md；前身 task-v3）。
  *
- * v2（fork-merge.ts，已删）把任务做成「拷库 + merge 搬运」；v3 是同一个库里的
- * owner 分治：turns.owner 列是唯一开关——NULL=对话的轮，'task-xxx'=任务的轮。
- * 派生关系全部靠号段表达，不拷任何文件：
+ * 同一个库里的 owner 分治：turns/messages/summaries 的 owner 列 = 'task-xxx'
+ * 是任务的行（主任务是 NULL）。任务与主任务平等——step 号都在各自的段里取
+ * （segments.ts），段满或关闭即合回，别的会话在压缩点拉合回段的摘要：
  *
- *   fork  = 一个事务：reserved 行顶高 rowid + 三轴 sequence 跳段 + manifest
+ *   开    = 一个事务：开一段 + 复制主干在场摘要（不调模型）+ manifest
  *   存活  = owner-scoped session 写同一个库（store.ts 的 TaskScope）
- *   关闭  = live→unloaded → 摘要排空 → owner 还俗 NULL → 补任务 turn 的 FTS 行
+ *   关闭  = live→unloaded → 摘要排空 → 段即刻合回（行的 owner 不变）
  *
- * 语义一句话：对话流私有（live/上下文/摘要按 owner 隔离），记忆共享
- * （归档、FTS、events 不分你我）。任务关闭后它的段就是对话的历史，
- * 压缩管线无差别覆盖——没有合并，没有丢弃，没有 marker。
+ * 不再复制 live 行（每任务约 1MB）、不再占 reserved 锚、不再跳 sequence，
+ * 也不要求主任务静止：开/关都只写自己的行和 segments 表。
  */
 import { join } from 'node:path'
-import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { openDb, type Db, type SqlValue } from './db.ts'
 import { MEMORY_RELATIVE } from './store.ts'
-import { reindexTurns } from './search-index.ts'
-import { copyMarker, ensureInheritedCopy, type TaskScope } from './store.ts'
+import { copyMarker, type TaskScope } from './store.ts'
 import { MIGRATIONS, SCHEMA } from './schema.sql.ts'
+import { closeSegments, markPulled, registerLegacySegments, TRUNK } from './segments.ts'
 
-/** task.ts 的三个写库函数自己开裸连接——不走 openStore（那是会话的事）。
+/** task.ts 的写库函数自己开裸连接——不走 openStore（那是会话的事）。
  * 连接要自带 schema：库通常已存在（对话先建），但「先派活后说话」的
- * 全新文件夹不该在 fork 就炸 */
+ * 全新文件夹不该在开任务时就炸 */
 const openTaskDb = (root: string): Db => {
   const db = openDb(join(root, MEMORY_RELATIVE, 'state.db'))
   db.exec(SCHEMA)
@@ -34,46 +33,50 @@ const openTaskDb = (root: string): Db => {
       if (!String(error).includes('duplicate column')) throw error
     }
   }
+  // 老库先登记段（幂等）：开任务要在已有段之上开新段
+  registerLegacySegments(db, root)
   return db
 }
-
-export const TASK_TURN_GAP = 1000
-export const TASK_STEP_GAP = 50000
-/**
- * 消息轴比其他轴大两个数量级（2026-09-23 用户拍板 3 万 → 300 万）：save 是
- * 全量 DELETE+INSERT（store.ts replaceLive，理由见那里），每存一次盘整份
- * live 重新占一批 id——消耗 ≈ 步数 × 在场消息数，随任务变长越来越快。
- * 真机 task-m06szj：24 条消息、约 1 小时就用掉约 1,940 个号；3 万个号约
- * 一百多步即段满停机。编号不占存储，放大无代价（fork 时主任务 id 跟着
- * 跳 300 万，INTEGER 上限 9e18，不是问题）。只对之后 fork 的任务生效
- */
-export const TASK_MSG_GAP = 3_000_000
-export const TASK_SUM_GAP = 5000
 
 export type TaskManifest = {
   owner: string
   name: string
   createdAt: string
-  /** 继承上界（含）：owner IS NULL 且 id ≤ forkTurn 的轮对任务可见 */
-  forkTurn: number
-  /** 四轴分配域：turns 是 [forkTurn+1, turnCeil)（reserved 行占 turnCeil），
-   *  其余三轴是 (floor, ceil]（floor = fork 时主库该轴 max） */
-  turnCeil: number
-  stepFloor: number
-  stepCeil: number
-  msgFloor: number
-  msgCeil: number
-  sumFloor: number
-  sumCeil: number
+  /** 回调的登记者 owner（主任务 ''），完成回调回给它（task-trunk 规则 12）。只有 agent
+   *  派的任务有；用户开的、老 manifest 没有 */
+  parent?: string
+  /** 完成回调：pending = 派出那一轮结束时还要回调一次；done = 已回调。老 manifest 没有 = 不回调 */
+  callback?: 'pending' | 'done'
+  /**
+   * 只输名称开的空任务（规则 13）：还没发过第一条消息。第一条消息前拼任务框架句、
+   * reload 恢复时不补回调（没有「派出那一轮」可被打断）；第一轮开跑时去掉
+   */
+  awaitingFirstMessage?: true
+  /**
+   * task-v3 遗产：升级时还开着的老任务才有。forkTurn = 继承上界（owner IS NULL 且
+   * id ≤ forkTurn 的轮对它可见），stepFloor = 继承段的 step 上界。其余号段字段
+   * 只在迁移时读（segments.ts registerLegacySegments）
+   */
+  forkTurn?: number
+  stepFloor?: number
+  stepCeil?: number
 }
 
 const OWNER_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789'
-const newOwnerId = (): string => {
-  let id = ''
-  for (let i = 0; i < 6; i++) {
-    id += OWNER_ALPHABET[Math.floor(Math.random() * OWNER_ALPHABET.length)]
+/**
+ * 6 位随机 = 36^6 ≈ 22 亿，一天 100 个任务一年撞一次的概率约 26%——撞上就把老任务
+ * 按 owner 存的轮与摘要混进新任务。用过的跳过：在开（manifest 在）或说过话（turns
+ * 有行；段和自己的摘要都要先有轮）。关了且没说过话的号，复制来的摘要与拉段记录
+ * 关闭时已删，复用无害
+ */
+const newOwnerId = (taken: (id: string) => boolean): string => {
+  for (;;) {
+    let id = 'task-'
+    for (let i = 0; i < 6; i++) {
+      id += OWNER_ALPHABET[Math.floor(Math.random() * OWNER_ALPHABET.length)]
+    }
+    if (!taken(id)) return id
   }
-  return `task-${id}`
 }
 
 const tasksDir = (root: string): string => join(root, '.simple-code', 'tasks')
@@ -106,91 +109,99 @@ export function listTaskManifests(root: string): TaskManifest[] {
 
 export const scopeOf = (m: TaskManifest): TaskScope => ({
   owner: m.owner,
-  forkTurn: m.forkTurn,
-  turnCeil: m.turnCeil,
-  stepFloor: m.stepFloor,
-  stepCeil: m.stepCeil,
-  msgFloor: m.msgFloor,
-  msgCeil: m.msgCeil,
-  sumFloor: m.sumFloor,
-  sumCeil: m.sumCeil,
+  forkTurn: m.forkTurn ?? 0,
+  inheritCeil: m.forkTurn ? (m.stepFloor ?? 0) : 0,
 })
 
-/**
- * 开任务。**调用方保证对话此刻静止**（不在一轮的中间——写的是活库）。
- * 一个事务完成全部写入，无文件拷贝；manifest 落盘在事务外（它不在库里，
- * 崩溃窗口的语义=「写了库没写 manifest」——号段被烧掉、任务不存在，无害）
- */
-export function forkTask(root: string, name: string): TaskManifest {
+export function writeTaskManifest(root: string, m: TaskManifest): void {
+  mkdirSync(tasksDir(root), { recursive: true })
+  writeFileSync(manifestPath(root, m.owner), JSON.stringify(m, null, 2))
+}
+
+/** 回调消息的头（webview 回放按它认出这一行，events.ts 有同款正则） */
+export const TASK_RESULT_HEAD = '〔任务结果〕'
+
+/** 回调插进登记者上下文的原文：头一行「任务名 · 状态」，其后是派出那一轮最后
+ *  一条回复，不截断——登记者看不到别人没合回的内容，不给原文就拿不到结果 */
+export const taskResultText = (task: string, status: string, reply: string): string =>
+  `${TASK_RESULT_HEAD}${task} · ${status}\n${reply === '' ? '（没有回复文本）' : reply}`
+
+/** 给登记者（owner 键：主任务 ''）投一条回调。登记者在下一个安全点取走
+ *  （store.takeTaskResults） */
+export function postTaskResult(root: string, owner: string, text: string): void {
   const db = openTaskDb(root)
   try {
-    const maxOf = (t: string): number =>
-      db.all<{ m: number | null }>(`SELECT MAX(id) AS m FROM ${t}`)[0]?.m ?? 0
-    // 三轴的 floor 要取「全局已占用的最高号」= max(MAX(id), sequence)。只
-    // 看 MAX(id) 的话：任务 A 在跑、主任务没写新行时再开 B，MAX(id) 是 A 段
-    // 里的行，B 的段就压在 A 的段上——两边分配器各自 +1 撞主键（2026-09-23
-    // 检视查出，task.test「连开两个任务」锁住）。A fork 时已把 sequence
-    // 顶到 A 段尾，它才是下一个真正空闲的号
-    const floorOf = (t: string): number => {
-      const seq =
-        db.all<{ s: number | null }>(`SELECT seq AS s FROM sqlite_sequence WHERE name = ?`, t)[0]?.s ?? 0
-      return Math.max(maxOf(t), seq)
-    }
-    const forkTurn = maxOf('turns')
-    const m: TaskManifest = {
-      owner: newOwnerId(),
-      name,
-      createdAt: new Date().toISOString(),
-      forkTurn,
-      turnCeil: forkTurn + TASK_TURN_GAP,
-      stepFloor: floorOf('steps'),
-      stepCeil: 0,
-      msgFloor: floorOf('messages'),
-      msgCeil: 0,
-      sumFloor: floorOf('summaries'),
-      sumCeil: 0,
-    }
-    m.stepCeil = m.stepFloor + TASK_STEP_GAP
-    m.msgCeil = m.msgFloor + TASK_MSG_GAP
-    m.sumCeil = m.sumFloor + TASK_SUM_GAP
-    db.transaction(() => {
-      // reserved 行：顶高 turns 的 rowid，对话的下一轮自然落在任务段之上。
-      // 它没有内容，任何按内容装配的路径天然跳过（state != 'reserved' 过滤，
-      // v2 遗产惯例）
-      db.run(
-        `INSERT INTO turns(id, started_at, state, owner) VALUES(?, ?, 'reserved', NULL)`,
-        m.turnCeil,
-        new Date().toISOString(),
-      )
-      // 三轴跳段：对话的下一个 id 自然落在段尾之上；任务侧 store 用显式
-      // id 填段内。MAX 保序——重试/并发下不会把 seq 往回拉
-      for (const [tbl, ceil] of [
-        ['steps', m.stepCeil],
-        ['messages', m.msgCeil],
-        ['summaries', m.sumCeil],
-      ] as const) {
-        // sqlite_sequence 的 name 列没有 UNIQUE 约束，ON CONFLICT 不合法
-        // （v2 实测写法）：has-then-update。MAX 保序——重试/并发下不会把
-        // seq 往回拉
-        const has = db.all(`SELECT 1 AS x FROM sqlite_sequence WHERE name = ?`, tbl).length > 0
-        if (has) {
-          db.run(`UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = ?`, ceil, tbl)
-        } else {
-          db.run(`INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)`, tbl, ceil)
-        }
-      }
-    })
-    // 上下文隔离：主任务此刻的上下文复制一份归任务（store.ts
-    // ensureInheritedCopy 注释）。放在跳段之后——副本的 id 取任务段
-    ensureInheritedCopy(db, scopeOf(m))
-    mkdirSync(tasksDir(root), { recursive: true })
-    writeFileSync(manifestPath(root, m.owner), JSON.stringify(m, null, 2))
-    return m
+    db.run(`INSERT INTO task_results(owner, text, created_at) VALUES(?, ?, ?)`, owner, text, new Date().toISOString())
   } finally {
     db.close()
   }
 }
 
+/** 任务最后一条有文字的回复（reload 打断了派出那一轮、恢复时补回调用）。没有 = '' */
+export function lastTaskReply(root: string, owner: string): string {
+  const db = openTaskDb(root)
+  try {
+    for (const { c } of db.all<{ c: string }>(
+      `SELECT content_json AS c FROM messages WHERE owner = ? AND role = 'assistant' ORDER BY id DESC LIMIT 50`,
+      owner,
+    )) {
+      const parts = (JSON.parse(c) as { parts: { type: string; text?: string }[] }).parts
+      const text = parts.map((p) => (p.type === 'text' ? (p.text ?? '') : '')).join('')
+      if (text !== '') return text
+    }
+    return ''
+  } finally {
+    db.close()
+  }
+}
+
+/**
+ * 开任务（规则 7）。一个事务：把主干在场的摘要复制成自己的 + 记下主干拉过的段
+ * （那些经历已在副本里，不再拉）。不调模型、不碰任何会话的行，任何时刻都能开。
+ *
+ * **不开段**：段等第一轮开始时开（store beginTurn → segmentForTurn）。只输名称的
+ * 空任务可能隔很久才发第一条消息（规则 13），段若此刻就开，「open 却零 step」的段
+ * 会被别人的摘要合并链跨过、之后才写进内容，被 applyMerges 当嵌套根误收（复审
+ * 2026-10-30）。之间主干新合回的段，第一个请求按 firstPull 拉（run.ts）。
+ * manifest 落盘在事务外——崩溃窗口的语义是「库里有摘要副本没 manifest」：无人读，无害
+ */
+export function createTask(
+  root: string,
+  name: string,
+  opts: { parent?: string; awaitingFirstMessage?: boolean } = {},
+): TaskManifest {
+  const db = openTaskDb(root)
+  try {
+    const m: TaskManifest = {
+      owner: newOwnerId(
+        (id) =>
+          existsSync(manifestPath(root, id)) ||
+          db.all(`SELECT 1 AS x FROM turns WHERE owner = ? LIMIT 1`, id).length > 0,
+      ),
+      name,
+      createdAt: new Date().toISOString(),
+      ...(opts.parent !== undefined ? { parent: opts.parent, callback: 'pending' as const } : {}),
+      ...(opts.awaitingFirstMessage === true ? { awaitingFirstMessage: true as const } : {}),
+    }
+    db.transaction(() => {
+      db.run(
+        `INSERT INTO summaries(level, covers_from, covers_to, text, status, in_context,
+                               superseded_by, head, archive_path, name, owner)
+         SELECT level, covers_from, covers_to, text, 'ready', 1, NULL, head, archive_path, name, ?
+         FROM summaries WHERE owner = ? AND in_context = 1 AND status = 'ready'
+         ORDER BY covers_from, level`,
+        m.owner,
+        TRUNK,
+      )
+      for (const { id } of db.all<{ id: number }>(`SELECT segment_id AS id FROM segment_pulls WHERE owner = ?`, TRUNK))
+        markPulled(db, m.owner, id)
+    })
+    writeTaskManifest(root, m)
+    return m
+  } finally {
+    db.close()
+  }
+}
 /**
  * 关闭第一步：任务的 live 尾巴翻成 unloaded——数据即刻成为历史。
  * 之后任务的摘要器还能继续摘它（段选择不要求 live）
@@ -237,71 +248,63 @@ export function flipTaskLive(root: string, owner: string): number {
 }
 
 /**
- * 关闭末步：owner 还俗 NULL——任务的段从此就是对话的历史，所有可见性
- * 过滤（owner IS NULL）零特殊路径地把它收进来。配额的 reserved 行不动
- * （它本来就是对话侧的路标）。最后只重做任务自己 turn 的 FTS 行：任务段
- * 的低号 step 在存活期间位于增量游标之下，增量同步收不到
+ * 关闭末步（规则 8）：任务的段即刻合回（行的 owner 不变，合回状态记在段表），
+ * 别的会话下一轮切段、在压缩点拉它的摘要（segments.ts closedAbove）。
+ * covers 不落在自己任何一段内的摘要行删掉：开场复制的主干摘要、拉进来的别段
+ * 摘要、自己跨着它们合出的行——别人只按段拉段内的行（copySegmentRoots），
+ * 这些行合回后再没人读，不删每个任务留约 250 行（task-trunk 复审）。
+ * task-v3 老任务另清掉 fork 时复制的继承上下文（消息副本 + covers 继承段的
+ * 私有摘要）——那是它窗口里的脚手架，不是经历
  */
-/** finalizeTask 各步改动行数——task_close 对账用（关闭后 owner/manifest 都没了，事后无从反推） */
+/** finalizeTask 各步改动行数——task_close 对账用 */
 export type FinalizeCounts = {
   sumDeleted: number
-  sumPromoted: number
   msgDeleted: number
-  msgPromoted: number
-  turnsPromoted: number
+  segments: number
 }
 
 export function finalizeTask(root: string, owner: string): FinalizeCounts {
   const db = openTaskDb(root)
   const count = (sql: string, ...p: SqlValue[]): number => db.all<{ c: number }>(`SELECT COUNT(*) AS c ${sql}`, ...p)[0]?.c ?? 0
-  const counts: FinalizeCounts = { sumDeleted: 0, sumPromoted: 0, msgDeleted: 0, msgPromoted: 0, turnsPromoted: 0 }
+  const counts: FinalizeCounts = { sumDeleted: 0, msgDeleted: 0, segments: 0 }
   try {
-    // 摘要账清尾（task-v3）：covers 继承段的私有摘要是任务跑期间的脚手架
-    // ——它的内容只服务于任务的窗口，对话的历史由对话自己的摘要器负责，
-    // 删。covers 自己段的私有摘要还俗（owner→NULL）：任务的经历从此就是
-    // 对话的历史，摘要跟着经历走。判据用 covers_from 对 stepFloor：段
-    // 不会跨界（nextSegment 按 turn 切，继承 turn 和自己的 turn 不同段）
-    const stepFloor = readTaskManifest(root, owner).stepFloor
+    const legacy = scopeOf(readTaskManifest(root, owner))
     db.transaction(() => {
-      // 继承段的摘要（fork 时的副本 + 任务替继承段做的私有摘要）要删；任务
-      // 自己段的摘要若被一条跨界的父行收编，先解开，不然外键拦住删除
+      if (legacy.forkTurn > 0) {
+        const ceil = legacy.inheritCeil
+        db.run(
+          `UPDATE summaries SET superseded_by = NULL
+           WHERE superseded_by IN (SELECT id FROM summaries WHERE owner = ? AND covers_from <= ?)
+             AND NOT (owner = ? AND covers_from <= ?)`,
+          owner,
+          ceil,
+          owner,
+          ceil,
+        )
+        counts.sumDeleted = count(`FROM summaries WHERE owner = ? AND covers_from <= ?`, owner, ceil)
+        db.run(`DELETE FROM summaries WHERE owner = ? AND covers_from <= ?`, owner, ceil)
+        counts.msgDeleted = count(`FROM messages WHERE owner = ? AND turn_id NOT IN (SELECT id FROM turns WHERE owner = ?)`, owner, owner)
+        db.run(`DELETE FROM messages WHERE owner = ? AND turn_id NOT IN (SELECT id FROM turns WHERE owner = ?)`, owner, owner)
+        db.run(`DELETE FROM migrations WHERE name = ?`, copyMarker(owner))
+      }
+      // 段内行被跨段父行收编的先解开（superseded_by 有外键）；它们在
+      // copySegmentRoots 眼里本就是链根，拉到的内容不变
+      const outside = `SELECT x.id FROM summaries x WHERE x.owner = ? AND NOT EXISTS (
+        SELECT 1 FROM segments g WHERE g.owner = x.owner
+          AND x.covers_from > g.step_floor AND x.covers_to <= g.step_ceil)`
       db.run(
         `UPDATE summaries SET superseded_by = NULL
-         WHERE superseded_by IN (SELECT id FROM summaries WHERE owner = ? AND covers_from <= ?)
-           AND NOT (owner = ? AND covers_from <= ?)`,
-        owner,
-        stepFloor,
-        owner,
-        stepFloor,
-      )
-      counts.sumDeleted = count(`FROM summaries WHERE owner = ? AND covers_from <= ?`, owner, stepFloor)
-      db.run(`DELETE FROM summaries WHERE owner = ? AND covers_from <= ?`, owner, stepFloor)
-      counts.sumPromoted = count(`FROM summaries WHERE owner = ?`, owner)
-      db.run(`UPDATE summaries SET owner = NULL WHERE owner = ?`, owner)
-      // 消息副本（行归任务、轮归主任务）删掉；任务自己轮的行还俗
-      counts.msgDeleted = count(`FROM messages WHERE owner = ? AND turn_id NOT IN (SELECT id FROM turns WHERE owner = ?)`, owner, owner)
-      db.run(
-        `DELETE FROM messages WHERE owner = ? AND turn_id NOT IN (SELECT id FROM turns WHERE owner = ?)`,
+         WHERE superseded_by IN (${outside}) AND id NOT IN (${outside})`,
         owner,
         owner,
       )
-      counts.msgPromoted = count(`FROM messages WHERE owner = ?`, owner)
-      db.run(`UPDATE messages SET owner = NULL WHERE owner = ?`, owner)
-      db.run(`DELETE FROM migrations WHERE name = ?`, copyMarker(owner))
-      counts.turnsPromoted = count(`FROM turns WHERE owner = ?`, owner)
-      const ownTurns = db.all<{ id: number }>(`SELECT id FROM turns WHERE owner = ?`, owner).map((r) => r.id)
-      db.run(`UPDATE turns SET owner = NULL WHERE owner = ?`, owner)
-      // 合并改写了主任务的前缀（任务的经历摘要从此渲染在主任务上下文里）。
-      // 前缀不变式：合法改写只搭压缩的车——合并这一刻主任务会话多半不在手上，
-      // 落一张「压缩车票」，主任务下一次请求把它当压缩触发（unloadIfNeeded
-      // 的触发条件之一），allowRewrite 在那儿放行。丢弃路径不改主任务上下文，
-      // 不需要
-      db.run(
-        `INSERT INTO migrations (name, ran_at) VALUES ('merge-rewrite-pending', ?)
-         ON CONFLICT(name) DO UPDATE SET ran_at = excluded.ran_at`,
-        new Date().toISOString(),
-      )
-      reindexTurns(db, ownTurns)
+      counts.sumDeleted += count(`FROM summaries WHERE id IN (${outside})`, owner)
+      db.run(`DELETE FROM summaries WHERE id IN (${outside})`, owner)
+      counts.segments = count(`FROM segments WHERE owner = ? AND state <> 'merged'`, owner)
+      closeSegments(db, owner, root)
+      // 关了不再拉段。开场从主干复制的拉段记录 ≈ 已合回段数、每任务一份，不删
+      // 就随天数平方涨（一天 100 任务一年约 13 亿行、98GB）
+      db.run(`DELETE FROM segment_pulls WHERE owner = ?`, owner)
     })
   } finally {
     db.close()
@@ -309,4 +312,3 @@ export function finalizeTask(root: string, owner: string): FinalizeCounts {
   rmSync(manifestPath(root, owner), { force: true })
   return counts
 }
-

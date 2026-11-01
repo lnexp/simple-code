@@ -4,7 +4,8 @@
 // 标签剥掉（干净输入也剥，marked 输出本身是对的）——jsdom 是 DOMPurify
 // 官方测试套件的环境，不赌其他标签有没有同类问题
 import { describe, expect, it } from 'vitest'
-import { renderMarkdown, splitOpenFence } from '../webview/markdown.ts'
+import { STYLE } from '../src/style.ts'
+import { MAX_INDENT, renderMarkdown, splitOpenFence } from '../webview/markdown.ts'
 
 /**
  * markdown 渲染的两类风险分开测：
@@ -166,5 +167,50 @@ describe('renderMarkdown 语法高亮', () => {
     const html = renderMarkdown('```diff\n+新增\n-删除\n```')
     expect(html).toMatch(/hljs-addition/)
     expect(html).toMatch(/hljs-deletion/)
+  })
+})
+
+describe('回答排版（2026-10-28）', () => {
+  const dom = (md: string): HTMLElement => {
+    const div = document.createElement('div')
+    div.innerHTML = renderMarkdown(md)
+    return div
+  }
+
+  it('整段只有加粗 → 小标题；加粗开头的正文不算', () => {
+    const div = dom('**验证情况**\n\n**改动效果**：一条命令只占一行\n\n- **列表里的加粗**')
+    const secs = [...div.querySelectorAll('p.md-sec')].map((p) => p.textContent)
+    expect(secs).toEqual(['验证情况'])
+  })
+
+  it('没标语言的代码块按行包，复制取到的文本与原文一字不差', () => {
+    const src = '用户消息\n  ○ 说明：甲\n\n    ✓ 命令乙'
+    const div = dom(`\`\`\`\n${src}\n\`\`\``)
+    const code = div.querySelector('pre code')
+    // 复制按钮取的就是 code.textContent（App.tsx copyCode）
+    expect(code?.textContent).toBe(`${src}\n`)
+    expect(div.querySelector('pre')?.classList.contains('wrap')).toBe(true)
+    expect(code?.querySelectorAll('.ln')).toHaveLength(4)
+    // 行首列数记在 data-i，续行按它悬挂缩进；行内不再拆段（拆了手动选中复制
+    // 会在段间插换行）
+    const rows = [...(code?.querySelectorAll('.ln') ?? [])] as HTMLElement[]
+    expect(rows.map((r) => r.dataset.i ?? '')).toEqual(['', '2', '', '4'])
+    expect(rows.every((r) => r.children.length === 0)).toBe(true)
+  })
+
+  it('tab 缩进按 8 列一档算；样式里的规则档数和 MAX_INDENT 一致', () => {
+    const div = dom('```\n\tx\n  \ty\n```')
+    const rows = [...div.querySelectorAll('.ln')] as HTMLElement[]
+    expect(rows.map((r) => r.dataset.i)).toEqual(['8', '8'])
+    expect(STYLE).toContain(`.ln[data-i="${MAX_INDENT}"]`)
+    expect(STYLE).not.toContain(`.ln[data-i="${MAX_INDENT + 1}"]`)
+  })
+
+  it('**对照：标了语言的代码块不包**（真代码折行会破坏对齐）', () => {
+    for (const md of ['```ts\nconst a = 1\n```', '```rust\nlet x = 1;\n```']) {
+      const div = dom(md)
+      expect(div.querySelector('.ln')).toBeNull()
+      expect(div.querySelector('pre')?.classList.contains('wrap')).toBe(false)
+    }
   })
 })

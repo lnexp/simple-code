@@ -172,8 +172,8 @@ describe('bash / 超时与中断', () => {
     expect(logPath).toMatch(/sc-bg-\d+\.log$/)
     // 进程还活着（转后台没杀）；登记簿里有它
     expect(() => process.kill(pid, 0)).not.toThrow()
-    expect(bgRegistry.snapshot().some((p) => p.pid === pid)).toBe(true)
-    expect(bgRegistry.snapshot().find((p) => p.pid === pid)?.logPath).toBe(logPath)
+    expect(bgRegistry.snapshot().some((p) => p.pgid === pid)).toBe(true)
+    expect(bgRegistry.snapshot().find((p) => p.pgid === pid)?.logPath).toBe(logPath)
     // 超时后的输出继续落进日志文件
     expect(logPath).toBeDefined()
     await run({ command: `echo after >> ${logPath}` })
@@ -203,7 +203,7 @@ describe('bash / 超时与中断', () => {
     expect(logPath).toMatch(/sc-bg-\d+\.log$/)
     // 进程还活着；登记簿里有它
     expect(() => process.kill(pid, 0)).not.toThrow()
-    expect(bgRegistry.snapshot().some((x) => x.pid === pid)).toBe(true)
+    expect(bgRegistry.snapshot().some((x) => x.pgid === pid)).toBe(true)
     process.kill(pid, 'SIGKILL') // 收尾
   })
 
@@ -222,39 +222,43 @@ describe('bash / 超时与中断', () => {
     // 上一个用例的进程已杀，这里从登记簿找本条的 pid
     const alive = bgRegistry.snapshot().filter((x) => /sleep/.test(x.command))
     expect(alive.length).toBeGreaterThan(0)
-    for (const x of alive) process.kill(x.pid, 'SIGKILL') // 收尾
+    for (const x of alive) process.kill(-x.pgid, 'SIGKILL') // 收尾
   })
 
   // t886 真机 bug：`... mvn ... & echo; sleep 55; curl` 转后台后，外层 bash
   // 跑完就退出、mvn 被 init 收养继续占着 8081，而登记簿按组长 pid 探活判它
   // 已死 → UI 上整条记录消失，用户看不到也关不掉
-  it('**组长先退出、组员还在跑**：登记簿换成组员，不整条消失', async () => {
+  it('**组长先退出、组员还在跑**：整组留着、成员换成组员，不整条消失', async () => {
     const r = await run({
       // 形状照抄真机：后台起长命令，外层 shell 自己很快就结束
       command: 'nohup sleep 30 > /dev/null 2>&1 & echo started; sleep 20',
       timeout: 0.4,
     })
     const leader = Number(r.output.match(/pid\s+(\d+)/)?.[1])
-    expect(bgRegistry.snapshot().some((p) => p.pid === leader)).toBe(true)
+    expect(bgRegistry.snapshot().some((p) => p.pgid === leader)).toBe(true)
 
     // 等组长自己退出（sleep 20 还没完就被 kill，模拟组长先走）
     process.kill(leader, 'SIGTERM')
     await new Promise((r2) => setTimeout(r2, 500))
     await bgRegistry.reap()
+    const kept = bgRegistry.snapshot().find((p) => p.pgid === leader)
+    expect(kept?.pids.includes(leader)).toBe(false)
+    expect(kept?.pids.length).toBeGreaterThan(0)
     // 覆盖第二道防线：把组员那条也抹掉，只留死掉的组长——模拟「转后台那一刻
     // 组员还没起来（mvn 启动要几十秒），collect 扫了个空」。这时只有 reap
     // 按 pgid 重扫才能把它找回来；缺了 reap 这里就会是空列表
-    bgRegistry.forget((pid) => pid !== leader)
+    bgRegistry.forget(() => true)
     expect(bgRegistry.snapshot().length).toBe(0)
-    bgRegistry.register(leader, 'nohup sleep 30 & ...')
+    bgRegistry.register(leader, { command: 'nohup sleep 30 & ...', startedAt: Date.now() })
     await bgRegistry.reap()
 
     const alive = bgRegistry.snapshot()
-    // 组长没了，但 nohup 那个还在——列表不能空
-    expect(alive.some((p) => p.pid === leader)).toBe(false)
-    expect(alive.length).toBeGreaterThan(0)
-    expect(alive.some((p) => p.command.includes('sleep 30'))).toBe(true)
-    for (const p of alive) process.kill(p.pid, 'SIGKILL')
+    // 组长没了，但 nohup 那个还在——这一组不能消失，成员里没有组长
+    const g = alive.find((p) => p.pgid === leader)
+    expect(g).toBeDefined()
+    expect(g?.pids.includes(leader)).toBe(false)
+    expect(g?.pids.length).toBeGreaterThan(0)
+    process.kill(-leader, 'SIGKILL')
   })
 
   it('timeout 参数被 maxTimeoutMs 夹住（夹住后同样转后台而不是干等）', async () => {
@@ -383,6 +387,14 @@ describe('bash / 环境变量白名单', () => {
     expect(without.definition.description).not.toContain('SIMPLE_CODE_LSP')
     // 默认参数（不传 env）= 空对象 = 不拼，老调用方行为不变
     expect(bash.definition.description).not.toContain('SIMPLE_CODE_LSP')
+  })
+
+  it('派任务句按注入条件拼：bin 与桥端口都在才写（终端 sc 没有任务条，对照）', () => {
+    const withTask = createBashTool(config, { SIMPLE_CODE_TASK: '/x/task.js', SIMPLE_CODE_TASK_PORT: '1' })
+    expect(withTask.definition.description).toContain('【派任务】"$SIMPLE_CODE_TASK"')
+    expect(withTask.definition.description).toContain('〔任务结果〕')
+    expect(createBashTool(config, { SIMPLE_CODE_TASK: '/x/task.js' }).definition.description).not.toContain('SIMPLE_CODE_TASK')
+    expect(createBashTool(config, {}).definition.description).not.toContain('SIMPLE_CODE_TASK')
   })
 
   it('note write 的格式原样写进描述：前缀 + --- 分隔（note-bin 正则要的就是这个）', () => {
@@ -559,7 +571,17 @@ describe('审批 always 白名单（approval.json）', () => {
     const r = await run({ command: 'curl https://example.com' }, { requestApproval: ra })
     expect(r.isError).toBe(true)
     expect(r.output).not.toContain('用户反馈')
+    expect(r.output).toContain('用户拒绝了这条命令')
     expect(r.output).toContain('不要换写法绕过审批')
+  })
+
+  it('超时拒绝：告诉模型是没人处理，不是用户拒绝（2026-10-31）', async () => {
+    const ra = () => Promise.resolve('timeout' as const)
+    const r = await run({ command: 'curl https://example.com' }, { requestApproval: ra })
+    expect(r.isError).toBe(true)
+    expect(r.output).toContain('审批被拒绝')
+    expect(r.output).toContain('无人处理')
+    expect(r.output).not.toContain('用户拒绝了这条命令')
   })
 
   it('路径白名单：批过外部目录后其子树免审、邻居仍弹', async () => {
@@ -621,15 +643,56 @@ describe('审批 always 白名单（approval.json）', () => {
     }
   })
 
-  it('隐藏路径不给 always：卡上没有第三键的语义（q.always 不出现）', async () => {
+  it('.simple-code 写：memory 不给 always，其余子目录按第二级给（2026-10-29）', async () => {
     const seen: Array<Parameters<NonNullable<ToolContext['requestApproval']>>[0] | undefined> = []
     const ra = (q: Parameters<NonNullable<ToolContext['requestApproval']>>[0]) => {
       seen.push(q)
       return Promise.resolve<'deny'>('deny')
     }
-    await run({ command: `echo x > ${root}/.simple-code/probe.txt` }, { requestApproval: ra })
-    expect(seen[0]?.always).toBeUndefined() // 隐藏路径不收敛，不给 always
+    await run(
+      { command: `echo x > ${root}/.simple-code/memory/probe.txt` },
+      { requestApproval: ra },
+    )
+    expect(seen[0]?.always).toBeUndefined() // 对话记录：每次都弹
     expect(seen[0]?.reason).toContain('.simple-code')
+    await run(
+      { command: `echo x > ${root}/.simple-code/scripts/probe.txt` },
+      { requestApproval: ra },
+    )
+    expect(seen[1]?.always).toEqual({ kind: 'hidden', path: '.simple-code/scripts', write: true })
+  })
+
+  it('multi 卡批量 always 掺隐藏路径：目录记 paths、隐藏路径记 hiddenRead（2026-10-29）', async () => {
+    const d1 = join(root, '..', 'sc-multi-h1')
+    mkdirSync(d1, { recursive: true })
+    writeFileSync(join(root, '.sc-multi-h'), 'x')
+    try {
+      const seen: Array<Parameters<NonNullable<ToolContext['requestApproval']>>[0]> = []
+      const ra = (q: Parameters<NonNullable<ToolContext['requestApproval']>>[0]) => {
+        seen.push(q)
+        return Promise.resolve<'always'>('always')
+      }
+      const r = await run({ command: `ls ${d1}; cat .sc-multi-h` }, { requestApproval: ra })
+      expect(r.isError).toBe(false)
+      const d1r = realpathSync(d1)
+      expect(seen[0]?.always).toEqual({
+        kind: 'paths',
+        dirs: [d1r],
+        hidden: [{ path: '.sc-multi-h', write: false }],
+      })
+      const data = JSON.parse(readFileSync(join(root, '.simple-code', 'approval.json'), 'utf8'))
+      expect(data.paths).toContain(d1r)
+      expect(data.hiddenRead).toContain('.sc-multi-h')
+      const r2 = await run(
+        { command: `ls ${d1}; cat .sc-multi-h` },
+        { requestApproval: () => Promise.resolve('deny') },
+      )
+      expect(r2.isError).toBe(false)
+    } finally {
+      rmSync(join(root, '.simple-code', 'approval.json'), { force: true })
+      rmSync(join(root, '.sc-multi-h'), { force: true })
+      rmSync(d1, { recursive: true, force: true })
+    }
   })
 })
 

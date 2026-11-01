@@ -10,7 +10,9 @@ import {
 
   openDbReadOnly,
   MEMORY_RELATIVE,
+  type TaskDispatchResponse,
   type TaskManifest,
+  type TaskModelsResponse,
 } from '@simple-code/core'
 import {
   type ApprovalCategory,
@@ -31,11 +33,13 @@ import {
   type ChatView,
   emptyView,
   hydrateItems,
-  reduce,
+  replayWithUsers,
 } from '../webview/events.ts'
 import type { ApprovalRequest, ToHost, ToWebview } from './protocol.ts'
+import { turnTracker, type RobotTaskView, type TurnEnd } from './robot-feed.ts'
 import { computeMemoryStats } from '@simple-code/core'
 import { REFLECT_TASK_BOOK } from './reflect.ts'
+import { pickTaskModel } from './task-bridge.ts'
 import { join } from 'node:path'
 import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { execFile as execFileCb } from 'node:child_process'
@@ -68,7 +72,7 @@ export type BridgeDeps = {
    */
   taskSession: (
     task: TaskManifest,
-    requestApproval: (q: TaskApprovalQ) => Promise<'allow' | 'always' | 'deny' | { deny: string }>,
+    requestApproval: (q: TaskApprovalQ) => Promise<'allow' | 'always' | 'deny' | 'timeout' | { deny: string }>,
   ) => Promise<Session>
   /** 任务模型选择的持久化（透传 TaskCenter）。不传 = 任务配置内存态 */
   choiceStore?: TaskChoiceStore
@@ -130,6 +134,11 @@ export type Bridge = {
   isRunning: () => boolean
   /** 任一分身在跑（router 并进 folder tab 绿点） */
   anyRunning: () => boolean
+  /** 桌面机器人（desktop-robot.md §4.3）：主任务 + 各分身的现状，挂起的审批卡 */
+  robotView: () => { tasks: RobotTaskView[]; approvals: ApprovalRequest[] }
+  /** 机器人上点「允许」：按 toolCallId 找此刻确实在等的卡，走面板点允许的同一条路。
+   *  卡已处理/已超时 = false（乱发的 toolCallId 批不了任何东西，§5.2） */
+  allowToolCall: (toolCallId: string) => boolean
   /**
    * 挂起中的审批数。路由层用它给后台文件夹的标签点角标——卡片本身不跨
    * 标签显示（怕人在没有对话上下文时误批），但「那边有事等着」要能看见
@@ -146,6 +155,12 @@ export type Bridge = {
   requestReload: () => void
   /** 分身任务面板要基线（attach 已含；此口留给路由层切回时直调） */
   rehydrateTasks: () => void
+  /** agent 派任务（$SIMPLE_CODE_TASK → task-bridge.ts，task-trunk 规则 11）。
+   *  owner = 派它的会话，登记为回调对象；model = --model 原文（规则 14，只认
+   *  taskModels 里的，省略 = 配置默认） */
+  dispatchFromAgent: (brief: string, owner: string, model?: string) => Promise<TaskDispatchResponse>
+  /** bin --models：本目录配置里的 taskModels 与配置默认模型（规则 14） */
+  taskModels: () => Promise<TaskModelsResponse>
   /**
    * 扩展停用。中断正在跑的 loop 并关 session——进程都要没了，没有
    * 「跑完再说」的余地
@@ -167,12 +182,10 @@ export function createBridge(deps: BridgeDeps): Bridge {
    */
   let ready = false
   let running = false
-  /** 等主任务这轮结束的人（任务关闭的还俗那一步）。send 的 finally 收口时放行 */
-  let idleWaiters: (() => void)[] = []
-  const waitIdle = async (): Promise<void> => {
-    // while 不是 if：放行后到这里之间主任务可能又开了一轮
-    while (running) await new Promise<void>((r) => idleWaiters.push(r))
-  }
+  /** 桌面机器人用：本轮开始时刻、上一轮的结局、本轮是否被用户停止（§5.3） */
+  let currentTurnStartedAt: number | null = null
+  let lastTurn: TurnEnd | null = null
+  let stopRequested = false
   /** 拿 session 的那个 promise。同一个面板只建一次，重复点发送不会建两个 */
   let pending: Promise<Session> | null = null
   /**
@@ -230,10 +243,11 @@ export function createBridge(deps: BridgeDeps): Bridge {
       /** 卡片留底：多根切回时 attach 重推 pending 的卡（webview 是无状态
        *  投影，切走即清，不重推的话后台目录的卡永远看不见） */
       card: ApprovalRequest
-      resolve: (r: 'allow' | 'always' | 'deny' | { deny: string }) => void
+      resolve: (r: 'allow' | 'always' | 'deny' | 'timeout' | { deny: string }) => void
     }
   >()
-  /** 挂机等不到人：宁可让模型把「审批超时」带回来，也不放行不确定的命令 */
+  /** 挂机等不到人：宁可让模型把「审批超时」带回来，也不放行不确定的命令。
+   *  到点 resolve 'timeout'（不是 'deny'）：bash 工具据此告诉模型「没人处理」 */
   const APPROVAL_TIMEOUT_MS = 5 * 60_000
   // fallback 要返回真 cancel——as 骗类型的话，答复路径调 cancel() 会当场
   // 拿 NodeJS.Timeout 当函数调（真事，测试抓的）
@@ -244,7 +258,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
       return () => clearTimeout(t)
     })
 
-  const finishApproval = (id: number, r: 'allow' | 'always' | 'deny' | { deny: string }): void => {
+  const finishApproval = (id: number, r: 'allow' | 'always' | 'deny' | 'timeout' | { deny: string }): void => {
     const entry = pendingApprovals.get(id)
     if (!entry) return
     pendingApprovals.delete(id)
@@ -252,6 +266,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
       ev: 'approval_result',
       folder: deps.folder,
       id,
+      toolCallId: entry.card.toolCallId,
+      ...(entry.card.task !== undefined ? { task: entry.card.task } : {}),
       decision: typeof r === 'string' ? r : `deny:${r.deny}`,
     })
     post({ type: 'approval_closed', id })
@@ -267,15 +283,16 @@ export function createBridge(deps: BridgeDeps): Bridge {
     category: ApprovalCategory
     detail: string
     reason: string
+    parts?: ApprovalCategory[]
     always?:
       | { kind: 'lead'; lead: string }
       | { kind: 'path'; dir: string }
       | { kind: 'nonpath'; lead: string; from: number }
-      | { kind: 'paths'; dirs: string[] }
+      | { kind: 'paths'; dirs: string[]; hidden?: { path: string; write: boolean }[] }
       | { kind: 'hidden'; path: string; write: boolean }
     /** 分身任务弹的卡：任务名，卡片标注来源 */
     task?: string
-  }): Promise<'allow' | 'always' | 'deny' | { deny: string }> => {
+  }): Promise<'allow' | 'always' | 'deny' | 'timeout' | { deny: string }> => {
     // 分支的卡按分支自己的开关判（2026-09-22 拍板）；主干/缺省走 folder 级
     const on = q.task !== undefined ? tasks.approvalOnOf(q.task) : approvalOn
     if (!on) return Promise.resolve('allow')
@@ -284,6 +301,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
       ev: 'approval_ask',
       folder: deps.folder,
       id,
+      toolCallId: q.toolCallId,
+      ...(q.task !== undefined ? { task: q.task } : {}),
       category: q.category,
       command: q.command.slice(0, 300),
       // reason 是「为什么弹」的人话（要触碰隐藏路径：X / 命令含 eval…）。
@@ -299,12 +318,13 @@ export function createBridge(deps: BridgeDeps): Bridge {
       category: q.category,
       detail: q.detail,
       reason: q.reason,
+      ...(q.parts ? { parts: q.parts } : {}),
       ...(q.always ? { always: q.always } : {}),
       ...(q.task !== undefined ? { task: q.task } : {}),
     }
     post(card)
     return new Promise((resolve) => {
-      const cancel = setTimer(APPROVAL_TIMEOUT_MS, () => finishApproval(id, 'deny'))
+      const cancel = setTimer(APPROVAL_TIMEOUT_MS, () => finishApproval(id, 'timeout'))
       pendingApprovals.set(id, {
         card,
         resolve: (r) => {
@@ -356,19 +376,28 @@ export function createBridge(deps: BridgeDeps): Bridge {
   /**
    * 当前轮的用户气泡。**user 消息是 App 本地 append 的，不在事件流里**——
    * 镜像不补它的话，跑着的时候重开面板会看到一段没有问题的回答。
-   * 必须是数组：插话（running 时 send）会再来一条，单数槽位的话后者
-   * 把前者顶掉——轮内切走再切回，第一条 user 气泡就"被改写"成插话
-   * 内容（某项目 turn-822 实测）。fold 时随重放一起收编进
-   * 基线后清空。顺序上插话排在全部过程前面——镜像本来是近似视图，
-   * 精确位置只有 fold 重读 messages() 才有
+   * 插话不在这里，在 queuedUsers（曾经同放一个单数槽位，插话把第一条
+   * 顶掉——轮内切走再切回，第一条 user 气泡"被改写"成插话内容，某项目
+   * turn-822 实测）。fold 时随重放一起收编进基线后清空。每条记下进来时
+   * 重放的长度（pos），镜像按它插回重放
    */
-  let pendingUsers: ChatItem[] = []
+  let pendingUsers: Array<{ item: ChatItem; pos: number }> = []
+  /**
+   * 跑着时的插话，镜像里先放 ChatView.queued，重放到 core 的 `input_delivered`
+   * 时 reduce 摆进 items——和实时视图同位置（2026-10-31 真机：按回车时的位置
+   * 插的话，回答流式中插话会排到这一步回答前面，reload 后又在回答后面）
+   */
+  let queuedUsers: ChatView['queued'] = []
 
   const mirrorView = (): ChatView => {
-    const items = [...baseItems, ...pendingUsers]
-    let view = { ...emptyView(), items, contextTokens: lastContextTokens, lastTiming }
-    for (const { ev, at } of replay) view = reduce(view, ev, at)
-    return view
+    const view = {
+      ...emptyView(),
+      items: [...baseItems],
+      contextTokens: lastContextTokens,
+      lastTiming,
+      queued: [...queuedUsers],
+    }
+    return replayWithUsers(view, replay, pendingUsers)
   }
 
   /**
@@ -388,6 +417,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
     baseItems = hydrateItems(session.historyRows())
     replay = []
     pendingUsers = []
+    queuedUsers = []
     // fold 本身就是一次基线同步：标记置上，warmUp 不再重读（重读也不重叠
     // ——replay 已清零——但没必要，messages() 全量读一次是有代价的）
     baselineSynced = true
@@ -400,29 +430,50 @@ export function createBridge(deps: BridgeDeps): Bridge {
 
   // ── 任务中心（task-v3）──────────────────────────────────────
   // 审批中枢在上面刚定义好——任务中心的 labeled 审批闭包引用它
+  /**
+   * 主任务取走投给它的任务回调（task-trunk 规则 12）并重推视图——回调是插进
+   * 历史的一条消息，基线重读即可显示。在跑 = loop 下一个请求前自己取（带
+   * task_result 事件），轮后 send 的 finally 再兜一次；没有 session = 信箱等着
+   */
+  const absorbMain = (session: Session): void => {
+    if (running || session.takeTaskResults() === 0) return
+    fold(session)
+    baseItems = withFooter(baseItems)
+    const mirror = mirrorView()
+    post({
+      type: 'hydrate',
+      items: mirror.items,
+      contextTokens: mirror.contextTokens,
+      ...(mirror.lastTiming ? { lastTiming: mirror.lastTiming } : {}),
+      ...(mirror.queued.length > 0 ? { queued: mirror.queued } : {}),
+    })
+  }
   const tasks = createTaskCenter({
     folder: deps.folder,
     post,
     session: deps.taskSession,
     requestApproval,
+    pokeMain: () => {
+      // 主任务 session 还没建（reload 后没对它说过话）也建出来取走：不然回调
+      // 看不见、在信箱里等到用户下一句（task-trunk 复审）
+      if (running) return
+      void getSession().then(absorbMain).catch(() => {})
+    },
     ...(deps.choiceStore !== undefined ? { choiceStore: deps.choiceStore } : {}),
     ...(deps.setTimer !== undefined ? { setTimer: deps.setTimer } : {}),
   })
-  /** 派活闸门在这里：fork 写活库（reserved 行+跳段），要对话静止在轮边界 */
-  const dispatchTask = (brief: string): void => {
-    const busy = (): string | null => (running ? '主任务正在跑——等这轮跑完再开任务' : null)
-    void tasks.dispatch(brief, busy).then((error) => {
+  /** 派活（task-trunk 规则 7）：不等主任务静止。from = 在哪个任务里开的（webview
+   *  当前 tab；省略 = 主任务），登记为父任务，派出那一轮结束回调给它（规则 12） */
+  const dispatchTask = (brief: string, from?: string): void => {
+    void tasks.dispatch(brief, tasks.ownerOf(from)).then((error) => {
       if (error !== null) post({ type: 'fatal', message: error })
     })
   }
 
-  /** 关闭任务（task-v3）：不碰对话的 session——owner 还俗后对话下次装配
-   *  自然看到该段。失败提示走 fatal，任务保留可重试 */
+  /** 关闭任务：不碰对话的 session——段合回后对话下一轮切段、在压缩点
+   *  拉它的摘要。失败提示走 fatal，任务保留可重试 */
   const doCloseTask = async (name: string): Promise<void> => {
-    const r = await tasks.close(name, {
-      busy: () => (running ? '主任务正在跑——等这轮跑完再关闭任务' : null),
-      waitIdle,
-    })
+    const r = await tasks.close(name)
     if (!r.ok) post({ type: 'fatal', message: r.error ?? '关闭失败' })
   }
   let closing: Promise<void> | null = null
@@ -556,6 +607,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         items: mirror.items,
         contextTokens: mirror.contextTokens,
         ...(mirror.lastTiming ? { lastTiming: mirror.lastTiming } : {}),
+        ...(mirror.queued.length > 0 ? { queued: mirror.queued } : {}),
       })
       // 切回补推（webview 是无状态投影，切走即清空）：后台进程清单 + 还在
       // 等答复的审批卡。不补的话前者永远空、后者只能等 5 分钟超时 deny
@@ -611,6 +663,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
     if (running) return
     try {
       const session = await getSession()
+      // 配置重载后可能是新 session；先恢复模型/预设，否则切档会把配置模型写回存档。
+      onSessionReady(session)
       session.setEffort(next)
       refresh(session)
       if (current) deps.saveChoice(next === null ? current : { ...current, effort: next })
@@ -626,8 +680,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
       // 排队插话（t656 翻案）：UI 已放行 running 时输入，这层以前
       // `if (running) return` 把它静默扔掉——用户消息石沉大海（2026-09-17
       // 实测）。core 的 send 在 running 时入队（tasks.push newInput）并
-      // 返回空流，工具批次边界插入；镜像补 pendingUser 让气泡先上屏
-      pendingUsers.push({ kind: 'user', text, ...(images && images.length > 0 ? { images } : {}) })
+      // 返回空流，工具批次边界插入；镜像补 queuedUsers 让气泡先上屏
+      queuedUsers.push({ kind: 'user', text, ...(images && images.length > 0 ? { images } : {}), interject: true })
       pushState()
       void getSession().then(async (s) => {
         try {
@@ -643,14 +697,23 @@ export function createBridge(deps: BridgeDeps): Bridge {
     const turnStartedAt = Date.now()
     running = true
     // user 气泡进镜像（App 本地 append 的，事件流里没有）。见 pendingUsers 注释
-    pendingUsers.push({ kind: 'user', text, ...(images && images.length > 0 ? { images } : {}) })
+    pendingUsers.push({
+      item: { kind: 'user', text, ...(images && images.length > 0 ? { images } : {}) },
+      pos: replay.length,
+    })
     pushState()
+    currentTurnStartedAt = turnStartedAt
+    stopRequested = false
+    const turn = turnTracker()
+    // 状态变了：机器人总览要显示「在跑」，上一轮的完成提醒随新一轮收起
+    deps.onTurnEnd?.()
     let session: Session | null = null
     try {
       session = await getSession()
       onSessionReady(session)
       for await (const agentEv of session.send(text, images)) {
         const at = Date.now()
+        turn.see(agentEv)
         replay.push({ ev: agentEv, at })
         if (agentEv.type === 'step_finish') {
           lastContextTokens = agentEv.contextTokens
@@ -681,16 +744,27 @@ export function createBridge(deps: BridgeDeps): Bridge {
       // core 抛到这里的是「这次根本没跑起来」——配置错、拿不到锁、core 自身
       // 的 bug。**必须接住**：不接的话未捕获的 rejection 会打到扩展宿主，
       // 而我们是进程内跑 core（vscode-impl.md §2.3）
+      turn.fail(error instanceof Error ? error.message : String(error))
       post({ type: 'fatal', message: error instanceof Error ? error.message : String(error) })
     } finally {
       // 所有退出路径收口到一个地方（CLAUDE.md §4.5）。散在三个 return 前面
       // 的话，早晚漏一个，现象是停止按钮一直是「运行中」
       running = false
-      const waiters = idleWaiters
-      idleWaiters = []
-      for (const w of waiters) w()
+      lastTurn = turn.end(stopRequested)
+      // 轮末收尾分段计时（2026-10-31 观测版）：一轮 finish:stop 后 5s 内
+      // ≥1s loop_lag 占 5–16%（tool-calls 0–3%），先看卡在哪段再定修不修
+      let mark = Date.now()
+      const lap = (): number => {
+        const now = Date.now()
+        const ms = now - mark
+        mark = now
+        return ms
+      }
+      let foldMs = 0
+      let absorbMs = 0
       if (session) {
         fold(session) // 定稿进基线，重放清零——下次重开从基线起
+        foldMs = lap()
         const finishedAt = Date.now()
         lastFooter = {
           model: current?.model ?? null,
@@ -698,17 +772,30 @@ export function createBridge(deps: BridgeDeps): Bridge {
           elapsedMs: finishedAt - turnStartedAt,
         }
         baseItems = withFooter(baseItems)
+        // 轮跑着时投来、最后一个请求之后才到的任务回调：现在插到末尾
+        absorbMain(session)
+        absorbMs = lap()
       }
       // 收口这次 state 带 footer：宿主账本（send→finally 全程在宿主，不受
       // 面板重开影响）覆盖 webview 本地账本——turnStartedAt 丢了的 webview
       // 靠这个补回耗时，而不是永远显示「无耗时」页脚等下次重开
       pushState(true)
       deps.onTurnEnd?.()
+      const notifyMs = lap()
       // 面板已经关了：这就是约定好的「跑完自动释放」。interrupt 路径也
       // 走这里（中断后 loop 收尾同样产出定稿历史）
       if (releaseAfterTurn) closeSession('detach')
       else if (reloadPending) closeSession('reload')
       else idle?.arm() // 一轮结束，从这一刻算空闲
+      logRun({
+        ev: 'turn_end_host',
+        folder: deps.folder,
+        foldMs,
+        items: baseItems.length,
+        absorbMs,
+        notifyMs,
+        tailMs: lap(),
+      })
     }
   }
 
@@ -736,8 +823,37 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // 分身是否在跑——router 合并进 folder tab 绿点（2026-09-22 真机反馈：
     // 分支干活时目录名前的绿点不亮）
     anyRunning: () => tasks.anyRunning(),
+    robotView: () => ({
+      tasks: [{ task: null, running, startedAt: currentTurnStartedAt, lastTurn }, ...tasks.robotViews()],
+      approvals: [...pendingApprovals.values()].map((e) => e.card),
+    }),
+    allowToolCall: (toolCallId) => {
+      for (const [id, e] of pendingApprovals) {
+        if (e.card.toolCallId !== toolCallId) continue
+        finishApproval(id, 'allow')
+        return true
+      }
+      return false
+    },
     pendingApprovals: () => pendingApprovals.size,
     rehydrateTasks: () => tasks.rehydrate(),
+    dispatchFromAgent: async (brief, owner, model) => {
+      // 列表取本目录主任务 session 的配置（热重载跟着走）；配置坏了 getSession
+      // 抛，桥回 500 带原因
+      const hit = model === undefined ? undefined : pickTaskModel((await getSession()).config.config.taskModels, model)
+      if (typeof hit === 'string') return { ok: false, error: hit }
+      const choice = hit && { provider: hit.provider, model: hit.model, ...(hit.effort ? { effort: hit.effort } : {}) }
+      const r = await tasks.dispatchUnique(brief, owner, choice)
+      return 'name' in r ? { ok: true, name: r.name } : { ok: false, error: r.error }
+    },
+    taskModels: async () => {
+      // 默认取建会话时的配置值，不取 config.config.model——主任务切过模型后
+      // 那是切换后的，而不写 --model 的任务从配置默认起跑（10-30 真机：报成
+      // 某网关模型，任务实际跑另一个模型）
+      const s = await getSession()
+      const d = s.defaultModel
+      return { ok: true, models: s.config.config.taskModels, defaultModel: `${d.provider}/${d.model}` }
+    },
     handle: (msg) => {
       switch (msg.type) {
         case 'ready':
@@ -759,6 +875,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         case 'interrupt':
           // session 还没建就中断是空操作，不用判断
           // 审批等待也一并按拒绝收场——用户点停止时不想让任何东西挂着
+          if (running) stopRequested = true
           for (const id of pendingApprovals.keys()) finishApproval(id, 'deny')
           void pending?.then((s) => s.interrupt('stop'))
           return
@@ -779,19 +896,25 @@ export function createBridge(deps: BridgeDeps): Bridge {
         case 'bg_kill':
           // 有卡片才有得点，session 必然已建——但仍走惰性拿，不破坏约定
           void getSession().then((s) => {
-            post({ type: 'bg_processes', items: s.terminateBg(msg.pid) })
+            post({ type: 'bg_processes', items: s.terminateBg(msg.pgid) })
           })
           return
         case 'task_dispatch':
-          dispatchTask(msg.brief)
+          dispatchTask(msg.brief, msg.from)
+          return
+        case 'task_create':
+          void tasks.create(msg.name, tasks.ownerOf(msg.from)).then((error) => {
+            if (error !== null) post({ type: 'fatal', message: error })
+          })
           return
         case 'reflect_panel':
           // 计数是纯 fs 扫描，同步算即可；folder 记忆库按目录（FolderPicker 切换后重取）
-          post({ type: 'memory_data', stats: computeMemoryStats(deps.folder) })
+          void getSession().then(s => {
+            post({ type: 'memory_data', stats: computeMemoryStats(deps.folder, undefined, s.config.config.memory) })
+          }).catch(e => post({ type: 'fatal', message: String(e) }))
           return
         case 'reflect_start': {
-          const busy = (): string | null => (running ? '主任务正在跑——等这轮跑完再开任务' : null)
-          void tasks.dispatch(REFLECT_TASK_BOOK, busy).then((error) => {
+          void tasks.dispatch(REFLECT_TASK_BOOK, tasks.ownerOf(msg.from)).then((error) => {
             post({
               type: 'reflect_result',
               ok: error === null,
@@ -803,17 +926,13 @@ export function createBridge(deps: BridgeDeps): Bridge {
         case 'reflect_reopen': {
           // 关旧 + 起新，ext 侧串行保证顺序。非原子：关成功、开失败 → 报错，
           // 旧任务已随关闭归档不丢（reflect-trigger.md §5，接受不做事务）
-          const busy = (): string | null => (running ? '主任务正在跑——等这轮跑完再关闭任务' : null)
           void (async () => {
-            const r = await tasks.close('反思', { busy, waitIdle })
+            const r = await tasks.close('反思')
             if (!r.ok) {
               post({ type: 'reflect_result', ok: false, reason: r.error ?? '关闭失败' })
               return
             }
-            const error = await tasks.dispatch(
-              REFLECT_TASK_BOOK,
-              () => (running ? '主任务正在跑——等这轮跑完再开任务' : null),
-            )
+            const error = await tasks.dispatch(REFLECT_TASK_BOOK, tasks.ownerOf(msg.from))
             post({
               type: 'reflect_result',
               ok: error === null,

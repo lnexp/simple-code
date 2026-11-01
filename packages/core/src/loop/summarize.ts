@@ -288,23 +288,23 @@ function representsContext(summaries: Summary[]): Set<number> {
     }
   }
   const rep = new Set<number>()
-  const mark = (id: number): boolean => {
-    if (rep.has(id)) return true
-    const node = summaries.find((x) => x.id === id)
-    if (!node) return false
+  // 传行不传 id：原来按 id 在整个数组里 find，每个 step 存盘后都跑
+  // （kickSummary → mergeWhileDue），真库 4554 行每次 35–105ms 占主线程（2026-10-31）
+  const mark = (node: Summary): boolean => {
+    if (rep.has(node.id)) return true
     if (node.inContext) {
-      rep.add(id)
+      rep.add(node.id)
       return true
     }
-    for (const child of childrenOf.get(id) ?? []) {
-      if (mark(child.id)) {
-        rep.add(id)
+    for (const child of childrenOf.get(node.id) ?? []) {
+      if (mark(child)) {
+        rep.add(node.id)
         return true
       }
     }
     return false
   }
-  for (const s of summaries) mark(s.id)
+  for (const s of summaries) mark(s)
   return rep
 }
 
@@ -645,12 +645,13 @@ export function activateBeyondStubZone(opts: {
   }
   // 区外还有 step 没被任何（未失效的）摘要盖住——在等自己的 L0，催一把。
   // 只认未失效的行：superseded 的段由它的链根负责，别替它们 kick
-  const covered = new Set<number>()
-  for (const s of opts.summaries()) {
-    if (s.supersededBy !== null) continue
-    for (let id = s.coversFrom; id <= s.coversTo; id++) covered.add(id)
-  }
-  const uncovered = opts.live.some((entry, index) => index < ceiling && !covered.has(entry.stepId))
+  // 按区间判，不把 covers 逐号展开：step 号是稀疏的（每段跳 SEGMENT_WIDTH），
+  // 链根区间总和随段数线性涨，展开成 Set 会到千万级（task-trunk 复审实测
+  // 15M 号 1.2s/587MB，过 V8 Set 上限约 1677 万直接抛 RangeError）。
+  // live × 链根 都只有几百
+  const roots = opts.summaries().filter((s) => s.supersededBy === null)
+  const coveredBy = (id: number): boolean => roots.some((s) => s.coversFrom <= id && id <= s.coversTo)
+  const uncovered = opts.live.some((entry, index) => index < ceiling && !coveredBy(entry.stepId))
   if (uncovered) opts.kick?.()
 }
 

@@ -1,11 +1,13 @@
-import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { memo, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { ApprovalRequest } from '../src/protocol.ts'
-import { type ActivityItem, type ChatItem, toolCount } from './events.ts'
+import type { ChatItem } from './events.ts'
 import { formatElapsed } from './footer.tsx'
 import { renderMarkdown } from './markdown.ts'
+import { errorLine, type Stats } from './steps.ts'
 
 /**
- * 活动组：一轮里 thinking + 工具调用的渲染。从 App.tsx 分出来的——那边超了
+ * 过程的零件：工具行、思考块、处理过程头（时间线骨架在 timeline.tsx）。
+ * 从 App.tsx 分出来的——那边超了
  * 300 行（CLAUDE.md §2），而「模型干活的过程」本来就是独立于「消息气泡」的
  * 一个概念。
  *
@@ -18,25 +20,27 @@ type ToolItem = Extract<ChatItem, { kind: 'tool' }>
 type ReasoningItem = Extract<ChatItem, { kind: 'reasoning' }>
 
 /**
- * 工具名 → 人话名 + codicon。
+ * 工具名 → 人话名（没有 desc 时站标题位）。
  *
  * 我们第一版只有 bash，所以是一张两行的表 + 一个兜底。**兜底不是防御性代码**：core 加了新工具而
  * 这里忘了加映射时，界面显示原始工具名而不是崩掉或显示空白。
+ *
+ * 行首图标表示结果（✓ / ✗ / 转圈），不再按工具类型配（2026-10-28 时间线
+ * 改版：标题已是 desc，类型图标不带信息，只让失败显眼）
  */
-const TOOL_DISPLAY: Record<string, { label: string; icon: string }> = {
-  bash: { label: 'Shell 命令', icon: 'terminal' },
-}
+const TOOL_DISPLAY: Record<string, string> = { bash: 'Shell 命令' }
 
-const displayOf = (name: string): { label: string; icon: string } => {
+const displayOf = (name: string): string => {
   // 回退链同 core 的 resolveTool（run.ts）：大小写 → 剥 mcp__<server>__ 前缀。
-  // GLM 渠道把 bash 采样成 Bash（2026-10-17 图标从终端变扳手）；
-  // claude-opus-5-5 网关包成 mcp__client__bash（2026-10-22 同症状）。流式行
+  // GLM 渠道把 bash 采样成 Bash（2026-10-17 标题从「Shell 命令」变 Bash）；
+  // 某网关把 bash 包成 mcp__client__bash（2026-10-22 同症状）。流式行
   // 是 tool_input_start 用渠道原名建的，库里老轮次也存着原名，只能在这里回退
   const stripped = name.replace(/^mcp__[a-z0-9-]+__/i, '')
   return (
     TOOL_DISPLAY[name] ??
     TOOL_DISPLAY[name.toLowerCase()] ??
-    TOOL_DISPLAY[stripped.toLowerCase()] ?? { label: name, icon: 'tools' }
+    TOOL_DISPLAY[stripped.toLowerCase()] ??
+    name
   )
 }
 
@@ -105,28 +109,37 @@ export function ToolRow({
     : tool.endedAt !== undefined && tool.startedAt !== undefined
       ? clock(tool.endedAt - tool.startedAt)
       : ''
-  const { label, icon } = displayOf(tool.name)
+  const label = displayOf(tool.name)
+  const icon = tool.failed ? 'close' : 'check'
 
   return (
     <>
-      <div className="tool-row" data-failed={tool.failed}>
+      <div className="tool-row" data-failed={tool.failed} data-running={running} data-open={expanded}>
         <button type="button" className="tool-head" onClick={() => setExpanded((v) => !v)}>
           <span className="tool-icon" aria-hidden>
             {running ? <span className="spinner" /> : <i className={`codicon codicon-${icon}`} />}
           </span>
+          {/* 耗时紧跟图标（10-29 用户：计时在最右侧注意不到）：跑着蓝色跳秒、
+              跑完灰色定格，一格定宽右对齐，说明文字不随位数跳。回放的历史没有
+              时间戳（duration 为空），这一格不渲染 */}
+          {duration !== '' && <span className="tool-duration">{duration}</span>}
           {/* 方案 C「desc 当标题」（2026-09-29 拍板，推翻 9-28 的「desc 并进
               命令格」）：有 desc 时 desc 顶替「Shell 命令」站标题位——正常亮色、
               界面字体、无底色；命令格照旧跟在后面（code 底色、单行截断）。
               没 desc 的（旧历史、非 bash 工具）标题仍是工具人话名 */}
           <span className="tool-title">{tool.desc || label}</span>
-          <span className="tool-duration">{duration}</span>
           <code className="tool-cmd">{tool.command || tool.name}</code>
         </button>
+        {tool.failed && (
+          // 失败原因不用点开就看得到（原型「只让异常显眼」）。bash 的失败只
+          // 看退出码，输出里找不到报错行时照实说——见 steps.ts errorLine
+          <div className="tool-err">{errorLine(tool.output, label === TOOL_DISPLAY.bash)}</div>
+        )}
         {(tool.command !== '' || tool.output !== '' || (tool.images?.length ?? 0) > 0) && (
           // 开合走 data-open，**不能用 `hidden`**：作者样式表里的 `display: grid`
           // 优先级高于 UA 的 `[hidden] { display: none }`，写了等于没写（tool 行
-          // 曾经因此根本展不开）。CSS 只认这两个 wrapper 上的 data-open，别往
-          // .tool-row/.thinking/.activity 上加——加了没有任何选择器会用
+          // 曾经因此根本展不开）。.tool-row 上那份 data-open 只管行头样式
+          // （展开时命令格常显），开合本身仍只认这里
           <div className="tool-body" data-open={expanded}>
             {tool.command !== '' && (
               // 完整命令：收起态 head 上是单行省略版，长命令看不全——展开在
@@ -155,18 +168,15 @@ export function ToolRow({
             </span>
             <span className="approval-reason">{approval.reason}</span>
           </div>
-          {/* 后台文件夹弹的卡：标明来源，不然用户以为当前对话要跑这条。
-              分身任务弹的卡同理——标注任务名（fork-merge.md §3） */}
-          {approval.folder && <div className="approval-folder">来自：{approval.folder}</div>}
+          {/* 分身任务弹的卡：标注任务名，不然用户以为当前对话要跑这条
+              （fork-merge.md §3）。目录不标：App 只收当前目录的卡（隔离），
+              「来自：目录」永远是当前目录，10-29 去掉 */}
           {approval.task && (
             <div className="approval-folder">来自分身任务「{approval.task}」</div>
           )}
           <code className="approval-cmd">{approval.command}</code>
-          {approval.detail && <div className="approval-detail">触碰：{approval.detail}</div>}
-          {countdown && (
-            <div className="approval-countdown" data-urgent={countdown.urgent}>
-              {countdown.text}
-            </div>
+          {approval.detail && !inReason(approval.detail, approval.reason) && (
+            <div className="approval-detail">触碰：{approval.detail}</div>
           )}
           {approval.always && (
             <div className="approval-detail">
@@ -179,7 +189,12 @@ export function ToolRow({
                     : approval.always.kind === 'nonpath'
                       ? `${approval.always.lead} 的第 ${approval.always.from} 位参数起不是路径`
                       : approval.always.kind === 'paths'
-                        ? approval.always.dirs.map((d) => `${d}/*`).join('、')
+                        ? [
+                            ...approval.always.dirs.map((d) => `${d}/*`),
+                            ...(approval.always.hidden ?? []).map(
+                              (h) => `${h.write ? '写' : '读'} ${h.path}`,
+                            ),
+                          ].join('、')
                         : `${approval.always.dir}/*`}
               </code>
             </div>
@@ -187,7 +202,7 @@ export function ToolRow({
           <div className="approval-actions">
             <button
               type="button"
-              className="approval-allow"
+              className="approval-once"
               onClick={() => onReply(approval.id, 'allow', approval.folder)}
             >
               允许一次
@@ -195,14 +210,16 @@ export function ToolRow({
             {approval.always && (
               <button
                 type="button"
-              className="approval-allow"
-              onClick={() => onReply(approval.id, 'always', approval.folder)}
-            >
-              {approval.always.kind === 'paths'
-                ? `始终允许这 ${approval.always.dirs.length} 个目录`
-                : '始终允许'}
-            </button>
-          )}
+                className="approval-allow"
+                onClick={() => onReply(approval.id, 'always', approval.folder)}
+              >
+                {approval.always.kind === 'paths'
+                  ? approval.always.hidden?.length
+                    ? `始终允许这 ${approval.always.dirs.length + approval.always.hidden.length} 项`
+                    : `始终允许这 ${approval.always.dirs.length} 个目录`
+                  : '始终允许'}
+              </button>
+            )}
             <button
               type="button"
               className="approval-deny"
@@ -212,6 +229,11 @@ export function ToolRow({
             >
               拒绝
             </button>
+            {countdown && (
+              <span className="approval-countdown" data-urgent={countdown.urgent}>
+                {countdown.text}
+              </span>
+            )}
           </div>
           {/* 拒绝反馈：留一句话，模型带着它重试，
               比裸拒绝猜方向质量高一档。空 = 裸拒绝，行为不变 */}
@@ -233,6 +255,13 @@ const APPROVAL_TAG: Record<string, string> = {
   hidden_path: '隐藏路径',
   network_cmd: '网络命令',
   unparseable: '无法静态判定',
+}
+
+/** 「触碰：detail」是否和第一行重复：core 的 reason 多半已带着 detail
+ * （「要读项目外路径：X」配 detail X；多处审批的 detail 是各条用「；」连起来，
+ * reason 里逐条列过），重复就不再起一行 */
+function inReason(detail: string, reason: string): boolean {
+  return detail.split('；').every((part) => reason.includes(part))
 }
 
 /** 头部摘要读成纯文本的 strip 序列 */
@@ -265,14 +294,18 @@ const durationOf = (block: ReasoningItem): string | null =>
     : clock(block.endedAt - block.startedAt)
 
 /**
- * thinking 块（D5）：流式中自动展开——能看到思考过程；结束自动收起
- * 成摘要行。**用户点过优先**：手动开/关之后
- * 自动状态不再覆盖用户的选择
+ * thinking 块：只在时间线里给**还在流式的那段思考**用（想完的收进步骤右上
+ * 角的「思考 N」，timeline.tsx）。流式中自动展开（D5），想完收起；用户点过
+ * 就听用户的。10-28 改版曾改成流式也不展开，10-29 用户实机看过后要回来：
+ * 「思考应该展开，思考完了再收起……一直在干活的感觉」
  */
 export function ThinkingBlock({ block, streaming }: { block: ReasoningItem; streaming: boolean }) {
   const [byUser, setByUser] = useState<boolean | null>(null)
   const expanded = byUser ?? streaming
-  const duration = durationOf(block)
+  // 流式中跑表（同工具行）：收起后一行字不动，看不出还在想
+  const now = useTick(streaming && block.startedAt !== undefined)
+  const duration =
+    streaming && block.startedAt !== undefined ? ticking(now - block.startedAt) : durationOf(block)
 
   /**
    * 内盒跟随。`.thinking-body` 展开时是**限高 40vh 的内部滚动容器**
@@ -337,86 +370,8 @@ export function ThinkingBlock({ block, streaming }: { block: ReasoningItem; stre
  * 每秒 10 次对全部历史 thinking 块重跑 renderMarkdown、全部工具行重渲，
  * 垃圾以内容千倍的量级产出，V8 提交的堆只涨不还——面板进程 24h 涨到 2.9GB
  */
-const MThinkingBlock = memo(ThinkingBlock)
-const MToolRow = memo(ToolRow)
-
-/**
- * 活动组：一轮的 thinking + 命令（D8a 两层折叠的外层）。
- * **收起时机**：组后面一有别的块（assistant 正文/用户消息）就自动收起
- * ——「最终回答出现时，之前的流程折叠」是用户在 D13 的补充需求。用户手动
- * 展开过则尊重用户。
- *
- * **收起 = 一条都不留。** 曾经保留最后 2 行预览，实际用下来
- * 那 2 行既读不出上下文、又让「已收起」看起来像没收起——用户的原话是
- * 「最上面没有都收起来」。要看过程就点开，头部的「N 个操作」是入口。
- *
- * **一个工具都没有的组不套组头**，直接把 thinking 块铺出来——见下面 tools 处
- */
-export function ActivityGroup({
-  items,
-  last,
-  running,
-  approvals,
-  onApprovalReply,
-}: {
-  items: ActivityItem[]
-  last: boolean
-  running: boolean
-  /** 挂在这一组里的审批请求（toolCallId 匹配），可能空 */
-  approvals: ApprovalRequest[]
-  onApprovalReply: (
-    id: number,
-    choice: 'allow' | 'always' | 'deny',
-    folder?: string,
-    feedback?: string,
-  ) => void
-}) {
-  const [byUser, setByUser] = useState<boolean | null>(null)
-  // 组后面已有内容（不是最后一块）= 它的「流程」已经被回答接棒，自动收起
-  const autoOpen = last && running
-  const open = byUser ?? autoOpen
-  /**
-   * 一个工具都没有的组 = 纯 thinking（模型想一下就直接回答）。这种组**不套
-   * 组头**：ThinkingBlock 自身就是一层折叠，外面再包一行「思考过程」等于把
-   * 同一件事折了两次——组头带不出任何内层没有的信息，却要多点一次才读得到
-   */
-  const tools = toolCount(items)
-  // 没有组头就没有展开它的入口，此时 open 无意义——内容必须直接铺出来
-  const collapsed = tools > 0 && !open
-
-  return (
-    <div className="activity">
-      {tools > 0 && (
-        <button type="button" className="activity-head" onClick={() => setByUser(!open)}>
-          <i className={`codicon codicon-chevron-${open ? 'down' : 'right'}`} aria-hidden />
-          {`${tools} 个操作`}
-        </button>
-      )}
-      {(collapsed ? [] : items).map((item, j) => {
-        const isTail = item === items.at(-1)
-        return item.kind === 'reasoning' ? (
-          // startedAt 做身份：组开合切换 preview 切片时块的组件状态不丢。
-          // 历史回放没有墙钟，落到下标——同组内已回放块不会增删改，够稳
-          <MThinkingBlock
-            key={`r${item.startedAt ?? `h${j}`}`}
-            block={item}
-            streaming={last && running && isTail}
-          />
-        ) : (
-          <MToolRow
-            key={item.id}
-            tool={item}
-            {...(() => {
-              const a = approvals.find((x) => x.toolCallId === item.id)
-              return a ? { approval: a } : {}
-            })()}
-            onReply={onApprovalReply}
-          />
-        )
-      })}
-    </div>
-  )
-}
+export const MThinkingBlock = memo(ThinkingBlock)
+export const MToolRow = memo(ToolRow)
 
 /**
  * 第三层折叠：一轮结束后，从提问到最终回答之间的**全部过程**收成一行。
@@ -425,29 +380,54 @@ export function ActivityGroup({
  * 「说明 → 3 个操作 → 说明 → 10 个操作 → …」，中间那些说明一个字都不折，
  * 最终回答被推到屏幕最底下。折进来的就是这些块，切分规则见 `splitTurns`。
  *
+ * 头部：「处理过程」+ 图标打头的「12 步」「39 个操作」「1 个失败」「耗时」
+ * + 右侧操作条（一格一条命令，失败标红，步与步之间留空）——不展开也看得出
+ * 失败在哪一段（2026-10-28 时间线改版）。整行淡底条、图标与回答底部那行
+ * 同款（10-29 对比页用户选 P3，替掉原来的「 · 」点号串）。
+ *
  * **默认收起，不跟随事件**：这一层只在轮结束后才存在（跑着的那一轮
  * `splitTurns` 不折），所以没有「流式中自动展开」这回事，展开只由用户决定
  */
 export function ProcessGroup({
-  tools,
+  stats,
   elapsedMs,
   children,
 }: {
-  tools: number
-  /** 回放的历史没有耗时（hydrateItems 不带时间戳），那时只显示条数 */
+  stats: Stats
+  /** 回放的历史没有耗时（hydrateItems 不带时间戳），那时不显示 */
   elapsedMs: number | undefined
-  children: React.ReactNode
+  children: ReactNode
 }) {
   const [open, setOpen] = useState(false)
-  const parts = ['处理过程']
-  if (tools > 0) parts.push(`${tools} 个操作`)
-  if (elapsedMs !== undefined) parts.push(formatElapsed(elapsedMs))
+  const meta = (icon: string, text: string, extra = '') => (
+    <span key={icon} className={`process-meta${extra}`}>
+      <i className={`codicon codicon-${icon}`} aria-hidden />
+      {text}
+    </span>
+  )
 
   return (
     <div className="process">
       <button type="button" className="process-head" onClick={() => setOpen(!open)}>
         <i className={`codicon codicon-chevron-${open ? 'down' : 'right'}`} aria-hidden />
-        {parts.join(' · ')}
+        <span className="process-title">处理过程</span>
+        {stats.steps > 0 && meta('list-ordered', `${stats.steps} 步`)}
+        {stats.tools > 0 && meta('tools', `${stats.tools} 个操作`)}
+        {stats.failed > 0 && meta('error', `${stats.failed} 个失败`, ' process-fail')}
+        {elapsedMs !== undefined && meta('watch', formatElapsed(elapsedMs))}
+        {stats.tools > 0 && (
+          <span className="process-strip" aria-hidden>
+            {stats.strip.map((step, i) => (
+              // biome-ignore lint/suspicious/noArrayIndexKey: 纯展示格子，只追加
+              <span key={i} className="strip-step">
+                {step.map((failed, j) => (
+                  // biome-ignore lint/suspicious/noArrayIndexKey: 同上
+                  <i key={j} data-failed={failed} />
+                ))}
+              </span>
+            ))}
+          </span>
+        )}
       </button>
       {open && <div className="process-body">{children}</div>}
     </div>

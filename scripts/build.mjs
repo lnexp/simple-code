@@ -88,15 +88,17 @@ const TARGETS = [
     options: { platform: 'node', format: 'esm', target: 'node22' },
   },
   {
-    name: 'memory-bin',
-    entry: 'packages/cli/src/memory-bin.ts',
-    outfile: 'packages/cli/dist/memory.js',
+    // 派任务薄壳（task-trunk 规则 11）：POST 到宿主派任务桥（vscode
+    // task-bridge.ts），任务由宿主 tasks 中心建与跑
+    name: 'task-bin',
+    entry: 'packages/cli/src/task-bin.ts',
+    outfile: 'packages/cli/dist/task.js',
     options: { platform: 'node', format: 'esm', target: 'node22' },
   },
   {
-    name: 'lesson-bin',
-    entry: 'packages/cli/src/lesson-bin.ts',
-    outfile: 'packages/cli/dist/lesson.js',
+    name: 'memory-bin',
+    entry: 'packages/cli/src/memory-bin.ts',
+    outfile: 'packages/cli/dist/memory.js',
     options: { platform: 'node', format: 'esm', target: 'node22' },
   },
   {
@@ -298,7 +300,11 @@ console.log('copied README.md + LICENSE (vscode package root)')
 // extension.cjs 的 activate 注入的 $SIMPLE_CODE_* 指向这里）
 // 新增 bin 记得登记这里——构建（TARGETS）只是产出，不拷进 vscode/dist
 // vsce 就带不上，$SIMPLE_CODE_* 指向空文件静默失败（event.js 漏过一次）
-for (const bin of ['webfetch.js', 'websearch.js', 'mcp.js', 'apply-patch.js', 'memory.js', 'lesson.js', 'note.js', 'skill.js', 'sc.js', 'lsp.js', 'event.js', 'imagegen.js']) {
+// 显式清理旧产物，否则增量构建会把已退役命令打进下一版包。
+for (const dir of ['packages/cli/dist', 'packages/vscode/dist']) {
+  await unlink(`${root}${dir}/lesson.js`).catch(e => { if (e.code !== 'ENOENT') throw e })
+}
+for (const bin of ['webfetch.js', 'websearch.js', 'mcp.js', 'apply-patch.js', 'memory.js', 'note.js', 'skill.js', 'sc.js', 'lsp.js', 'event.js', 'imagegen.js', 'task.js']) {
   await copyFile(`${root}packages/cli/dist/${bin}`, `${root}packages/vscode/dist/${bin}`)
 }
 console.log('copied webfetch.js + websearch.js')

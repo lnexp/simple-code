@@ -215,6 +215,9 @@ export function createRenderer(
       }
       case 'error':
         return sink.err(`\n错误：${agentEv.message}\n`)
+      case 'task_result':
+        // sc 里没有任务（无插件宿主），正常走不到；首行够认出是什么
+        return sink.err(`\n${errPaint.dim(agentEv.text.split('\n', 1)[0] ?? '')}\n`)
 
       // 这几个在 CLI 里没有对应的显示：text_start 靠 delta 自然开头，
       // tool_input_* 是参数流式拼装的中间态（拼完了才是 tool_call）
@@ -224,6 +227,8 @@ export function createRenderer(
       // 后台进程快照是 vscode UI 的东西，终端里没地方放（孤儿列表
       // session 内存里也有，真要时 ps 一下就行）
       case 'bg_processes':
+      // 插话投进历史的位置信号，终端没有排队气泡要摆
+      case 'input_delivered':
         return
       default:
         return assertNever(agentEv)

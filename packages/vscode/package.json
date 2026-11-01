@@ -2,7 +2,7 @@
   "name": "simplecode-agent",
   "displayName": "SimpleCode",
   "description": "在侧边栏里跑 simple-code agent",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "icon": "assets/marketplace-icon.png",
   "type": "module",
   "publisher": "lnexp",
@@ -93,6 +93,21 @@
           "name": "对话",
           "type": "webview",
           "when": "simpleCode.noSecondarySidebar"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "simpleCode.installRobot",
+        "title": "安装桌面机器人",
+        "category": "SimpleCode"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "simpleCode.installRobot",
+          "when": "isMac"
         }
       ]
     }

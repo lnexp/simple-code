@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
 import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -271,5 +271,30 @@ describe('queueEventArchive（失败重排一次）', () => {
     await until(() => calls >= 2)
     await new Promise((r) => setTimeout(r, 100))
     expect(calls).toBe(2)
+  })
+})
+
+// 2026-10-31 巡检：reload 后 archiver 84 次调用 0 条 llm_usage——它直调
+// sendRequest，绕过了 collectText（10-14 给 recall/summary/merge 补的副模型
+// usage 观测），llm_req/llm 行也没 folder
+describe('archiver 的副模型观测', () => {
+  it('记 llm_usage（tag=archiver、带 folder），llm_req 也带 folder', async () => {
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      await runEventArchive({
+        root,
+        summary: SUMMARY,
+        config: await loaded(),
+        fetchImpl: fakeFetch('{"match":null,"progress":""}'),
+      })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(calls.filter((c) => c.ev === 'llm_usage')).toMatchObject([
+      { tag: 'archiver', folder: root, input: 5, output: 4, cacheRead: expect.any(Number), cacheWrite: expect.any(Number) },
+    ])
+    expect(calls.find((c) => c.ev === 'llm_req')).toMatchObject({ tag: 'archiver', folder: root })
   })
 })

@@ -147,7 +147,6 @@ export const bashConfig = strictObject({
       'SIMPLE_CODE_MCP',
       'SIMPLE_CODE_APPLY_PATCH',
       'SIMPLE_CODE_MEMORY',
-      'SIMPLE_CODE_LESSON',
       'SIMPLE_CODE_NOTE',
       'SIMPLE_CODE_EVENT',
       'SIMPLE_CODE_SKILL',
@@ -162,6 +161,11 @@ export const bashConfig = strictObject({
       // 生图 bin（经上面的凭据代理；VS Code 与终端 sc 都会起代理并注入）
       'SIMPLE_CODE_IMAGEGEN',
       'SIMPLE_CODE_DOC',
+      // 派任务（task-trunk 规则 11，vscode task-bridge.ts）：bin 路径 + 桥端口 +
+      // token 三个成对，缺任一 bin 报「无任务桥」。只有 VS Code 宿主注入
+      'SIMPLE_CODE_TASK',
+      'SIMPLE_CODE_TASK_PORT',
+      'SIMPLE_CODE_TASK_TOKEN',
     ]),
 })
 
@@ -203,9 +207,9 @@ const retryConfig = strictObject({
 const loopConfig = strictObject({
   // 纯粹防失控的最终保险丝。主会话不设上限，靠上下文窗口和用户打断兜底。
   // 我们保留一个大值：doomLoopGuard 拦精确循环、上下文预算拦膨胀，这里只兜
-  // 「渐变式磨洋工」的挂机场景。500 ≈ 实测最长 marathon turn（~100 轮，
-  // turn-74/171）的 5 倍，对正常任务不构成约束。
-  maxIterations: z.number().int().positive().default(500),
+  // 「渐变式磨洋工」的挂机场景。500→2000（10-31，500 几小时就撞上）→5000
+  // （11-01，用户拍板，与段宽 SEGMENT_WIDTH=10000 对齐为单轮 step 上限）。
+  maxIterations: z.number().int().positive().default(5000),
   retry: retryConfig.prefault({}),
   /**
    * 流式响应两个数据块之间的最大间隔。超过就中止本次尝试，交给 retry 重发。
@@ -222,6 +226,18 @@ const loopConfig = strictObject({
 })
 
 const memoryConfig = strictObject({
+  /** 用户级与项目级 AGENTS.md 各自的估算 token 上限，不合并计额。 */
+  agentsMaxTokens: z.number().int().positive().default(2048),
+  /** 四类共用估算 token 预算；当前目标完整保留，可借用其他类额度。 */
+  noteBudgetTokens: z.number().int().positive().default(2100),
+  noteRatios: strictObject({
+    general: z.number().min(0).max(1).default(.35),
+    lesson: z.number().min(0).max(1).default(.10),
+    principle: z.number().min(0).max(1).default(.20),
+    goal: z.number().min(0).max(1).default(.35),
+  }).default({ general: .35, lesson: .10, principle: .20, goal: .35 })
+    .refine(r => Math.abs(r.general + r.lesson + r.principle + r.goal - 1) < 1e-8,
+      'noteRatios 四类比例之和必须为 1；零比例仅取消该类通常份额，当前 goal 仍完整保留'),
   // 没有 unloadThresholdRatio：触发不再是比例，而是
   // `contextWindow - maxTokens - 安全余量`（run.ts 的 inputBudget）。
   // 比例形式的问题是它把「给输出留多少」藏在一个数字里——0.7 碰巧盖住了
@@ -445,6 +461,19 @@ export const configSchema = strictObject({
   // 的对象形式，但 model 不必登记在 provider.models 里——它不是对话模型，没有
   // 上下文窗口可填；provider 只借 baseUrl/apiKey。只由宿主凭据代理读（全局级）
   imageModel: strictObject({ provider: z.string(), model: z.string() }).nullable().default(null),
+  // agent 派任务可选的模型（task-trunk 规则 14）：$SIMPLE_CODE_TASK --model 只能从
+  // 这里选，--models 列出；use 是给 agent 看的一句用途。不配 = 派任务只用配置默认。
+  // provider/model 必须已登记（load.ts checkTaskModels），effort 同主模型档位
+  taskModels: z
+    .array(
+      strictObject({
+        provider: z.string(),
+        model: z.string(),
+        effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
+        use: z.string().min(1),
+      }),
+    )
+    .default([]),
   loop: loopConfig.prefault({}),
   memory: memoryConfig.prefault({}),
   // recall 线索层（docs/proposals/recall.md）：send 入口算一次 TF-IDF×

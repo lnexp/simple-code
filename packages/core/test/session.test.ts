@@ -357,6 +357,17 @@ describe('AGENTS.md', () => {
     expect(system).not.toContain('notes 索引')
   })
 
+  it('经验沉淀规则：持续工作主动建立 goal，原则先写 candidate', async () => {
+    const system = await systemAfterRound()
+    expect(system).toContain('先检查当前项目是否有 current: true 的 goal')
+    expect(system).toContain('跨多个请求继续推进')
+    expect(system).toContain('用 NOTE write --type goal 建立')
+    expect(system).toContain('一次性任务或目标不清楚时不要创建')
+    expect(system).toContain('出现可复用的判断')
+    expect(system).toContain('NOTE write --type principle')
+    expect(system).toContain('不能因为项目没有 principle 或运行了一段时间就创建')
+  })
+
   it('AGENTS.md 超 2k token 截断 + 内嵌警告行', async () => {
     const system = await systemAfterRound((dir) =>
       // 中文 ~1 token/字：2400 字稳超 2048
@@ -404,7 +415,12 @@ describe('AGENTS.md', () => {
     expect(none).toContain('与确信与否无关')
     // t885 常驻清单：同为 core 行为，无条件在场
     expect(none).toContain('常驻上下文（每轮全价重发）')
-    expect(none).toContain('各类正文只在你主动 read 时才进上下文')
+    expect(none).toContain('其余正文与依据按需 read')
+    // 写到哪（2026-10-30）：原句只给 AGENTS.md 一个去处，「记住」就落进
+    // AGENTS.md（某真实项目三次被用户撤回）。默认 note，AGENTS.md 只收规则
+    expect(none).toContain('默认写 note')
+    expect(none).toContain('用户让记住某事也一样')
+    expect(none).toContain('事实、结论、经过不是规则')
     // 模型切换句只在 vscode 宿主（注入过 bin）出现——CLI 一次性进程切不了
     expect(none).not.toContain('模型与档位')
     expect(withBoth).toContain('模型与档位')
@@ -427,8 +443,8 @@ describe('AGENTS.md', () => {
     // 2026-10-22 两条日常纪律（reflection 首跑产出）：撞到即订正、做完即闭环
     expect(withAll).toContain('recall/search 撞到内容与现实矛盾的条目')
     expect(withAll).toContain('完成某 event 挂账的下一步时，当场 progress 闭环一行')
-    expect(withAll).toContain('查教训用 "$SIMPLE_CODE_LESSON" read <name>')
-    expect(withAll).toContain('读结论记忆用 "$SIMPLE_CODE_NOTE" read <name>')
+    expect(withAll).not.toContain('$SIMPLE_CODE_LESSON')
+    expect(withAll).toContain('note 统一记录/教训/原则/目标："$SIMPLE_CODE_NOTE" read <name>')
     expect(withAll).toContain('以 git、notes 与 events 为准')
     // 没注入的环境：DOC 不指路、不教 LSP、不提事件归档——说了就是误导
     expect(none).not.toContain('$SIMPLE_CODE_DOC')

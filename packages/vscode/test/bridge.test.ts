@@ -4,6 +4,12 @@ import type { ApprovalCategory } from '@simple-code/core'
 import { createBridge, type SavedChoice } from '../src/bridge.ts'
 import type { ToHost, ToWebview } from '../src/protocol.ts'
 import type { ChatItem } from '../webview/events.ts'
+import { logRun } from '@simple-code/core'
+
+vi.mock('@simple-code/core', async (original) => ({
+  ...await original<typeof import('@simple-code/core')>(),
+  logRun: vi.fn(),
+}))
 
 /**
  * 面板逻辑。这里的 bug **都不抛异常**：消息丢了界面就一直空着，状态没复位
@@ -35,7 +41,9 @@ function fakeSession(
   // 测的是不存在的行为
   let busy = false
   const queued: { text: string; images?: unknown[] }[] = []
-  const terminateBg = vi.fn((pid: number) => [{ pid: pid + 1, command: 'after', startedAt: 0 }])
+  const terminateBg = vi.fn((pgid: number) => [
+    { pgid: pgid + 1, pids: [pgid + 1], label: 'after', command: 'after', startedAt: 0 },
+  ])
   // warmUp（attach）补推后台清单要读它。[] 是稳态：没有进程就没有条目
   const bgSnapshot = vi.fn(() => [] as ReturnType<typeof terminateBg>)
   // watchIdle 建的时候要读 idleSummarizeDelayMs；配 0 = 不排定时器，
@@ -107,6 +115,7 @@ function fakeSession(
       return hit ? { rows: hit.rows, next: hit.next } : { rows: [], next: null }
     },
     isRunning: () => false,
+    takeTaskResults: () => 0,
     interrupt,
     terminateBg,
     bgSnapshot,
@@ -199,7 +208,7 @@ function harness(
     detail: string
     reason: string
     always?: { kind: 'lead'; lead: string } | { kind: 'path'; dir: string }
-  }) => Promise<'allow' | 'always' | 'deny' | { deny: string }>) | undefined
+  }) => Promise<'allow' | 'always' | 'deny' | 'timeout' | { deny: string }>) | undefined
   const bridge = createBridge({
     post: (msg) => posted.push(msg),
     session: async (requestApproval) => {
@@ -313,6 +322,27 @@ describe('运行状态', () => {
     await settle()
     const states = h.posted.slice(from).filter((m) => m.type === 'state')
     expect(states.map((s) => s.type === 'state' && s.running)).toEqual([true, false])
+  })
+
+  // 2026-10-31 观测：一轮 finish:stop 后 5s 内 ≥1s loop_lag 占 5–16%（对照
+  // tool-calls 0–3%），轮末收尾没有分段计时。记一行 turn_end_host
+  it('轮末收尾分段计时：一轮结束记一行 turn_end_host', async () => {
+    vi.mocked(logRun).mockClear()
+    const h = harness({ events: [{ type: 'text_delta', text: '答' }] })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'send', text: '问题' })
+    await settle()
+    const rows = vi.mocked(logRun).mock.calls.map(([ev]) => ev).filter((ev) => ev.ev === 'turn_end_host')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({
+      foldMs: expect.any(Number),
+      items: expect.any(Number),
+      absorbMs: expect.any(Number),
+      notifyMs: expect.any(Number),
+      tailMs: expect.any(Number),
+    })
+    expect(rows[0]?.owner).toBeUndefined()
   })
 
   // t886：settings.json 写坏 → 热加载关 session → 建不起来。此前 pending
@@ -1196,6 +1226,7 @@ describe('会话延续 > 关开竞态', () => {
 
 describe('审批中枢', () => {
   it('ask 级命令：推 approval_request，reply 后 resolve 并关闭气泡', async () => {
+    vi.mocked(logRun).mockClear()
     const h = harness()
     h.bridge.handle({ type: 'ready' })
     await settle(); await settle(); await settle()
@@ -1208,6 +1239,8 @@ describe('审批中枢', () => {
     h.bridge.handle({ type: 'approval_reply', id: 1, choice: 'allow' })
     await expect(p).resolves.toBe('allow')
     expect(h.posted.at(-1)).toEqual({ type: 'approval_closed', id: 1 })
+    expect(logRun).toHaveBeenCalledWith(expect.objectContaining({ ev: 'approval_ask', id: 1, toolCallId: 'tu_1' }))
+    expect(logRun).toHaveBeenCalledWith(expect.objectContaining({ ev: 'approval_result', id: 1, toolCallId: 'tu_1', decision: 'allow' }))
   })
 
   it('挂卡通知时数已经加上：onTurnEnd 那一刻 pendingApprovals()=1（角标数据源）', async () => {
@@ -1250,7 +1283,7 @@ describe('审批中枢', () => {
     expect(h.posted.at(-1)).toEqual({ type: 'approval_closed', id: 1 })
   })
 
-  it('超时兜底：等不到答复按 deny', async () => {
+  it('超时兜底：等不到答复按拒绝处理，结果标 timeout（与人点的 deny 区分）', async () => {
     let fire: (() => void) | null = null
     const setTimer = ((_ms: number, fn: () => void) => { fire = fn; return () => {} }) as SetTimer
     const h = harness({}, { setTimer })
@@ -1260,7 +1293,7 @@ describe('审批中枢', () => {
     await settle()
 
     fire!() // 5 分钟到点
-    await expect(p).resolves.toBe('deny')
+    await expect(p).resolves.toBe('timeout')
   })
 })
 
@@ -1269,7 +1302,10 @@ describe('bridge / 后台进程', () => {
     const h = harness({
       events: [
         { type: 'text_delta', text: 'hi' },
-        { type: 'bg_processes', items: [{ pid: 42, command: 'sleep 30', startedAt: 1 }] },
+        {
+          type: 'bg_processes',
+          items: [{ pgid: 42, pids: [42], label: '睡', command: 'sleep 30', startedAt: 1 }],
+        },
       ],
     })
     h.bridge.handle({ type: 'ready' })
@@ -1277,11 +1313,11 @@ describe('bridge / 后台进程', () => {
     await vi.waitFor(() => expect(h.posted.find((m) => m.type === 'bg_processes')).toBeTruthy())
     // attach（warmUp）会先补推一条空清单，find 头名是它——找事件推的那条
     const bg = h.posted.find(
-      (m) => m.type === 'bg_processes' && m.items.some((p) => p.pid === 42),
+      (m) => m.type === 'bg_processes' && m.items.some((p) => p.pgid === 42),
     )
     expect(bg).toEqual({
       type: 'bg_processes',
-      items: [{ pid: 42, command: 'sleep 30', startedAt: 1 }],
+      items: [{ pgid: 42, pids: [42], label: '睡', command: 'sleep 30', startedAt: 1 }],
     })
     // 不该出现包着它的 agent 透传（reduce 没有它的位置）
     expect(
@@ -1292,9 +1328,9 @@ describe('bridge / 后台进程', () => {
   it('bg_kill 调 session.terminateBg 并回推更新后的快照', async () => {
     const h = harness()
     h.bridge.handle({ type: 'ready' })
-    h.bridge.handle({ type: 'bg_kill', pid: 7 })
+    h.bridge.handle({ type: 'bg_kill', pgid: 7 })
     await vi.waitFor(() =>
-      expect(h.posted.some((m) => m.type === 'bg_processes' && m.items[0]?.pid === 8)).toBe(true),
+      expect(h.posted.some((m) => m.type === 'bg_processes' && m.items[0]?.pgid === 8)).toBe(true),
     )
     expect(h.session.terminateBg).toHaveBeenCalledWith(7)
   })
@@ -1366,10 +1402,168 @@ describe('插话镜像', () => {
     const hydrates = h.posted
       .slice(before)
       .filter((m): m is Extract<ToWebview, { type: 'hydrate' }> => m.type === 'hydrate')
-    const users = (hydrates.at(-1)?.items ?? []).filter(
+    // 插话还没投递（假 core 没发 input_delivered）：在 queued，第一条在 items
+    const last = hydrates.at(-1)
+    const users = [...(last?.items ?? []), ...(last?.queued ?? [])].filter(
       (i): i is Extract<ChatItem, { kind: 'user' }> => i.kind === 'user',
     )
     expect(users.map((u) => u.text)).toEqual(['你来实现吧', 'VPN回来了，你再重试下'])
+    expect(last?.items.filter((i) => i.kind === 'user')).toHaveLength(1)
     h.release()
+  })
+
+  it('**插话等 input_delivered 才摆进镜像**：投递前在 queued，投递后排在 core 投递的位置', async () => {
+    // 镜像原来按按回车时的位置插（8796573），2026-10-31 真机：回答流式中插话，
+    // 实时视图气泡在回答前、reload 后在回答后。现在两边都按 core 投进历史的位置
+    const h = harness()
+    let open!: () => void
+    const gate = new Promise<void>((r) => {
+      open = r
+    })
+    let finish!: () => void
+    const done = new Promise<void>((r) => {
+      finish = r
+    })
+    let calls = 0
+    ;(h.session as unknown as { send: (t: string) => AsyncGenerator<AgentEvent> }).send = () => {
+      const first = calls++ === 0
+      return (async function* () {
+        if (!first) return // 插话：真 core 入队即返回空流
+        yield { type: 'tool_input_start', id: 't1', name: 'bash' } as AgentEvent
+        await gate // 工具跑着时插话
+        yield { type: 'input_delivered' } as AgentEvent // loop 顶出队
+        yield { type: 'text_start' } as AgentEvent
+        await done
+      })()
+    }
+    const reopen = async () => {
+      const before = h.posted.length
+      h.bridge.handle({ type: 'ready' })
+      await settle()
+      return h.posted
+        .slice(before)
+        .filter((m): m is Extract<ToWebview, { type: 'hydrate' }> => m.type === 'hydrate')
+        .at(-1)
+    }
+    const shape = (items: ChatItem[] = []): string[] =>
+      items.map((i) => (i.kind === 'user' ? `user:${i.text}` : i.kind))
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'send', text: '你来实现吧' })
+    await settle()
+    h.bridge.handle({ type: 'send', text: '顺便看下日志' })
+    await settle()
+
+    const queued = await reopen()
+    expect(shape(queued?.items)).toEqual(['user:你来实现吧', 'tool'])
+    expect(queued?.queued).toEqual([{ kind: 'user', text: '顺便看下日志', interject: true }])
+
+    open()
+    await settle()
+    const delivered = await reopen()
+    expect(shape(delivered?.items)).toEqual(['user:你来实现吧', 'tool', 'user:顺便看下日志', 'assistant'])
+    expect(delivered?.queued ?? []).toEqual([])
+    // 插话带标记（跑着时 splitTurns 据此不把前面的过程折走），本轮第一条不带
+    expect(delivered?.items[0]).not.toHaveProperty('interject')
+    expect(delivered?.items[2]).toMatchObject({ kind: 'user', interject: true })
+    finish()
+    await settle()
+    // 轮结束 fold：插话已落库（基线重读），queued 清空，不再重复画
+    expect((await reopen())?.queued ?? []).toEqual([])
+  })
+})
+
+// ── 桌面机器人（desktop-robot.md §5.2、§5.3）──────────────────────
+
+describe('桌面机器人：主任务的结局与卡', () => {
+  const mainOf = (h: ReturnType<typeof harness>) => h.bridge.robotView().tasks[0]
+
+  it('正常跑完：done + 最后一段回答；开跑时就通知（总览显示在跑）', async () => {
+    let notified = 0
+    const h = harness(
+      {
+        events: [
+          { type: 'text_start' },
+          { type: 'text_delta', text: '先看看。' },
+          { type: 'tool_call', id: 't1', name: 'bash', input: {} },
+          { type: 'text_start' },
+          { type: 'text_delta', text: '改完了，测试全过。' },
+          { type: 'step_finish', usage: usage(), contextTokens: 0 },
+        ],
+        hang: true,
+      },
+      { onTurnEnd: () => notified++ },
+    )
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    expect(mainOf(h)).toMatchObject({ task: null, running: false, lastTurn: null })
+    const before = notified
+    h.bridge.handle({ type: 'send', text: '改一下' })
+    expect(notified).toBe(before + 1)
+    await settle()
+    expect(mainOf(h)).toMatchObject({ running: true, lastTurn: null })
+    expect(mainOf(h)?.startedAt).toBeTypeOf('number')
+    h.release()
+    await settle()
+    await settle()
+    expect(mainOf(h)).toMatchObject({ running: false, lastTurn: { end: 'done', text: '改完了，测试全过。' } })
+  })
+
+  it('error 事件结束这一轮：记 error 与错误原文', async () => {
+    const h = harness({ events: [{ type: 'error', message: 'API 返回 529 overloaded', retryable: true }] })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'send', text: 'x' })
+    await settle()
+    await settle()
+    expect(mainOf(h)?.lastTurn).toMatchObject({ end: 'error', text: 'API 返回 529 overloaded' })
+  })
+
+  it('用户点停止：stopped（不提醒）；对照：没停的同一轮是 done', async () => {
+    const h = harness({ events: [{ type: 'text_start' }, { type: 'text_delta', text: '做到一半' }], hang: true })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'send', text: 'x' })
+    await settle()
+    h.bridge.handle({ type: 'interrupt' })
+    h.release()
+    await settle()
+    await settle()
+    expect(mainOf(h)?.lastTurn?.end).toBe('stopped')
+    // 下一轮没停：stopRequested 被复位，不会把上一轮的停止带过来
+    h.bridge.handle({ type: 'send', text: 'y' })
+    await settle()
+    h.release()
+    await settle()
+    await settle()
+    expect(mainOf(h)?.lastTurn?.end).toBe('done')
+  })
+
+  it('allowToolCall 走面板点允许的同一条路：resolve allow、关气泡、记 approval_result；再点 = false', async () => {
+    vi.mocked(logRun).mockClear()
+    const h = harness()
+    h.bridge.handle({ type: 'ready' })
+    await settle(); await settle(); await settle()
+    const p = h.getApproval()!({ command: 'ls /Users/dev', toolCallId: 'tu_9', category: 'external_dir', detail: '/Users/dev', reason: 'r' })
+    await settle()
+    expect(h.bridge.robotView().approvals.map((c) => c.toolCallId)).toEqual(['tu_9'])
+    expect(h.bridge.allowToolCall('tu_other')).toBe(false)
+    expect(h.bridge.allowToolCall('tu_9')).toBe(true)
+    await expect(p).resolves.toBe('allow')
+    expect(h.posted.at(-1)).toEqual({ type: 'approval_closed', id: 1 })
+    expect(logRun).toHaveBeenCalledWith(expect.objectContaining({ ev: 'approval_result', toolCallId: 'tu_9', decision: 'allow' }))
+    // 卡已处理：机器人那边显示「卡已处理」
+    expect(h.bridge.allowToolCall('tu_9')).toBe(false)
+    expect(h.bridge.robotView().approvals).toEqual([])
+  })
+
+  it('multi 卡的各段类别带到卡上（机器人据此判能否允许）', async () => {
+    const h = harness()
+    h.bridge.handle({ type: 'ready' })
+    await settle(); await settle(); await settle()
+    const approve = h.getApproval() as unknown as (q: object) => Promise<unknown>
+    void approve({ command: 'cd /x && git push', toolCallId: 'tu_m', category: 'multi', detail: 'd', reason: 'r', parts: ['external_dir', 'ask_rule'] })
+    await settle()
+    expect(h.bridge.robotView().approvals[0]?.parts).toEqual(['external_dir', 'ask_rule'])
   })
 })

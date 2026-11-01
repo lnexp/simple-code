@@ -46,7 +46,7 @@ const run = (name: string, args: string[], input?: string) =>
 describe('bin 在子目录下认工作区根', () => {
   it('note / lesson / event / skill read 找得到', () => {
     expect(run('note', ['read', 'n1']).stdout).toContain('正文 n1')
-    expect(run('lesson', ['read', 'l1']).stdout).toContain('症状 l1')
+    expect(run('note', ['read', 'l1', '--type', 'lesson']).stdout).toContain('症状 l1')
     expect(run('event', ['read', 'e1']).stdout).toContain('描述 e1')
     expect(run('skill', ['read', 's1']).stdout).toContain('正文 s1')
   }, 60_000)

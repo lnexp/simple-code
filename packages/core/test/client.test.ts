@@ -429,6 +429,31 @@ describe('运行日志（2026-09-30 补观测）', () => {
     return calls
   }
 
+  it.each([
+    ['max', 200], ['low', 200], ['none', 200],
+    ['max', 400], ['low', 400], ['none', 400],
+  ] as const)('effort=%s、HTTP %s：请求与结果日志均记实际 request.effort', async (effort, status) => {
+    const response = status === 200
+      ? new Response(bodyOf(ANTHROPIC_SSE))
+      : new Response('test error', { status })
+    const fetch = stubFetch(response)
+    const calls = await capture(() => drain(sendRequest({ ...REQ, effort }, {
+      protocol: resolveProtocol('anthropic-messages'), provider: PROVIDER,
+      signal: new AbortController().signal, fetchImpl: fetch.impl,
+    })))
+    expect(fetch.calls).toHaveLength(1)
+    expect(JSON.parse(String(fetch.calls[0]?.init.body)).output_config).toEqual({ effort })
+    expect(calls.filter((c) => c.ev === 'llm_req' || c.ev === 'llm')
+      .map((c) => ({ ev: c.ev, effort: c.effort }))).toEqual([
+        { ev: 'llm_req', effort }, { ev: 'llm', effort },
+      ])
+    const llm = calls.find((c) => c.ev === 'llm')
+    if (status === 200) {
+      expect(llm?.error).toBeUndefined()
+      expect(llm?.finish).toBe('stop')
+    } else expect(llm?.error).toBeDefined()
+  })
+
   it('流没走完就断：llm 行带上收到的事件计数与最后一条 data', async () => {
     // 9-30 真机形态：没有 event: 行，只有 data.type，且断在结束标记之前
     const sse =

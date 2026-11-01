@@ -95,12 +95,13 @@ const tasks = (status: 'running' | 'idle'): ToWebview => ({
       approvalOn: true,
     },
   ],
-  limit: 3,
 })
 
 const stats: MemoryStats = {
   notes: { total: 69, visible: 20, hidden: 44, superseded: 5 },
   lessons: { total: 43, visible: 30, hidden: 13, superseded: 0 },
+  principles: { total: 2, visible: 2, hidden: 0, superseded: 0 },
+  goals: { total: 1, visible: 1, hidden: 0, superseded: 0 },
   events: { total: 125, visible: 30, hidden: 95, superseded: 0 },
   skills: 2,
   summaries: 628,
@@ -116,10 +117,23 @@ describe('记忆面板接线', () => {
 
     app.send({ type: 'memory_data', stats })
     const html = app.html()
-    // 同上下文面板：一根整条按四库分段，每库一行只给总数与占比
-    expect(html).toContain('共 239 条') // 69+43+125+2
+    // 六项互斥计数，四种 note 类型不再合并或重复叠加。
+    expect(html).toContain('共 242 条') // 69+43+2+1+125+2
     expect(html).toContain('ctx-stack')
-    expect(html).toContain('29%') // note 69/239
+    const rows = [...host!.querySelectorAll('.ctx-row')].map(row => ({
+      label: row.querySelector('.ctx-label')?.textContent,
+      count: row.querySelector('.ctx-num')?.textContent,
+      pct: row.querySelector('.ctx-pct')?.textContent,
+    }))
+    expect(rows).toEqual([
+      { label: 'note', count: '69', pct: '29%' },
+      { label: 'lesson', count: '43', pct: '18%' },
+      { label: 'principle', count: '2', pct: '1%' },
+      { label: 'goal', count: '1', pct: '0%' },
+      { label: 'event', count: '125', pct: '52%' },
+      { label: 'skill', count: '2', pct: '1%' },
+    ])
+    expect(host!.querySelectorAll('.ctx-stack > span')).toHaveLength(6)
     expect(html).not.toContain('收起')
     expect(html).toContain('另有 summary 628 份')
     expect(html).toContain('2026-10-22 · recall-review')
@@ -181,13 +195,13 @@ describe('记忆面板接线', () => {
     expect(sent.some((m) => m.type === 'reflect_reopen')).toBe(true)
   })
 
-  it('主任务 running：按钮置灰显示「主任务运行中」', () => {
+  it('主任务 running：照样可点「反思」（task-trunk 去掉静止闸；对照：v3 置灰「主任务运行中」）', () => {
     const app = mount()
     app.send(state(true))
     app.clickMem()
     app.send({ type: 'memory_data', stats })
     const html = app.html()
-    expect(html).toContain('主任务运行中')
-    expect(html).not.toContain('关闭并重开')
+    expect(html).not.toContain('主任务运行中')
+    expect(html).toContain('后台执行，报告后挂起待过目')
   })
 })

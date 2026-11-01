@@ -9,7 +9,7 @@ import type { Message, Request, Usage } from '../src/llm/types.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
 import type { LoopDeps } from '../src/loop/run.ts'
 import { listBucketFiles } from '../src/session/buckets.ts'
-import { forkTask, scopeOf } from '../src/session/task.ts'
+import { createTask, scopeOf } from '../src/session/task.ts'
 import { getSession, MODEL_SWITCH_HEAD, modelSwitchNotice } from '../src/session/session.ts'
 import { MEMORY_RELATIVE, openStore } from '../src/session/store.ts'
 import type { Tool } from '../src/tools/types.ts'
@@ -209,6 +209,9 @@ describe('session.setModel', () => {
 
     expect(seen[1]?.model).toBe('b-one')
     expect(session.config.baseUrl).toBe('https://beta.invalid')
+    // 配置默认不跟着切（新任务从它起跑，bin --models 报它）
+    expect(session.defaultModel).toEqual({ provider: 'alpha', model: 'a-small' })
+    expect(session.config.config.model).toBe('b-one') // 对照：config 已经换了
     await session.close()
   })
 
@@ -637,16 +640,15 @@ describe('切换事件告知（2026-10-17 甲案）', () => {
     await session.close()
   })
 
-  it('lastTurnModel 按会话域：任务看自己的轮，fork 前继承主任务最后一轮；主任务跳过 reserved', async () => {
+  it('lastTurnModel 按会话域：任务只看自己的轮（task-trunk 不 fork，新任务没有上一轮）', async () => {
     const { dir, session } = await openPersisted([says('答')])
     await drain(session.send('主任务第一轮'))
     await session.close()
-    const manifest = forkTask(dir, '试跑')
+    const manifest = createTask(dir, '试跑')
     const main = openStore(dir)
     const task = openStore(dir, { task: scopeOf(manifest) })
-    // fork 插的 reserved 行没有 meta——主任务不能读到它变成 null
     expect(main.lastTurnModel()).toBe('alpha/a-small')
-    expect(task.lastTurnModel()).toBe('alpha/a-small')
+    expect(task.lastTurnModel()).toBeNull()
     task.beginTurn({ model: 'beta/b-one', effort: null })
     expect(task.lastTurnModel()).toBe('beta/b-one')
     expect(main.lastTurnModel()).toBe('alpha/a-small')

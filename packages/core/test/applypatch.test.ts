@@ -227,10 +227,64 @@ describe('applyPatch 应用', () => {
  not-in-file
 + x
 *** End Patch`),
-    ).rejects.toThrow(/bad\.txt：找不到要替换的行（第 1 行是「not-in-file」）/)
+    ).rejects.toThrow(/bad\.txt：找不到要替换的行——首行「not-in-file」在文件里找不到/)
     // ok.txt 不该被改——补丁是整体的，第二块失败第一块也不落盘
     expect(await R('ok.txt')).toBe('fine\n')
     expect(await R('bad.txt')).toBe('actual\n')
+  })
+
+  // 报错指出哪一行对不上（note apply-patch-mismatch-replay：129 次失败回放，
+  // 只给首行时 37 次首行其实在、26 次漏抄中间一行——报错指错了地方）
+  describe('找不到上下文：指出第一处不一致', () => {
+    const fails = async (file: string, body: string): Promise<string> => {
+      await W('f.txt', file)
+      const err = await applyPatch(root, `*** Begin Patch\n*** Update File: f.txt\n${body}\n*** End Patch`).catch((e: Error) => e)
+      expect(err).toBeInstanceOf(Error)
+      expect(await R('f.txt')).toBe(file)
+      return (err as Error).message
+    }
+
+    it('首行在、后面某行抄错（t17121 注释折行 reach / reach the）：报对上的范围与两边原文', async () => {
+      const msg = await fails(
+        'x\n/**\n * went to reasoning. Re-think (only the steps needed to reach the\n * answer) directly.\n */\n',
+        '@@\n /**\n- * went to reasoning. Re-think (only the steps needed to reach\n+ * new',
+      )
+      expect(msg).toContain('前 1 行对上了文件第 2 行')
+      expect(msg).toContain('补丁：「 * went to reasoning. Re-think (only the steps needed to reach」')
+      expect(msg).toContain('文件第 3 行：「 * went to reasoning. Re-think (only the steps needed to reach the」')
+    })
+
+    it('漏抄中间一行（某真实项目 t775 漏 @Test）：文件那一行就是被漏掉的', async () => {
+      const msg = await fails('  }\n\n  @Test\n  void foo() {\n', '@@\n   }\n \n-  void foo() {\n+  void bar() {')
+      expect(msg).toContain('前 2 行对上了文件第 1–2 行')
+      expect(msg).toContain('文件第 3 行：「  @Test」')
+    })
+
+    it('首行就不存在但有近似行（t16975 xli / xcli）：给最像的那行', async () => {
+      const msg = await fails(
+        "a\n      await tool.execute({ command: 'xcli get f.pptx /slide[2]', cwd: root }, ctx)\nb\n",
+        "@@\n-      await tool.execute({ command: 'xli get f.pptx /slide[2]', cwd: root }, ctx)\n+      x",
+      )
+      expect(msg).toContain("首行「      await tool.execute({ command: 'xli get f.pptx /slide[2]', cwd: root }, ctx)」在文件里找不到")
+      expect(msg).toContain("最像的是文件第 2 行：「      await tool.execute({ command: 'xcli get f.pptx /slide[2]', cwd: root }, ctx)」")
+    })
+
+    it('首行找不到也没有近似行：提示先重读文件', async () => {
+      const msg = await fails('alpha\nbeta\n', '@@\n-totally different line\n+x')
+      expect(msg).toContain('首行「totally different line」在文件里找不到')
+      expect(msg).toContain('先重新读一遍文件')
+    })
+
+    it('chunk 顺序写反（后面的写在前）：提示按文件顺序排', async () => {
+      const msg = await fails('one\ntwo\nthree\nfour\n', '@@\n-four\n+FOUR\n@@\n-two\n+TWO')
+      expect(msg).toContain('在上一个 chunk 之前')
+      expect(msg).toContain('按文件里的先后顺序')
+    })
+
+    it('整段都在但带 End of File 锚、不在末尾：点明是锚的问题', async () => {
+      const msg = await fails('a\nb\nc\n', '@@\n-a\n+A\n*** End of File')
+      expect(msg).toContain('这段在文件第 1 行，但不在文件末尾')
+    })
   })
 
   it('add 已存在 / update 不存在 / delete 不存在 / 同文件两次，都拒绝', async () => {

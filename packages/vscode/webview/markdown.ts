@@ -94,8 +94,67 @@ export function renderMarkdown(md: string): string {
   // 性 a，setAttribute 自带转义），不构成绕过消毒的注入面。链接化产物也不
   // 需要再过 DOMPurify——它只认危险结构，data-* 属性原样放行
   const doc = new DOMParser().parseFromString(`<body>${clean}</body>`, 'text/html')
+  markBoldHeadings(doc.body)
+  wrapPlainCode(doc.body)
   linkifyDom(doc.body)
   return doc.body.innerHTML
+}
+
+/**
+ * 整段只有一处加粗的段落（「**验证情况**」「**请你决定：**」）按小标题显示。
+ * 模型分节习惯写加粗行而不是 `###`，不标出来的话它和「**改动效果**：……」
+ * 这种加粗开头的正文长得一样，层级读不出来（2026-10-28 回答排版改版）。
+ * 只看顶层段落：列表项里的加粗是条目内容，不是分节
+ */
+function markBoldHeadings(body: HTMLElement): void {
+  for (const p of body.children) {
+    if (p.tagName !== 'P') continue
+    const nodes = [...p.childNodes].filter((n) => n.nodeType !== 3 || n.textContent?.trim() !== '')
+    if (nodes.length === 1 && (nodes[0] as Element).tagName === 'STRONG') p.classList.add('md-sec')
+  }
+}
+
+/**
+ * 没标语言的代码块按行包一层，超宽行折行、续行比本行多缩进 2 格。
+ * 这类块多是文字图、目录树、日志——横向滚动时右半截看不到；标了语言的
+ * 是真代码，折行会破坏对齐，不包（仍横滚）。
+ *
+ * 每行一个 `.ln`，整行原文（含行首空格）原样放在里面，行首空白的列数记在
+ * data-i；style.ts 按 data-i 给悬挂缩进（CSP 禁内联 style，只能按属性值
+ * 预生成规则）。行尾 \n 留在文本里：复制按钮取 code.textContent，拷出来
+ * 必须和原文一字不差。
+ *
+ * 不能把缩进拆成单独的 span 再用 flex 排：鼠标选中再 Cmd+C 时，浏览器在
+ * 每个 flex 子项之间插换行，缩进行全被拆成两行（2026-10-29 实测）
+ */
+function wrapPlainCode(body: HTMLElement): void {
+  for (const code of body.querySelectorAll('pre > code')) {
+    if (code.className !== '') continue // hljs 或未注册语言的 language-xxx
+    const doc = code.ownerDocument
+    const lines = (code.textContent ?? '').split(/(?<=\n)/)
+    code.textContent = ''
+    for (const line of lines) {
+      const row = Object.assign(doc.createElement('span'), { className: 'ln', textContent: line })
+      const cols = indentCols(line)
+      if (cols > 0) row.dataset.i = String(Math.min(cols, MAX_INDENT))
+      code.append(row)
+    }
+    code.parentElement?.classList.add('wrap')
+  }
+}
+
+/** style.ts 预生成的悬挂缩进规则只到这么多列，更深的续行按这个缩进 */
+export const MAX_INDENT = 40
+
+/** 行首空白占几列：tab 跳到下一个 8 的倍数（同 CSS tab-size 默认值） */
+function indentCols(line: string): number {
+  let col = 0
+  for (const ch of line) {
+    if (ch === ' ') col++
+    else if (ch === '\t') col = (Math.floor(col / 8) + 1) * 8
+    else break
+  }
+  return col
 }
 
 /**

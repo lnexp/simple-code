@@ -11,7 +11,7 @@ import {
   renderMergeInput,
 } from '../src/loop/summarize.ts'
 import { MEMORY_RELATIVE, openStore, type Store } from '../src/session/store.ts'
-import { forkTask, scopeOf } from '../src/session/task.ts'
+import { createTask, scopeOf } from '../src/session/task.ts'
 
 /**
  * 3b-2 的两段式验收之一：**纯逻辑**（挑合并组、渲染、请求）和 **store 层**
@@ -189,7 +189,7 @@ describe('挑合并组', () => {
 
     // 活任务：fork 出的任务在预留段里写 step（对话视角看不见消息，
     // 但 steps 行在库里）→ 对话的 gapHasContent 必须报 true
-    const m = forkTask(dir, '跨缝保险')
+    const m = createTask(dir, '跨缝保险')
     const task = openStore(dir, { task: scopeOf(m) })
     task.save([{ role: 'user', parts: [{ type: 'text', text: '任务里干活' }] }])
     const taskStep = task.withTurns(task.load())[0]?.stepId ?? 0
@@ -210,6 +210,49 @@ describe('挑合并组', () => {
         3,
       ),
     ).toBeNull()
+  })
+
+  it('**没生效的上层行，子树里有生效的就算在场**（级联）；子树全没生效不算', () => {
+    // L2(30) ← L1(20) ← L0(1) 在场：30 未生效也代表 context。
+    // L2(32) ← L0(3) 都不在场：32 不算，凑 3 条时不能把它当成员
+    const rows = [
+      s({ id: 1, coversFrom: 1, coversTo: 1, supersededBy: 20 }),
+      s({ id: 3, coversFrom: 3, coversTo: 3, supersededBy: 32, inContext: false }),
+      s({ id: 20, level: 1, coversFrom: 1, coversTo: 1, supersededBy: 30, inContext: false }),
+      s({ id: 30, level: 2, coversFrom: 1, coversTo: 1, inContext: false }),
+      s({ id: 31, level: 2, coversFrom: 2, coversTo: 2 }),
+      s({ id: 32, level: 2, coversFrom: 3, coversTo: 3, inContext: false }),
+    ]
+    expect(pickMergeGroup(rows, 2)?.members.map((m) => m.id)).toEqual([30, 31])
+    expect(pickMergeGroup(rows, 3)).toBeNull()
+  })
+
+  it('两万条历史摘要也不卡（2026-10-31：4554 行真库每步 35–105ms，逐行线性查找）', () => {
+    // 每个 step 存盘后都要跑一遍（kickSummary → mergeWhileDue → indexMembers），
+    // 占的是扩展宿主主线程。合成金字塔：L0×20000 → L1×2000 → L2×200 全已合走，
+    // 最后 10 条 L0 在场。改前同机 0.7–0.8s，改后约 7ms
+    const gone = (id: number, level: number, from: number, width: number, up: number | null) =>
+      s({
+        id,
+        level,
+        coversFrom: from,
+        coversTo: from + width - 1,
+        inContext: false,
+        supersededBy: up,
+      })
+    const rows: Summary[] = []
+    for (let i = 0; i < 200; i++) rows.push(gone(100_000 + i, 2, i * 100 + 1, 100, null))
+    for (let i = 0; i < 2000; i++)
+      rows.push(gone(50_000 + i, 1, i * 10 + 1, 10, 100_000 + Math.floor(i / 10)))
+    for (let i = 0; i < 20_000; i++)
+      rows.push(gone(i + 1, 0, i + 1, 1, 50_000 + Math.floor(i / 10)))
+    const live = Array.from({ length: 10 }, (_, i) => 200_000 + i)
+    for (const [i, id] of live.entries())
+      rows.push(s({ id, coversFrom: 20_001 + i, coversTo: 20_001 + i }))
+    const t = performance.now()
+    const group = pickMergeGroup(rows, 10)
+    expect(performance.now() - t).toBeLessThan(150)
+    expect(group?.members.map((m) => m.id)).toEqual(live)
   })
 
   it('多层都够时从最老的层开始——低层是更新的历史，先合远的', () => {
@@ -380,6 +423,8 @@ describe('store：合并落库（只写库）', () => {
     // 取极大根，等宽时留 id 小的
     const dir = await workspace()
     const store = openStore(dir)
+    // 摘要盖的是真实 step（applyMerges 只收库里有的号——号稀疏，不逐号展开）
+    for (let i = 0; i < 2; i++) store.beginStep()
     const row = (level: number, coversFrom: number, coversTo: number, inContext: boolean) => ({
       level,
       coversFrom,
@@ -455,6 +500,8 @@ describe('store：生效', () => {
   it('子孙 → 0、链根 → 1，返回被换出的 turn 集合', async () => {
     const dir = await workspace()
     const store = openStore(dir)
+    // 摘要盖的是真实 step（applyMerges 只收库里有的号——号稀疏，不逐号展开）
+    for (let i = 0; i < 3; i++) store.beginStep()
     const ids = [1, 2, 3].map((t) => store.addSummary(draft({ coversFrom: t, coversTo: t })))
     const parentId = store.recordMerge(
       draft({ level: 1, coversFrom: 1, coversTo: 3, inContext: false }),
@@ -479,11 +526,29 @@ describe('store：生效', () => {
     store.close()
   })
 
+  it('稀疏号：关掉的行区间跨二十亿号，只返回库里真有的 step（不逐号展开）', async () => {
+    // task-trunk 每段跳 50000，高层行的 covers 跨度随段数涨；逐号展开过 V8 Set
+    // 上限（约 1677 万）直接抛 RangeError
+    const dir = await workspace()
+    const store = openStore(dir)
+    for (let i = 0; i < 2; i++) store.beginStep()
+    const ids = [store.addSummary(draft({ coversFrom: 1, coversTo: 2_000_000_000 }))]
+    store.recordMerge(
+      draft({ level: 1, coversFrom: 1, coversTo: 2_000_000_000, inContext: false }),
+      ids,
+    )
+
+    expect(store.applyMerges()).toEqual(new Set([1, 2]))
+    store.close()
+  })
+
   it('**级联的根直接吃掉整棵子树**：L2 生效时 L1/L0 一起关', async () => {
     // L0×2 → L1a；再 L0×2 → L1b；L1a+L1b → L2。全并好之后一次 apply：
     // 最终 context 里只剩 L2 一条
     const dir = await workspace()
     const store = openStore(dir)
+    // 摘要盖的是真实 step（applyMerges 只收库里有的号——号稀疏，不逐号展开）
+    for (let i = 0; i < 4; i++) store.beginStep()
     const l0a = [1, 2].map((t) => store.addSummary(draft({ coversFrom: t, coversTo: t })))
     const l1a = store.recordMerge(
       draft({ level: 1, coversFrom: 1, coversTo: 2, inContext: false }),

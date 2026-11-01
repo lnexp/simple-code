@@ -68,14 +68,12 @@ export type LoopDeps = {
   /** 记忆库根（分身任务 = 任务目录；缺省 = root）。bash 注入
    *  SIMPLE_CODE_MEMORY_DIR 给 $SIMPLE_CODE_MEMORY 分流用（memory.ts） */
   memoryRoot?: string
-  /**
-   * 任务跑超检查（task-v3 配额闸，2026-09-23 用户拍板）。
-   * 只在分身 session 存在（memoryRoot 旁有 task.json，session 层装配）；
-   * 返回 null = 没超，字符串 = 停止原因（发给用户看）。loop 每轮迭代顶查
-   * 一次——拦「轮中长个儿」的 steps/messages；turn 起头的拦在 session.send
-   * 入口（beginTurn 在 loop 之前就写 turns 表）
-   */
-  taskOverflow?: () => string | null
+  /** 本会话的 owner（主任务 ''，任务 'task-xxx'）。bash 注入 SIMPLE_CODE_OWNER：
+   *  memory search 按它过滤可见段，$SIMPLE_CODE_TASK 派任务时登记父任务 */
+  owner?: string
+  /** 取走投给本会话的任务回调（task-trunk 规则 12，store.takeTaskResults）。
+   *  loop 在每次发请求前取，作为 user 消息追加到末尾 */
+  takeTaskResults?: () => string[]
   /**
    * 前缀不变式守卫（prefix-guard.ts）：发请求前核对「这次以上次为前缀」，
    * 压缩点放行一次。不传 = 不守（单测、ephemeral）
@@ -98,9 +96,9 @@ export type LoopDeps = {
    * 摘要顶替已把前缀缓存整个作废，换 system 是零边际成本；任何其他时机
    * 调用都会废掉全史 KV 缓存。one session 长会话靠它拿到用户中途改的
    * 约定，不必等 reload（AGENTS.md 本体仍是建会话读一次）。
-   * 返回 { agentsOverLimit: [超限的文件] } 时由本层发提示——deps 自己没有事件通道
+   * 返回 agentsOverLimit（超限文件与额度）时由本层发提示——deps 自己没有事件通道
    */
-  reloadSystem?: () => Promise<void | { agentsOverLimit?: string[] }>
+  reloadSystem?: () => Promise<void | { agentsOverLimit?: { files: string[]; maxTokens: number }; noteError?: string }>
   /**
    * 主动催一次摘要生成（非阻塞）。存根段超线又没有 ready 摘要可顶替时由
    * activateByStubLevel 调——连续使用中 idle 摘要跟不上，存根堆着没人
@@ -238,6 +236,11 @@ export type MemoryDeps = {
    *  unloadIfNeeded 的触发条件）——任务合并还俗改写了前缀，改写合法性由
    *  这一趟压缩的车票背书 */
   consumeMergePending?: () => boolean
+  /** 有没有别的会话合回的段等着拉（task-trunk 规则 5）。只在压缩点拉；自己不触发
+   *  压缩，唯一例外是会话第一个请求（见 unloadIfNeeded） */
+  pullPending?: () => boolean
+  /** 压缩点内调：把可拉的段的摘要复制成自己的（前缀已放行），返回行数 */
+  pullSegments?: () => number
   /**
    * 给内存历史配上 turn 归属。
    *
@@ -356,6 +359,10 @@ export async function* run(ctx: LoopContext): AsyncIterable<AgentEvent> {
   try {
     yield* runLoop(ctx)
   } catch (error) {
+    // 用户停止：在途 await 抛的 AbortError 是停止的回声，不是错误
+    // （2026-10-29：面板在「已中断」上面多一条「AbortError: …」，runlog
+    // 的 error 计数混进停止）。停止本身由 session 记 ev=interrupt
+    if (ctx.signal.aborted) return
     ctx.failed = true
     // LLMStreamError 带 ProtocolError detail（kind/retryable/retryAfterMs，
     // message 是协议层写给用户看的人话）。String(error) 会把它抹成
@@ -388,13 +395,6 @@ export async function* run(ctx: LoopContext): AsyncIterable<AgentEvent> {
 /** 外层：一直跑到真的没事做了 */
 async function* runLoop(ctx: LoopContext): AsyncIterable<AgentEvent> {
   for (let iteration = 0; iteration < ctx.deps.maxIterations; iteration++) {
-    // 分支跑超（§10.2 运行时版）：任何一轴的预留段用满即停，排队的输入
-    // 也不收——继续写会侵入段间缓冲、撞兄弟任务的 marker，停下后只能合并
-    const overflow = ctx.deps.taskOverflow?.()
-    if (overflow !== undefined && overflow !== null) {
-      yield { type: 'error', message: overflow, retryable: false }
-      return
-    }
     // 排队的任务优先于生成新回复。不需要单独的调度器——每轮结束检查一遍即可。
     //
     // **shift 不是 pop。** core-modules.md §7 写的是「栈」，但用户在 agent
@@ -403,6 +403,7 @@ async function* runLoop(ctx: LoopContext): AsyncIterable<AgentEvent> {
     const task = ctx.tasks.shift()
     if (task) {
       ctx.messages.push({ role: 'user', parts: userParts(task.text, task.images) })
+      yield { type: 'input_delivered' }
       continue
     }
 
@@ -417,6 +418,16 @@ async function* runLoop(ctx: LoopContext): AsyncIterable<AgentEvent> {
     }
 
     if (shouldExit(ctx)) return
+
+    // 任务回调（task-trunk 规则 12）：登记者在跑 = 下一个请求就看到。只在
+    // 确定要发请求的这里插——轮要结束了（上面 shouldExit）就留给宿主在轮后
+    // 插，插在这之前会让模型多答一次，等于被唤醒。追加在末尾，前缀不变
+    if (canAppendUser(ctx.messages)) {
+      for (const text of ctx.deps.takeTaskResults?.() ?? []) {
+        ctx.messages.push({ role: 'user', parts: [{ type: 'text', text }] })
+        yield { type: 'task_result', text }
+      }
+    }
 
     // 非视觉模型 + 配了 visionModel：发请求前把历史里没转述过的图（用户
     // 贴图 / reload 进来的）转述进缓存——发送出口按缓存把图换成转述文本。
@@ -587,6 +598,13 @@ function shouldExit(ctx: LoopContext): boolean {
     !hasPendingToolCalls(ctx.messages) &&
     !hasUnansweredUserInput(ctx.messages)
   )
+}
+
+/** 末尾能不能接一条 user 消息：不能插在 tool_call 与它的结果之间（结果还没
+ *  回来的 assistant 末条）。空历史、user/tool 末条、纯文本回答之后都行 */
+export function canAppendUser(messages: readonly Message[]): boolean {
+  const last = messages.at(-1)
+  return last === undefined || last.role !== 'assistant' || !last.parts.some((p) => p.type === 'tool_call')
 }
 
 /**
@@ -905,17 +923,27 @@ async function* unloadIfNeeded(ctx: LoopContext, force = false, manual = false):
   // 被推翻——四趟车都断缓存，捎带卸载边际成本为零；反过来「stale/任务关闭
   // 不卸」会让低用量会话的保底外原文/存根永远堆着，没人收
   const mergePending = memory.consumeMergePending?.() ?? false
+  // 别人合回的段（task-trunk 规则 5）只在压缩点拉：拉进来是在历史中段插入，
+  // 与合并生效同一类前缀改写。**搭车不发车**（2026-10-30 用户订正，原话
+  // t20698「其他任务只有上下文压缩时候才会有这段的摘要」）：原来有可拉的就把
+  // 这次请求当压缩点，关一个任务所有开着的任务各断一次缓存——真机主任务空闲
+  // 4 分钟（TTL 内）被拉段触发，cacheRead 0 / cacheWrite 50337。
+  // 例外：会话第一个请求（还没响应过）没有缓存可断，有就拉——新任务开在主干
+  // 拷入刚关的段之前（主干维护是空闲异步做的），靠这一下补上
+  const pullPending = memory.pullPending?.() ?? false
+  const firstPull = pullPending && memory.lastResponseAt() === null
   const stale = isCacheStale(memory)
   const over = currentUsage(ctx) > inputBudget(ctx)
-  if (!force && !manual && !mergePending && !stale && !over) return
+  if (!force && !manual && !mergePending && !firstPull && !stale && !over) return
   ctx.deps.prefixGuard?.allowRewrite()
+  if (pullPending) memory.pullSegments?.()
 
   // 触发了：**先应用待生效的合并，再看还要卸多少**（§9.1「生效必须先于
   // 卸载」）。塌缩本身就能释放一大块（10 条 L0 变 1 条 L1），很多时候应用完
   // 已经在预算内，一条都不用卸——顺序反了会按「还没释放」的状态多卸一批
   yield* applyPendingMerges(ctx)
   try {
-    yield* unloadOldest(ctx, { force, manual, stale, over, mergePending })
+    yield* unloadOldest(ctx, { force, manual, stale, over, mergePending: mergePending || pullPending })
   } finally {
     // 摘要进场（compaction-v2 §0.4 位置制：存根区天花板之外的段）。
     // 放 finally：卸载提前返回（挑不出可卸的）时这趟车照样要搭——原来
@@ -976,11 +1004,13 @@ async function* unloadOldest(
   // 搭这趟本来就要破缓存的车刷新 system prompt（AGENTS.md / notes 有没有
   // 改过、改了什么，都无所谓——重读一遍几 ms，横竖前缀已作废）
   const reload = await ctx.deps.reloadSystem?.()
-  if (reload?.agentsOverLimit?.length) {
-    const files = reload.agentsOverLimit.join('、')
+  if (reload?.noteError) yield { type: 'error', message: reload.noteError, retryable: false }
+  if (reload?.agentsOverLimit?.files.length) {
+    const files = reload.agentsOverLimit.files.join('、')
+    const limit = reload.agentsOverLimit.maxTokens.toLocaleString('en-US')
     yield {
       type: 'error',
-      message: `${files} 超过 2,048 token 上限，本次刷新已跳过（system 仍用旧版）。请精简——超限部分每轮全价；拆出来的结论放 .simple-code/notes/。`,
+      message: `${files} 超过 ${limit} token 上限，本次刷新已跳过（system 仍用旧版）。请精简——超限部分每轮全价；拆出来的结论放 .simple-code/notes/。`,
       retryable: false,
     }
   }
@@ -1541,6 +1571,7 @@ async function runOne(ctx: LoopContext, call: ToolCallPart): Promise<[ToolResult
     out = await tool.execute(call.input, {
       root: ctx.deps.root,
       ...(ctx.deps.memoryRoot ? { memoryRoot: ctx.deps.memoryRoot } : {}),
+      ...(ctx.deps.owner !== undefined ? { owner: ctx.deps.owner } : {}),
       signal: ctx.signal,
       ...(ctx.interject ? { interjectSignal: ctx.interject.current.signal } : {}),
       toolCallId: call.id,

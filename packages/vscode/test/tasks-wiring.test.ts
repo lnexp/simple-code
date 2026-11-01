@@ -7,7 +7,7 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 import type { Session, SetTimer } from '@simple-code/core'
-import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -15,11 +15,15 @@ import { createBridge } from '../src/bridge.ts'
 import { MEMORY_RELATIVE, openStore } from '@simple-code/core'
 import type { ToWebview } from '../src/protocol.ts'
 import type { BridgeDeps } from '../src/bridge.ts'
+import type { ChatItem } from '../webview/events.ts'
 
 const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 0))
 
 /** 分身的假 session：send 产事件，interrupt/close 记调用 */
-function fakeTaskSession(events: { type: string; text?: string; message?: string }[]) {
+function fakeTaskSession(
+  events: { type: string; text?: string; message?: string }[],
+  hang?: () => Promise<void>,
+) {
   const calls: string[] = []
   const session = {
     root: '/tmp/x',
@@ -35,6 +39,7 @@ function fakeTaskSession(events: { type: string; text?: string; message?: string
     messages: () => [],
     historyRows: () => [],
     isRunning: () => false,
+    takeTaskResults: () => 0,
     interrupt: () => {
       calls.push('interrupt')
     },
@@ -60,6 +65,7 @@ function fakeTaskSession(events: { type: string; text?: string; message?: string
       calls.push(`send:${text}`)
       return (async function* () {
         for (const ev of events) yield ev as never
+        if (hang) await hang()
       })()
     },
     get config() {
@@ -84,6 +90,8 @@ function taskHarness(options: {
   mainEvents?: { type: string; text?: string }[]
   mainHang?: () => Promise<void>
   taskEvents?: { type: string; text?: string; message?: string }[]
+  /** 任务的 send 产完事件后挂住，直到它 resolve（测停止） */
+  taskHang?: () => Promise<void>
   /** 复用这个目录建 bridge（恢复测试：第一次留下的 task- 目录要被第二次
    *  扫到）。不传 = 独立临时目录 */
   folder?: string
@@ -93,10 +101,20 @@ function taskHarness(options: {
   /** taskSession 工厂按次抛这些错（shift 取用），耗尽后返回正常 session。
    *  测 ensureSession 的 BUSY 重试与终态可见（2026-09-23 卡死回归） */
   taskSessionErrors?: Error[]
+  /** 主任务配置里的 taskModels（agent 派任务 --model，规则 14） */
+  taskModels?: { provider: string; model: string; effort?: string; use: string }[]
+  /** 主任务建会话时的配置默认；不给 = 与 config 的 p/m 相同（没切过模型） */
+  mainDefault?: { provider: string; model: string }
 }) {
   const posted: ToWebview[] = []
   const mainCalls: string[] = []
-  const taskFake = fakeTaskSession(options.taskEvents ?? [{ type: 'text_delta', text: '分身在干活' }])
+  /** 主任务 takeTaskResults 被调次数（回调戳主任务的观测点） */
+  let mainTakes = 0
+  const mainTaken = (): number => {
+    mainTakes++
+    return 0
+  }
+  const taskFake = fakeTaskSession(options.taskEvents ?? [{ type: 'text_delta', text: '分身在干活' }], options.taskHang)
   const built: string[] = []
   const choiceStore = {
     stored: new Map<string, unknown>(),
@@ -114,6 +132,7 @@ function taskHarness(options: {
         messages: () => [],
         historyRows: () => [],
         isRunning: () => false,
+        takeTaskResults: () => mainTaken(),
         interrupt: () => {},
         bgSnapshot: () => [],
         terminateBg: () => [],
@@ -138,11 +157,13 @@ function taskHarness(options: {
               model: 'm',
               providers: { p: { models: { m: {} } } },
               memory: { idleSummarizeDelayMs: 0 },
+              taskModels: options.taskModels ?? [],
             },
             model: { effort: 'high', capabilities: { images: false }, contextWindow: 200_000 },
             request: { effort: 'high' },
           }
         },
+        defaultModel: options.mainDefault ?? { provider: 'p', model: 'm' },
       } as unknown as Session
       return session
     },
@@ -174,7 +195,16 @@ function taskHarness(options: {
     store.close()
   }
   const bridge = createBridge(deps)
-  return { bridge, posted, taskFake, built, choiceStore, depsFolder: deps.folder as string, mainCalls }
+  return {
+    bridge,
+    posted,
+    taskFake,
+    built,
+    choiceStore,
+    depsFolder: deps.folder as string,
+    mainCalls,
+    mainTakes: () => mainTakes,
+  }
 }
 const choiceStoreOf = (h: ReturnType<typeof taskHarness>): Map<string, unknown> =>
   h.choiceStore.stored
@@ -202,14 +232,26 @@ describe('分身任务接线', () => {
     // 任务目录在主干文件夹下 fork 出来（manifest 写进去才算派成）
   })
 
-  it('派活后 kick 一次私有压缩（继承段进场顶替，不阻塞 brief）', async () => {
-    const h = taskHarness({ taskEvents: [{ type: 'text_delta', text: '第一轮' }] })
+  it('任务轮末收尾分段计时：记一行 turn_end_host（带 owner）', async () => {
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../../core/src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    const h = taskHarness({ taskEvents: [{ type: 'text_delta', text: '分身说' }] })
     h.bridge.handle({ type: 'ready' })
     await settle()
-    h.bridge.handle({ type: 'task_dispatch', brief: '继承段压缩' })
-    for (let i = 0; i < 4; i++) await settle()
-    // dispatch 即 kick：不等 idle 30 秒，任务摘要器马上开始收继承段
-    expect(h.taskFake.calls).toContain('summarizeIdle')
+    h.bridge.handle({ type: 'task_dispatch', brief: '调研某库\n细节' })
+    await settle()
+    await settle()
+    spy.mockRestore()
+    const rows = calls.filter((c) => c.ev === 'turn_end_host')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({
+      owner: expect.stringMatching(/^task-/),
+      foldMs: expect.any(Number),
+      items: expect.any(Number),
+      postMs: expect.any(Number),
+      tailMs: expect.any(Number),
+    })
   })
 
   it('dispatch 撞 database is locked → 退避重试后自愈（不卡 running）', async () => {
@@ -237,6 +279,9 @@ describe('分身任务接线', () => {
   })
 
   it('session 建立连续失败 → 任务进 error 态可见（不再无声 running）', async () => {
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../../core/src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
     const h = taskHarness({
       taskSessionErrors: Array.from({ length: 6 }, () => new Error('database is locked')),
     })
@@ -245,6 +290,11 @@ describe('分身任务接线', () => {
     h.bridge.handle({ type: 'task_dispatch', brief: '永远撞锁' })
     await new Promise((r) => setTimeout(r, 900))
     for (let i = 0; i < 6; i++) await settle()
+    spy.mockRestore()
+    // runlog 也有一行（任务条的错误 reload 后就没了）
+    expect(calls.filter((c) => c.ev === 'task_session_fail')).toMatchObject([
+      { task: '永远撞锁', error: expect.stringContaining('database is locked') },
+    ])
     const tasks = h.posted.filter((m) => m.type === 'tasks').at(-1) as
       | { tasks: { name: string; status: string; error?: string }[] }
       | undefined
@@ -313,7 +363,7 @@ describe('分身任务接线', () => {
     await settle()
   })
 
-  it('派活时主干在跑 → fatal 拒掉，不建任务', async () => {
+  it('派活时主干在跑 → 照样开成（task-trunk 去掉主任务静止闸；对照：v3 这里 fatal 拒）', async () => {
     let release!: () => void
     const blocked = new Promise<void>((r) => {
       release = r
@@ -329,16 +379,13 @@ describe('分身任务接线', () => {
     await settle()
     h.bridge.handle({ type: 'task_dispatch', brief: '新任务' })
     await settle()
-    expect(h.posted.some((m) => m.type === 'fatal')).toBe(true)
-    expect(h.posted.some((m) => m.type === 'tasks')).toBe(false)
-    expect(h.built).not.toContain('task')
+    expect(h.posted.some((m) => m.type === 'fatal')).toBe(false)
+    expect(h.posted.some((m) => m.type === 'tasks')).toBe(true)
     release()
     await settle()
   })
 
-  // 用户设计（2026-09-30 重申）：开任务与关任务都只能在主任务 turn 结束后。
-  // v3 规格曾把关闭闸删掉（task-v3.md:19），9-24 那次讨论把后台摘要合并与任务
-  // 关闭混为一谈，闸门没被找回来
+  // task-trunk（2026-10-29 用户拍板）：开/关任务只写自己的行和段表，不再等主任务静止
   const taskNames = (h: ReturnType<typeof taskHarness>) =>
     h.posted
       .filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks')
@@ -346,7 +393,7 @@ describe('分身任务接线', () => {
   const manifests = (h: ReturnType<typeof taskHarness>) =>
     readdirSync(join(h.depsFolder, '.simple-code', 'tasks')).filter((f) => f.endsWith('.json'))
 
-  it('主任务在跑时点关闭：拒绝，任务原样保留', async () => {
+  it('主任务在跑时点关闭：照样关掉（对照：v3 这里拒绝）', async () => {
     let release!: () => void
     const blocked = new Promise<void>((r) => {
       release = r
@@ -354,7 +401,7 @@ describe('分身任务接线', () => {
     const h = taskHarness({ mainEvents: [{ type: 'text_delta', text: '主干在跑' }], mainHang: () => blocked })
     h.bridge.handle({ type: 'ready' })
     await settle()
-    h.bridge.handle({ type: 'task_dispatch', brief: '关不掉' })
+    h.bridge.handle({ type: 'task_dispatch', brief: '跑着也能关' })
     await settle()
     const name = taskNames(h)[0] as string
     h.bridge.handle({ type: 'send', text: '主任务开跑' })
@@ -362,45 +409,11 @@ describe('分身任务接线', () => {
     h.posted.length = 0
     h.bridge.handle({ type: 'task_close', name })
     for (let i = 0; i < 4; i++) await settle()
-    const fatal = h.posted.find((m): m is Extract<ToWebview, { type: 'fatal' }> => m.type === 'fatal')
-    expect(fatal?.message).toContain('等这轮跑完再关闭任务')
-    expect(manifests(h)).toHaveLength(1)
-    expect(h.taskFake.calls).not.toContain('close')
+    expect(h.posted.some((m) => m.type === 'fatal')).toBe(false)
+    expect(manifests(h)).toHaveLength(0)
+    expect(h.taskFake.calls).toContain('close')
     release()
     await settle()
-  })
-
-  it('点关闭时主任务停着、排空期间主任务开跑：还俗等主任务这轮结束才落', async () => {
-    let releaseMain!: () => void
-    const mainBlocked = new Promise<void>((r) => {
-      releaseMain = r
-    })
-    const h = taskHarness({ mainEvents: [{ type: 'text_delta', text: '主干在跑' }], mainHang: () => mainBlocked })
-    h.bridge.handle({ type: 'ready' })
-    await settle()
-    h.bridge.handle({ type: 'task_dispatch', brief: '慢慢关' })
-    await settle()
-    const name = taskNames(h)[0] as string
-    let releaseDrain!: () => void
-    const drain = new Promise<void>((r) => {
-      releaseDrain = r
-    })
-    ;(h.taskFake.session as unknown as { summarizeIdle: () => Promise<boolean> }).summarizeIdle = async () => {
-      await drain
-      return false
-    }
-    h.bridge.handle({ type: 'task_close', name })
-    await settle()
-    // 排空中，用户给主任务发了消息
-    h.bridge.handle({ type: 'send', text: '关闭期间主任务开跑' })
-    await settle()
-    releaseDrain()
-    for (let i = 0; i < 6; i++) await settle()
-    expect(manifests(h)).toHaveLength(1) // 还俗没落：主任务还在跑
-    releaseMain()
-    for (let i = 0; i < 8; i++) await settle()
-    expect(manifests(h)).toHaveLength(0) // 主任务这轮结束后才还俗
-    expect(h.taskFake.calls).toContain('close')
   })
 
   it('fork 撞锁（主任务摘要器在写库）→ 退避重试后开成', async () => {
@@ -476,6 +489,7 @@ describe('分身任务接线', () => {
       .at(-1)
     const items = hydrate?.items ?? []
     expect(items.some((i) => i.kind === 'user' && i.text === '顺便看下这个')).toBe(false)
+    expect(hydrate?.queued ?? [], '排队气泡也撤掉').toEqual([])
     const notice = items.find((i) => i.kind === 'notice')
     expect(notice).toMatchObject({ kind: 'notice', errorKind: '插话失败' })
     expect((notice as { text: string }).text).toContain('顺便看下这个')
@@ -549,7 +563,7 @@ describe('分身任务接线', () => {
     for (let i = 0; i < 6; i++) await settle()
   })
 
-  it('runlog 对账（2026-09-30 补观测）：fork 记号段、摘要失败逐条记原因、close 记轮数/耗时/改动行数', async () => {
+  it('runlog 对账（2026-09-30 补观测）：fork 记身份与父任务、摘要失败逐条记原因、close 记轮数/耗时/改动行数', async () => {
     const calls: Record<string, unknown>[] = []
     const mod = await import('../../core/src/runlog.ts')
     const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
@@ -560,9 +574,15 @@ describe('分身任务接线', () => {
       h.bridge.handle({ type: 'task_dispatch', brief: '摘要会挂' })
       await settle()
       const fork = calls.find((c) => c.ev === 'task_fork')
-      for (const k of ['forkTurn', 'turnCeil', 'stepFloor', 'msgFloor', 'sumFloor']) {
-        expect(typeof fork?.[k]).toBe('number')
-      }
+      expect(fork).toMatchObject({ parent: '', via: 'user' }) // 在主任务 tab 里开的
+      expect(typeof fork?.ms).toBe('number')
+      // 开任务不开段：段等第一轮开始（store beginTurn）才开（规则 13，core task.test 有真库用例）
+      expect(calls.some((c) => c.ev === 'segment_open' && c.owner === fork?.owner)).toBe(false)
+      await h.bridge.dispatchFromAgent('agent 派的', '')
+      expect(calls.filter((c) => c.ev === 'task_fork').at(-1)).toMatchObject({
+        via: 'agent',
+        parent: '',
+      })
       const s = h.taskFake.session as unknown as { summarizeIdle: () => Promise<boolean>; summaryDebt: () => boolean }
       s.summarizeIdle = async () => {
         throw new Error('摘要模型 503')
@@ -570,7 +590,8 @@ describe('分身任务接线', () => {
       s.summaryDebt = () => true
       const name = h.posted
         .filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks')
-        .at(-1)?.tasks[0]?.name
+        .at(-1)
+        ?.tasks.find((t) => t.name === '摘要会挂')?.name
       h.bridge.handle({ type: 'task_close', name: name as string })
       for (let i = 0; i < 6; i++) await settle()
       const fails = calls.filter((c) => c.ev === 'task_close_summary_fail')
@@ -578,7 +599,7 @@ describe('分身任务接线', () => {
       expect(String(fails[0]?.error)).toContain('摘要模型 503')
       const close = calls.find((c) => c.ev === 'task_close')
       expect(close).toMatchObject({ rounds: 3, failures: 3, debtLeft: true })
-      for (const k of ['ms', 'flipped', 'sumDeleted', 'sumPromoted', 'msgDeleted', 'msgPromoted', 'turnsPromoted']) {
+      for (const k of ['ms', 'flipped', 'sumDeleted', 'msgDeleted', 'segments']) {
         expect(typeof close?.[k]).toBe('number')
       }
     } finally {
@@ -663,6 +684,69 @@ describe('分身任务接线', () => {
     await settle()
   })
 
+  it('**分支插话等 input_delivered 才摆进镜像**：投递前在 queued，投递后排在 core 投递的位置', async () => {
+    // 同 bridge 那条（2026-10-31 真机：实时与 reload 后插话位置相反）
+    let open!: () => void
+    const gate = new Promise<void>((r) => {
+      open = r
+    })
+    let release!: () => void
+    const blocked = new Promise<void>((r) => {
+      release = r
+    })
+    const h = taskHarness({ taskEvents: [] })
+    let calls = 0
+    ;(h.taskFake.session as unknown as { send: (t: string) => AsyncGenerator<{ type: string }> }).send = (
+      t: string,
+    ) => {
+      h.taskFake.calls.push(`send:${t}`)
+      const first = calls++ === 0
+      return (async function* () {
+        if (!first) return // 插话：真实 session 入队即返回空流
+        yield { type: 'tool_input_start', id: 't1', name: 'bash' }
+        await gate // 工具跑着时插话
+        yield { type: 'input_delivered' } // loop 顶出队
+        yield { type: 'text_start' }
+        await blocked
+      })()
+    }
+    const reopen = async () => {
+      h.posted.length = 0
+      h.bridge.handle({ type: 'task_open', task: '长活' })
+      await settle()
+      return h.posted.find((m): m is Extract<ToWebview, { type: 'task_hydrate' }> => m.type === 'task_hydrate')
+    }
+    const shape = (items: ChatItem[] = []): string[] => {
+      const from = items.findIndex((i) => i.kind === 'user' && i.text === '长活')
+      return items.slice(from).map((i) => (i.kind === 'user' ? `user:${i.text}` : i.kind))
+    }
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'task_dispatch', brief: '长活' })
+    await settle()
+    await settle()
+    h.bridge.handle({ type: 'task_send', task: '长活', text: '插一句' })
+    await settle()
+    await settle()
+
+    const queued = await reopen()
+    expect(shape(queued?.items)).toEqual(['user:长活', 'tool'])
+    expect(queued?.queued).toEqual([{ kind: 'user', text: '插一句', interject: true }])
+
+    open()
+    await settle()
+    const delivered = await reopen()
+    expect(shape(delivered?.items)).toEqual(['user:长活', 'tool', 'user:插一句', 'assistant'])
+    expect(delivered?.queued ?? []).toEqual([])
+    const items = delivered?.items ?? []
+    expect(items.find((i) => i.kind === 'user' && i.text === '长活')).not.toHaveProperty('interject')
+    expect(items.find((i) => i.kind === 'user' && i.text === '插一句')).toMatchObject({ interject: true })
+    release()
+    await settle()
+    // 轮结束 fold：插话已落库（基线重读），queued 清空，不再重复画
+    expect((await reopen())?.queued ?? []).toEqual([])
+  })
+
   it('task_open → 补一份 task_hydrate 基线（选中分支时宿主是唯一真相）', async () => {
     const h = taskHarness({ taskEvents: [{ type: 'text_delta', text: '分支经历' }] })
     h.bridge.handle({ type: 'ready' })
@@ -724,30 +808,26 @@ describe('分身任务接线', () => {
     expect(h.taskFake.calls.some((c) => c.startsWith('setModel:'))).toBe(true)
   })
 
-  it('满 3 个：第 4 个派活 fatal 拒绝，tasks 消息带 limit（+ 入口显隐的真相）', async () => {
+  it('不限数（task-trunk）：连开 6 个都受理，tasks 快照不再带 limit', async () => {
     const h = taskHarness({ taskEvents: [] })
     h.bridge.handle({ type: 'ready' })
     await settle()
-    for (const brief of ['一', '二', '三']) {
+    for (const brief of ['一', '二', '三', '四', '五', '六']) {
       h.bridge.handle({ type: 'task_dispatch', brief })
       await settle()
     }
-    h.bridge.handle({ type: 'task_dispatch', brief: '第四个' })
-    await settle()
-    expect(h.posted.some((m) => m.type === 'fatal')).toBe(true)
-    // 第 4 个被拒不发新快照——最后一份 tasks 仍是 3 个 + limit
+    expect(h.posted.some((m) => m.type === 'fatal')).toBe(false)
     const snap = h.posted
       .filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks')
       .at(-1)
-    expect(snap?.tasks).toHaveLength(3)
-    expect(snap?.limit).toBe(3)
-    // 关一个就有位置了
+    expect(snap?.tasks).toHaveLength(6)
+    expect(snap && 'limit' in snap).toBe(false)
     h.bridge.handle({ type: 'task_close', name: '二' })
     for (let i = 0; i < 4; i++) await settle()
     const after = h.posted
       .filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks')
       .at(-1)
-    expect(after?.tasks).toHaveLength(2)
+    expect(after?.tasks).toHaveLength(5)
   })
 
   it('带 task 的 get_regions 走任务 session 的 memoryRoot', async () => {
@@ -955,5 +1035,313 @@ describe('分身任务接线', () => {
     await settle()
     expect(h.posted.some((m) => m.type === 'tasks')).toBe(true)
     expect(h.posted.some((m) => m.type === 'task_hydrate')).toBe(true)
+  })
+})
+
+describe('完成回调（task-trunk 规则 12）', () => {
+  const mailbox = (folder: string): { owner: string; text: string }[] => {
+    const db = new DatabaseSync(join(folder, MEMORY_RELATIVE, 'state.db'))
+    const rows = db.prepare(`SELECT owner, text FROM task_results ORDER BY id`).all() as {
+      owner: string
+      text: string
+    }[]
+    db.close()
+    return rows
+  }
+  const manifestOf = (folder: string): Record<string, unknown> => {
+    const dir = join(folder, '.simple-code', 'tasks')
+    const file = readdirSync(dir).find((f) => f.endsWith('.json')) ?? ''
+    return JSON.parse(readFileSync(join(dir, file), 'utf8')) as Record<string, unknown>
+  }
+  const settleN = async (n = 6): Promise<void> => {
+    for (let i = 0; i < n; i++) await settle()
+  }
+
+  it('主任务派的任务：派出那一轮结束投一次给主任务（状态 + 最后回复原文），戳主任务取走；第二轮不再投', async () => {
+    const h = taskHarness({ realStore: true, taskEvents: [{ type: 'text_delta', text: '查完了：结论在此' }] })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'send', text: '先说一句' }) // 建主任务 session
+    await settleN()
+    const takesBefore = h.mainTakes()
+    await h.bridge.dispatchFromAgent('调研某库', '')
+    await settleN()
+    expect(mailbox(h.depsFolder)).toEqual([{ owner: '', text: '〔任务结果〕调研某库 · 完成\n查完了：结论在此' }])
+    expect(manifestOf(h.depsFolder).callback).toBe('done')
+    expect(h.mainTakes()).toBeGreaterThan(takesBefore) // 戳了主任务
+    // 第二轮（用户切进任务接着说）：不再回调
+    h.bridge.handle({ type: 'task_send', task: '调研某库', text: '再查一点' })
+    await settleN()
+    expect(mailbox(h.depsFolder)).toHaveLength(1)
+  })
+
+  it('主任务 session 还没建（面板未 attach：reload 恢复时补的回调、后台目录的任务）：回调到时建出来取走，不等用户下一句', async () => {
+    // 不发 ready：attach 会顺手建主任务 session，那就测不到 pending===null 这条路
+    const h = taskHarness({ realStore: true, taskEvents: [{ type: 'text_delta', text: '结论' }] })
+    expect(h.mainTakes()).toBe(0)
+    await h.bridge.dispatchFromAgent('没说话就开', '')
+    await settleN()
+    expect(mailbox(h.depsFolder)).toHaveLength(1)
+    expect(h.mainTakes()).toBeGreaterThan(0) // 修前：pending===null 直接 return，信箱干等
+  })
+
+  it('轮内出错 → 状态写「出错」', async () => {
+    const h = taskHarness({
+      realStore: true,
+      taskEvents: [{ type: 'error', message: '上游 500' }],
+    })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    await h.bridge.dispatchFromAgent('会出错的', '')
+    await settleN()
+    expect(mailbox(h.depsFolder)[0]?.text).toMatch(/^〔任务结果〕会出错的 · 出错：上游 500\n/)
+  })
+
+  it('任务里派的任务回调给派它的任务（owner 键），不给主任务', async () => {
+    const h = taskHarness({ realStore: true })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    await h.bridge.dispatchFromAgent('父', '')
+    await settleN()
+    const parentOwner = String(manifestOf(h.depsFolder).owner)
+    await h.bridge.dispatchFromAgent('子', parentOwner)
+    await settleN()
+    const rows = mailbox(h.depsFolder)
+    expect(rows.map((r) => r.owner)).toEqual(['', parentOwner]) // 父回主任务、子回父
+    expect(rows[1]?.text.startsWith('〔任务结果〕子 · 完成')).toBe(true)
+  })
+
+  it('派出那一轮被停止键打断 → 状态写「被停止」，带停之前的回复', async () => {
+    let release = (): void => {}
+    const h = taskHarness({
+      realStore: true,
+      taskEvents: [{ type: 'text_delta', text: '做到一半' }],
+      taskHang: () => new Promise<void>((r) => (release = r)),
+    })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    await h.bridge.dispatchFromAgent('长活', '')
+    await settleN()
+    expect(mailbox(h.depsFolder)).toEqual([]) // 还在跑：不投
+    h.bridge.handle({ type: 'task_stop', name: '长活' })
+    await settle()
+    release() // 假 session 没有真中断：放行即「中断后流结束」
+    await settleN()
+    expect(mailbox(h.depsFolder)).toEqual([{ owner: '', text: '〔任务结果〕长活 · 被停止\n做到一半' }])
+  })
+
+  it('登记者已关闭（manifest 里的 parent 已不在）：不投，标已回调', async () => {
+    const folder = mkdtempSync(join(tmpdir(), 'sc-taskcb-'))
+    const { createTask } = await import('@simple-code/core')
+    createTask(folder, '孤儿', { parent: 'task-gone' })
+    const h = taskHarness({ folder })
+    h.bridge.handle({ type: 'ready' })
+    await settleN()
+    expect(mailbox(folder)).toEqual([])
+    expect(manifestOf(folder).callback).toBe('done')
+  })
+
+  it('agent 派任务（$SIMPLE_CODE_TASK）：进任务条、同名自动编号不拒、回调给派它的会话', async () => {
+    const h = taskHarness({ realStore: true, taskEvents: [{ type: 'text_delta', text: '子结论' }] })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    const a = await h.bridge.dispatchFromAgent('查 A 库\n细节', '')
+    const b = await h.bridge.dispatchFromAgent('查 A 库\n另一个角度', '')
+    expect(a).toEqual({ ok: true, name: '查 A 库' })
+    expect(b).toEqual({ ok: true, name: '查 A 库 2' })
+    await settleN()
+    const snap = h.posted.filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks').at(-1)
+    expect(snap?.tasks.map((t) => t.name).sort()).toEqual(['查 A 库', '查 A 库 2'])
+    expect(mailbox(h.depsFolder).map((r) => r.text.split('\n')[0])).toEqual([
+      '〔任务结果〕查 A 库 · 完成',
+      '〔任务结果〕查 A 库 2 · 完成',
+    ])
+    // 用户 /task 同名仍拒（行为不变，对照）
+    h.bridge.handle({ type: 'task_dispatch', brief: '查 A 库' })
+    await settle()
+    expect(h.posted.some((m) => m.type === 'fatal' && m.message.includes('已有同名任务'))).toBe(true)
+  })
+
+  it('用户开的任务（/task、反思按钮）不登记、不回调；agent 派的照常回调（对照）', async () => {
+    // 10-30 用户订正规则 12：只有 SC 派出的任务回调。修前三个用户入口都传 parent
+    // 就登记，真机用户开的任务回调进主任务三次
+    const h = taskHarness({ realStore: true, taskEvents: [{ type: 'text_delta', text: '结论' }] })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'task_dispatch', brief: '用户开的' })
+    await settleN()
+    expect(manifestOf(h.depsFolder)).not.toHaveProperty('parent')
+    expect(manifestOf(h.depsFolder)).not.toHaveProperty('callback')
+    h.bridge.handle({ type: 'reflect_start' })
+    await settleN()
+    expect(h.posted.some((m) => m.type === 'reflect_result' && m.ok)).toBe(true)
+    expect(mailbox(h.depsFolder)).toEqual([])
+    await h.bridge.dispatchFromAgent('agent 派的', '')
+    await settleN()
+    expect(mailbox(h.depsFolder)).toEqual([{ owner: '', text: '〔任务结果〕agent 派的 · 完成\n结论' }])
+  })
+
+  it('agent 派任务带 --model（规则 14）：建会话时先套模型与档位再跑、存进 choiceStore；列表外拒绝不建；不写不套（对照）', async () => {
+    const h = taskHarness({ taskModels: [{ provider: 'p', model: 'm2', effort: 'low', use: '查' }] })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    expect(await h.bridge.dispatchFromAgent('指定模型', '', 'm2')).toEqual({ ok: true, name: '指定模型' })
+    await settleN()
+    const calls = h.taskFake.calls
+    const setAt = calls.indexOf('setModel:{"provider":"p","model":"m2","effort":"low"}')
+    expect(setAt).toBeGreaterThanOrEqual(0)
+    expect(calls).toContain('setEffort:low')
+    expect(setAt).toBeLessThan(calls.findIndex((c) => c.startsWith('send:'))) // 第一轮之前就套上
+    expect([...choiceStoreOf(h).keys()]).toHaveLength(1)
+    const miss = await h.bridge.dispatchFromAgent('列表外', '', 'gpt-9')
+    expect(miss).toMatchObject({ ok: false, error: expect.stringContaining('不在 taskModels 里') })
+    expect(await h.bridge.dispatchFromAgent('不指定', '')).toEqual({ ok: true, name: '不指定' })
+    await settleN()
+    expect(calls.filter((c) => c.startsWith('setModel:'))).toHaveLength(1)
+    const snap = h.posted.filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks').at(-1)
+    expect(snap?.tasks.map((t) => t.name).sort()).toEqual(['不指定', '指定模型'])
+  })
+
+  it('bin --models 报的默认 = 建会话时的配置默认，不是主任务切换后的模型（10-30 真机误报）', async () => {
+    const models = [{ provider: 'p', model: 'm2', use: '查' }]
+    // 主任务当前 config 是 p/m（模拟切换后），配置默认是 p/m0
+    const h = taskHarness({ taskModels: models, mainDefault: { provider: 'p', model: 'm0' } })
+    expect(await h.bridge.taskModels()).toEqual({ ok: true, models, defaultModel: 'p/m0' })
+    const same = taskHarness({ taskModels: models }) // 对照：没切过，两者相同
+    expect(await same.bridge.taskModels()).toEqual({ ok: true, models, defaultModel: 'p/m' })
+  })
+
+  it('派出那一轮被 reload 打断（manifest 仍 pending）：恢复时补一次「被停止」回调', async () => {
+    const folder = mkdtempSync(join(tmpdir(), 'sc-taskcb-'))
+    {
+      const h = taskHarness({ folder, realStore: true })
+      h.bridge.handle({ type: 'ready' })
+      await settle()
+    }
+    const { createTask } = await import('@simple-code/core')
+    createTask(folder, '被打断的', { parent: '' })
+    const h2 = taskHarness({ folder })
+    h2.bridge.handle({ type: 'ready' })
+    await settleN()
+    expect(mailbox(folder)).toEqual([{ owner: '', text: '〔任务结果〕被打断的 · 被停止（窗口重载打断）\n（没有回复文本）' }])
+    expect(manifestOf(folder).callback).toBe('done')
+  })
+
+  it('恢复时读最后回复抛错（坏行）：回调照补、正文留空，任务中心照常起来', async () => {
+    const folder = mkdtempSync(join(tmpdir(), 'sc-taskcb-'))
+    {
+      const h = taskHarness({ folder, realStore: true })
+      h.bridge.handle({ type: 'ready' })
+      await settle()
+    }
+    const { createTask, scopeOf } = await import('@simple-code/core')
+    const m = createTask(folder, '坏行的', { parent: '' })
+    const s = openStore(folder, { task: scopeOf(m) })
+    const turn = s.beginTurn({ model: 'p/m', effort: null })
+    s.save([
+      { role: 'user', parts: [{ type: 'text', text: '问' }] },
+      { role: 'assistant', parts: [{ type: 'text', text: '答' }] },
+    ])
+    s.finishTurn(turn, 1, 'done')
+    s.close()
+    const db = new DatabaseSync(join(folder, MEMORY_RELATIVE, 'state.db'))
+    db.prepare(
+      `UPDATE messages SET content_json = '{坏' WHERE owner = ? AND role = 'assistant'`,
+    ).run(m.owner)
+    db.close()
+    const h2 = taskHarness({ folder })
+    h2.bridge.handle({ type: 'ready' })
+    await settleN()
+    expect(mailbox(folder)).toEqual([
+      { owner: '', text: '〔任务结果〕坏行的 · 被停止（窗口重载打断）\n（没有回复文本）' },
+    ])
+    expect(manifestOf(folder).callback).toBe('done')
+  })
+
+  /** 发给任务 session 的原文（fake 记成 send:<text>） */
+  const sentOf = (h: ReturnType<typeof taskHarness>): string[] =>
+    h.taskFake.calls.filter((c) => c.startsWith('send:')).map((c) => c.slice('send:'.length))
+
+  it('只输名称开空任务（规则 13）：idle 不跑，可先切模型；第一条拼框架句只拼一次；用户开的不回调', async () => {
+    const h = taskHarness({ realStore: true, taskEvents: [{ type: 'text_delta', text: '空任务答' }] })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'task_create', name: '空任务' })
+    await settleN()
+    const snap = h.posted.filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks').at(-1)
+    expect(snap?.tasks.map((t) => [t.name, t.status])).toEqual([['空任务', 'idle']])
+    expect(sentOf(h)).toEqual([]) // 建好不跑
+    expect(manifestOf(h.depsFolder)).toMatchObject({ awaitingFirstMessage: true })
+    expect(manifestOf(h.depsFolder)).not.toHaveProperty('callback')
+    h.bridge.handle({ type: 'setModel', choice: { provider: 'p', model: 'm2' }, task: '空任务' })
+    await settleN()
+    expect(h.taskFake.calls).toContain('setModel:{"provider":"p","model":"m2"}')
+    expect(sentOf(h)).toEqual([])
+    h.bridge.handle({ type: 'task_send', task: '空任务', text: '第一句' })
+    await settleN()
+    const [first] = sentOf(h)
+    expect(first?.startsWith('（task-空任务：你是一个独立任务')).toBe(true)
+    expect(first?.endsWith('\n\n第一句')).toBe(true)
+    expect(manifestOf(h.depsFolder).awaitingFirstMessage).toBeUndefined()
+    expect(mailbox(h.depsFolder)).toEqual([]) // 第一轮结束也不回调
+    h.bridge.handle({ type: 'task_send', task: '空任务', text: '第二句' })
+    await settleN()
+    expect(sentOf(h).at(-1)).toBe('第二句') // 不再拼
+    expect(mailbox(h.depsFolder)).toEqual([])
+  })
+
+  it('老的空任务（10-30 前用户开的，manifest 仍 pending + awaitingFirstMessage）被 reload：恢复 idle、不补回调；第一条照样拼框架句', async () => {
+    const folder = mkdtempSync(join(tmpdir(), 'sc-taskcb-'))
+    {
+      const h = taskHarness({ folder, realStore: true })
+      h.bridge.handle({ type: 'ready' })
+      await settle()
+    }
+    const { createTask } = await import('@simple-code/core')
+    createTask(folder, '没说话的', { parent: '', awaitingFirstMessage: true })
+    const h2 = taskHarness({ folder })
+    h2.bridge.handle({ type: 'ready' })
+    await settleN()
+    expect(mailbox(folder)).toEqual([]) // 对照：上一条用例里非空任务被打断会补「被停止」
+    expect(manifestOf(folder)).toMatchObject({ awaitingFirstMessage: true, callback: 'pending' })
+    h2.bridge.handle({ type: 'task_send', task: '没说话的', text: '开工' })
+    await settleN()
+    expect(sentOf(h2)[0]?.startsWith('（task-没说话的：')).toBe(true)
+  })
+})
+
+
+describe('桌面机器人：任务的结局（desktop-robot.md §5.3）', () => {
+  const taskOf = (h: ReturnType<typeof taskHarness>, name: string) =>
+    h.bridge.robotView().tasks.find((t) => t.task === name)
+
+  it('跑完：done + 最后一段回答；轮内 error 事件结束：error', async () => {
+    const h = taskHarness({ taskEvents: [{ type: 'text_start' }, { type: 'text_delta', text: '调研完了。' }] })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'task_dispatch', brief: '调研某库' })
+    await settle()
+    await settle()
+    expect(taskOf(h, '调研某库')).toMatchObject({ running: false, lastTurn: { end: 'done', text: '调研完了。' } })
+    expect(taskOf(h, '调研某库')?.startedAt).toBeTypeOf('number')
+
+    const e = taskHarness({ taskEvents: [{ type: 'error', message: 'PrefixBrokenError: 前缀被改写' }] })
+    e.bridge.handle({ type: 'ready' })
+    await settle()
+    e.bridge.handle({ type: 'task_dispatch', brief: '会出错' })
+    await settle()
+    await settle()
+    expect(taskOf(e, '会出错')?.lastTurn).toMatchObject({ end: 'error', text: 'PrefixBrokenError: 前缀被改写' })
+  })
+
+  it('会话建不起来（ensureSession 回 null，不走 catch）：也记 error，不误报 done', async () => {
+    const h = taskHarness({ taskSessionErrors: Array.from({ length: 6 }, () => new Error('database is locked')) })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'task_dispatch', brief: '永远撞锁' })
+    await new Promise((r) => setTimeout(r, 900))
+    for (let i = 0; i < 6; i++) await settle()
+    expect(taskOf(h, '永远撞锁')?.lastTurn).toMatchObject({ end: 'error' })
+    expect(taskOf(h, '永远撞锁')?.lastTurn?.text).toContain('会话建立失败')
   })
 })

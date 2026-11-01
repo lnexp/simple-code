@@ -40,6 +40,23 @@ async function writeWorkspace(value: unknown) {
 const load = (env: NodeJS.ProcessEnv = {}) => loadConfig(join(root, 'ws'), { globalPath, env })
 
 describe('config / 基本加载', () => {
+  it('AGENTS 上限默认 2048，可由工作区覆盖且只接受正整数', async () => {
+    expect(configSchema.parse(MINIMAL).memory.agentsMaxTokens).toBe(2048)
+    for (const value of [0, -1, 1.5, '4096']) {
+      expect(() => configSchema.parse({ ...MINIMAL, memory: { agentsMaxTokens: value } })).toThrow()
+    }
+    await writeGlobal({ ...MINIMAL, memory: { agentsMaxTokens: 4096 } })
+    expect((await load()).config.memory.agentsMaxTokens).toBe(4096)
+    await writeWorkspace({ memory: { agentsMaxTokens: 1024 } })
+    expect((await load()).config.memory.agentsMaxTokens).toBe(1024)
+  })
+  it('note 四类型共享预算默认值、比例校验与旧配置兼容', () => {
+    expect(configSchema.parse(MINIMAL).memory.noteBudgetTokens).toBe(2100)
+    expect(configSchema.parse(MINIMAL).memory.noteRatios).toEqual({ general: .35, lesson: .1, principle: .2, goal: .35 })
+    expect(() => configSchema.parse({ ...MINIMAL, memory: { noteRatios: { goal: .8 } } })).toThrow('比例之和')
+    expect(() => configSchema.parse({ ...MINIMAL, memory: { noteBudgetTokens: 0 } })).toThrow()
+    expect(configSchema.parse({ ...MINIMAL, memory: { noteRatios: { general: 1, lesson: 0, principle: 0, goal: 0 } } }).memory.noteRatios.goal).toBe(0)
+  })
   it('最小配置能解析出协议、baseUrl、模型规格', async () => {
     await writeGlobal(MINIMAL)
     const loaded = await load()
@@ -100,7 +117,34 @@ describe('config / 基本加载', () => {
   })
 
   it('两份配置都不存在时报错，而不是用一套猜出来的默认值', async () => {
-    await expect(load()).rejects.toThrow(/配置校验失败/)
+    const error = await load().catch((e: Error) => e)
+    expect(error).toBeInstanceOf(Error)
+    expect(String(error)).toContain(`还没有配置文件：${globalPath}`)
+    expect(String(error)).toContain('https://github.com/lnexp/simple-code#快速开始')
+    expect(String(error)).toContain('${SIMPLE_CODE_API_KEY}')
+    expect(String(error)).not.toContain('expected string')
+    await writeGlobal(MINIMAL)
+    expect((await load()).config.model).toBe('m')
+  })
+
+  it.each([{}, null])('已有配置 %j 不误报文件不存在', async (value) => {
+    await writeGlobal(value)
+    await expect(load()).rejects.toThrow('配置校验失败')
+  })
+
+  it('坏 JSON 保留文件路径与具体错误', async () => {
+    await writeFile(globalPath, '{')
+    await expect(load()).rejects.toThrow(`配置文件 ${globalPath} 不是合法的 JSON`)
+  })
+
+  it('配置路径是目录时保留读取错误，不引导创建文件', async () => {
+    await mkdir(globalPath)
+    await expect(load()).rejects.toThrow('EISDIR')
+  })
+
+  it('只有工作区配置时仍指向必需的用户级配置', async () => {
+    await writeWorkspace({ request: { effort: 'high' } })
+    await expect(load()).rejects.toThrow(`还没有配置文件：${globalPath}`)
   })
 })
 
@@ -312,6 +356,34 @@ describe('config / 工作区黑名单', () => {
     expect(loaded.warnings.join('\n')).toMatch(/providers\.p\.models\.m\.extraBody/)
   })
 
+  it('preset 里的 headers / extraBody 同样剥掉——选中预设就会生效', () => {
+    const { value, stripped } = stripDenied({
+      providers: {
+        p: {
+          models: {
+            m: {
+              presets: {
+                x: {
+                  headers: { authorization: 'Bearer attacker' },
+                  extraBody: { providerId: 999 },
+                  // 对照组：preset 的请求偏好不危险，留着
+                  request: { maxTokens: 10 },
+                },
+              },
+            },
+          },
+        },
+      },
+    })
+    expect(value).toEqual({
+      providers: { p: { models: { m: { presets: { x: { request: { maxTokens: 10 } } } } } } },
+    })
+    expect(stripped).toEqual([
+      'providers.p.models.m.presets.x.headers',
+      'providers.p.models.m.presets.x.extraBody',
+    ])
+  })
+
   it('剥离发生在合并之前——否则分不清 baseUrl 是谁给的', async () => {
     // 若顺序反了，合并后的对象里工作区的 baseUrl 已经盖掉了全局的，
     // 这时再按路径剥就把两个一起剥没了，provider 解析直接失败
@@ -319,6 +391,10 @@ describe('config / 工作区黑名单', () => {
     await writeWorkspace({ providers: { p: { baseUrl: 'https://evil.test' } } })
     const loaded = await load()
     expect(loaded.baseUrl).toBe('https://api.test')
+  })
+
+  it('单次发送的模型调用上限默认 5000（2026-11-01 拍板，与段宽 10000 对齐为单轮 step 上限）', () => {
+    expect(configSchema.parse(MINIMAL).loop.maxIterations).toBe(5000)
   })
 
   it('工作区没有黑名单字段时不产生 warn', async () => {
@@ -533,6 +609,30 @@ describe('visionModel 解析', () => {
   it('指向不存在的模型时报错并列出已配置的', async () => {
     await writeGlobal({ ...MINIMAL, visionModel: 'nope' })
     await expect(load()).rejects.toThrow(/visionModel "nope".*已配置的：m/s)
+  })
+})
+
+describe('config / taskModels（task-trunk 规则 14）', () => {
+  it('缺省 []；配了原样进 config（effort 可省）', async () => {
+    await writeGlobal({ ...MINIMAL })
+    expect((await load()).config.taskModels).toEqual([])
+    const list = [{ provider: 'p', model: 'm', effort: 'high', use: '改代码' }]
+    await writeGlobal({ ...MINIMAL, taskModels: list })
+    expect((await load()).config.taskModels).toEqual(list)
+  })
+
+  it('指向没登记的 provider / 模型：加载时报错并列出已配置的（对照：上一条登记了的不报）', async () => {
+    await writeGlobal({ ...MINIMAL, taskModels: [{ provider: 'p', model: 'nope', use: 'x' }] })
+    await expect(load()).rejects.toThrow(/taskModels\[0\] "nope".*已配置的：m/s)
+    await writeGlobal({ ...MINIMAL, taskModels: [{ provider: 'q', model: 'm', use: 'x' }] })
+    await expect(load()).rejects.toThrow(/taskModels\[0\] 的 provider "q"/)
+  })
+
+  it('use 必填、未知字段报错', async () => {
+    await writeGlobal({ ...MINIMAL, taskModels: [{ provider: 'p', model: 'm' }] })
+    await expect(load()).rejects.toThrow(/taskModels/)
+    await writeGlobal({ ...MINIMAL, taskModels: [{ provider: 'p', model: 'm', use: 'x', note: 'y' }] })
+    await expect(load()).rejects.toThrow(/未知的配置项 note/)
   })
 })
 

@@ -1,0 +1,5 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "$comment": ["只有宿主侧的小段 TS（拉起 .app、开关命令）；机器人本体是 app/ 下的 Swift"]
+}

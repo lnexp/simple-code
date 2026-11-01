@@ -111,7 +111,9 @@ search 定位 turn 作据、在 progress 行注明证据形态；「没再复现
 - event：闭环 progress <name> "<一句话>"；碎片 merge（旧文件先
   cp 到 .simple-code/tmp/event-merge-backup-$(date +%s)/，events
   通常不入 git，删了没有退路）；遗漏的事件补录。
-- lesson："$SIMPLE_CODE_LESSON" write（五段格式）。
+- lesson："$SIMPLE_CODE_NOTE" write --type lesson（Markdown 五段格式）。
+- principle：可提出候选、补依据；必须核对原话，不能将自己的推断当用户认可。
+- goal：不因整理记忆而切换当前目标；仅按明确要求订正，不自判主观目标完成。
 
 综述（主题加工的产物）规格：
 
@@ -137,10 +139,52 @@ search 定位 turn 作据、在 progress 行注明证据形态；「没再复现
 发现错误当场订正，再复读改动处；不能确认的明确写「未核实」，不把
 部分完成报成全部完成。收尾 event 写完也复读。
 
+## 第五步：自我诊断（必做）
+
+统计「同一类错误第二次出现」：用户纠正主会话 agent 的次数里，有多少
+是纠正前库里就有能避免它的内容。本步只统计不修——发现的问题写进报告，
+不在本步改 note/lesson。本步自成一段：先读完、最后一次性追加账本。
+
+1. 定范围。账本 .simple-code/diagnosis/self-diagnosis.md 存在 → 从最后
+   一行「覆盖 turn」的末号 +1 起；不存在（首次）→ 最近 14 天：先用
+   date 算出 14 天前的日期，再 find .simple-code/memory/turns -name
+   'turn-*.jsonl' -newermt '<该日期>' 取最小 turn 号。止于当前最新
+   turn（"$SIMPLE_CODE_MEMORY" log -n 1）。
+2. 找纠正。"$SIMPLE_CODE_MEMORY" log -n <范围条数> 分段读（每段
+   ≤150 行）每轮首条用户消息，疑似的用 show 看该轮与前一轮定性。
+   纠正 = 用户指出 agent 说错、做错，或提出了已否决/已存在的东西；
+   用户改自己的主意、补新要求不算。不靠关键词——没有纠正词的纠正
+   （如「定期检查就是反思」）一样算。〔系统〕模型切换行不算用户消息。
+3. 逐条判定。每条纠正先跑检索再定类，判定只凭命令输出：
+   - 必跑："$SIMPLE_CODE_NOTE" search <主题词> --all（默认跨普通记录、教训、原则、目标；主题词取纠正里的
+     名词，一次多试用 OR），涉及约定再 grep AGENTS.md。报告里每条
+     纠正写出所跑命令与命中条目名，0 命中写「0 命中」。
+   - 没跑检索的不能判「新错误」，记「未判定」。
+   - 新错误：纠正前库里（note/lesson/AGENTS.md 及否决清单/代码）
+     没有能避免它的内容。
+   - 重复·没想起来：有，但出错时不在上下文——条目不在常驻区，也
+     没在出错那几轮的 turn 文件里出现（grep 条目名核实）。
+   - 重复·想起来没用上：有，且出错时在上下文（在常驻区，或那几轮
+     turn 文件里读过、被 recall 过）。
+   重复必附证据：用户原话 + turn 号；既有条目路径 + 创建日期（front
+   matter 的 created、git log 或条目自带日期，命令核实，不凭印象），
+   且创建日期早于纠正。证据不足记「未判定」，不进重复数。
+   日期对比贴两行原文：grep -m1 '^created' <条目文件> 的输出，与
+   sqlite3 .simple-code/memory/state.db "select started_at from turns
+   where id=<turn>" 的输出。推翻已有判定（含以前的试算）同此标准。
+4. 写账本。首次用 apply_patch Add File 建，内容为下面两行表头；之后
+   cat >> 追加一行，追加后 tail -3 复读。明细每条只写 turn 号、一句话、
+   类别、条目名，完整证据进报告。
+   | 反思时间 | 覆盖 turn | 纠正 | 重复·没想起来 | 重复·想起来没用上 | 未判定 | 明细 |
+   |---|---|---|---|---|---|---|
+   反思时间取 date '+%Y-%m-%d %H:%M:%S' 输出；覆盖 turn 写「起–止」。
+   本期没有纠正也写一行（纠正 0），范围才能接续。
+
 ## 收尾（必做）
 
 1. 报告：写了什么（每条一句理由）、闭环了什么、放弃了什么及原因。
    简述自查发现并订正了什么、还有什么未核实；不要只写「自查通过」。
+   单列「自我诊断」一节：范围、纠正数、各类数、逐条明细与证据。
 2. 归档本次反思为 event：name 用 memory-reflect-<主题> 前缀（如
    memory-reflect-recall-review——产品按此前缀显示「上次反思」）。
    event-bin 无 create 子命令，用 apply_patch 直写

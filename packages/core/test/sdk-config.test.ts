@@ -123,13 +123,13 @@ it.skipIf(process.platform !== 'darwin').each(['m', 'summary'])(
   '任务可以从 %s 建立会话并切换SDK模型/preset，不改变摘要模型',
   async (initialModel) => {
     const { getSession } = await import('../src/session/session.ts')
-    const { forkTask, scopeOf } = await import('../src/session/task.ts')
+    const { createTask, scopeOf } = await import('../src/session/task.ts')
     const value = config()
     value.model = initialModel
     await load(value)
     const folder = dirs.at(-1)!
     const ws = join(folder, 'ws')
-    const task = scopeOf(forkTask(ws, 'SDK测试'))
+    const task = scopeOf(createTask(ws, 'SDK测试'))
     const session = await getSession(ws, {
       globalPath: join(folder, 'global.json'),
       env: {},

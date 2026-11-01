@@ -119,8 +119,8 @@ function toWireMessages(msg: Message): WireMessage[] {
   // - 发 {content:null} 无 tool_calls → DeepSeek 官方 API 400「content or
   //   tool_calls must be set」，不可重试，续写连死（2026-10-10 turn-000178）
   // - 整条跳过（e35d16c）→ 续写看不到截断前的推理，每次从头想、再被截断
-  //   （2026-10-24 Terminal-Bench glm-5.3-mb 4×32k 空转）
-  // 网关 glm-5.3-mb 实测 content:"" + reasoning_content 能读到推理；
+  //   （2026-10-24 Terminal-Bench 某 GLM 模型 4×32k 空转）
+  // 网关 某 GLM 模型 实测 content:"" + reasoning_content 能读到推理；
   // DeepSeek 官方对 "" 的接受度待远程机实测。三者全空才跳过
   const starved = content.length === 0 && toolCalls.length === 0
   if (starved && reasoning === '') return []

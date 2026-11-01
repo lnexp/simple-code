@@ -120,3 +120,166 @@ describe('回答结束后，过程收成一行', () => {
     expect(app.html()).not.toContain('已中断')
   })
 })
+
+describe('跑着时插话', () => {
+  /** 在输入框里打字回车（跑着时 = 插话） */
+  const enter = (text: string): void => {
+    const ta = document.querySelector('textarea') as HTMLTextAreaElement
+    const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set
+    act(() => {
+      setValue?.call(ta, text)
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    act(() => {
+      ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    })
+  }
+
+  it('**插话不把前面的过程折走**：插话前的说明和命令照样在、排在插话前面，跑完再一起折', () => {
+    const app = mount()
+    app.send(state(false))
+    enter('你来实现吧')
+    app.send(state(true))
+    app.send({ type: 'agent', event: { type: 'text_start' }, at: 1 })
+    app.send({ type: 'agent', event: { type: 'text_delta', text: '我先跑一下' }, at: 1 })
+    app.send({ type: 'agent', event: { type: 'text_end' }, at: 1 })
+    app.send({ type: 'agent', event: { type: 'tool_input_start', id: 't1', name: 'bash' }, at: 1 })
+    enter('顺便看下日志')
+    // core 在 loop 顶投进历史（工具结果之后）——这之后它才进时间线、切开这一轮
+    app.send({ type: 'agent', event: { type: 'input_delivered' }, at: 1 })
+
+    expect(app.html()).toContain('顺便看下日志')
+    expect(app.html()).not.toContain('process-head')
+    expect(app.html()).toContain('我先跑一下')
+    expect(app.html().indexOf('我先跑一下')).toBeLessThan(app.html().indexOf('顺便看下日志'))
+    // 命令也得在（10-31 真机：说明在、命令没了——插话把轮切成两段，前一段
+    // 不 live 也没折，renderBlock 把活动块画成 null）。收起的步骤留句尾计数
+    expect(app.html()).toContain('1 个操作')
+    expect(app.html().indexOf('1 个操作')).toBeLessThan(app.html().indexOf('顺便看下日志'))
+    expect(document.querySelectorAll('.turn-progress').length, '进度头只在跑着的那段').toBe(1)
+    // 插话前那段的步骤都收起（插话后还没新事件，全页没有「当前步」）
+    expect(document.querySelectorAll('.tl-step[data-current="true"]').length).toBe(0)
+
+    app.send(state(false)) // 跑完：照旧收起
+    expect(app.html()).toContain('process-head')
+  })
+
+  it('**回答流式中插话，气泡排在这一步回答后面**：投递前留在最下面，与 reload 后的库顺序一致', () => {
+    // 2026-10-31 真机：模型在出最后一段回答时插话，气泡当场进时间线，回答排到
+    // 气泡后面、前面的命令被切走；core 实际在这步之后才投递，reload 后气泡在最下面
+    const app = mount()
+    app.send(state(false))
+    enter('你来实现吧')
+    app.send(state(true))
+    app.send({ type: 'agent', event: { type: 'tool_input_start', id: 't1', name: 'bash' }, at: 1 })
+    app.send({ type: 'agent', event: { type: 'reasoning_start' }, at: 1 })
+    enter('为什么会这样')
+    app.send({ type: 'agent', event: { type: 'text_start' }, at: 1 })
+    app.send({ type: 'agent', event: { type: 'text_delta', text: '可以做：结论' }, at: 1 })
+    app.send({ type: 'agent', event: { type: 'text_end' }, at: 1 })
+    expect(app.html().indexOf('可以做：结论')).toBeLessThan(app.html().indexOf('为什么会这样'))
+    expect(document.querySelectorAll('.turn-progress').length, '还没投递，这一轮没被切开').toBe(1)
+    app.send({ type: 'agent', event: { type: 'input_delivered' }, at: 1 })
+    app.send({ type: 'agent', event: { type: 'text_start' }, at: 1 })
+    app.send({ type: 'agent', event: { type: 'text_delta', text: '先修这个' }, at: 1 })
+    app.send({ type: 'agent', event: { type: 'text_end' }, at: 1 })
+    // 跟一个工具：流式中的最后一条气泡是节流异步刷的，后面有块才同步出字
+    app.send({ type: 'agent', event: { type: 'tool_input_start', id: 't2', name: 'bash' }, at: 1 })
+    const html = app.html()
+    expect(html.indexOf('可以做：结论')).toBeLessThan(html.indexOf('为什么会这样'))
+    expect(html.indexOf('为什么会这样')).toBeLessThan(html.indexOf('先修这个'))
+    expect(html.indexOf('为什么会这样')).toBe(html.lastIndexOf('为什么会这样'))
+  })
+
+  it('hydrate 带 queued（轮内重开面板）：排队气泡画在最下面', () => {
+    const app = mount()
+    app.send(state(true))
+    app.send({
+      type: 'hydrate',
+      items: [{ kind: 'user', text: '你来实现吧' }, { kind: 'assistant', text: '我先跑一下' }],
+      queued: [{ kind: 'user', text: '顺便看下日志', interject: true }],
+    })
+    expect(app.html()).toContain('顺便看下日志')
+    expect(app.html().indexOf('我先跑一下')).toBeLessThan(app.html().indexOf('顺便看下日志'))
+  })
+
+  it('**插话时前面挂着的审批卡不消失**：卡所在的步骤强制展开', () => {
+    const app = mount()
+    app.send(state(false))
+    enter('你来实现吧')
+    app.send(state(true))
+    app.send({ type: 'agent', event: { type: 'text_start' }, at: 1 })
+    app.send({ type: 'agent', event: { type: 'text_delta', text: '要读个隐藏文件' }, at: 1 })
+    app.send({ type: 'agent', event: { type: 'text_end' }, at: 1 })
+    app.send({ type: 'agent', event: { type: 'tool_input_start', id: 't1', name: 'bash' }, at: 1 })
+    app.send({
+      type: 'approval_request',
+      folder: '/tmp/x',
+      expiresAt: Date.now() + 300_000,
+      id: 1,
+      toolCallId: 't1',
+      command: 'cat .env',
+      category: 'hidden_path',
+      detail: '.env',
+      reason: '要触碰隐藏路径：.env',
+    })
+    expect(document.querySelectorAll('.approval-card').length).toBe(1)
+    enter('先别读')
+    expect(document.querySelectorAll('.approval-card').length, '插话后卡还在').toBe(1)
+    expect(app.html().indexOf('approval-card')).toBeLessThan(app.html().indexOf('先别读'))
+  })
+
+  it('**分支里插话同样不折**：选中跑着的分支，插话前的过程照样在、排在插话前面', () => {
+    const app = mount()
+    app.send(state(false))
+    const name = '长活'
+    app.send({
+      type: 'tasks',
+      folder: '/tmp/x',
+      tasks: [
+        {
+          name,
+          status: 'running',
+          lastText: '',
+          current: null,
+          effort: null,
+          effortOverridden: false,
+          presets: [],
+          imagesEnabled: false,
+          contextWindow: 0,
+          approvalOn: true,
+        },
+      ],
+    })
+    act(() => {
+      // 任务 tab 是 span，能点的是里面的 .branch-open
+      const tab = [...document.querySelectorAll<HTMLButtonElement>('.branch-open')].find(
+        (b) => b.textContent === name,
+      )
+      if (!tab) throw new Error(`没有任务 tab：${name}`)
+      tab.click()
+    })
+    app.send({ type: 'task_hydrate', folder: '/tmp/x', name, items: [{ kind: 'user', text: '分支任务书' }], contextTokens: 0 })
+    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'text_start' }, at: 1 })
+    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'text_delta', text: '分支先跑一下' }, at: 1 })
+    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'text_end' }, at: 1 })
+    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'tool_input_start', id: 't1', name: 'bash' }, at: 1 })
+    enter('插一句')
+    // 投递前到的回答排在插话前面（插话在 queued，画在最下面）
+    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'text_start' }, at: 1 })
+    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'text_delta', text: '分支答完' }, at: 1 })
+    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'text_end' }, at: 1 })
+    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'tool_input_start', id: 't2', name: 'bash' }, at: 1 })
+    expect(app.html().indexOf('分支答完')).toBeLessThan(app.html().indexOf('插一句'))
+    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'input_delivered' }, at: 1 })
+
+    // 先确认看的是分支（选中失败的话插话落进主任务，下面的断言会空过）
+    expect(app.html()).toContain('分支任务书')
+    expect(app.html()).toContain('分支先跑一下')
+    expect(app.html()).toContain('插一句')
+    expect(app.html()).not.toContain('process-head')
+    expect(app.html().indexOf('分支先跑一下')).toBeLessThan(app.html().indexOf('插一句'))
+    expect(app.html()).toContain('1 个操作')
+    expect(app.html().indexOf('1 个操作')).toBeLessThan(app.html().indexOf('插一句'))
+  })
+})

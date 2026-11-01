@@ -8,6 +8,8 @@ export type ToolContext = {
   /** 记忆库根（分身任务 = 任务目录）。bash 往子进程注入
    *  SIMPLE_CODE_MEMORY_DIR——$SIMPLE_CODE_MEMORY 靠它认自己的库 */
   memoryRoot?: string
+  /** 本会话的 owner（主任务 ''，任务 'task-xxx'）。bash 注入 SIMPLE_CODE_OWNER */
+  owner?: string
   /** 工作区根目录的绝对路径。工具的相对路径都基于它解析 */
   root: string
   /** 用户中断。中断时正在跑的命令跟着杀，不等它跑完（design.md §5.2） */
@@ -60,15 +62,19 @@ export type ToolContext = {
     category: ApprovalCategory
     detail: string
     reason: string
+    /** multi 卡合并前各段的类别（approval.ts mergeAsks） */
+    parts?: ApprovalCategory[]
     /** 支持「始终允许」时的预览：选了会往 approval.json 记什么。没有
      * 这个字段 = 该卡不出第三键（隐藏路径等不收敛的场景） */
     always?:
       | { kind: 'lead'; lead: string }
       | { kind: 'path'; dir: string }
       | { kind: 'nonpath'; lead: string; from: number }
-      | { kind: 'paths'; dirs: string[] }
+      | { kind: 'paths'; dirs: string[]; hidden?: { path: string; write: boolean }[] }
       | { kind: 'hidden'; path: string; write: boolean }
-  }) => Promise<'allow' | 'always' | 'deny' | { deny: string }>
+    // timeout：等审批超时、无人处理，按拒绝办（宿主兜底）——与人点的 deny 分开，
+    // 模型才不会把「没人在」读成「用户不同意」（2026-10-31）
+  }) => Promise<'allow' | 'always' | 'deny' | 'timeout' | { deny: string }>
   /**
    * 视觉转述（vision relay）：主模型无视觉且配置了 visionModel 时由 session
    * 注入。view_image 拿它把图换成文字描述——主模型全程不见像素。可选：

@@ -1,52 +1,103 @@
 {
   "$comment": [
-    "拷到 ~/.simple-code/settings.json 后填写。没有默认 provider、没有默认 model，",
-    "五项必填：provider / model / providers.<名>.protocol / .baseUrl / .apiKey，",
-    "以及每个模型的 contextWindow。缺一个就在启动时报错，不猜。",
+    "SimpleCode 完整配置示例。拷到 ~/.simple-code/settings.json，删掉用不到的",
+    "provider 再填密钥。除下面「必填」外每一项都可以不写——这里写出的值就是",
+    "默认值（模型名、地址、密钥等示例数据除外），照抄不会改变行为。",
     "",
-    "apiKey 写 ${环境变量名} 会去读环境变量，写别的就是字面量。",
-    "工作区的 .simple-code/settings.json 里，provider / model / baseUrl / apiKey /",
-    "模型的 headers / extraBody / bash.envPassthrough / bash.sandbox 会被忽略并",
-    "警告——那份文件来自仓库内容。",
+    "【必填】没有默认 provider、没有默认 model，缺一项启动即报错，不猜：",
+    "  provider / model / providers.<名>.protocol / .baseUrl / .apiKey，",
+    "  以及每个模型的 contextWindow（卸载触发点由它推算，填错某轮会 400）。",
     "",
-    "模型级的 headers / extraBody 见下面的 my-gateway：某些网关要求额外的路由",
-    "参数（请求头或请求体字段），按模型配、原样透传。headers 同名会覆盖协议",
-    "自己的头（换认证方式时要用）；extraBody 覆盖不了 model / stream / messages",
-    "这些协议骨架字段——被覆盖后的现象极难排查，不如直接挡住。",
+    "【providers】protocol 三选一：openai-chat / anthropic-messages /",
+    "  openai-responses。baseUrl 写到 /v1 之前为止，SC 自己拼",
+    "  /v1/chat/completions、/v1/messages、/v1/responses。",
+    "  apiKey 写 ${环境变量名} 读环境变量，写别的就是字面量——别把密钥明文写进来。",
+    "  capabilities.images：模型能否看图，默认 false，要自己声明。",
+    "  cacheTtlMs：距上次模型响应超过这么久，下次请求前先压缩上下文（缓存大概率",
+    "  已过期，全价重付的基数越小越好）。默认 3 小时，宁大勿小。",
+    "  headers / extraBody：网关要的额外请求头 / 请求体字段，按模型配、原样透传，",
+    "  值只能是字符串、数字、布尔。headers 同名会覆盖协议自己的头（换认证方式",
+    "  时用）；extraBody 覆盖不了 model / stream / messages 等协议字段。",
+    "  presets：同一模型的可切换参数组（如网关的不同线路），键名即界面上的名字，",
+    "  只能改 request / headers / extraBody，深合并到模型本体之上。",
     "",
-    "loop.streamIdleTimeoutMs 计的是流里两块数据之间的间隔，不是请求总时长——",
-    "慢慢吐十分钟的长回答不会被杀，只有真的不动了才触发，然后走重试。",
+    "【request】请求偏好，可写在顶层（全局）、模型或 preset 里，越具体越优先。",
+    "  maxTokens：单次输出上限；thinking：adaptive / disabled；",
+    "  effort：low / medium / high / xhigh / max（界面与 sc -e 可临时切换）；",
+    "  reasoningDisplay：omitted / summarized；",
+    "  cacheTtl：5m / 1h，仅 anthropic-messages 生效，1h 时 cacheTtlMs 自动 ≥ 1 小时。",
     "",
-    "除了预算，还有一个时间维度的触发：距上次模型响应超过模型的 cacheTtlMs",
-    "（默认 3 小时），下一次发请求前也会先压到 target——因为那时 prompt cache",
-    "过期的概率极高，全价重付的基数越小越好。想激进一点就显式配小（比如",
-    "1800000 = 半小时）；这个值宁大勿小：缓存还热就压，比缓存死了不压更亏。",
+    "【副模型】visionModel（主模型不能看图时代为转述）与 memory.summaryModel",
+    "  （后台摘要、recall 选择器；null = 用主模型）两种写法：",
+    "  字符串 = 当前 provider 下的模型名；对象 { provider, model, effort? } = 跨",
+    "  provider，effort 比主模型多一档 none。被引用的模型必须登记在 providers 里。",
+    "  imageModel（生图）只认对象 { provider, model }，model 不必登记，只借该",
+    "  provider 的 baseUrl / apiKey；目前只支持 OpenAI 图片接口（/v1/images/generations）。",
     "",
-    "卸载的触发不是配置项：它是 contextWindow - request.maxTokens - 安全余量。",
-    "窗口不等于能装的输入量——输出要在同一个窗口里占掉 maxTokens。原来这里有个",
-    "unloadThresholdRatio，问题是它把「给输出留多少」藏在一个比例里：0.7 碰巧",
-    "盖得住默认的 maxTokens，配成 0.95 就直接撞窗口，而那时配置看起来完全合理。",
-    "unloadTargetRatio 保留，它管的是「卸到多低」，跟预留无关。",
-    "reservedTokens 是那个「安全余量」：给 system prompt 和工具定义留的（它们",
-    "每轮都发但不在历史里）。默认 2000 没有实测依据，是从官方客户端的 13k 按窗口比例",
-    "推的——发现频繁早卸就调小，发现仍然撞窗口就调大。",
+    "【taskModels】agent 派任务（$SIMPLE_CODE_TASK --model <名>）可选的模型：",
+    "  [{ provider, model, effort?, use }]，use 写一句用途给 agent 看；只能从这里选，",
+    "  不写 --model = 用上面的 provider/model。被引用的模型必须登记在 providers 里。",
     "",
-    "memory 段整段可以不写，全有默认值。idleSummarizeDelayMs 只在交互式",
-    "（simple-code 不带参数）下有用——一次性执行没有「空闲」这个状态。",
-    "写 0 就是关掉后台摘要，卸载时退回「只有头部+归档路径」。",
-    "mergeFactor 现在还不生效，分层合并是第 3b-2 步的事。",
+    "【bash】defaultTimeoutMs / maxTimeoutMs：命令超时（上限 5 分钟，更久的任务",
+    "  超时会自动转后台、输出不丢）；maxOutputChars：单次输出保留字数；",
+    "  killGraceMs：先 SIGTERM 再等多久 SIGKILL；sandbox 目前只有 none。",
+    "  envPassthrough：传进 bash 的环境变量白名单。下面是完整默认列表——",
+    "  SIMPLE_CODE_* 是 apply_patch、记忆检索等工具的入口，删了工具就用不了；",
+    "  要加自己的变量请在此列表上追加，别另写一份短的。",
     "",
-    "nonPathFrom（审批白名单，写在 ~/.simple-code/approval.json，不在本文件）：给「参数不是文件路径、只是长得像」的工具用。",
-    "键是命令名，值是位置参数起始位（0 基）——从该位起（含）不判为路径。",
-    "典型是元素寻址语法（/slide[2] 以 / 开头，长得像绝对路径会误拦）；",
-    "从起始位起的整段豁免（flag 值也会被数进位置参数），带写意图的",
-    "token（重定向目标等）不豁免。core 不内置任何条目，用到哪个配哪个。"
+    "【webfetch】网页抓取的超时与输出上限。",
+    "",
+    "【loop】maxIterations：一轮最多调用多少次模型（防失控的保险丝）；",
+    "  streamIdleTimeoutMs：流里两块数据之间的最大间隔，不是总时长——慢慢吐",
+    "  十分钟的长回答不会被杀，真不动了才中止并按 retry 重试。",
+    "",
+    "【memory】上下文压缩，整段可以不写。预算 = contextWindow - maxTokens -",
+    "  reservedTokens（给 system prompt 和工具定义留的余量）。",
+    "  agentsMaxTokens：用户级/项目级 AGENTS.md 各自的估算 token 上限，默认 2048，",
+    "  可配正整数；首次加载超限截断，压缩点刷新超限保旧，与 note 预算分开。",
+    "  noteBudgetTokens：四类型 note 常驻的估算 token 总量，默认 2100。",
+    "  noteRatios：general/lesson/principle/goal 比例之和为 1；当前 goal 完整，",
+    "  超份额先用空余再依次减少普通记录/教训/原则尾部，总预算不增。",
+    "  floorTokens：最近这么多 token 原文不动；unloadTargetRatio：这一区的比例",
+    "  上限（取 min(floorTokens, 预算 × 比例)，照顾小窗口模型）。",
+    "  stubTokens / stubSteps：已卸成存根、摘要还没进场的缓冲带上界，先到先停。",
+    "  clipThresholdChars / clipCommandChars / clipOutputHeadChars /",
+    "  clipOutputTailChars：卸载时工具调用留多少（原文全量在磁盘上）。",
+    "  keepHeadChars：本地存根的描述截断长度。",
+    "  summaryMinTokens：短于此的 step 不做摘要；segmentTokens：单次摘要的输入上限。",
+    "  idleSummarizeDelayMs：空闲多久后后台摘要，0 = 关闭。",
+    "  indexRatio：摘要索引最多占预算的比例，超了才合并；mergeFactor：一次合并几条。",
+    "  hotLeaves：展开正文的摘要条数；demoteBatch：一次降级几条（成批是为了保缓存）。",
+    "",
+    "【recall】mode：on = 每轮用 summaryModel 从记忆库挑相关条目提示 agent，",
+    "  会多一次副模型请求；shadow（默认）/ off = 不提示。",
+    "  topK：每轮最多提示几条历史摘要。",
+    "",
+    "【工作区覆盖】项目里的 .simple-code/settings.json 会深合并到这份之上，但",
+    "  provider / model / baseUrl / apiKey、模型及 preset 的 headers / extraBody、",
+    "  bash.envPassthrough / bash.sandbox 只认用户级——那份文件来自仓库内容，",
+    "  被忽略时会警告。imageModel 也只读用户级这份。",
+    "",
+    "【不在本文件】审批规则在 approval.json，MCP 在 ~/.simple-code/mcp.json，",
+    "  网页搜索的 key 在 ~/.simple-code/websearch.json。"
   ],
 
-  "provider": "my-anthropic",
-  "model": "claude-opus-4-8",
+  "provider": "my-deepseek",
+  "model": "deepseek-flash",
 
   "providers": {
+    "my-deepseek": {
+      "protocol": "openai-chat",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKey": "${SIMPLE_CODE_API_KEY}",
+      "models": {
+        "deepseek-flash": {
+          "contextWindow": 1000000,
+          "capabilities": { "images": true }
+        }
+      }
+    },
+
     "my-anthropic": {
       "protocol": "anthropic-messages",
       "baseUrl": "https://api.anthropic.com",
@@ -54,7 +105,9 @@
       "models": {
         "claude-opus-4-8": {
           "contextWindow": 1000000,
-          "capabilities": { "images": true }
+          "capabilities": { "images": true },
+          "request": { "cacheTtl": "1h" },
+          "cacheTtlMs": 10800000
         }
       }
     },
@@ -72,15 +125,6 @@
       }
     },
 
-    "my-deepseek": {
-      "protocol": "openai-chat",
-      "baseUrl": "https://api.deepseek.com",
-      "apiKey": "${DEEPSEEK_API_KEY}",
-      "models": {
-        "deepseek-chat": { "contextWindow": 128000 }
-      }
-    },
-
     "my-gateway": {
       "protocol": "openai-chat",
       "baseUrl": "https://gateway.example.com",
@@ -89,7 +133,11 @@
         "some-model": {
           "contextWindow": 128000,
           "headers": { "X-Route": "cluster-a" },
-          "extraBody": { "providerId": 51 }
+          "extraBody": { "providerId": 51 },
+          "presets": {
+            "备用线路": { "headers": { "X-Route": "cluster-b" } },
+            "长输出": { "request": { "maxTokens": 64000 } }
+          }
         }
       }
     }
@@ -102,27 +150,39 @@
     "reasoningDisplay": "summarized"
   },
 
+  "visionModel": null,
+  "imageModel": { "provider": "my-openai", "model": "gpt-image-1" },
+  "taskModels": [
+    { "provider": "my-anthropic", "model": "claude-opus-4-8", "effort": "high", "use": "改代码、排查、长任务" },
+    { "provider": "my-deepseek", "model": "deepseek-flash", "use": "只读查询、简单汇总" }
+  ],
+
   "bash": {
     "defaultTimeoutMs": 120000,
-    "maxTimeoutMs": 600000,
+    "maxTimeoutMs": 300000,
     "maxOutputChars": 16000,
     "killGraceMs": 3000,
     "sandbox": "none",
-    "envPassthrough": ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "USER"]
+    "envPassthrough": [
+      "PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "USER",
+      "SIMPLE_CODE_WEBFETCH", "SIMPLE_CODE_WEBSEARCH", "SIMPLE_CODE_MCP",
+      "SIMPLE_CODE_APPLY_PATCH", "SIMPLE_CODE_MEMORY", "SIMPLE_CODE_LESSON",
+      "SIMPLE_CODE_NOTE", "SIMPLE_CODE_EVENT", "SIMPLE_CODE_SKILL",
+      "SIMPLE_CODE_LSP", "SIMPLE_CODE_LSP_PORT",
+      "SIMPLE_CODE_PROXY_PORT", "SIMPLE_CODE_PROXY_TOKEN",
+      "SIMPLE_CODE_IMAGEGEN", "SIMPLE_CODE_DOC",
+      "SIMPLE_CODE_TASK", "SIMPLE_CODE_TASK_PORT", "SIMPLE_CODE_TASK_TOKEN"
+    ]
   },
 
-  "memory": {
-    "unloadTargetRatio": 0.4,
-    "reservedTokens": 2000,
-    "keepHeadChars": 300,
-    "mergeFactor": 10,
-    "summaryModel": null,
-    "idleSummarizeDelayMs": 3000,
-    "summaryMinTokens": 100
+  "webfetch": {
+    "defaultTimeoutMs": 30000,
+    "maxTimeoutMs": 120000,
+    "maxOutputChars": 100000
   },
 
   "loop": {
-    "maxIterations": 500,
+    "maxIterations": 2000,
     "streamIdleTimeoutMs": 120000,
     "retry": {
       "maxAttempts": 5,
@@ -130,5 +190,34 @@
       "backoffFactor": 2,
       "maxDelayMs": 60000
     }
+  },
+
+  "memory": {
+    "agentsMaxTokens": 2048,
+    "noteBudgetTokens": 2100,
+    "noteRatios": { "general": 0.35, "lesson": 0.1, "principle": 0.2, "goal": 0.35 },
+    "reservedTokens": 2000,
+    "floorTokens": 16000,
+    "unloadTargetRatio": 0.1,
+    "stubTokens": 16000,
+    "stubSteps": 30,
+    "clipThresholdChars": 0,
+    "clipCommandChars": 200,
+    "clipOutputHeadChars": 100,
+    "clipOutputTailChars": 100,
+    "keepHeadChars": 300,
+    "summaryModel": null,
+    "summaryMinTokens": 100,
+    "segmentTokens": 16000,
+    "idleSummarizeDelayMs": 3000,
+    "indexRatio": 0.05,
+    "mergeFactor": 10,
+    "hotLeaves": 8,
+    "demoteBatch": 10
+  },
+
+  "recall": {
+    "mode": "shadow",
+    "topK": 2
   }
 }

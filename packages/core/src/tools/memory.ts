@@ -244,7 +244,8 @@ async function tryFtsTurns(
   let db: ReturnType<typeof openDbReadOnly> | undefined
   try {
     db = openDbReadOnly(dbPath)
-    const rows = ftsSearch(db, query, max * perFile)
+    // 会话里的 bin 带 SIMPLE_CODE_OWNER（bash.ts spawnEnv）：只看已合回段与自己的轮
+    const rows = ftsSearch(db, query, max * perFile, process.env.SIMPLE_CODE_OWNER)
     if (rows.length === 0) return null
     const hits: SearchHitWithContext[] = []
     const perTurn = new Map<number, number>()

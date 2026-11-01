@@ -146,7 +146,7 @@ export async function loadConfig(
   const globalPath = options.globalPath ?? GLOBAL_CONFIG_PATH
   const workspacePath = join(folderPath, WORKSPACE_CONFIG_RELATIVE)
 
-  const global = await readJson(globalPath)
+  const global = await readJson(globalPath, true)
   // 同一个文件不能既当全局又当工作区：空工作区时面板的 folderList 兜底成
   // home，<home>/.simple-code/settings.json 恰好是（默认）全局配置——再按
   // 工作区读一遍会把它剥掉 provider/model/baseUrl/apiKey，空壳过不了校验。
@@ -170,12 +170,20 @@ export async function loadConfig(
   })
 }
 
-async function readJson(path: string): Promise<unknown> {
+async function readJson(path: string, required = false): Promise<unknown> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
-  } catch {
-    return null // 文件不存在是正常的，两份配置都是可选的
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    if (!required) return null // 工作区覆盖文件可选；模型凭据只认用户级配置
+    // 放在共用加载入口：面板、终端对话和 --models 都需要首次运行指引。
+    throw new Error(
+      `还没有配置文件：${path}\n\n` +
+      `请按快速开始创建配置：\nhttps://github.com/lnexp/simple-code#快速开始\n\n` +
+      `配置中可用 \${SIMPLE_CODE_API_KEY} 引用密钥环境变量，别把 key 写进文件。\n` +
+      `设置变量后，终端需在当前 shell 导出；VS Code 请完全退出后重新打开。`,
+    )
   }
   try {
     return JSON.parse(text)
@@ -242,6 +250,7 @@ function resolve(
   const baseUrl = provider.baseUrl
   const apiKey = expandEnv(provider.apiKey, ctx.env)
   const main = { name: config.model, model, request, protocol, baseUrl, apiKey }
+  checkTaskModels(config)
   return {
     config,
     model,
@@ -278,6 +287,25 @@ function resolveSummary(
   const ref = config.memory.summaryModel
   if (ref === null) return main
   return resolveSideModel('memory.summaryModel', ref, config, ctx, main)
+}
+
+/**
+ * `taskModels` 每项必须指向已登记的模型（task-trunk 规则 14）。在加载时响：
+ * 否则写错要等 agent 派任务、任务会话 setModel 失败才暴露，而那里静默退回默认
+ * 模型（tasks.ts ensureSession），症状是「指定了模型却没生效」
+ */
+function checkTaskModels(config: Config): void {
+  config.taskModels.forEach((t, i) => {
+    const provider = config.providers[t.provider]
+    if (!provider) {
+      const known = Object.keys(config.providers).join(' / ') || '(一个都没配)'
+      throw new Error(`taskModels[${i}] 的 provider "${t.provider}" 不在 providers 里。已配置的：${known}`)
+    }
+    if (!provider.models[t.model]) {
+      const known = Object.keys(provider.models).join(' / ') || '(一个都没配)'
+      throw new Error(`taskModels[${i}] "${t.model}" 不在 provider "${t.provider}" 的 models 里。已配置的：${known}`)
+    }
+  })
 }
 
 /**

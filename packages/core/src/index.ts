@@ -65,16 +65,30 @@ export { watchIdle } from './session/idle.ts'
 export type { Lock } from './session/lock.ts'
 export { acquireLock, LOCK_RELATIVE, LockHeldError } from './session/lock.ts'
 export {
-  TASK_TURN_GAP,
+  createTask,
   flipTaskLive,
   finalizeTask,
-  forkTask,
+  lastTaskReply,
   listTaskManifests,
+  postTaskResult,
   readTaskManifest,
   scopeOf,
+  TASK_RESULT_HEAD,
   type TaskManifest,
+  taskResultText,
+  writeTaskManifest,
 } from './session/task.ts'
 export type { TaskScope } from './session/store.ts'
+export {
+  TASK_PORT_ENV,
+  TASK_TOKEN_ENV,
+  TASK_TOKEN_HEADER,
+  type TaskDispatchRequest,
+  type TaskDispatchResponse,
+  type TaskModelEntry,
+  type TaskModelsRequest,
+  type TaskModelsResponse,
+} from './session/task-endpoint.ts'
 export { SegmentFullError } from './session/store.ts'
 export { openStore } from './session/store.ts'
 export type { CompactResult, Session, SessionOptions } from './session/session.ts'
@@ -120,7 +134,7 @@ export {
   type LastReflect,
   type LibraryStat,
   type MemoryStats,
-} from './tools/memory-stats.ts'
+} from './session/memory-stats.ts'
 export { listSkills, readSkill, searchSkills } from './tools/skill.ts'
 export type { PatchHunk, PatchChunk } from './tools/applypatch.ts'
 export type { WebfetchConfig } from './tools/webfetch.ts'
@@ -137,5 +151,5 @@ export { listMcpTools, callMcpTool } from './tools/mcp.ts'
 export { startCredentialProxy } from './proxy/credential-proxy.ts'
 export { describeError } from './tools/describe.ts'
 export type { EnsureShimsOptions, ShimEntry } from './shims.ts'
-export { ensureShims, probeNode, resolveNodeBin } from './shims.ts'
+export { ensureDocCopy, ensureShims, probeNode, resolveNodeBin } from './shims.ts'
 export { PrefixBrokenError, findBreak, fingerprint } from './loop/prefix-guard.ts'

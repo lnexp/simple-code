@@ -26,7 +26,17 @@ const fmtInterval = (ms: number | null): string => {
 export type ImageRef = { data: string; mimeType: string }
 
 export type ChatItem =
-  | { kind: 'user'; text: string; images?: ImageRef[] }
+  | {
+      kind: 'user'
+      text: string
+      images?: ImageRef[]
+      /**
+       * 跑着时发的插话。`splitTurns` 跑着时据此认出本轮真正的起点，不把插话
+       * 前那段过程折走。只有实时视图和宿主镜像带；历史回放（hydrateItems）
+       * 不带——跑完的轮插话照旧是折叠分界
+       */
+      interject?: true
+    }
   | {
       kind: 'assistant'
       text: string
@@ -84,6 +94,8 @@ export type ChatItem =
   /** 模型切换分割线（2026-10-17 用户定样式：文字居中、两侧横线自适应宽度）。
    *  位置在切换后那轮的 user 气泡**前**——「从这条起换了模型」 */
   | { kind: 'divider'; text: string }
+  /** 任务完成回调（task-trunk 规则 12）：一行「任务名 · 状态」，点开看回复原文 */
+  | { kind: 'task_result'; head: string; body: string }
 
 export type ChatView = {
   items: ChatItem[]
@@ -108,6 +120,12 @@ export type ChatView = {
    * 下一轮会拿上一轮的起点算，耗时越跑越大
    */
   turnStartedAt: number | null
+  /**
+   * 跑着时发的插话，core 还没投进历史（等 `input_delivered`）。画在全部条目
+   * 之后、不进 splitTurns：投递前到的回答排在它前面，与库里的顺序一致
+   * （2026-10-31 真机：当场进 items 的话回答排到它后面，reload 又反过来）
+   */
+  queued: SingleItem[]
 }
 
 export const emptyView = (): ChatView => ({
@@ -115,6 +133,7 @@ export const emptyView = (): ChatView => ({
   lastTiming: null,
   contextTokens: 0,
   turnStartedAt: null,
+  queued: [],
 })
 
 /** 毫秒 → 人话：843ms / 1s / 8.4s（一位小数去尾零） */
@@ -247,7 +266,25 @@ export function reduce(view: ChatView, agentEv: AgentEvent, now: number): ChatVi
 
     case 'model_switch':
       return insertBeforeLastUser(view, { kind: 'divider', text: switchText(agentEv.from, agentEv.to) })
+
+    case 'task_result':
+      return append(view, parseTaskResult(agentEv.text) ?? { kind: 'notice', text: agentEv.text })
+
+    case 'input_delivered': {
+      // FIFO：core 按入队顺序一条一个事件
+      const [first, ...rest] = view.queued
+      return first ? { ...append(view, first), queued: rest } : view
+    }
   }
+}
+
+/**
+ * core 插进历史的任务回调原文 → 条目；不是回调 → null。头与格式和 core
+ * task.ts 的 TASK_RESULT_HEAD / taskResultText 成对（同 parseModelSwitch，抄一份）
+ */
+export function parseTaskResult(text: string): Extract<ChatItem, { kind: 'task_result' }> | null {
+  const m = /^〔任务结果〕([^\n]*)\n?([\s\S]*)$/.exec(text)
+  return m ? { kind: 'task_result', head: m[1] as string, body: m[2] as string } : null
 }
 
 /** 分割线文案。只说事实，不带给 agent 看的末句「此前的回复由上一个模型生成」 */
@@ -272,6 +309,30 @@ function insertBeforeLastUser(view: ChatView, item: ChatItem): ChatView {
   const at = view.items.findLastIndex((i) => i.kind === 'user')
   if (at === -1) return append(view, item)
   return { ...view, items: [...view.items.slice(0, at), item, ...view.items.slice(at)] }
+}
+
+/**
+ * 宿主镜像：把本轮的用户气泡按位置插回事件重放。`pos` = 这条进来时重放里
+ * 已有的事件数——实时视图就是在那一刻本地 append 的，按同一位置插回，
+ * 切回后看到的和实时一致（插话在当时跑着的工具后面，不挤到 query 下面）
+ */
+export function replayWithUsers(
+  view: ChatView,
+  replay: ReadonlyArray<{ ev: AgentEvent; at: number }>,
+  users: ReadonlyArray<{ item: ChatItem; pos: number }>,
+): ChatView {
+  let next = view
+  let u = 0
+  const flush = (upTo: number): void => {
+    for (; u < users.length && (users[u] as { pos: number }).pos <= upTo; u++)
+      next = append(next, (users[u] as { item: ChatItem }).item)
+  }
+  for (const [i, { ev, at }] of replay.entries()) {
+    flush(i)
+    next = reduce(next, ev, at)
+  }
+  flush(Number.POSITIVE_INFINITY)
+  return next
 }
 
 /**
@@ -523,27 +584,21 @@ export function groupItems(items: ChatItem[]): Block[] {
 }
 
 /**
- * 组头和折叠头的条数口径：**只数工具，不数 thinking**。
- *
- * 活动组头原来是 `items.length`，而 `ActivityItem = reasoning | tool`——
- * 所以「2 个操作」很可能是 1 次思考 + 1 条命令，「操作」这个词名不副实。
- * 第三层折叠也要报条数，两处口径不一致会当场露馅：外层说 34、点开把内层
- * 加起来是 41。收成一个函数，就不会只改一头
- */
-export const toolCount = (items: readonly ActivityItem[]): number =>
-  items.filter((item) => item.kind === 'tool').length
-
-/**
  * 第三层折叠的渲染单元。`at` 是它在原 `Block[]` 里的下标——渲染层靠
- * 「是不是最后一块」决定 spinner 和流式节流，折完之后下标会乱，所以带着走
+ * 「是不是最后一块」决定 spinner 和流式节流，折完之后下标会乱，所以带着走。
+ * 折叠头的步数/操作数/失败数由 steps.ts 的 stepStats 从 blocks 现算
  */
 export type Section =
   | { kind: 'block'; block: Block; at: number }
-  | { kind: 'process'; blocks: Block[]; tools: number; elapsedMs?: number }
+  | { kind: 'process'; blocks: Block[]; elapsedMs?: number }
 
 const isUserBlock = (block: Block): boolean => block.kind === 'single' && block.item.kind === 'user'
+const isInterjectBlock = (block: Block): boolean =>
+  block.kind === 'single' && block.item.kind === 'user' && block.item.interject === true
 const isNoticeBlock = (block: Block): boolean =>
-  block.kind === 'single' && (block.item.kind === 'notice' || block.item.kind === 'divider')
+  block.kind === 'single' &&
+  // task_result：空闲时插在轮尾的任务回调，同 notice 留在折叠外（不然连同最终回答一起被折进「处理过程」）
+  (block.item.kind === 'notice' || block.item.kind === 'divider' || block.item.kind === 'task_result')
 const isAssistantBlock = (block: Block): boolean =>
   block.kind === 'single' && block.item.kind === 'assistant'
 
@@ -585,6 +640,9 @@ function turnStarts(blocks: Block[]): number[] {
  */
 export function splitTurns(blocks: Block[], foldLast: boolean): Section[] {
   const starts = turnStarts(blocks)
+  // 跑着时不折的起点：最后一个不是插话的轮首。插话也是 user 条目，会把跑着
+  // 的一轮切成几段——按「最后一段」算的话插话前那段（含正在跑的工具）被折走
+  const live = starts.findLastIndex((at) => !isInterjectBlock(blocks[at] as Block))
   const sections: Section[] = []
   for (const [i, start] of starts.entries()) {
     const end = starts[i + 1] ?? blocks.length
@@ -596,11 +654,11 @@ export function splitTurns(blocks: Block[], foldLast: boolean): Section[] {
     if (keep > body && isAssistantBlock(blocks[keep - 1] as Block)) keep--
 
     const process = blocks.slice(body, keep)
-    if (process.length > 0 && (foldLast || i < starts.length - 1)) {
+    if (process.length > 0 && (foldLast || i < live)) {
       sections.push({
         kind: 'process',
         blocks: process,
-        ...processMeta(process, blocks, keep, end),
+        ...elapsedOf(blocks, keep, end),
       })
     } else {
       for (const [j, block] of process.entries())
@@ -613,39 +671,29 @@ export function splitTurns(blocks: Block[], foldLast: boolean): Section[] {
 }
 
 /**
- * 折叠头要的两个数：工具调用条数、整轮耗时。
+ * 折叠头的整轮耗时。
  *
  * 耗时直接取保留区里那条 assistant 的 `elapsedMs`（`finishTurn` 记的整轮
  * 时长），不另存一份。**回放的历史没有这个字段**——`hydrateItems` 不带
- * 时间戳，所以往上翻的旧轮只有条数没有耗时，这是已知的、故意不修的
+ * 时间戳，所以往上翻的旧轮没有耗时，这是已知的、故意不修的
  * （要修得动 schema 加迁移，为一个装饰性数字不值）
  */
-function processMeta(
-  process: Block[],
-  blocks: Block[],
-  keep: number,
-  end: number,
-): { tools: number; elapsedMs?: number } {
-  const tools = process.reduce(
-    (sum, block) => sum + (block.kind === 'activity' ? toolCount(block.items) : 0),
-    0,
-  )
+function elapsedOf(blocks: Block[], keep: number, end: number): { elapsedMs?: number } {
   for (let at = keep; at < end; at++) {
     const block = blocks[at]
     if (block?.kind !== 'single' || block.item.kind !== 'assistant') continue
-    if (block.item.elapsedMs !== undefined) return { tools, elapsedMs: block.item.elapsedMs }
+    if (block.item.elapsedMs !== undefined) return { elapsedMs: block.item.elapsedMs }
   }
-  return { tools }
+  return {}
 }
 
 /**
  * 存库消息尾巴上的卸载标记。两种形态（unload.ts）：文本版 `\n[已卸载，…]`，
  * shell 版 `\n# [已卸载，…]`（`#` 前缀防泄漏事故的产物）。
  *
- * **带标记 = 这是一条存根**：它的完整原文在 messages 表的 unloaded 行里，
- * 往上拉的历史分页会渲染全文。所以这里**整条跳过而不是剥掉标记渲染头部**
- * ——剥了渲染的话同一段内容出现两遍（下方一份截断的、上方一份全的），
- * 界面上像是模型把同一句话说了两次
+ * **带标记 = 这是一条存根**：session.historyRows 已在原位置换回库里的原文，
+ * 并让历史分页跳过这些已展示行。这里仅过滤老数据残留的存根，不把截断内容
+ * 冒充原文；不能靠本函数过滤后再到历史里找，否则思考与工具会分离。
  */
 const STUB_MARKER = /\n?#? ?\[已卸载，完整内容见 [^\]]*\]$/
 
@@ -707,6 +755,12 @@ export function hydrateItems(
       const divider = images.length === 0 ? parseModelSwitch(text) : null
       if (divider !== null) {
         items.push({ kind: 'divider', text: divider })
+        continue
+      }
+      // 任务回调（core 在登记者历史末尾插的 user 行）：用户没说过这话，渲染成一行
+      const result = images.length === 0 ? parseTaskResult(text) : null
+      if (result !== null) {
+        items.push(result)
         continue
       }
       items.push({ kind: 'user', text, ...(images.length > 0 ? { images } : {}) })

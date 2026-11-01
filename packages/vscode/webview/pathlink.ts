@@ -70,6 +70,13 @@ export function findPathTokens(text: string, mode: 'all' | 'abs' = 'all'): PathT
       const start = m.index
       const ln = m[1] === undefined ? undefined : Number(m[1])
       const end = start + m[0].length
+      // 右边界：匹配后面紧跟的还是路径字符（ASCII 字素或 /），说明正则是
+      // 回溯到半截才凑出「扩展名」——目录 .simple-code/ 被切成 .simple-co
+      // （扩展名上限 9），链接指向不存在的路径。整条不链接，同目录路径规则
+      if (/[\w@.+\-/]/.test(text[end] ?? '')) {
+        m = re.exec(text)
+        continue
+      }
       // 尾部约束（正则贪不到的）：路径末字符若是 '.' 或 '-'，缩到合法处
       let e = end
       while (e > start + 1 && /[.-]$/.test(text.slice(start, e))) e--

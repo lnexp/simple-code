@@ -505,10 +505,11 @@ describe('合并端到端', () => {
     expect(usage.every((c) => typeof c.input === 'number' && typeof c.cacheRead === 'number')).toBe(true)
     expect(usage.every((c) => typeof c.model === 'string' && (c.model as string).length > 0)).toBe(true)
     expect(usage.every((c) => typeof c.estimated === 'number' && (c.estimated as number) > 0)).toBe(true)
-    // 副模型行：带 tag 与缓存读写字段，缓存命中可从日志直接判
+    // 副模型行：带 tag 与缓存读写字段，缓存命中可从日志直接判。archiver
+    // 2026-10-31 起也记（原先直调 sendRequest 漏记）
     const side = calls.filter((c) => c.ev === 'llm_usage' && typeof c.tag === 'string')
     expect(side.length).toBeGreaterThanOrEqual(1)
-    expect(side.every((c) => ['summary', 'merge'].includes(c.tag as string))).toBe(true)
+    expect(side.every((c) => ['summary', 'merge', 'archiver'].includes(c.tag as string))).toBe(true)
     expect(side.every((c) => typeof c.input === 'number' && typeof c.cacheRead === 'number' && typeof c.cacheWrite === 'number')).toBe(true)
   })
 

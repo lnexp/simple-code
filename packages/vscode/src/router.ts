@@ -1,5 +1,7 @@
+import type { TaskDispatchRequest, TaskDispatchResponse, TaskModelsRequest, TaskModelsResponse } from '@simple-code/core'
 import type { ToHost, ToWebview } from './protocol.ts'
 import type { Bridge } from './bridge.ts'
+import type { RobotFolderView } from './robot-feed.ts'
 
 /**
  * 多根工作区的文件夹路由（design.md §7）。
@@ -26,6 +28,9 @@ export type RouterDeps = {
   folders: () => string[]
   /** 持久化/读取上次选择（workspaceState）。实现自己处理失效值 */
   saveFolder: (folder: string) => void
+  /** 机器人看的状态变了（目录清单重推的同一批时机 + 面板换了显示的任务）。
+   *  desktop-robot.md §9：「postFolders 的同一批时机推一次 status」 */
+  onChange?: () => void
 }
 
 export type Router = {
@@ -38,12 +43,32 @@ export type Router = {
   requestReloadAll: () => void
   /** 工作区文件夹增删时（onDidChangeWorkspaceFolders） */
   setFolders: () => void
+  /** agent 派任务（task-bridge.ts）：交给 root 所在文件夹的 bridge。那个
+   *  文件夹没有 bridge = 派它的会话不在本窗口，拒绝 */
+  dispatchFromAgent: (req: TaskDispatchRequest) => Promise<TaskDispatchResponse>
+  /** bin --models（规则 14）：root 所在文件夹配置里的 taskModels */
+  taskModels: (req: TaskModelsRequest) => Promise<TaskModelsResponse>
+  /** 桌面机器人：各已打开目录的现状（只含建过 bridge 的——没打开过的目录不可能有事） */
+  robotFolders: () => RobotFolderView[]
+  /** 面板此刻显示的目录与任务（null = 主任务）。§5.1 seen 的判据之一 */
+  showing: () => { folder: string; task: string | null }
+  /** 机器人上点「允许」：找到卡所在的 bridge 放行。没有这张卡 = false */
+  allow: (toolCallId: string) => boolean
+  /** 机器人上点某条：切到目录，再让 webview 选中任务。webview 还没就绪
+   *  （面板刚被 focus 命令拉起）就等 ready 后再做 */
+  focus: (folder: string, task: string | null) => void
   dispose: () => void
 }
 
 export function createRouter(deps: RouterDeps): Router {
   const bridges = new Map<string, Bridge>()
   let active = ''
+  /** webview 报来的「正显示哪个任务」（view_task） */
+  let shownTask: string | null = null
+  /** webview 能收消息吗：ready 置真，面板关掉（detachAll）置假。之前发的
+   *  select_task 会被 VS Code 静默丢掉（protocol.ts ready 的注释） */
+  let webviewReady = false
+  let pendingFocus: { folder: string; task: string | null } | null = null
 
   const activeBridge = (): Bridge | undefined => bridges.get(active)
 
@@ -61,6 +86,7 @@ export function createRouter(deps: RouterDeps): Router {
       })),
       active,
     })
+    deps.onChange?.()
   }
 
   /** 该文件夹 bridge 的 post：非 active 只放行状态类消息（带 folder 标注），
@@ -101,11 +127,16 @@ export function createRouter(deps: RouterDeps): Router {
     ;(bridges.get(folder) ?? spawn(folder)).attach()
   }
 
+  const selectTask = (task: string | null): void => {
+    deps.post({ type: 'select_task', task })
+  }
+
   return {
     seed: (folder) => {
       if (active === '' && deps.folders().includes(folder)) active = folder
     },
     detachAll: () => {
+      webviewReady = false
       for (const b of bridges.values()) b.detach()
     },
     requestReloadAll: () => {
@@ -114,15 +145,26 @@ export function createRouter(deps: RouterDeps): Router {
     handle: (msg) => {
       switch (msg.type) {
         case 'ready':
+          webviewReady = true
+          // 机器人点了跳转、面板是被 focus 命令拉起来的：直接落到目标目录
+          if (pendingFocus !== null && deps.folders().includes(pendingFocus.folder)) active = pendingFocus.folder
           // seed 已设过 active（上次选择）就不动它——「没 spawn」不是重置
           // active 的理由，否则 seed 被 [0] 顶掉，出现先连 [0] 再跳的闪换
           if (active === '') active = pick()
           if (active && !bridges.has(active)) spawn(active)
           bridges.get(active)?.attach()
           postFolders()
+          if (pendingFocus !== null) {
+            selectTask(pendingFocus.task)
+            pendingFocus = null
+          }
           return
         case 'switchFolder':
           switchTo(msg.folder)
+          return
+        case 'view_task':
+          shownTask = msg.task
+          deps.onChange?.()
           return
         case 'approval_reply':
           // 后台文件夹的卡：id 是各 bridge 自己的 seq，必须路由回原地
@@ -154,6 +196,45 @@ export function createRouter(deps: RouterDeps): Router {
       } else {
         postFolders()
       }
+    },
+
+    dispatchFromAgent: async ({ root, brief, owner, model }) => {
+      const b = bridges.get(root)
+      if (!b) return { ok: false, error: `本窗口没有打开「${root}」的 SC 会话` }
+      return b.dispatchFromAgent(brief, owner, model)
+    },
+
+    taskModels: async ({ root }) => {
+      const b = bridges.get(root)
+      if (!b) return { ok: false, error: `本窗口没有打开「${root}」的 SC 会话` }
+      return b.taskModels()
+    },
+
+    robotFolders: () =>
+      deps
+        .folders()
+        .flatMap((folder) => {
+          const b = bridges.get(folder)
+          return b ? [{ folder, ...b.robotView() }] : []
+        }),
+
+    showing: () => ({ folder: active, task: shownTask }),
+
+    allow: (toolCallId) => {
+      for (const b of bridges.values()) if (b.allowToolCall(toolCallId)) return true
+      return false
+    },
+
+    focus: (folder, task) => {
+      if (!deps.folders().includes(folder)) return
+      if (!webviewReady) {
+        pendingFocus = { folder, task }
+        return
+      }
+      // 先切目录：switchTo 同步推 folders/hydrate/tasks，webview 按序处理，
+      // select_task 排在后面，不会被切目录时的「恢复上次选中的任务」盖掉
+      switchTo(folder)
+      selectTask(task)
     },
 
     dispose: () => {

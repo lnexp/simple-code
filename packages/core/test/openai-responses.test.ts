@@ -38,6 +38,39 @@ async function feed(events: [string, Record<string, unknown>][]): Promise<LLMEve
 }
 
 describe('openai-responses / parseStream', () => {
+  it('多段推理摘要之间补空行，不拼成 **A****B**（2026-10-29，事件序列取自 calllog/sse-a.txt）', async () => {
+    const part = (i: number) =>
+      [
+        'response.reasoning_summary_part.added',
+        {
+          item_id: 'rs_1',
+          output_index: 0,
+          summary_index: i,
+          part: { type: 'summary_text', text: '' },
+        },
+      ] as [string, Record<string, unknown>]
+    const delta = (i: number, d: string) =>
+      [
+        'response.reasoning_summary_text.delta',
+        { item_id: 'rs_1', output_index: 0, summary_index: i, delta: d },
+      ] as [string, Record<string, unknown>]
+    const events = await feed([
+      part(0),
+      delta(0, '**Acknowledging unintended GLM content exposure**'),
+      part(1),
+      delta(1, '**Identifying P1 direct offer handler race condition**'),
+      part(2),
+      delta(2, '**Recommending purge-before-execute strategy**'),
+      ['response.completed', { response: { status: 'completed', output: [] } }],
+    ])
+    const text = events.map((e) => (e.type === 'reasoning_delta' ? e.text : '')).join('')
+    expect(text).toBe(
+      '**Acknowledging unintended GLM content exposure**\n\n' +
+        '**Identifying P1 direct offer handler race condition**\n\n' +
+        '**Recommending purge-before-execute strategy**',
+    )
+  })
+
   it('流 EOF 但没收到 response.completed：当断流抛错，不当成功', async () => {
     // 同 anthropic 侧：干净 EOF 不是模型说完了，是链路把流掐了
     await expect(

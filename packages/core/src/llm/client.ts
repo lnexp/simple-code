@@ -56,6 +56,7 @@ export async function* sendRequest(
   logRun({
     ev: 'llm_req',
     model: request.model,
+    effort: request.effort,
     ...(options.folder ? { folder: options.folder } : {}),
     ...(options.tag ? { tag: options.tag } : {}),
     // 网关路由参数（providerId 这类）：同一模型走哪个渠道，只有它分得清
@@ -141,6 +142,7 @@ export async function* sendRequest(
     logRun({
       ev: 'llm',
       model: request.model,
+      effort: request.effort,
       ...(options.folder ? { folder: options.folder } : {}),
       ...(options.tag ? { tag: options.tag } : {}),
       ms,

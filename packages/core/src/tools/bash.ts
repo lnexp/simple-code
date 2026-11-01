@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ToolDefinition } from '../llm/types.ts'
 import type { ApprovalConfig } from './approval.ts'
+import type { BgMeta } from './bg.ts'
 import {
   classify,
   DEFAULT_ASK_COMMANDS,
@@ -69,6 +70,14 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
       ? '【生图】"$SIMPLE_CODE_IMAGEGEN" "<指令>" <输出路径.png>（尺寸由模型按画面内容决定；图片只落盘、stdout 回一行路径；' +
         '路径限项目内，同名已存在会另存带 hash 的文件名，实际格式与扩展名不符会改扩展名并写明；看效果另用 view_image）。\n'
       : '') +
+    // 派任务（task-trunk 规则 11）：只有 VS Code 宿主起了派任务桥才写——终端 sc 没有任务条
+    (env.SIMPLE_CODE_TASK !== undefined && env.SIMPLE_CODE_TASK_PORT !== undefined
+      ? '【派任务】"$SIMPLE_CODE_TASK" <<\'MD\' 任务书 MD（首行当任务名）：派一个并行任务进任务条，与用户开的任务一样跑、用户可切过去看；' +
+        '立即返回任务名，不等跑完，可一次派多个。它看不到你当前的对话，任务书要自带背景、目标、交付物；' +
+        '派出那一轮结束时结果以〔任务结果〕消息回到你这里，不用轮询；它的经历之后合回历史。' +
+        // 规则 14：固定一句，列表不进描述——用户改 taskModels 不动 tools[0]
+        '可加 --model <名> 指定模型（"$SIMPLE_CODE_TASK" --models 列出可选的及用途；不写 = 配置默认）。\n'
+      : '') +
     '【补丁】改既有文件用 "$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n' +
     '*** Begin Patch\n*** Update File: 路径（相对工作区根）\n@@\n 照抄文件里已有的行（上下文）\n-要删的行\n+要加的行\n@@\n 另一处改动的上下文行\n-旧行\n+新行\n*** End Patch\nPATCH' +
     '（上下文与删除行须与文件逐行一致且各留一个前导空格，空行也不例外——写补丁前先用 grep -n 定位、' +
@@ -86,9 +95,10 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
     '再一行 ---，其后是正文；新结论当场记一条）。' +
     '改内容用 "$SIMPLE_CODE_APPLY_PATCH"（.simple-code/notes/，免审批；write 撞同名拒绝，不覆盖）；' +
     '结论被推翻时不删，头里加 status: superseded 与 by: <接替的 note 名>，从此不进索引。\n' +
-    '【教训】"$SIMPLE_CODE_LESSON" list [--all] | read <name> | search <关键词> [--all] | ' +
-    'write（五段 heredoc JSON 走 stdin，字段 name/title/description/symptom/misjudged/rootCause/fix/verified，格式自动组装）。' +
-    '调试一轮没修好先查教训，失败 ≥2 次后成功用 write 记一条。局部改走 "$SIMPLE_CODE_APPLY_PATCH"（.simple-code/lessons/，免审批）。\n' +
+    '所有 note 操作可加 --type general|lesson|principle|goal；list/search 默认跨类型，write 默认 general。' +
+    'lesson 正文五个 ## 节：症状、当时怎么误判的、根因、修法、怎么验证的；principle：判断、适用边界、依据（默认 candidate，核实认可后改 active）；' +
+    'goal：这件事是什么、目标、当前范围与边界、怎样算达到目标；头 current: true 指定当前目标，仅一个，状态 active/paused/completed/superseded。' +
+    '新文件在 notes/<type>/（general 在根）；旧目录原位兼容，不自动迁移。当前 goal 和入选原则完整常驻，其余 read 按需。\n' +
     '【技能】（点名或不确定怎么做时查用）"$SIMPLE_CODE_SKILL" list | read <name> | search <关键词>。' +
     '改项目级 SKILL.md 走 "$SIMPLE_CODE_APPLY_PATCH"（免审批）；用户级在 ~/.simple-code，写走 bash 审批。',
   parameters: {
@@ -121,7 +131,8 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
   },
 })
 
-type Args = { command: string; timeoutMs: number }
+/** desc 只给后台进程条当行标签用（bg.ts）；执行本身不看它 */
+type Args = { command: string; timeoutMs: number; desc?: string }
 
 /**
  * 漏 desc 时追加在结果末尾（2026-09-29 用户拍板方案 B）。schema 必填挡不住
@@ -211,14 +222,18 @@ async function checkApproval(
           ? { kind: 'hidden' as const, ...verdict.alwaysHidden }
           : verdict.nonPathFrom !== undefined
             ? { kind: 'nonpath' as const, ...verdict.nonPathFrom }
-            : verdict.alwaysPaths !== undefined
-            ? { kind: 'paths' as const, dirs: verdict.alwaysPaths }
-            : verdict.category === 'external_dir'
-              ? (() => {
-                  const dir = dirHint(verdict.detail)
-                  return dir === null ? undefined : { kind: 'path' as const, dir }
-                })()
-              : undefined
+            : verdict.alwaysPaths !== undefined || verdict.alwaysHiddens !== undefined
+              ? {
+                  kind: 'paths' as const,
+                  dirs: verdict.alwaysPaths ?? [],
+                  ...(verdict.alwaysHiddens ? { hidden: verdict.alwaysHiddens } : {}),
+                }
+              : verdict.category === 'external_dir'
+                ? (() => {
+                    const dir = dirHint(verdict.detail)
+                    return dir === null ? undefined : { kind: 'path' as const, dir }
+                  })()
+                : undefined
       : undefined
 
   // 中断兜底：宿主收到 abort 应自行 resolve 'deny'，但没做的话这里
@@ -233,6 +248,7 @@ async function checkApproval(
       category: verdict.category,
       detail: verdict.detail,
       reason: verdict.reason,
+      ...(verdict.parts ? { parts: verdict.parts } : {}),
       ...(alwaysHint ? { always: alwaysHint } : {}),
     }),
     aborted,
@@ -245,17 +261,24 @@ async function checkApproval(
       else if (alwaysHint.kind === 'hidden') appendHidden(ctx.root, alwaysHint.path, alwaysHint.write)
       else if (alwaysHint.kind === 'nonpath') appendNonPathFrom(ctx.root, alwaysHint.lead, alwaysHint.from)
       else if ('dir' in alwaysHint) appendPath(ctx.root, alwaysHint.dir)
-      else for (const d of alwaysHint.dirs) appendPath(ctx.root, d)
+      else {
+        for (const d of alwaysHint.dirs) appendPath(ctx.root, d)
+        for (const h of alwaysHint.hidden ?? []) appendHidden(ctx.root, h.path, h.write)
+      }
     } catch (err) {
       process.stderr.write(
         `approval.json 写入失败（本次仍放行）：${err instanceof Error ? err.message : String(err)}\n`,
       )
     }
   }
-  // { deny: '...' } 与裸 'deny' 同走拒绝，前者带用户的话
+  // { deny: '...' }、裸 'deny'、'timeout' 同走拒绝，前者带用户的话
   if (decision === 'allow' || decision === 'always') return null
   const feedback = typeof decision === 'object' ? decision.deny.trim() : ''
-  const note = ctx.signal.aborted ? '等待审批时被用户中断' : '用户拒绝了这条命令'
+  const note = ctx.signal.aborted
+    ? '等待审批时被用户中断'
+    : decision === 'timeout'
+      ? '审批等待超时、无人处理，已按拒绝处理（不是用户拒绝）'
+      : '用户拒绝了这条命令'
   return {
     output:
       `审批被拒绝：${verdict.reason}。${note}。` +
@@ -296,7 +319,11 @@ function parseArgs(input: unknown, config: BashConfig): Args | string {
     ? Math.min(raw.timeout * 1000, config.maxTimeoutMs)
     : config.defaultTimeoutMs
 
-  return { command: raw.command, timeoutMs }
+  // 与 hasDesc 同口径：glm 把 desc 写成 description 键，内容一样算数
+  const desc = [raw.desc, raw.description].find(
+    (d): d is string => typeof d === 'string' && d.trim() !== '',
+  )
+  return { command: raw.command, timeoutMs, ...(desc === undefined ? {} : { desc }) }
 }
 
 // ---------------------------------------------------------------- 执行
@@ -315,6 +342,12 @@ function run(args: Args, config: BashConfig, ctx: ToolContext): Promise<ToolOutp
     // 审批范围扩大一圈（直接干会弹卡、借 sc 静默放行）的路在这里堵死。
     // 不走 envPassthrough：这值必须是本层的事实，从更外层继承来的值
     // 在这里被覆盖——每过一个 agent 层就收窄一次
+    // 后台进程条的一行（bg.ts）：标签 desc、agent 写的原命令、开始时刻
+    const bgMeta: BgMeta = {
+      command: args.command,
+      startedAt: Date.now(),
+      ...(args.desc === undefined ? {} : { desc: args.desc }),
+    }
     const child = spawn('bash', ['-c', `exec 2>&1\n${args.command}`], {
       cwd: ctx.root,
       // 独立进程组。少了它 kill 只能杀掉 bash 自己，它派生的子进程会变成孤儿
@@ -372,12 +405,12 @@ function run(args: Args, config: BashConfig, ctx: ToolContext): Promise<ToolOutp
       child.stderr.removeAllListeners('data')
       child.stderr.on('data', intoFile)
       child.on('close', () => stream?.end())
-      ctx.bg?.register(pid, args.command, logPath)
+      ctx.bg?.register(pid, { ...bgMeta, logPath })
       // 组长（这个 bash）随时可能先于组员退出——`... & echo; sleep; curl`
       // 跑完就走，nohup 起的服务被 init 收养继续跑（t886 实测 mvn 占着
       // 8081，UI 上却空空如也）。转后台这一刻先扫一次组，组长之后再死
       // 也有组员顶着；不 await——转后台的返回不该等一次 ps
-      void ctx.bg?.collect(pid)
+      void ctx.bg?.collect(pid, bgMeta)
       clearTimeout(timer)
       ctx.signal.removeEventListener('abort', onAbort)
       ctx.interjectSignal?.removeEventListener('abort', onInterject)
@@ -439,7 +472,8 @@ function run(args: Args, config: BashConfig, ctx: ToolContext): Promise<ToolOutp
         exitCode: code ?? -1,
         note: signal ? `\n[命令被信号 ${signal} 终止]` : '',
       }
-      const noteBg = ctx.bg && args.command.includes('&') ? ctx.bg.collect(child.pid!) : undefined
+      const noteBg =
+        ctx.bg && args.command.includes('&') ? ctx.bg.collect(child.pid!, bgMeta) : undefined
       // collect 不 reject（ps 失败内部吞掉），但 finally 保险；undefined 分支
       // 必须直落 finish——可选链漏掉它的话前台命令永远不 resolve（测试抓的）
       if (noteBg) noteBg.finally(() => finish(outcome))
@@ -496,5 +530,8 @@ function spawnEnv(config: BashConfig, ctx: ToolContext): Record<string, string> 
     // 记忆库实际位置：分身任务的 $SIMPLE_CODE_MEMORY 靠它查自己的库
     // （cwd 冒泡会找到主干的——分身 cwd 就是主 folder）
     SIMPLE_CODE_MEMORY_DIR: ctx.memoryRoot ?? ctx.root,
+    // 本会话是谁：memory search 只给它看已合回段与它自己的轮；
+    // $SIMPLE_CODE_TASK 派任务时记作父任务（task-trunk 规则 11/12）
+    ...(ctx.owner !== undefined ? { SIMPLE_CODE_OWNER: ctx.owner } : {}),
   }
 }

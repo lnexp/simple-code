@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, describe, expect, it } from 'vitest'
-import { ensureShims, resolveNodeBin } from '../src/shims.ts'
+import { ensureDocCopy, ensureShims, resolveNodeBin } from '../src/shims.ts'
 
 const run = promisify(execFile)
 const dirs: string[] = []
@@ -15,6 +15,17 @@ afterEach(async () => {
 })
 
 describe('shims（宿主内置 Node 优先、系统 node 兜底）', () => {
+  it('清除退役 lesson 的自有 shim，保留用户同名脚本', async () => {
+    const binDir = await mkdtemp(join(tmpdir(), 'sc-retired-'))
+    dirs.push(binDir)
+    const path = join(binDir, 'sc-lesson')
+    await writeFile(path, '#!/bin/sh\n# SimpleCode 自动生成\nnode /old/lesson.js')
+    await ensureShims([], { binDir, nodeBin: process.execPath })
+    await expect(readFile(path)).rejects.toThrow()
+    await writeFile(path, '#!/bin/sh\necho custom')
+    await ensureShims([], { binDir, nodeBin: process.execPath })
+    expect(await readFile(path, 'utf8')).toContain('custom')
+  })
   it('写 shim 并真的能跑：参数透传、输出回收', async () => {
     const binDir = await mkdtemp(join(tmpdir(), 'sc-shim-'))
     const scriptDir = await mkdtemp(join(tmpdir(), 'sc-script-'))
@@ -72,5 +83,24 @@ describe('shims（宿主内置 Node 优先、系统 node 兜底）', () => {
     expect(await resolveNodeBin('/nonexistent/node')).toBe('node')
     // 本进程的 node 能跑 node:sqlite——正常路径命中 candidate
     expect(await resolveNodeBin(process.execPath)).toBe(process.execPath)
+  })
+})
+
+describe('ensureDocCopy（self.md 拷到 bin 目录，读它不弹隐藏路径卡）', () => {
+  it('拷贝内容并返回拷贝路径；没变不重写，变了重写', async () => {
+    const binDir = await mkdtemp(join(tmpdir(), 'sc-doc-'))
+    const srcDir = await mkdtemp(join(tmpdir(), 'sc-doc-src-'))
+    dirs.push(binDir, srcDir)
+    const src = join(srcDir, 'self.md')
+    await writeFile(src, '# 教程 v1\n')
+    const path = ensureDocCopy(src, binDir)
+    expect(path).toBe(join(binDir, 'self.md'))
+    expect(await readFile(path, 'utf8')).toBe('# 教程 v1\n')
+    const before = (await stat(path)).mtimeMs
+    ensureDocCopy(src, binDir)
+    expect((await stat(path)).mtimeMs).toBe(before)
+    await writeFile(src, '# 教程 v2\n')
+    ensureDocCopy(src, binDir)
+    expect(await readFile(path, 'utf8')).toBe('# 教程 v2\n')
   })
 })

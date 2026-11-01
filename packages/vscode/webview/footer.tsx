@@ -84,7 +84,9 @@ export function MessageFooter({
         </span>
       )}
       {elapsedMs !== undefined && (
-        <span className="footer-item" title="本轮耗时">
+        // 本轮有「处理过程」那一行时，耗时已在那行显示，这里由 CSS 藏掉（style.ts
+        // .footer-elapsed）。没有命令的轮没有那一行，耗时只在这里
+        <span className="footer-item footer-elapsed" title="本轮耗时">
           <i className="codicon codicon-watch" aria-hidden />
           {formatElapsed(elapsedMs)}
         </span>

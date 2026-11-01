@@ -81,9 +81,40 @@ for (const rel of checks) {
 
 rmSync(stage, { recursive: true, force: true })
 
+// 6. 注册核对（教训 extension-folder-exists-but-not-loaded）：目录在 ≠ VS Code
+// 会加载——UI 卸载会删 extensions.json 条目并在 .obsolete 打标。reload 前抓这层，
+// 别等 reload 后行为没变再倒查
+{
+  const extParent = join(extRoot, '..')
+  const registryFile = join(extParent, 'extensions.json')
+  const obsoleteFile = join(extParent, '.obsolete')
+  try {
+    const registry = JSON.parse(readFileSync(registryFile, 'utf8'))
+    const wantId = `${manifest.publisher}.${manifest.name}`.toLowerCase()
+    if (!registry.some((e) => e?.identifier?.id === wantId && e?.version === manifest.version && e?.location?.path === extRoot)) {
+      console.error(`[deploy] ✗ extensions.json 没有指向本目录的注册条目（${extRoot}）——reload 不会加载它`)
+      console.error('[deploy]   修法见教训 extension-folder-exists-but-not-loaded：补注册条目或清 .obsolete')
+      ok = false
+    } else {
+      console.log('[deploy] ✓ extensions.json 注册条目在位')
+    }
+    if (existsSync(obsoleteFile)) {
+      const obsolete = JSON.parse(readFileSync(obsoleteFile, 'utf8'))
+      if (obsolete[extRoot.split('/').pop()]) {
+        console.error(`[deploy] ✗ .obsolete 标记了 ${extDirName}——目录会被 VS Code 视为已卸载`)
+        ok = false
+      } else {
+        console.log('[deploy] ✓ .obsolete 无本目录标记')
+      }
+    }
+  } catch (e) {
+    console.error(`[deploy] ⚠ 注册核对失败（${e instanceof Error ? e.message : String(e)}）——md5 已一致，继续`)
+  }
+}
+
 // ~/.simple-code/bin/ 的 sc 不再由 deploy 建软链——扩展激活时的 shim
 // 接管（core src/shims.ts：宿主内置 Node 优先、系统 node 兜底，激活
 // 每次重写，路径永远新鲜）。deploy 建的软链会和 shim 互相覆盖打架
 if (!ok) { console.error('[deploy] 核对失败——上面的差异要处理，别 reload'); process.exit(1) }
 console.log(`[deploy] 完成。Cmd+Shift+P → Reload Window 生效`)
-console.log(`[deploy] 注：reload 后行为仍没变，先跑 verify-install 教训那套（jsonl 仲裁），再怀疑缓存`)
+console.log(`[deploy] reload 后跑 node scripts/verify-install.mjs 仲裁新版在跑（ext_activate 版本事件）`)

@@ -15,9 +15,14 @@
  * 再按 token 顺序组成 phrase——phrase 要求相邻，等价于原文含连续子串，
  * 语义与老的 indexOf 对齐。单字查询（「图」）与奇数段尾单字用前缀匹配（`"图" *`）兜住。
  *
- * 游标：steps 表的行从不删除（DELETE 只打 messages），所以 last_step_id
- * 是安全的增量游标。宿主在 save 尾部同步；CLI（$SIMPLE_MEMORY search）
+ * 游标：每个 steps 号段一个（segments.indexed_step / indexed_rowid，
+ * task-trunk）。原来是全局 last_step_id——段交错后号低于游标的段增量收不到，
+ * 谁的段号最高谁才实时进索引。steps 表的行从不删除（DELETE 只打 messages），
+ * 段内游标是安全的增量游标。宿主在 save 尾部同步；CLI（$SIMPLE_MEMORY search）
  * 只读查询——写路径只有宿主，没有 SQLITE_BUSY 的并发写问题。
+ *
+ * 可见性：索引收全部段，查询时按调用者过滤——只返回已合回段与自己的轮
+ * （`ftsSearch` 的 owner 参数）。别的任务没合回的经历对它还不是历史。
  */
 import { readFile } from 'node:fs/promises'
 import { basename } from 'node:path'
@@ -71,23 +76,6 @@ export function matchExpr(query: string): string | null {
   return exprs.join(' OR ')
 }
 
-const META_LAST_STEP = 'last_step_id'
-// 游标 step 那一行的 rowid：save 时 step 可能只落了 assistant（工具结果
-// 随后才落库），下次同步按 rowid 删掉重做游标 step，否则工具输出永远
-// 搜不到（2026-10-23 库副本比对：上次全量重灌后 118+ 行缺工具输出）
-const META_LAST_ROWID = 'last_rowid'
-
-const readMeta = (db: Db, k: string): string | undefined =>
-  (db.all<{ v: string }>(`SELECT v FROM search_fts_meta WHERE k = ?`, k)[0] as { v: string } | undefined)?.v
-
-const writeMeta = (db: Db, k: string, v: number): void =>
-  db.run(
-    `INSERT INTO search_fts_meta(k, v) VALUES(?, ?)
-     ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
-    k,
-    String(v),
-  )
-
 /** 一个 step 聚合入倒排表，返回新行 rowid；step 还没有消息返回 null */
 function indexStep(db: Db, s: { id: number; turn_id: number }): number | null {
   const msgs = db.all<{ content_json: string }>(
@@ -121,64 +109,59 @@ function indexStep(db: Db, s: { id: number; turn_id: number }): number | null {
   return (db.all<{ r: number }>(`SELECT last_insert_rowid() r`)[0] as { r: number }).r
 }
 
-/** 增量同步：重做游标 step（它可能后补了工具结果）+ 聚合 > 游标的新
- * step。宿主 save 尾部调用。 */
+/** 增量同步，逐段：重做 open 段的游标 step（它可能后补了工具结果）+ 聚合
+ * 游标之上的新 step。full/merged 段主人已切走，游标 step 不会再长，只收
+ * 游标之上的（通常没有）。宿主 save 尾部调用。 */
 export function syncSearchIndex(db: Db): void {
-  db.exec(`CREATE TABLE IF NOT EXISTS search_fts_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`)
-  const last = Number(readMeta(db, META_LAST_STEP) ?? 0)
-  const lastRowid = readMeta(db, META_LAST_ROWID)
-  // 老库没有 last_rowid：游标 step 那行找不到，只能照旧从 > 游标开始
-  if (lastRowid !== undefined) {
-    db.run(`DELETE FROM search_fts WHERE rowid = ?`, Number(lastRowid))
-    // 先清掉指针：删掉的 rowid 可能被下一行复用，没重新插入就不能留着
-    db.run(`DELETE FROM search_fts_meta WHERE k = ?`, META_LAST_ROWID)
-  }
-  const steps = db.all<{ id: number; turn_id: number }>(
-    `SELECT id, turn_id FROM steps WHERE id ${lastRowid !== undefined ? '>=' : '>'} ? ORDER BY id`,
-    last,
+  const segs = db.all<{ id: number; floor: number; ceil: number; state: string; step: number | null; rowid: number | null }>(
+    `SELECT id, step_floor AS floor, step_ceil AS ceil, state, indexed_step AS step, indexed_rowid AS rowid FROM segments`,
   )
-  for (const s of steps) {
-    const rowid = indexStep(db, s)
-    if (rowid === null) continue
-    writeMeta(db, META_LAST_STEP, s.id)
-    writeMeta(db, META_LAST_ROWID, rowid)
-  }
-}
-
-/**
- * 只重做指定 turn 的索引行（先删后灌，可重入）。关闭任务用：任务段的
- * step 号在对话游标之下，增量同步收不到；以前在这里全量重灌，大库
- * 冻宿主十几秒（2026-10-23 某真库 2.8 万 step 12.8s）。
- * 游标不动；游标 step 恰在这些 turn 里时，last_rowid 跟到新行。
- */
-export function reindexTurns(db: Db, turnIds: number[]): void {
-  if (turnIds.length === 0) return
-  db.exec(`CREATE TABLE IF NOT EXISTS search_fts_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`)
-  const marks = turnIds.map(() => '?').join(',')
-  db.run(`DELETE FROM search_fts WHERE turn_no IN (${marks})`, ...turnIds)
-  const last = Number(readMeta(db, META_LAST_STEP) ?? 0)
-  const steps = db.all<{ id: number; turn_id: number }>(
-    `SELECT id, turn_id FROM steps WHERE turn_id IN (${marks}) ORDER BY id`,
-    ...turnIds,
-  )
-  for (const s of steps) {
-    const rowid = indexStep(db, s)
-    if (s.id !== last) continue
-    if (rowid === null) db.run(`DELETE FROM search_fts_meta WHERE k = ?`, META_LAST_ROWID)
-    else writeMeta(db, META_LAST_ROWID, rowid)
+  for (const g of segs) {
+    const redo = g.rowid !== null && g.state === 'open'
+    if (redo) {
+      db.run(`DELETE FROM search_fts WHERE rowid = ?`, g.rowid)
+      // 先清掉指针：删掉的 rowid 可能被下一行复用，没重新插入就不能留着
+      db.run(`UPDATE segments SET indexed_rowid = NULL WHERE id = ?`, g.id)
+    }
+    const steps = db.all<{ id: number; turn_id: number }>(
+      `SELECT id, turn_id FROM steps WHERE id ${redo ? '>=' : '>'} ? AND id <= ? ORDER BY id`,
+      g.step ?? g.floor,
+      g.ceil,
+    )
+    for (const s of steps) {
+      const rowid = indexStep(db, s)
+      if (rowid === null) continue
+      db.run(`UPDATE segments SET indexed_step = ?, indexed_rowid = ? WHERE id = ?`, s.id, rowid, g.id)
+    }
   }
 }
 
 /** 只读查询：MATCH → [(turn_no, step_no)]，按 BM25 相关性排（FTS5 内置
  * bm25()，返回负值、越相关越小；深入讨论过——提词多次的 step——排
  * 在顺带一提的前面）。同分 rowid 兜底，保证排序确定。 */
-export function ftsSearch(db: Db, query: string, limit: number): { turn: number; step: number }[] {
+export function ftsSearch(
+  db: Db,
+  query: string,
+  limit: number,
+  /** 调用者（主任务 ''、任务 'task-xxx'）：只返回已合回段与它自己的轮。
+   *  不传 = 不过滤（终端里手敲的查询，不属于任何会话） */
+  owner?: string,
+): { turn: number; step: number }[] {
   const expr = matchExpr(query)
   if (expr === null) return []
+  // 一轮的 step 全在同一段（只在轮之间切段），按轮的首个 step 定段
+  const visible =
+    owner === undefined
+      ? ''
+      : `AND (turn_no IN (SELECT id FROM turns WHERE owner IS ?)
+              OR EXISTS (SELECT 1 FROM segments g WHERE g.state = 'merged'
+                         AND (SELECT MIN(s.id) FROM steps s WHERE s.turn_id = turn_no) > g.step_floor
+                         AND (SELECT MIN(s.id) FROM steps s WHERE s.turn_id = turn_no) <= g.step_ceil))`
   const rows = db.all<{ turn_no: number; step_no: number }>(
-    `SELECT turn_no, step_no FROM search_fts WHERE search_fts MATCH ?
+    `SELECT turn_no, step_no FROM search_fts WHERE search_fts MATCH ? ${visible}
      ORDER BY bm25(search_fts), rowid LIMIT ?`,
     expr,
+    ...(owner === undefined ? [] : [owner === '' ? null : owner]),
     limit,
   )
   return rows.map((r) => ({ turn: r.turn_no, step: r.step_no }))

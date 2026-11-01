@@ -4,7 +4,8 @@ import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import { openDb } from '../src/session/db.ts'
 import { SCHEMA } from '../src/session/schema.sql.ts'
-import { ftsSearch, matchExpr, reindexTurns, syncSearchIndex, toFtsText } from '../src/session/search-index.ts'
+import { ftsSearch, matchExpr, syncSearchIndex, toFtsText } from '../src/session/search-index.ts'
+import { openSegment } from '../src/session/segments.ts'
 import { runSearch } from '../src/tools/memory.ts'
 
 describe('toFtsText / matchExpr（中文分词）', () => {
@@ -41,25 +42,29 @@ describe('syncSearchIndex + ftsSearch（真库）', () => {
   const dir = mkdtempSync(join(tmpdir(), 'sc-fts-'))
   const db = openDb(join(dir, 'state.db'))
   db.exec(SCHEMA)
+  // 游标在段上（task-trunk）：主任务一段 (0, 50000]，下面的 step 都在里面
+  openSegment(db, '', dir)
 
-  const insert = (turn: number, step: number, role: string, text: string) => {
-    db.run(`INSERT INTO turns(id, started_at) VALUES(?, '2026-01-01') ON CONFLICT(id) DO NOTHING`, turn)
+  const insert = (turn: number, step: number, role: string, text: string, owner: string | null = null) => {
+    db.run(`INSERT INTO turns(id, started_at, owner) VALUES(?, '2026-01-01', ?) ON CONFLICT(id) DO NOTHING`, turn, owner)
     db.run(`INSERT INTO steps(id, turn_id, started_at) VALUES(?, ?, '2026-01-01')`, step, turn)
     db.run(
-      `INSERT INTO messages(turn_id, role, content_json, state, step_id) VALUES(?, ?, ?, 'live', ?)`,
+      `INSERT INTO messages(turn_id, role, content_json, state, step_id, owner) VALUES(?, ?, ?, 'live', ?, ?)`,
       turn,
       role,
       JSON.stringify({ role, parts: [{ type: 'text', text }] }),
       step,
+      owner,
     )
   }
   // 往已存在的 step 追加一条消息（工具结果在 assistant 之后才落库）
-  const append = (turn: number, step: number, text: string) =>
+  const append = (turn: number, step: number, text: string, owner: string | null = null) =>
     db.run(
-      `INSERT INTO messages(turn_id, role, content_json, state, step_id) VALUES(?, 'tool', ?, 'live', ?)`,
+      `INSERT INTO messages(turn_id, role, content_json, state, step_id, owner) VALUES(?, 'tool', ?, 'live', ?, ?)`,
       turn,
       JSON.stringify({ role: 'tool', parts: [{ type: 'text', text }] }),
       step,
+      owner,
     )
   const rowsOf = (turn: number) =>
     db.all<{ c: number }>(`SELECT COUNT(*) c FROM search_fts WHERE turn_no = ?`, turn)[0]!.c
@@ -132,32 +137,32 @@ describe('syncSearchIndex + ftsSearch（真库）', () => {
     expect(rowsOf(4)).toBe(1)
   })
 
-  it('reindexTurns：游标之下的 turn（任务段）只重做这些 turn，先删后灌不重复', () => {
-    // 任务先存了一部分（step 40 已入索引，只有半截），之后对话写到 50、游标越过
-    insert(5, 40, 'assistant', '任务前半截')
+  it('每段一个游标：号低于别人游标的段也实时进索引（原全局游标要等关闭时补）', () => {
+    // 任务 A 的段开在主任务段之上 (50000, 100000]；之后主任务在自己段里写 60
+    // ——原来全局游标跳到 50001，主任务的 60 永远收不进来
+    const a = openSegment(db, 'task-aaa', dir)
+    insert(5, a.floor + 1, 'assistant', '任务前半截', 'task-aaa')
     syncSearchIndex(db)
-    insert(6, 50, 'user', '对话继续往前走')
+    insert(6, 60, 'user', '对话继续往前走')
+    append(5, a.floor + 1, '任务后半截的结论', 'task-aaa')
+    insert(5, a.floor + 2, 'assistant', '任务第二步发现', 'task-aaa')
     syncSearchIndex(db)
-    append(5, 40, '任务后半截的结论')
-    insert(5, 41, 'assistant', '任务第二步发现')
-    syncSearchIndex(db) // 增量看不到游标之下的东西
-    expect(ftsSearch(db, '二步发现', 10)).toEqual([])
-    const cursor = db.all<{ v: string }>(`SELECT v FROM search_fts_meta WHERE k = 'last_step_id'`)[0]!.v
-    reindexTurns(db, [5])
+    expect(ftsSearch(db, '继续往前', 10)).toEqual([{ turn: 6, step: 1 }])
     expect(ftsSearch(db, '后半截的', 10)).toEqual([{ turn: 5, step: 1 }])
     expect(ftsSearch(db, '二步发现', 10)).toEqual([{ turn: 5, step: 2 }])
     expect(rowsOf(5)).toBe(2)
-    reindexTurns(db, [5])
-    expect(rowsOf(5)).toBe(2)
-    // 别的 turn 不动，游标不动
-    expect(ftsSearch(db, '继续往前', 10)).toEqual([{ turn: 6, step: 1 }])
-    expect(db.all<{ v: string }>(`SELECT v FROM search_fts_meta WHERE k = 'last_step_id'`)[0]!.v).toBe(cursor)
-    // 游标 step 恰在被重做的 turn 里：指针要跟到新行，下次同步不留双份
-    append(6, 50, '对话那步的工具输出')
-    reindexTurns(db, [6])
     syncSearchIndex(db)
-    expect(rowsOf(6)).toBe(1)
-    expect(ftsSearch(db, '工具输出', 10)).toContainEqual({ turn: 6, step: 1 })
+    expect(rowsOf(5)).toBe(2)
+  })
+
+  it('可见性：只给已合回段与自己的轮；不传 owner 不过滤（对照组）', () => {
+    expect(ftsSearch(db, '二步发现', 10, '')).toEqual([]) // 主任务看不到 A 没合回的段
+    expect(ftsSearch(db, '二步发现', 10, 'task-aaa')).toEqual([{ turn: 5, step: 2 }])
+    expect(ftsSearch(db, '二步发现', 10)).toEqual([{ turn: 5, step: 2 }])
+    expect(ftsSearch(db, '继续往前', 10, 'task-aaa')).toEqual([]) // 主任务段也没合回
+    expect(ftsSearch(db, '继续往前', 10, '')).toEqual([{ turn: 6, step: 1 }])
+    db.run(`UPDATE segments SET state = 'merged' WHERE owner = 'task-aaa'`)
+    expect(ftsSearch(db, '二步发现', 10, '')).toEqual([{ turn: 5, step: 2 }])
   })
 
   it('奇数字中文词在汉字段中间也能命中（2026-10-23：「金丝雀」只在段尾才中）', () => {
@@ -182,6 +187,7 @@ describe('runSearch：FTS 优先、0 命中回退老扫描（端到端）', () =
   // db 与文件 step 对齐：step1=user 行，step2=assistant 行
   const db = openDb(join(root, '.simple-code/memory/state.db'))
   db.exec(SCHEMA)
+  openSegment(db, '', root)
   db.run(`INSERT INTO turns(id, started_at) VALUES(1, '2026-01-01')`)
   db.run(`INSERT INTO steps(id, turn_id, started_at) VALUES(1, 1, '2026-01-01')`)
   db.run(

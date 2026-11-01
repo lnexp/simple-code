@@ -54,6 +54,51 @@ describe('AST 路径：与正则路径同规则的抽样回归', () => {
     blocked('python3 /tmp/x.py', '任意代码')
     blocked('echo a | bash', '任意代码')
   })
+  it('透传前缀（nohup/timeout/env/xargs …）后面的真命令照判（2026-10-30 实案）', () => {
+    const t = { ...cfg, askCommands: ['git push', 'appctl build run'] }
+    expect(
+      classify(
+        `cd ${ROOT}\nnohup appctl build run --env dev --wait > .simple-code/tmp/b.log 2>&1 &\necho "pid=$!"`,
+        ROOT,
+        t,
+      ),
+    ).toMatchObject({ kind: 'ask', category: 'ask_rule', detail: 'appctl build run' })
+    for (const c of [
+      'timeout -s KILL 30 git push',
+      'nice -n 10 git push',
+      'env A=1 git push',
+      'echo dev | xargs -I {} git push origin {}',
+      'nohup timeout 5 git push',
+    ])
+      expect(classify(c, ROOT, t), c).toMatchObject({ kind: 'ask', detail: 'git push' })
+    blocked('nohup python3 x.py', '任意代码')
+    // 写动词按内层算：外层 lead 是 nohup 时 rm 的参数曾被当读
+    blocked('nohup rm .simple-code/memory/state.db', '写入')
+    // 对照：内层无害、查询形态、无命令
+    allow('nohup node server.js > .simple-code/tmp/s.log 2>&1 &')
+    allow('command -v python3')
+    allow('exec > .simple-code/tmp/x.log 2>&1')
+    allow('ls | xargs -I{} wc -l {}')
+  })
+
+  it('重定向写在中间 / 命令前 / heredoc 起始行后照判（2026-10-30）', () => {
+    blocked('echo > /etc/passwd x', '项目外')
+    blocked('> /etc/passwd echo x', '项目外')
+    blocked("cat <<'E' > /etc/passwd\nhi\nE", '项目外')
+    // 批过 python3 也只免命令名那一层，写项目外照弹（真机形态）
+    expect(
+      classify(`cd ${ROOT} && python3 - <<'PY' > /tmp/x.patch\nprint(1)\nPY`, ROOT, {
+        ...cfg,
+        alwaysLeads: ['python3'],
+      }),
+    ).toMatchObject({ kind: 'ask', category: 'external_dir' })
+    const t = { ...cfg, askCommands: ['git push'] }
+    for (const c of ['> o.log git push', 'nohup > .simple-code/tmp/o.log git push'])
+      expect(classify(c, ROOT, t), c).toMatchObject({ kind: 'ask', detail: 'git push' })
+    // 对照：目标在项目内 / /dev/null、中间重定向后面的参数不再当写目标
+    allow("cat <<'E' > .simple-code/tmp/ok.txt\nhi\nE")
+    allow('grep -rn a src 2>/dev/null package.json')
+  })
 })
 
 describe('AST 路径：正则做不到的结构性判定（本次升级的目的）', () => {
@@ -77,6 +122,19 @@ describe('AST 路径：正则做不到的结构性判定（本次升级的目的
     blocked('echo $(cat ~/.ssh/id_rsa)', '隐藏路径')
     blocked('echo file_$(rm ~/.zshrc)', '隐藏路径')
     allow('echo $(ls src)')
+  })
+  it('tr 的字符集不是路径；读重定向 < 是真文件，不进参数位豁免（2026-10-30）', () => {
+    allow(`n="$(git rev-list --left-right --count a...b | tr '\\t' '/')"`)
+    allow(`echo a/b | tr -d '/'`)
+    // tr 读 stdin：`< 文件` 等于把文件内容打出来
+    blocked('tr a b < /Users/dev/Desktop/y.txt', '项目外')
+    blocked('tr -d x < ~/.ssh/id_rsa', '隐藏路径')
+    // 同一个洞也在 nonPathFrom 豁免位上（xcli 第 2 位起豁免）
+    const v = classify('xcli get f.pptx /body < /Users/dev/Desktop/y.txt', ROOT, {
+      ...cfg,
+      nonPathFrom: { xcli: 2 },
+    })
+    expect(v).toMatchObject({ kind: 'ask', category: 'external_dir' })
   })
   it('引号内的 | 和 ; 不再误切段（正则会切成多段，只影响收紧方向）', () => {
     allow('grep "a|b" src/x.ts')
@@ -129,6 +187,11 @@ describe('AST 路径：重定向在 && / 管道 / 复合语句里不再漏扫（
     blocked(`cd ${ROOT} && cat src/a.ts > ../outside.txt`, '项目外')
     blocked('echo x | cat > /etc/passwd', '项目外')
     blocked(`cd ${ROOT} && { echo x; } > /etc/passwd`, '项目外')
+    // for/case 的循环体（do_group/case_item）曾不往里找最右命令，整个
+    // 重定向没人认领（2026-10-31 修）
+    blocked('for f in a; do echo x; done > /etc/passwd', '项目外')
+    blocked('case a in a) echo x;; esac > /etc/passwd', '项目外')
+    blocked('while read l; do echo $l; done < x > /etc/passwd', '项目外')
     // 项目内照旧放行——收紧不能变成见重定向就问
     allow(`cd ${ROOT} && echo x > out.txt`)
     allow('echo x | cat > out.txt')
@@ -234,6 +297,16 @@ describe('multi 同质 external_dir 的批量 always（2026-09-21 方案 1）', 
       expect(v.alwaysPaths).toBeUndefined()
       expect(v.alwaysLead).toBeUndefined()
     }
+  })
+
+  it('multi 带各段类别：桌面机器人据此判「git push 混在 && 里」只能回窗口处理', () => {
+    const v = classify('cd /Users/dev && git push origin main', ROOT, { ...cfg, askCommands: ['git push'] })
+    expect(v).toMatchObject({ kind: 'ask', category: 'multi' })
+    if (v.kind === 'ask') expect([...(v.parts ?? [])].sort()).toEqual(['ask_rule', 'external_dir'])
+    // 单一触发不是 multi，类别本身就是答案，不带 parts
+    const one = classify('git push origin main', ROOT, { ...cfg, askCommands: ['git push'] })
+    expect(one).toMatchObject({ kind: 'ask', category: 'ask_rule' })
+    if (one.kind === 'ask') expect(one.parts).toBeUndefined()
   })
 
   it('含过宽目录（家目录直下的文件）：不给批量 always', () => {

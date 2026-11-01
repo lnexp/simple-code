@@ -109,3 +109,10 @@ export type AgentEvent =
    * detail 用的，UI 拿它决定给不给重试按钮、怎么标色。非协议错误
    * （未分类异常、熔断提示）就是纯 message */
   | { type: 'error'; message: string; retryable: boolean; kind?: ErrorKind }
+  /** 任务完成回调（task-trunk 规则 12）：本会话派出的任务那一轮结束，结果
+   *  作为一条 user 消息插进本会话末尾。text 是消息原文（task.ts taskResultText） */
+  | { type: 'task_result'; text: string }
+  /** 跑着时排队的插话（session.send 入队的 newInput）此刻投进了历史——loop
+   *  顶出队，在上一步的工具结果/回答之后。按入队顺序一条一个事件，宿主据此
+   *  把排队气泡摆到它真正进历史的位置（实时视图与 reload 后一致） */
+  | { type: 'input_delivered' }

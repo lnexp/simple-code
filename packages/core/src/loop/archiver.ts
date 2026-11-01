@@ -17,6 +17,7 @@
  */
 import type { LoadedConfig } from '../config/load.ts'
 import { sendRequest } from '../llm/client.ts'
+import type { LLMEvent } from '../llm/events.ts'
 import { logRun } from '../runlog.ts'
 import { emptyAccumulator, accumulate, finishAccumulator } from './accumulate.ts'
 import { appendProgress, createEvent, listEvents, renameEvent, updateDescription } from '../tools/events.ts'
@@ -63,6 +64,7 @@ export async function runEventArchive(opts: {
 
   // 单次调用，无 tools——accumulate 只为把流拼成完整 text
   let acc = emptyAccumulator()
+  let finish: Extract<LLMEvent, { type: 'finish' }> | undefined
   const stream = sendRequest(
     { ...config.summary.request, model: config.summary.name, system: CLASSIFY_SYSTEM, tools: [], messages: [{ role: 'user', parts: [{ type: 'text', text: user }] }] },
     {
@@ -77,9 +79,26 @@ export async function runEventArchive(opts: {
       idleTimeoutMs: config.config.loop.streamIdleTimeoutMs,
       ...(fetchImpl ? { fetchImpl } : {}),
       tag: 'archiver',
+      folder: root,
     },
   )
-  for await (const llmEv of stream) acc = accumulate(acc, llmEv)[0]
+  for await (const llmEv of stream) {
+    acc = accumulate(acc, llmEv)[0]
+    if (llmEv.type === 'finish') finish = llmEv
+  }
+  // 副模型 usage 观测，字段同 session.ts collectText（2026-10-31 巡检：这里
+  // 直调 sendRequest，reload 后 84 次调用一条 llm_usage 都没有）
+  if (finish)
+    logRun({
+      ev: 'llm_usage',
+      model: config.summary.name,
+      tag: 'archiver',
+      folder: root,
+      input: finish.usage.inputTokens,
+      cacheRead: finish.usage.cacheReadInputTokens,
+      cacheWrite: finish.usage.cacheCreationInputTokens,
+      output: finish.usage.outputTokens,
+    })
   const raw = finishAccumulator(acc)
 
   const text = raw.parts

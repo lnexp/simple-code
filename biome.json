@@ -33,7 +33,11 @@
       }
     },
     {
-      "includes": ["packages/vscode/webview/App.tsx", "packages/vscode/webview/activity.tsx"],
+      "includes": [
+        "packages/vscode/webview/App.tsx",
+        "packages/vscode/webview/activity.tsx",
+        "packages/vscode/webview/timeline.tsx"
+      ],
       "linter": {
         "rules": {
           "security": {

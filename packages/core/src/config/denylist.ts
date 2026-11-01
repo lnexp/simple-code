@@ -23,6 +23,9 @@ const DENYLIST = [
   // 任意请求体注入。覆盖不了协议自己的字段（mergeBody 挡着），但仍能塞进
   // 网关认识的路由参数，把请求导到另一个后端
   'providers.*.models.*.extraBody',
+  // preset 深合并到模型本体之上，用户在界面选中即生效，危险与上面两条相同
+  'providers.*.models.*.presets.*.headers',
+  'providers.*.models.*.presets.*.extraBody',
   'bash.envPassthrough', // 可以把 API key 加回白名单，绕过 §12 的裁剪
   'bash.sandbox', // 将来有沙箱时，不能让仓库自己关掉
 ] as const

@@ -507,6 +507,70 @@ describe('自定义审批规则 askCommands（2026-09-27 拍板）', () => {
     })
     expect(v).toMatchObject({ kind: 'ask', category: 'ask_rule', detail: 'appctl deploy' })
   })
+
+  it('透传前缀包一层照拦：nohup/timeout/env/xargs … 后面才是真命令（2026-10-30 实案）', () => {
+    const t = { ...gcfg, askCommands: [...DEFAULT_ASK_COMMANDS, 'appctl build run'] }
+    // 实案原文形态：nohup 后台跑构建，发布闸曾静默放行
+    expect(
+      classify(
+        'nohup appctl build run --workload a --env dev --wait > .simple-code/tmp/b.log 2>&1 &',
+        ROOT,
+        t,
+      ),
+    ).toMatchObject({
+      kind: 'ask',
+      category: 'ask_rule',
+      detail: 'appctl build run',
+      alwaysLead: 'appctl build run',
+    })
+    for (const c of [
+      'nohup git push origin dev',
+      'nohup > .simple-code/tmp/o.log git push',
+      'timeout 30 git push',
+      'timeout -s KILL 30 git push',
+      'time git push',
+      'nice -n 10 git push',
+      'env A=1 B=2 git push',
+      'env -u X git push',
+      'exec git push',
+      'command git push',
+      'stdbuf -oL git push',
+      'caffeinate -i git push',
+      'echo dev | xargs -I{} git push origin {}',
+      'nohup timeout 5 git push',
+    ])
+      expect(classify(c, ROOT, t), c).toMatchObject({ kind: 'ask', detail: 'git push' })
+    // 按命令名判的其他规则同理：解释器、网络命令
+    expect(classify('nohup python3 -c 1', ROOT, cfg)).toMatchObject({
+      kind: 'ask',
+      category: 'unparseable',
+    })
+    expect(classify('timeout 5 curl https://x.com', ROOT, cfg)).toMatchObject({
+      kind: 'ask',
+      category: 'network_cmd',
+    })
+    // 卡上采集的是内层键：批过后包不包都放行
+    expect(
+      classify('nohup appctl build run --env dev &', ROOT, {
+        ...t,
+        alwaysLeads: ['appctl build run'],
+      }).kind,
+    ).toBe('allow')
+  })
+
+  it('透传前缀对照：内层无害照放，查询形态与无命令不算执行', () => {
+    for (const c of [
+      'nohup node server.js > .simple-code/tmp/s.log 2>&1 &',
+      'timeout 5 sleep 1',
+      'command -v python3',
+      'ls | xargs',
+      'ls | xargs -I{} wc -l {}',
+      'env',
+      'exec > .simple-code/tmp/x.log 2>&1',
+      'time git status',
+    ])
+      expect(classify(c, ROOT, gcfg), c).toEqual({ kind: 'allow' })
+  })
 })
 
 describe('always 白名单（approval.json，两个力度）', () => {
@@ -549,6 +613,18 @@ describe('always 白名单（approval.json，两个力度）', () => {
     if (v2.kind === 'ask') expect('alwaysLead' in v2).toBe(false)
     else throw new Error('eval 嵌深处也应弹卡')
   })
+  it('agent-browser 带值全局 flag（--session/--cdp/--profile）的值不是子命令', () => {
+    // 真机：某真实项目 10-22/10-26 共 28 张卡，`--session s1` 的 s1
+    // 被当成子命令，已批的 agent-browser eval 对不上，卡上也没有采集键
+    const cfgE = { ...cfg, alwaysLeads: ['agent-browser eval'] }
+    allow2('agent-browser --session dag-m01-verify eval "document.title"', cfgE)
+    allow2('agent-browser --cdp 9222 eval "document.title"', cfgE)
+    allow2('agent-browser --profile Default eval "document.title"', cfgE)
+    expect(classify('agent-browser --session s1 eval "document.title"', ROOT, cfg)).toMatchObject({
+      kind: 'ask',
+      alwaysLead: 'agent-browser eval',
+    })
+  })
   it('path 白名单：前缀目录免审（含 ~ 展开），邻居目录不沾光', () => {
     allow2('cat /Users/dev/Code/external/foo/src/x.ts', cfgA)
     // ~ 展开用的是本机真实 homedir——白名单同形态构造才对得上
@@ -586,10 +662,14 @@ describe('always 白名单（approval.json，两个力度）', () => {
     allow(`echo '.env 里有 key'`)
     // printf 的 /etc/passwd 是要打印的文本，不构成触碰
     allow(`printf '%s' "...[中略]..." /etc/passwd`)
+    // tr 只有字符集参数，没有文件参数（2026-10-30 实弹：`tr '\t' '/'` 报「要读项目外路径：/」）
+    allow(`git rev-list --count HEAD | tr '\\t' '/'`)
+    allow(`echo a/b | tr -d '/'`)
     // 重定向目标不在豁免罩内：那是 echo 唯一的文件系统接触
     // （项目外点开头报隐藏路径，2026-09-30；此夹具 pathExists 恒真）
     blocked('echo pwned > /Users/dev/.zshrc', '隐藏路径')
     blocked('echo x > /Users/dev/Desktop/y.txt', '项目外')
+    blocked('tr a b < /Users/dev/Desktop/y.txt', '项目外')
   })
 
   it('nonPathFrom 豁免位：元素路径不当路径，文件参数照常判', () => {

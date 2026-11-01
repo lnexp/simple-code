@@ -38,7 +38,7 @@ const search = (lib: string, query: string) =>
   )
 
 it('五个库的 search 每次记一行 runlog：库、查询词、命中数（零命中也记）', () => {
-  const libs = ['note', 'lesson', 'event', 'skill', 'memory']
+  const libs = ['note', 'event', 'skill', 'memory']
   for (const lib of libs) {
     search(lib, '金丝雀')
     search(lib, '不存在的词')
@@ -49,7 +49,8 @@ it('五个库的 search 每次记一行 runlog：库、查询词、命中数（�
     .map((l) => JSON.parse(l) as Record<string, unknown>)
     .filter((e) => e.ev === 'search')
   const got = rows.map((e) => `${e.lib}|${e.query}|${e.hits}`).sort()
-  const want = libs.flatMap((lib) => [`${lib}|金丝雀|1`, `${lib}|不存在的词|0`]).sort()
+  // NOTE 默认跨类型：普通记录 a 和历史 lesson a 是两个独立条目。
+  const want = libs.flatMap((lib) => [`${lib}|金丝雀|${lib === 'note' ? 2 : 1}`, `${lib}|不存在的词|0`]).sort()
   expect(got).toEqual(want)
   expect(rows.find((e) => e.lib === 'note' && e.query === '金丝雀')?.hidden).toBe(1)
   expect(new Set(rows.map((e) => e.folder))).toEqual(new Set([realpathSync(ws)]))

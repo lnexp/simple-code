@@ -1,9 +1,17 @@
 import { join } from 'node:path'
 import * as vscode from 'vscode'
-import { ensureShims, logRun, startCredentialProxy, type ShimEntry } from '@simple-code/core'
+import {
+  ensureDocCopy,
+  ensureShims,
+  logRun,
+  startCredentialProxy,
+  type ShimEntry,
+} from '@simple-code/core'
 import { startLspBridge } from './lsp-bridge.ts'
+import { startTaskBridge } from './task-bridge.ts'
 import { watchLoopLag } from './loop-lag.ts'
 import { ChatPanel } from './panel.ts'
+import { installRobot, startRobot } from './robot.ts'
 
 /**
  * 全部 bin 名（→ dist 里同名 .js）。DOC 例外：只读的文档，不是可执行。
@@ -12,8 +20,8 @@ import { ChatPanel } from './panel.ts'
  * （LSP 只读、固定语义，非 APPLY_PATCH 那种内容决定路径的例外）
  */
 const BINS = [
-  'WEBFETCH', 'WEBSEARCH', 'MCP', 'APPLY_PATCH', 'MEMORY', 'LESSON',
-  'NOTE', 'EVENT', 'SKILL', 'LSP', 'IMAGEGEN',
+  'WEBFETCH', 'WEBSEARCH', 'MCP', 'APPLY_PATCH', 'MEMORY',
+  'NOTE', 'EVENT', 'SKILL', 'LSP', 'IMAGEGEN', 'TASK',
 ] as const
 
 /**
@@ -47,11 +55,20 @@ async function wireBins(): Promise<void> {
   for (const { name } of entries) {
     process.env[`SIMPLE_CODE_${name}`] = resolved[name]
   }
-  // 教程（self.md）：同 CLI 侧 run.ts injectLocalTools，指向 dist 拷贝
-  process.env.SIMPLE_CODE_DOC = join(__dirname, 'self.md')
+  // 教程（self.md）：同 CLI 侧 run.ts injectLocalTools，指向 ~/.simple-code/bin
+  // 下的拷贝（core ensureDocCopy）；拷不进回落 dist 原件
+  const selfDoc = join(__dirname, 'self.md')
+  try {
+    process.env.SIMPLE_CODE_DOC = ensureDocCopy(selfDoc)
+  } catch {
+    process.env.SIMPLE_CODE_DOC = selfDoc
+  }
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  // 激活即记一行带版本的日志：装机/reload 后的仲裁锚点（scripts/verify-install.mjs）。
+  // 此前日志里没有任何带版本的事件，reload 是否装上新版只能靠猜
+  logRun({ ev: 'ext_activate', version: context.extension.packageJSON.version })
   await wireBins()
   const lspServer = startLspBridge()
   // 凭据代理（docs/proposals/credential-proxy.md）：url 型 MCP server 的密钥
@@ -71,16 +88,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // 错误值上，入口要等第二次刷新
   const [major = 0, minor = 0] = vscode.version.split('.').map(Number)
   const engineTooOld = !(major > 1 || (major === 1 && minor >= 106))
-  void vscode.commands.executeCommand(
-    'setContext',
-    'simpleCode.noSecondarySidebar',
-    engineTooOld || vscode.env.uriScheme === 'cursor',
-  )
+  const noSecondarySidebar = engineTooOld || vscode.env.uriScheme === 'cursor'
+  void vscode.commands.executeCommand('setContext', 'simpleCode.noSecondarySidebar', noSecondarySidebar)
 
   const panel = new ChatPanel(context.extensionUri, context.workspaceState)
+  // 派任务桥（task-trunk 规则 11）：bin 经 127.0.0.1 + token 把任务书交给面板
+  const taskServer = startTaskBridge({
+    dispatch: (req) => panel.dispatchFromAgent(req),
+    models: (req) => panel.taskModels(req),
+  })
   context.subscriptions.push(
     // 桥跟着扩展走：停用即关，端口随 env 消失，bin 侧明确报不可达
     { dispose: () => lspServer.close() },
+    { dispose: () => taskServer.close() },
     { dispose: () => proxy?.close() },
     watchLoopLag((ev) => logRun(ev)),
     ...ChatPanel.viewTypes.map((viewType) =>
@@ -90,6 +110,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         webviewOptions: { retainContextWhenHidden: true },
       })),
     panel,
+    // 桌面机器人（desktop-robot.md）：只在本机 macOS 连；面板在哪一侧决定展开命令
+    startRobot(panel, {
+      version: context.extension.packageJSON.version,
+      focusCommand: `${noSecondarySidebar ? 'simpleCode.chat.cursor' : 'simpleCode.chat'}.focus`,
+    }),
+    vscode.commands.registerCommand('simpleCode.installRobot', installRobot),
     // 多根工作区：文件夹增删时路由层要清失效 bridge / 回落 active（design.md §7）
     vscode.workspace.onDidChangeWorkspaceFolders(() => panel.setFolders()),
   )

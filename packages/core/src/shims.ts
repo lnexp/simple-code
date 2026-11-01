@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 
 /**
  * 工具脚本的 Node 解析（2026-09-19 拍板：消灭 node 依赖）。
@@ -92,6 +92,14 @@ export async function ensureShims(
   const binDir = options.binDir ?? join(homedir(), '.simple-code', 'bin')
   const nodeBin = options.nodeBin ?? (await resolveNodeBin())
   mkdirSync(binDir, { recursive: true })
+  // 只清理 SC 自己生成的退役 shim，不碰用户的同名脚本或旧安装目录。
+  const retired = join(binDir, 'sc-lesson')
+  try {
+    const text = readFileSync(retired, 'utf8')
+    if (text.includes('# SimpleCode 自动生成') && text.includes('lesson.js')) rmSync(retired)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
   const paths: Record<string, string> = {}
   for (const { name, bin, script } of entries) {
     const path = join(binDir, bin)
@@ -110,4 +118,31 @@ export async function ensureShims(
     paths[name] = path
   }
   return paths
+}
+
+/**
+ * 教程 self.md 拷一份到 bin 目录，返回拷贝路径（调用方据此设 SIMPLE_CODE_DOC）。
+ *
+ * dist 原件在 ~/.vscode/extensions/… 下，路径带 .vscode：系统提示让 agent
+ * 在任何项目 grep 它，项目外读就弹隐藏路径卡（2026-10-28 某真实项目
+ * 6 张）。~/.simple-code 下的读本来免审。只能拷贝不能软链——审批按真实
+ * 路径判（approval.ts realpath），软链会追回 .vscode。内容没变不重写。
+ */
+export function ensureDocCopy(
+  src: string,
+  binDir = join(homedir(), '.simple-code', 'bin'),
+): string {
+  const content = readFileSync(src, 'utf8')
+  const path = join(binDir, basename(src))
+  mkdirSync(binDir, { recursive: true })
+  let existing: string | undefined
+  try {
+    existing = readFileSync(path, 'utf8')
+  } catch {
+    // 不存在——首写
+  }
+  if (existing !== content) {
+    writeFileSync(path, content)
+  }
+  return path
 }

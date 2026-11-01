@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160">
+<defs>
+  <linearGradient id="metal" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#FBFCFD"/><stop offset="0.55" stop-color="#D8DBE0"/><stop offset="1" stop-color="#A7ACB4"/>
+  </linearGradient>
+  <linearGradient id="dark" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#3A3E46"/><stop offset="1" stop-color="#1F2227"/>
+  </linearGradient>
+  <linearGradient id="visor" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#22252B"/><stop offset="1" stop-color="#121418"/>
+  </linearGradient>
+  <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+    <stop offset="0" stop-color="#FFB020" stop-opacity="0.55"/><stop offset="1" stop-color="#FFB020" stop-opacity="0"/>
+  </radialGradient>
+</defs>
+<ellipse cx="80" cy="150" rx="34" ry="5" fill="#000000" opacity="0.18"/>
+<path d="M56 118 L44 134" stroke="#7A808A" stroke-width="12" stroke-linecap="round"/><path d="M56 118 L44 134" stroke="#2A2D33" stroke-width="9" stroke-linecap="round"/><circle cx="44" cy="134" r="7" fill="url(#metal)" stroke="#8E949C" stroke-width="1.5"/><path d="M104 118 L150 78" stroke="#7A808A" stroke-width="12" stroke-linecap="round"/><path d="M104 118 L150 78" stroke="#2A2D33" stroke-width="9" stroke-linecap="round"/><circle cx="150" cy="78" r="7" fill="url(#metal)" stroke="#8E949C" stroke-width="1.5"/>
+<rect x="52" y="104" width="56" height="40" rx="15" fill="url(#dark)" stroke="#7A808A" stroke-width="1.5"/>
+<path d="M68 125 C68 119 75 119 80 125 C85 131 92 131 92 125 C92 119 85 119 80 125 C75 131 68 131 68 125 Z" stroke="#D8DBE0" stroke-width="3" fill="none"/>
+<circle cx="80" cy="14" r="15" fill="url(#glow)"/>
+<rect x="78" y="16" width="4" height="18" rx="2" fill="#8A9099"/>
+<circle cx="80" cy="14" r="7" fill="#FFB020" stroke="#FFFFFF" stroke-opacity="0.5" stroke-width="1.5"/>
+<rect x="15" y="56" width="13" height="30" rx="5.5" fill="#6E747D"/>
+<rect x="132" y="56" width="13" height="30" rx="5.5" fill="#6E747D"/>
+<rect x="24" y="30" width="112" height="84" rx="30" fill="url(#metal)" stroke="#8E949C" stroke-width="2"/>
+<rect x="36" y="44" width="88" height="56" rx="20" fill="url(#visor)"/>
+<path d="M46 52 Q52 47 62 47" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="3" fill="none" stroke-linecap="round"/>
+<circle cx="64" cy="69" r="9.5" fill="#FFB020"/><circle cx="96" cy="69" r="9.5" fill="#FFB020"/><circle cx="67" cy="66" r="3" fill="#FFFFFF" opacity="0.85"/><circle cx="99" cy="66" r="3" fill="#FFFFFF" opacity="0.85"/><circle cx="80" cy="88" r="3.6" stroke="#FFB020" stroke-width="2.6" fill="none"/>
+
+</svg>

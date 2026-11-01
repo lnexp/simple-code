@@ -16,7 +16,23 @@ import { dirHint, expandTilde } from './approval-always.ts'
 import { existsSync, realpathSync } from 'node:fs'
 import { isAbsolute, resolve } from 'node:path'
 import { astSegments } from './shell-ast.ts'
-import { cdTarget, gitRevPath, hiddenVerdict, isHiddenSeg, localVarsOf, realPathOf, type RealCtx } from './hidden-path.ts'
+import {
+  applyAssigns,
+  cdTarget,
+  dotdotPathOf,
+  gitRevPath,
+  hiddenVerdict,
+  isHiddenSeg,
+  localVarsOf,
+  loopValuesOf,
+  loopVariants,
+  neverAlways,
+  realPathOf,
+  type RealCtx,
+  revPathVerdict,
+  runtimeVarsOf,
+  unknownPathAsk,
+} from './hidden-path.ts'
 import { findWorkspaceRoot } from './workspace-root.ts'
 
 export type ApprovalVerdict =
@@ -35,15 +51,21 @@ export type ApprovalVerdict =
        * 触发必然是 verb + 文件参数之后的位）。位 <2 的卡不给（cat
        * /etc/passwd 的参数全是路径，这个选项只是噪音） */
       nonPathFrom?: { lead: string; from: number }
-      /** 方案 1（2026-09-21 拍板）：multi 触发点全是 external_dir、每个
-       * 都收敛出合法目录（dirHint 非 null——家目录/根过宽不记）且去重
-       * 后 ≤5 个时的批量 always 预览。掺任何别的类别（解释器/网络/
-       * 隐藏路径）不给——粒度不一的东西一键全记，等于替用户批了
-       * 没细看的 */
+      /** 方案 1（2026-09-21 拍板）：multi 触发点全是能记的路径时的批量
+       * always 预览——项目外目录收敛出合法目录（dirHint 非 null——家目录/
+       * 根过宽不记），隐藏路径带 alwaysHidden（2026-10-29 加入，记进
+       * alwaysHiddens），两者合计去重后 ≤5 项。掺任何别的（解释器/网络/
+       * 算不出/凭据）不给——粒度不一的东西一键全记，等于替用户批了没细看的 */
       alwaysPaths?: string[]
+      alwaysHiddens?: { path: string; write: boolean }[]
       /** 隐藏路径的始终允许预览（2026-09-29 拍板，hidden-path.md）：记到
        * 第一个隐藏段为止、读写分开。项目内是相对路径，项目外是绝对路径 */
       alwaysHidden?: { path: string; write: boolean }
+      /** multi 专属：合并前各段的类别（去重）。detail/reason 是给人看的
+       * 拼接文本，类别在里面已丢——桌面机器人要据此判「git push 跟别的
+       * 命令 && 在一起」只能回窗口处理（desktop-robot.md §5.2：两周 10 张
+       * 含 git push 的卡，2 张是 multi） */
+      parts?: ApprovalCategory[]
     }
 
 /** 审批类别。UI 用它显示标签（external_dir 等），detail 是触发物 */
@@ -167,7 +189,13 @@ const SEGMENT_SPLIT_RE = /(?:&&|\|\||[;|&])/
 export function classify(command: string, root: string, cfg: ApprovalConfig): ApprovalVerdict {
   const cmd = command.trim()
   // 第 2 层的真实路径上下文（hidden-path.ts）：cwd 随顶层 cd 逐段更新
-  const real: RealCtx = { cwd: root, env: cfg.env ?? {}, localVars: localVarsOf(cmd) }
+  const real: RealCtx = {
+    cwd: root,
+    env: cfg.env ?? {},
+    localVars: localVarsOf(cmd),
+    loopValues: loopValuesOf(cmd),
+    vars: new Map(),
+  }
 
   // 规则 0：自家 bin。引号形态固定（宿主注入的就是 "$SIMPLE_CODE_X"）。
   // 例外：APPLY_PATCH 的 heredoc 里藏着任意路径的写操作（补审批闭环的
@@ -220,7 +248,11 @@ export function classify(command: string, root: string, cfg: ApprovalConfig): Ap
   const segs = astSegments(cmd)
   if (segs) {
     const asks: Extract<ApprovalVerdict, { kind: 'ask' }>[] = []
+    const entered: ScopeEntry[] = []
+    const runtime = runtimeVarsOf(cmd)
     for (const s of segs) {
+      followScopes(entered, s.scopes ?? [], real)
+      applyAssigns(s.assigns, real, runtime)
       if (s.unparseable) {
         // lead 白名单命中=段放行（judge 的同语义）：批过 python3 就是
         // 接受它的一切内联形态，heredoc 不例外。这条早退原本绕过白
@@ -272,8 +304,22 @@ export function classify(command: string, root: string, cfg: ApprovalConfig): Ap
   return mergeAsks(asks)
 }
 
-/** 段是 cd 时更新当前目录：顶层的按目标算，非顶层的（子 shell、管道、
- * $( )、if/for 里）效果不确定，之后一律算不出 */
+type ScopeEntry = { id: number; cwd: string | null }
+
+/** 子 shell、$( )、<( )、后台语句各带一份当前目录（shell-ast scopesOf）：
+ * 出了作用域恢复进入前的目录，进新作用域记下当时的目录。段按源码顺序来，
+ * entered 始终是上一段的作用域链 */
+function followScopes(entered: ScopeEntry[], scopes: number[], real: RealCtx): void {
+  for (let top = entered.at(-1); top && !scopes.includes(top.id); top = entered.at(-1)) {
+    entered.pop()
+    real.cwd = top.cwd
+  }
+  for (const id of scopes)
+    if (!entered.some((e) => e.id === id)) entered.push({ id, cwd: real.cwd })
+}
+
+/** 段是 cd 时更新当前目录：作用域里顶层的按目标算，非顶层的（管道、
+ * if/for 里）效果不确定，之后一律算不出（出了所在作用域才恢复） */
 function trackCd(lead: string, items: { text: string }[], topLevel: boolean, real: RealCtx): void {
   if (unquote(lead) !== 'cd') return
   if (!topLevel) {
@@ -305,11 +351,17 @@ function mergeAsks(asks: Extract<ApprovalVerdict, { kind: 'ask' }>[]): ApprovalV
   }
   // 上限 8 条：长脚本逐行触发会收集出几十条，全列反而读不动
   const head = lines.length > 8 ? [...lines.slice(0, 8)!, `等 ${lines.length} 处`] : lines
-  // 批量 always 的判据：全是 external_dir、每个 dirHint 都收敛出合法
-  // 目录、去重后 ≤5 个（一笔大账逼你分开看）
+  // 批量 always 的判据：每处都能记——external_dir 的 dirHint 收敛出合法
+  // 目录，或隐藏路径带 alwaysHidden（2026-10-29）——去重后合计 ≤5 项
+  // （一笔大账逼你分开看）
   const dirs = new Set<string>()
+  const hiddens = new Map<string, { path: string; write: boolean }>()
   let batchAlways = true
   for (const a of asks) {
+    if (a.alwaysHidden) {
+      hiddens.set(`${a.alwaysHidden.write}:${a.alwaysHidden.path}`, a.alwaysHidden)
+      continue
+    }
     if (a.category !== 'external_dir') {
       batchAlways = false
       break
@@ -321,38 +373,81 @@ function mergeAsks(asks: Extract<ApprovalVerdict, { kind: 'ask' }>[]): ApprovalV
     }
     dirs.add(d)
   }
+  const batch = batchAlways && dirs.size + hiddens.size <= 5
   return {
     kind: 'ask',
     category: 'multi',
     detail: head.join('；'),
     reason: `命令有多处需要审批：\n${head.map((l, i) => `${i + 1}. ${l}`).join('\n')}`,
-    ...(batchAlways && dirs.size <= 5 ? { alwaysPaths: [...dirs] } : {}),
+    parts: [...new Set(asks.map((a) => a.category))],
+    ...(batch && dirs.size > 0 ? { alwaysPaths: [...dirs] } : {}),
+    ...(batch && hiddens.size > 0 ? { alwaysHiddens: [...hiddens.values()] } : {}),
   }
 }
 
-/** lead 后第一个位置参数：跳 flag、赋值、骨架词、lead 占位（正则回退
- * 段的 items 含 lead，AST 段不含——`t === lead` 对 AST 段里恰好同名
- * 的参数也只是多跳一个，影响方向是收紧不是漏放）。子命令级白名单
- * ('agent-browser eval') 的匹配与采集共用它，两侧必须对称 */
-function firstPositional(lead: string, items: { text: string }[]): string | undefined {
-  for (const it of items) {
+/** 子命令之前的带值全局 flag：值是普通 token，不跳过会被当成子命令。
+ *  git：`git -C /tmp push` 取成 /tmp → 匹配不上 'git push' → fail-open
+ *  绕过。agent-browser：`--session s1 eval` 取成 s1 → 已批的
+ *  'agent-browser eval' 对不上、卡上也没有采集键（2026-10-29，真机
+ *  某真实项目两天 28 张卡；三个是近两月真机命令里子命令前出现过的） */
+const VALUE_FLAGS: Record<string, string[]> = {
+  git: ['-C', '-c'],
+  'agent-browser': ['--session', '--cdp', '--profile'],
+}
+
+/** 透传前缀：自己不做事，把后面的参数当命令跑。valueFlags 是带值选项
+ *  （值单独占一个 token 时连值跳过；`-n10`、`--signal=KILL` 粘连形态
+ *  本就是一个 token）；pos 是命令前的固定位置参数（timeout 的时长）；
+ *  noRun 出现即不执行后续（`command -v jq` 是查询） */
+const PASSTHROUGH: Record<string, { valueFlags?: string[]; pos?: number; noRun?: string[] }> = {
+  nohup: {},
+  time: { valueFlags: ['-o'] },
+  nice: { valueFlags: ['-n', '--adjustment'] },
+  timeout: { valueFlags: ['-s', '-k', '--signal', '--kill-after'], pos: 1 },
+  env: { valueFlags: ['-u', '-C', '-S', '-P', '--unset', '--chdir', '--split-string'] },
+  exec: { valueFlags: ['-a'] },
+  command: { noRun: ['-v', '-V'] },
+  stdbuf: { valueFlags: ['-i', '-o', '-e', '--input', '--output', '--error'] },
+  caffeinate: { valueFlags: ['-t', '-w'] },
+  xargs: { valueFlags: ['-I', '-J', '-L', '-n', '-P', '-s', '-E', '-R', '-S', '-a', '-d'] },
+}
+
+/** 段内 token：AST 的 AstItem 与回退分词（classifySegment）同形 */
+type Item = { text: string; write: boolean; redirect?: boolean }
+
+/** 透传前缀后面真正执行的命令（AST 段形态：items 不含 lead）。不是透传
+ *  前缀、或后面没有命令（`xargs` 默认 echo、`exec > log`）返回 null */
+function passthroughInner(lead: string, rest: Item[]): { lead: string; items: Item[] } | null {
+  const spec = PASSTHROUGH[unquote(lead)]
+  if (!spec) return null
+  let pos = spec.pos ?? 0
+  for (let i = 0; i < rest.length; i++) {
+    const it = rest[i]
+    if (!it) break
     const t = unquote(it.text)
-    if (t === '' || t === '-' || t === lead) continue
-    if (t.startsWith('-')) continue
-    if (SHELL_RESERVED.has(t)) continue
-    if (/^[^/"'.]*=/.test(t)) continue
-    return t
+    if (it.write || /^\d*&?[<>]/.test(t)) continue // 重定向符与目标不是命令
+    if (spec.noRun?.includes(t)) return null
+    if (t.startsWith('-')) {
+      if (spec.valueFlags?.includes(t)) i++
+      continue
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) continue // env 的 FOO=bar
+    if (pos > 0) {
+      pos--
+      continue
+    }
+    return { lead: t, items: rest.slice(i + 1) }
   }
-  return undefined
+  return null
 }
 
-/** 位置参数序列（askCommands 规则与 alwaysLeads 豁免共用）：lead 后的
- *  位置参数按序收集，flag 跳过。不能直接用 firstPositional——git 的
- *  -C <path> / -c <k=v> 是带值全局 flag，值是普通 token，`git -C /tmp
- *  push` 会被取成 /tmp → 匹配不上 'git push' → fail-open 绕过。带值
- *  全局 flag 就 git 这两个 */
+/** 位置参数序列（askCommands 规则、alwaysLeads 豁免、eval 卡的采集键
+ *  共用——匹配与采集必须对称）：lead 后的位置参数按序收集，flag 跳过，
+ *  VALUE_FLAGS 里的 flag 连值一起跳过。正则回退段的 items 含 lead，AST
+ *  段不含——`t === lead` 对 AST 段里恰好同名的参数也只是多跳一个 */
 function positionalsOf(lead: string, items: { text: string }[]): string[] {
   const out: string[] = []
+  const valueFlags = VALUE_FLAGS[unquote(lead)] ?? []
   let skipNext = false
   for (const it of items) {
     const t = unquote(it.text)
@@ -362,7 +457,7 @@ function positionalsOf(lead: string, items: { text: string }[]): string[] {
     }
     if (t === '' || t === '-' || t === unquote(lead)) continue
     if (t.startsWith('-')) {
-      if (unquote(lead) === 'git' && (t === '-C' || t === '-c')) skipNext = true
+      if (valueFlags.includes(t)) skipNext = true
       continue
     }
     if (SHELL_RESERVED.has(t)) continue
@@ -447,8 +542,9 @@ const NONPATH_FIRST_POSITIONAL = new Set(['sed', 'grep', 'egrep', 'fgrep', 'awk'
  * `echo "...[中略]..."`）都不构成触碰（2026-09-15 实案：echo
  * 省略号分隔文本弹「隐藏路径」卡，抢了同命令里真报的戏）。写成
  * 表而非塞进 nonPathFrom 配置：与 sed/grep 表同性质——通用工具的
- * 调用约定，内置对所有用户成立 */
-const NONPATH_ALL_POSITIONAL = new Set(['echo', 'printf'])
+ * 调用约定，内置对所有用户成立。tr 同理：只有字符集参数、只读 stdin
+ * （2026-10-30 实弹：`tr '\t' '/'` 报「要读项目外路径：/」） */
+const NONPATH_ALL_POSITIONAL = new Set(['echo', 'printf', 'tr'])
 
 /** 这些 flag 的**值**是脚本/模式/glob 而非路径：sed/grep/awk 的 -e、
  * find 的 -name/-path、tar/rsync 的 --exclude。等号形态（--regexp=x）
@@ -490,7 +586,7 @@ const SHELL_RESERVED = new Set(['do', 'then', 'else', 'elif', 'fi', 'done', 'esa
  * 路径共用——供给不同，规则必须同一套 */
 function judge(
   lead: string,
-  items: { text: string; write: boolean }[],
+  items: Item[],
   root: string,
   cfg: ApprovalConfig,
   real: RealCtx,
@@ -520,6 +616,16 @@ function judge(
   const fromFallback = lead === ''
   if (fromFallback && head < items.length) lead = unquote(items[head]?.text ?? '')
 
+  // 透传前缀（nohup/timeout/env/xargs …）后面才是真正执行的命令：内层
+  // 整段先判一次，再按外层照旧判（只收紧不放宽）。按命令名判的规则只
+  // 看 lead，包一层就全部失效——2026-10-30 实案：`nohup appctl build run
+  // … &`、`nohup appctl release create …` 发布闸静默放行
+  const inner = passthroughInner(lead, fromFallback ? items.slice(head + 1) : items)
+  if (inner) {
+    const v = judge(inner.lead, inner.items, root, cfg, real, rawCmd)
+    if (v.kind === 'ask') return v
+  }
+
   // always 执行器白名单：leadAllowed（含子命令级条目，见其注释）。
   // 必须在 lead 回填**之后**（回退路径进来时 lead 是 ''，靠上面回填
   // 成首 token）。命中只免掉命令名这一层（解释器/网络/自定义规则），
@@ -533,11 +639,7 @@ function judge(
 
 /** 规则 1b–2：看命令名就能判的（解释器、eval、自定义规则、网络命令）。
  * 不命中返回 null */
-function commandRules(
-  lead: string,
-  items: { text: string; write: boolean }[],
-  cfg: ApprovalConfig,
-): ApprovalVerdict | null {
+function commandRules(lead: string, items: Item[], cfg: ApprovalConfig): ApprovalVerdict | null {
   // 规则 1b/1c：解释器、裸 shell、eval
   if (INTERPRETERS.has(lead) || SHELLS.has(lead)) {
     return {
@@ -559,7 +661,7 @@ function commandRules(
   if (items.some((i) => unquote(i.text) === 'eval')) {
     // eval 恰为第一个位置参数（'agent-browser eval …'）才有可收敛的
     // 子命令粒度；嵌在深处出现（'foo eval bar'）没有安全键，两键
-    const sub = firstPositional(unquote(lead), items)
+    const sub = positionalsOf(lead, items)[0]
     return {
       kind: 'ask',
       category: 'unparseable',
@@ -614,7 +716,7 @@ function commandRules(
 /** 规则 3/4：逐 token 查路径 */
 function pathRules(
   lead: string,
-  items: { text: string; write: boolean }[],
+  items: Item[],
   root: string,
   cfg: ApprovalConfig,
   real: RealCtx,
@@ -654,7 +756,10 @@ function pathRules(
   let skipNextValue = false
   let firstPositionalLeft = nonPathFirst
   for (const [idx, item] of items.entries()) {
-    const t = unquote(stripRedirect(item.text))
+    let t = unquote(stripRedirect(item.text))
+    // 在丢掉引号信息前解析确定的变量路径，随后走全部审批规则。
+    // 只在 hiddenVerdict 展开会漏掉 paths 白名单与 .simple-code 读豁免。
+    t = expandPathPrefix(item.text, t, real)
     if (t === '' || t === '-') continue
     if (SHELL_RESERVED.has(t)) continue // 段中/段尾骨架词（done 等）
     if (skipNextValue) {
@@ -669,15 +774,16 @@ function pathRules(
       continue // 选项
     }
     if (fromFallback && idx === head && t === lead) continue // 回退路径的 lead 占位
-    if (firstPositionalLeft) {
+    if (firstPositionalLeft && !item.redirect) {
       firstPositionalLeft = false
       continue // sed/grep/awk 的 script/pattern 位
     }
     // 豁免只罩「读形态」的 token：带写意图的（> /tmp/x 的重定向目标、
     // rm 类写动词的参数）不豁免——元素寻址工具的豁免位起没有写语义的
     // fs 路径参数，但重定向能把任意文件变成它的 token。真机踩过：
-    // `xcli get f.pptx /body > ~/Desktop/y.txt` 曾被区间豁免放过
-    if (positionalSeen >= exemptFromPosition && !item.write && !verbWrites) {
+    // `xcli get f.pptx /body > ~/Desktop/y.txt` 曾被区间豁免放过。
+    // 读重定向同理（`tr a b < ~/.ssh/id_rsa` 把文件打到输出，2026-10-30）
+    if (positionalSeen >= exemptFromPosition && !item.write && !item.redirect && !verbWrites) {
       positionalSeen++
       continue // nonPathFrom 豁免位起：元素路径与 flag 值，非 fs 路径
     }
@@ -685,15 +791,34 @@ function pathRules(
     positionalSeen++
     const write = item.write || verbWrites
     // git 的 REV:path：冒号后是仓库历史里的路径，磁盘上不一定有——不查
-    // 存在，按第 1 层看名字（`git show HEAD:.env` 拦）
+    // 存在，按第 1 层看名字（`git show HEAD:.env` 拦）；始终允许与磁盘读同键
     const revPath = unquote(lead) === 'git' ? gitRevPath(t) : null
     if (revPath !== null) {
-      if (revPath.split('/').some(isHiddenSeg)) {
-        return { kind: 'ask', category: 'hidden_path', detail: t, reason: `要读取 git 历史里的隐藏路径：${t}` }
-      }
+      const rv = revPathVerdict(revPath, t, cfg)
+      if (rv.kind === 'ask') return rv
       continue
     }
-    const v = pathVerdict(t, root, cfg, write, real)
+    const v = tokenVerdict(t, root, cfg, write, real)
+    // nonPathFrom 采集依据：触发位 ≥2 且是 external_dir（hidden_path 的
+    // 触发物是真路径，这个选项是误导）。lead 在段首，元素寻址工具的
+    // 结构必然是 verb（位0）+ 文件参数（位1）+ 元素路径（位2+）
+    if (v.kind === 'ask')
+      return { ...v, ...(at >= 2 && v.category === 'external_dir' ? { nonPathFrom: { lead, from: at } } : {}) }
+  }
+  return { kind: 'allow' }
+}
+
+/** 单个路径 token 的判定。for 循环变量逐值代入（loopVariants），每个
+ * 取值都过一遍，有一个要弹就弹；算不出取值的原样判 */
+function tokenVerdict(
+  t: string,
+  root: string,
+  cfg: ApprovalConfig,
+  write: boolean,
+  real: RealCtx,
+): ApprovalVerdict {
+  for (const tv of loopVariants(t, real.loopValues)) {
+    const v = pathVerdict(tv, root, cfg, write, real)
     // 项目外的点开头路径按隐藏路径判（2026-09-30，不论有无 lead）：卡上
     // 始终允许键收敛到隐藏段、读写分开（~/.ssh 读），不走 external_dir 记
     // 整个目录（读写全免）。存在且已批（hiddenRead/Write）= 过；不存在 =
@@ -701,18 +826,14 @@ function pathRules(
     // lead 与路径是 AND（2026-09-30 拍板）：lead 只免命令名那一层，走到
     // 这里的路径判定与没批 lead 时完全相同
     if (v.kind === 'ask' && v.category === 'external_dir') {
-      const abs = realPathOf(t, real)
+      const abs = realPathOf(tv, real)
       if (abs === null || abs.split('/').some(isHiddenSeg)) {
-        const h = hiddenVerdict(t, root, cfg, write, real)
+        const h = hiddenVerdict(tv, root, cfg, write, real)
         if (h.kind === 'ask') return h
         if (abs !== null && !/[*?]/.test(abs) && (cfg.pathExists ?? existsSync)(abs)) continue
       }
     }
-    // nonPathFrom 采集依据：触发位 ≥2 且是 external_dir（hidden_path 的
-    // 触发物是真路径，这个选项是误导）。lead 在段首，元素寻址工具的
-    // 结构必然是 verb（位0）+ 文件参数（位1）+ 元素路径（位2+）
-    if (v.kind === 'ask')
-      return { ...v, ...(at >= 2 && v.category === 'external_dir' ? { nonPathFrom: { lead, from: at } } : {}) }
+    if (v.kind === 'ask') return v
   }
   return { kind: 'allow' }
 }
@@ -728,12 +849,14 @@ function classifySegment(
   real: RealCtx,
   rawCmd?: string,
 ): ApprovalVerdict {
-  const items: { text: string; write: boolean }[] = []
-  let pendingRedirect = false
+  const items: Item[] = []
+  let pendingRedirect: 'write' | 'read' | false = false
   for (const token of seg) {
-    const redirectedWrite = /^\d*&?>>?/.test(token) || pendingRedirect
-    pendingRedirect = /^\d*&?>>?$/.test(token)
-    items.push({ text: token, write: redirectedWrite })
+    // 读写两个方向都标 redirect（参数位豁免罩不到），write 只认 >
+    const redirect = /^\d*&?[<>]/.test(token) || pendingRedirect !== false
+    const redirectedWrite = /^\d*&?>>?/.test(token) || pendingRedirect === 'write'
+    pendingRedirect = /^\d*&?>>?$/.test(token) ? 'write' : /^\d*<$/.test(token) ? 'read' : false
+    items.push({ text: token, write: redirectedWrite, redirect })
   }
   return judge('', items, root, cfg, real, rawCmd)
 }
@@ -778,6 +901,25 @@ const unquote = (v: string) => v.replace(/^(['"])(.*)\1$/, '$2')
  * 参数剥掉前导数字变 `.4`，掉进隐藏路径误判——sleep 0.4 弹过卡 */
 const stripRedirect = (t: string) => t.replace(/^\d*&?>>/, '').replace(/^\d*&?</, '')
 
+/** 延续 PWD 的窄范围展开：单引号、转义、复杂替换不猜；不执行 shell。
+ * 保留 link/.. 给 dotdotPathOf，不能先 resolve 折叠掉真实路径。 */
+function expandPathPrefix(raw: string, token: string, real: RealCtx): string {
+  if (/['\\]/.test(raw)) return token
+  const plain = token.replace(/"/g, '')
+  const m = /^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))(\/[^$`]*|)$/.exec(plain)
+  if (!m) return token
+  const name = m[1] ?? m[2]!
+  // 命令内确定的赋值（applyAssigns）：相对值也代——之后按普通相对路径判
+  if (real.vars.has(name)) {
+    const v = real.vars.get(name)
+    return v == null || /[$`'"\\*?[\]{}]/.test(v) ? token : `${v}${m[3] ?? ''}`
+  }
+  if (real.localVars.has(name)) return token
+  const value = name === 'PWD' ? real.cwd : real.env[name]
+  if (!value || !isAbsolute(value) || /[$`'"\\*?\[\]{}]/.test(value)) return token
+  return value + m[3]!
+}
+
 /** 逐级 realpath：最长存在前缀的真实路径 + 剩余未创建段。无展开时原样返回 */
 function resolveSymlinked(t: string, root: string): string {
   const abs = t.startsWith('~')
@@ -811,6 +953,23 @@ function pathVerdict(
 ): ApprovalVerdict {
   if (PATH_ALLOWLIST.has(t)) return { kind: 'allow' }
 
+  // 代码文本不是路径（2026-10-26 审计：eval 的 JS、python -c、sh -c 的
+  // 脚本被切出 `.test(t))` 这类「隐藏段」误弹）。只豁免读——写目标
+  // （重定向）照判，`> "/etc/a b;c"` 不能借这个形态放行
+  if (!write && looksLikeCode(t)) return { kind: 'allow' }
+
+  // `..` 先算出实际位置再判（2026-10-26 审计：`cd packages/vscode && … ;
+  // cd ../..` 两周弹 98 张）。早于下面所有分支——字面判 .simple-code
+  // 豁免时 `.simple-code/tmp/../../../x` 曾能写出项目。算不出：字面无隐藏段
+  // 的如实说算不出（2026-10-31）；有隐藏段的仍报项目外，由 pathRules 按隐藏
+  // 路径判（变量可能指向 .ssh）
+  if (t.split('/').includes('..')) {
+    const abs = dotdotPathOf(t, real)
+    if (abs !== null) return pathVerdict(abs, root, cfg, write, real)
+    if (!t.split('/').some(isHiddenSeg)) return unknownPathAsk(t)
+    return { kind: 'ask', category: 'external_dir', detail: t, reason: `要${write ? '写' : '读'}项目外路径：${t}` }
+  }
+
   // root 先规范到真实形态：root 自身含链接（macOS /var→/private/var）
   // 时，路径的真实形态永远对不上字面 root，会全部误弹
   let rootReal = root
@@ -828,9 +987,10 @@ function pathVerdict(
   const orig = t
 
   // always 路径白名单：展开 ~ 后按目录前缀匹配（d + '/' 防
-  // /a/bc 沾 /a/b 的光）。读写同权——批的是「这个目录可以碰」
-  if (cfg.alwaysPaths) {
-    const et = expandTilde(t)
+  // /a/bc 沾 /a/b 的光）。读写同权——批的是「这个目录可以碰」。
+  // 凭据类与 SC 控制文件不沾目录的光（2026-10-29，neverAlways）
+  const et = expandTilde(t)
+  if (cfg.alwaysPaths && !neverAlways(et)) {
     for (const d of cfg.alwaysPaths) {
       if (et === d || et.startsWith(d.endsWith('/') ? d : `${d}/`)) return { kind: 'allow' }
     }
@@ -847,7 +1007,13 @@ function pathVerdict(
   // ——SC 自家状态目录，工具描述引导 agent 跨项目直读（events/turns 原文），
   // 不放行则审批与产品机制打架。其余项目外读**仍弹**（~/.ssh、/etc、
   // 其他项目源码——泄露面在读）。写不论是否 .simple-code 都弹
-  if (t.startsWith('~')) return write || !inSimpleCodeTree(t) ? outside(t) : { kind: 'allow' }
+  if (t.startsWith('~')) {
+    // 展开后落在项目内的按绝对路径判（2026-10-29：`cd ~/Code/<项目>` 被当
+    // 项目外，两周 24 张卡）。项目外的保留 ~ 原形态，卡上照旧显示 ~/x
+    const r = root.endsWith('/') ? root : `${root}/`
+    if (et === root || et.startsWith(r)) return pathVerdict(et, root, cfg, write, real)
+    return write || !inSimpleCodeTree(t) ? outside(t) : { kind: 'allow' }
+  }
 
   if (t.startsWith('/')) {
     // 绝对路径：不在 root 前缀内即项目外
@@ -859,8 +1025,7 @@ function pathVerdict(
     t = t.slice(r.length)
   }
 
-  // 组件级：.. 逃逸（绝对与相对统一保守处理，foo/../bar 不逃逸也会问，
-  // 换取不解析真实走向的简单性）+ 隐藏组件
+  // 组件级：隐藏组件（`..` 已在开头解析掉）
   const parts = t.split('/').filter((p) => p !== '')
   // .simple-code 子树读写分离（用户拍板）：读放行——memory 检索通道
   // ($SIMPLE_CODE_MEMORY) 本就免审批，grep/cat 直读不该两样待遇；写弹卡
@@ -882,10 +1047,16 @@ function pathVerdict(
     // tmp（2026-10-22 拍板）：bash 工具描述指定的临时文件落点，指了路
     // 又拦写是自相矛盾
     if (SC_OPEN_DIRS.has(parts[1] ?? '')) return { kind: 'allow' }
-    // 其余整树：读放行（对话史、regions——用户拍板），写弹卡
-    return write ? writeAsk : { kind: 'allow' }
+    // 其余整树：读放行（对话史、regions——用户拍板），写弹卡。写给始终允许，
+    // 记到第二级（.simple-code/scripts，2026-10-29）；approval.json / memory
+    // 不给、已批不算（neverAlways，settings.json 上面已拦）
+    if (!write) return { kind: 'allow' }
+    const rel = parts.join('/')
+    if (parts.length < 2 || neverAlways(rel)) return writeAsk
+    if ((cfg.hiddenWrite ?? []).some((e) => rel === e || rel.startsWith(`${e}/`)))
+      return { kind: 'allow' }
+    return { ...writeAsk, alwaysHidden: { path: `.simple-code/${parts[1]}`, write: true } }
   }
-  if (parts.includes('..')) return write || !inSimpleCodeTree(t) ? outside(t) : { kind: 'allow' }
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i] ?? ''
     // 省略号形态（纯点 ≥3，echo ... 的分隔符）与 `.` 不是隐藏段——isHiddenSeg
@@ -900,5 +1071,18 @@ function pathVerdict(
   return { kind: 'allow' }
 }
 
-/** .simple-code 下读写都免审的目录（2026-09-29 拍板；tmp 2026-10-22 加入） */
-const SC_OPEN_DIRS = new Set(['notes', 'lessons', 'events', 'skills', 'tmp'])
+/** .simple-code 下读写都免审的目录（2026-09-29 拍板；tmp 2026-10-22、diagnosis 2026-10-26 加入；
+ * principles 2026-10-30：principle 类 note 的旧目录，与 lessons 同为 note-files.ts 兼容的旧位置） */
+const SC_OPEN_DIRS = new Set([
+  'notes',
+  'lessons',
+  'principles',
+  'events',
+  'skills',
+  'tmp',
+  'diagnosis',
+])
+
+/** 像代码而不像路径：空白加语句符号（`Application Support`、`x (1).txt`
+ * 这类带空格的真路径不中）。换行到这里已被剥掉，不能拿来判 */
+const looksLikeCode = (t: string): boolean => /\s/.test(t) && /[;&|{}=]/.test(t)

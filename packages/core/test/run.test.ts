@@ -77,8 +77,6 @@ async function drive(options: {
   reloadSystem?: LoopDeps['reloadSystem']
   /** 注入 deps.kickSummary，观测水位检查催没催摘要 */
   kickSummary?: LoopDeps['kickSummary']
-  /** 注入 deps.taskOverflow（分支跑超）——观测 loop 顶的闸 */
-  taskOverflow?: LoopDeps['taskOverflow']
 }): Promise<Harness> {
   const scripted = scriptedStream(options.rounds ?? [])
   const tools = options.tools ?? [fakeTool('bash')]
@@ -99,7 +97,6 @@ async function drive(options: {
     },
     maxIterations: options.maxIterations ?? 10,
     ...(options.reloadSystem ? { reloadSystem: options.reloadSystem } : {}),
-    ...(options.taskOverflow ? { taskOverflow: options.taskOverflow } : {}),
     ...(options.kickSummary ? { kickSummary: options.kickSummary } : {}),
     ...(options.memory ? { memory: options.memory } : {}),
   }
@@ -419,6 +416,12 @@ describe('退出条件', () => {
     expect(h.requests()).toBe(2)
     const texts = h.ctx.messages.filter((m) => m.role === 'user').flatMap((m) => m.parts)
     expect(texts).toContainEqual({ type: 'text', text: '顺便统计行数' })
+    // 投进历史的那一刻报出来：宿主据此把排队的气泡摆到它真正进历史的位置
+    // （2026-10-31 真机：气泡落在本步回答前面，reload 后跑到回答后面）
+    const types = h.events.map((e) => e.type)
+    const at = types.indexOf('input_delivered')
+    expect(at).toBeGreaterThan(types.indexOf('step_finish'))
+    expect(at).toBeLessThan(types.lastIndexOf('text_start'))
   })
 
   it('连发两条消息按发送顺序处理', async () => {
@@ -438,6 +441,7 @@ describe('退出条件', () => {
       .flatMap((m) => m.parts)
       .map((p) => (p as { text: string }).text)
     expect(userTexts).toEqual(['跑一下', '先做 A', '再做 B'])
+    expect(h.events.filter((e) => e.type === 'input_delivered')).toHaveLength(2)
   })
 
   it('finish=tool-calls 但没有待办时也要再跑一轮', async () => {
@@ -592,6 +596,31 @@ describe('中断', () => {
 
     expect(h.requests()).toBe(0)
   })
+
+  it('用户中断抛出的 AbortError 不发 error 事件、不记 error 日志（2026-10-29）', async () => {
+    // 停止会让在途的 await 抛 DOMException AbortError，原来走 catch 兜底：
+    // 面板在「已中断」上面多一条「AbortError: This operation was aborted」，
+    // runlog 的 error 计数也混进用户停止（10-20~29 共 29 次，全紧跟 interrupt）
+    const calls: Record<string, unknown>[] = []
+    const mod = await import('../src/runlog.ts')
+    const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
+    try {
+      const controller = new AbortController()
+      const h = await drive({
+        signal: controller.signal,
+        stream: () =>
+          (async function* (): AsyncIterable<StreamEvent> {
+            yield { type: 'text_start' }
+            controller.abort()
+            controller.signal.throwIfAborted()
+          })(),
+      })
+      expect(h.events.some((e) => e.type === 'error')).toBe(false)
+      expect(calls.some((c) => c.ev === 'error')).toBe(false)
+    } finally {
+      spy.mockRestore()
+    }
+  })
 })
 
 describe('健壮性', () => {
@@ -714,17 +743,6 @@ const starved = (thinking: string): StreamEvent[] => [
   { type: 'reasoning_end' },
   { type: 'finish', reason: 'length', usage: usage() },
 ]
-
-describe('任务跑超（task-v3 配额闸）', () => {
-  it('命中即收口：一个 error 事件、不发请求、排队输入不消费', async () => {
-    const h = await drive({
-      rounds: [says('做完了')],
-      taskOverflow: () => '分支跑超预留编号段（turns 的 id 已到 10000，段上限 10000），已自动停止——只能合并或丢弃，不能继续',
-    })
-    expect(h.events.filter((e) => e.type === 'error')).toHaveLength(1)
-    expect(h.requests()).toBe(0)
-  })
-})
 
 describe('输出被 max_tokens 截断', () => {
   it('续写而不是当成正常结束', async () => {
@@ -1485,6 +1503,46 @@ describe('缓存过期触发（提案 §12）', () => {
     expect(m.calls).toEqual([])
   })
 
+  // task-trunk 规则 5（2026-10-30 用户订正）：别人合回的段搭压缩点拉，自己不发车。
+  // 真机：主任务空闲 4 分钟（TTL 内）因有段可拉被当压缩点，cacheWrite 50337
+  const pullable = () => {
+    const n = { pulled: 0 }
+    const deps = {
+      pullPending: () => n.pulled === 0,
+      pullSegments: () => {
+        n.pulled++
+        return 2
+      },
+    }
+    return { n, deps }
+  }
+
+  it('有段可拉、缓存没过期：不拉也不卸——拉段不单独断缓存', async () => {
+    const p = pullable()
+    const m = spyMemory({ now: () => 0, lastResponseAt: () => -1000, ...p.deps })
+    await drive({ messages: three(), memory: m.memory, rounds: [says('好的')] })
+
+    expect(p.n.pulled).toBe(0)
+    expect(m.calls).toEqual([])
+  })
+
+  it('对照组：同样有段可拉，stale 发车时顺带拉', async () => {
+    const p = pullable()
+    const m = spyMemory({ now: () => 0, lastResponseAt: () => -4 * 60 * 60 * 1000, ...p.deps })
+    await drive({ messages: three(), memory: m.memory, rounds: [says('好的')] })
+
+    expect(p.n.pulled).toBe(1)
+    expect(m.calls).toEqual([[0, 1]])
+  })
+
+  it('会话第一个请求（还没响应过）有段可拉就拉：没有缓存可断', async () => {
+    const p = pullable()
+    const m = spyMemory({ now: () => 0, lastResponseAt: () => null, ...p.deps })
+    await drive({ messages: three(), memory: m.memory, rounds: [says('好的')] })
+
+    expect(p.n.pulled).toBe(1)
+  })
+
   it('生成的存根登记给 store（markStubs），归档才不会把它当新消息再写一遍（2026-09-30）', async () => {
     const m = spyMemory({ now: () => 0, lastResponseAt: () => -4 * 60 * 60 * 1000 })
     const h = await drive({ messages: three(), memory: m.memory, rounds: [says('好的')] })
@@ -1541,11 +1599,11 @@ describe('缓存过期触发（提案 §12）', () => {
       messages: three(),
       memory: m.memory,
       rounds: [says('好的')],
-      reloadSystem: async () => ({ agentsOverLimit: ['AGENTS.md'] }),
+      reloadSystem: async () => ({ agentsOverLimit: { files: ['AGENTS.md'], maxTokens: 4096 } }),
     })
     const ev = h.events.find((e) => e.type === 'error')
     expect(ev).toMatchObject({ type: 'error', retryable: false })
-    expect((ev as { message: string }).message).toContain('AGENTS.md 超过')
+    expect((ev as { message: string }).message).toContain('AGENTS.md 超过 4,096 token 上限')
   })
 
   it('对照组：本进程还没响应过（重启后第一条），不判 stale', async () => {

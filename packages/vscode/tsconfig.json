@@ -22,7 +22,11 @@
     "test/memory-wiring.test.ts",
     "test/user-clamp.test.ts",
     "test/draft-bar-render.test.ts",
-    "test/main-task-dot.test.ts"
+    "test/main-task-dot.test.ts",
+    "test/branch-approval-badge.test.ts",
+    "test/turn-memo.test.ts",
+    "test/bottom-area.test.ts",
+    "test/scroll-restore-wiring.test.ts"
   ],
   "$comment": [
     "排除的这些测试要 DOM 类型（toolrow 还要 JSX），而这个 project 没有 DOM lib、",

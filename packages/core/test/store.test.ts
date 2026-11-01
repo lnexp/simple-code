@@ -2,10 +2,10 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Message, Part } from '../src/llm/types.ts'
 import { listBucketFiles, resolveBucketFile } from '../src/session/buckets.ts'
-import { forkTask, scopeOf } from '../src/session/task.ts'
+import { createTask, scopeOf } from '../src/session/task.ts'
 import { lastRegionLine, MEMORY_RELATIVE, openStore, type Store } from '../src/session/store.ts'
 
 const dirs: string[] = []
@@ -95,10 +95,9 @@ describe('落盘与读回', () => {
 
   it('重启兜底：lastRespondedAt 读最后一轮的完成时刻（ended_at）', async () => {
     // 提案 §12。正常计时走 session 闭包的 lastResponseAt（响应结束时刻），
-    // 只有重启后那份丢了才读这里。口径是完成时刻（2026-09-20 从「最后一个
-    // step 的开始」改来：TTL 按模型配、glm-5.3 是 5 分钟，开始口径会把
-    // 间隔算小、倾向误判过期）。空库返回 null——「没有响应过」和
-    // 「响应过但时刻未知」要能区分，后者不存在，前者不能是 0（epoch 零点）
+    // 只有重启后那份丢了才读这里。已完成轮保留 ended_at 口径；未完成轮
+    // 取 assistant 落盘时刻（cache-restart.test.ts 覆盖长轮）。空库返回
+    // null，不能用 0（epoch 零点）冒充响应时刻。
     const dir = await workspace()
     const empty = openStore(dir)
     expect(empty.lastRespondedAt()).toBeNull()
@@ -108,7 +107,7 @@ describe('落盘与读回', () => {
     const turn = store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('一'), assistantSays('二')])
     const at = store.lastRespondedAt()
-    // 没落耗时（elapsed null）退回开始时刻，只比现在早、且早不了太多
+    // 没落耗时（elapsed null）取回复落盘时刻，只比现在早、且早不了太多
     // （测试里就几毫秒）。
     // null 先用 typeof 挡掉：null 参与大小比较会被强转成 0，比较断言挡不住它
     expect(typeof at).toBe('number')
@@ -820,6 +819,49 @@ describe('摘要（3b-1）', () => {
     store.close()
   })
 
+  it('covers 跨百亿号也按区间判，不逐号展开：照样挑出没盖住的那一轮', async () => {
+    // task-trunk 每段跳 50000，高层行的 covers 跨度随段数涨（10-30 真库
+    // 4536 行跨度总和 670 万）。原实现逐号展开成 Set：真库每步 0.4–1s
+    // 主线程同步（step_persist kickMs），再涨下去过 V8 上限抛 RangeError，
+    // 被 summarizeOnce 吞掉，摘要从此静默停摆
+    const dir = await workspace()
+    const store = openStore(dir)
+    store.beginTurn({ model: 'p/m', effort: null })
+    store.save([userSays('问一'), assistantSays('答一')])
+    store.beginTurn({ model: 'p/m', effort: null })
+    store.save([userSays('问一'), assistantSays('答一'), userSays('问二'), assistantSays('答二')])
+
+    const first = store.nextSegmentToSummarize(1_000_000, null)
+    expect(first).not.toBeNull() // 前提：本来就有候选
+    store.addSummary(draft({ coversFrom: first?.from ?? 0, coversTo: first?.to ?? 0, inContext: false }))
+    store.addSummary(draft({ coversFrom: 10_000_000_000, coversTo: 20_000_000_000, inContext: false }))
+
+    const second = store.nextSegmentToSummarize(1_000_000, null)
+    expect(second).not.toBeNull()
+    expect(second?.turn).not.toBe(first?.turn)
+    // 对照组：两轮都盖住 → 没有候选
+    store.addSummary(draft({ coversFrom: second?.from ?? 0, coversTo: second?.to ?? 0, inContext: false }))
+    expect(store.nextSegmentToSummarize(1_000_000, null)).toBeNull()
+    store.close()
+  })
+
+  it('高层行套着低层行（同起点、低层在后）照样算盖住', async () => {
+    // 真库常态：L1 [a, z] 与成员 L0 [a, b] 同起点。合并区间时短的排在后面
+    // 不能把已合的右端缩回去
+    const dir = await workspace()
+    const store = openStore(dir)
+    store.beginTurn({ model: 'p/m', effort: null })
+    store.save([userSays('问一'), assistantSays('答一')])
+    store.beginTurn({ model: 'p/m', effort: null })
+    store.save([userSays('问一'), assistantSays('答一'), userSays('问二'), assistantSays('答二')])
+
+    const first = store.nextSegmentToSummarize(1_000_000, null)
+    store.addSummary(draft({ level: 1, coversFrom: first?.from ?? 0, coversTo: 20_000_000_000, inContext: false }))
+    store.addSummary(draft({ coversFrom: first?.from ?? 0, coversTo: first?.to ?? 0, inContext: false }))
+    expect(store.nextSegmentToSummarize(1_000_000, null)).toBeNull()
+    store.close()
+  })
+
   it('对照组：ready 的行不会被删', async () => {
     // 没有这条的话，「启动时把 summaries 清空」也能让上面两条通过——
     // 那会把已经生成好的摘要全部作废，每次启动重算一遍
@@ -1125,6 +1167,38 @@ describe('摘要候选优先给还占着 context 的 turn', () => {
     // 出洞，L1 合并再也接不上（提案 §4.3 的候选枯竭、§6.6 同一个坑）
     for (const id of stale) expect(id).toBeLessThan(segment?.from ?? 0)
     reopened.close()
+  })
+
+  it('判「占着 context」只走 live 行的索引，不逐个 step 回表读消息行', async () => {
+    // 2026-10-31 真机：原写法 EXISTS(… m2.step_id = s.id AND m2.state = 'live' …) 走
+    // messages_step 找到行后回表取 state/owner，这两列排在 content_json 之后，主任务
+    // 3 万多行约 109MB 溢出页每个 step 跑完全读一遍；内存紧时这些页被系统回收，
+    // 主线程每步卡在 pread 约 400ms（note kick-summary-sync-cost-480ms）。
+    // 测试里造不出那个数据量、量时间也不稳，锁查询计划
+    const dir = await workspace()
+    const store = openStore(dir)
+    store.beginTurn({ model: 'p/m', effort: null })
+    store.save([userSays('一'), assistantSays('二')])
+    const prepare = vi.spyOn(DatabaseSync.prototype, 'prepare')
+    let sql: string | undefined
+    try {
+      store.nextSegmentToSummarize(1_000_000, null)
+      // 先取再还原：mockRestore 会连记下的调用一起清掉
+      sql = prepare.mock.calls.map(([text]) => text).find((text) => text.includes('holds_context'))
+    } finally {
+      prepare.mockRestore()
+    }
+    store.close()
+    expect(sql).toBeDefined()
+    const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'))
+    const plan = db
+      .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+      .all(null, null)
+      .map((row) => String(row.detail))
+      .join('\n')
+    db.close()
+    expect(plan).toMatch(/SEARCH m2 USING (COVERING )?INDEX messages_live \(state=\?\)/)
+    expect(plan).not.toMatch(/CORRELATED/)
   })
 })
 
@@ -1544,7 +1618,7 @@ describe('regions.jsonl：四个区的诊断记录（提案 §13）', () => {
   it('行带 owner，lastRegionLine 按会话取尾行——任务视图不串台主任务的数字', async () => {
     const dir = await workspace()
     const main = openStore(dir)
-    const m = forkTask(dir, '面板串台')
+    const m = createTask(dir, '面板串台')
     const task = openStore(dir, { task: scopeOf(m) })
 
     // 主任务和任务交错写（真实时序：两边并发跑，谁装配请求谁追加）

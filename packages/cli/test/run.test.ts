@@ -224,7 +224,9 @@ describe('出错时的退出码', () => {
 
     expect(code).toBe(2)
     expect(c.stderr()).toContain('还没有配置文件')
-    expect(c.stderr()).toContain('settings.example.json')
+    expect(c.stderr()).toContain(join(dir, '不存在.json'))
+    expect(c.stderr()).toContain('https://github.com/lnexp/simple-code#快速开始')
+    expect(c.stderr()).toContain('${SIMPLE_CODE_API_KEY}')
     // 对照组：这条路径不该退化成 zod 那串字段错误
     expect(c.stderr()).not.toContain('expected string')
   })
@@ -241,16 +243,18 @@ describe('出错时的退出码', () => {
 })
 
 describe('injectLocalTools（终端裸跑自补工具路径）', () => {
-  it('变量缺失时指向 shim；已有注入不覆盖；缺文件跳过', async () => {
+  it('变量缺失时指向 shim；已有注入不覆盖；缺文件跳过；教程指 bin 目录拷贝', async () => {
     const { injectLocalTools } = await import('../src/run.ts')
     const dir = await mkdtemp(join(tmpdir(), 'sc-inject-'))
     const binDir = await mkdtemp(join(tmpdir(), 'sc-shim-'))
     dirs.push(dir)
     await writeFile(join(dir, 'webfetch.js'), '#!/usr/bin/env node\n', { mode: 0o755 })
     await writeFile(join(dir, 'note.js'), '#!/usr/bin/env node\n', { mode: 0o755 })
+    await writeFile(join(dir, 'self.md'), '# 教程\n')
     const savedNote = process.env.SIMPLE_CODE_NOTE
     const savedWebfetch = process.env.SIMPLE_CODE_WEBFETCH
     const savedLesson = process.env.SIMPLE_CODE_LESSON
+    const savedDoc = process.env.SIMPLE_CODE_DOC
     try {
       delete process.env.SIMPLE_CODE_WEBFETCH
       delete process.env.SIMPLE_CODE_LESSON // 本进程可能带扩展注入的值——清了才验「缺文件跳过」
@@ -261,6 +265,9 @@ describe('injectLocalTools（终端裸跑自补工具路径）', () => {
       await expect(access(join(binDir, 'sc-webfetch'), fsConstants.X_OK)).resolves.toBeUndefined()
       expect(process.env.SIMPLE_CODE_NOTE).toBe('/host/injected/note.js') // 不覆盖
       expect(process.env.SIMPLE_CODE_LESSON).toBeUndefined() // 目录里没有 → 跳过
+      // 拷贝而非 dist 原件：原件在 ~/.vscode/extensions 下，项目外读弹隐藏路径卡
+      expect(process.env.SIMPLE_CODE_DOC).toBe(join(binDir, 'self.md'))
+      expect(await readFile(join(binDir, 'self.md'), 'utf8')).toBe('# 教程\n')
     } finally {
       if (savedWebfetch === undefined) delete process.env.SIMPLE_CODE_WEBFETCH
       else process.env.SIMPLE_CODE_WEBFETCH = savedWebfetch
@@ -268,6 +275,32 @@ describe('injectLocalTools（终端裸跑自补工具路径）', () => {
       else process.env.SIMPLE_CODE_NOTE = savedNote
       if (savedLesson === undefined) delete process.env.SIMPLE_CODE_LESSON
       else process.env.SIMPLE_CODE_LESSON = savedLesson
+      if (savedDoc === undefined) delete process.env.SIMPLE_CODE_DOC
+      else process.env.SIMPLE_CODE_DOC = savedDoc
+    }
+  })
+})
+
+describe('injectLocalTools：删掉继承来的派任务桥', () => {
+  it('从 VS Code bash 起的 sc 带着 SIMPLE_CODE_TASK/_PORT/_TOKEN：一律删（派任务只属于宿主会话）', async () => {
+    const { injectLocalTools } = await import('../src/run.ts')
+    const dir = await mkdtemp(join(tmpdir(), 'sc-inject-'))
+    const binDir = await mkdtemp(join(tmpdir(), 'sc-shim-'))
+    dirs.push(dir)
+    const keys = ['SIMPLE_CODE_TASK', 'SIMPLE_CODE_TASK_PORT', 'SIMPLE_CODE_TASK_TOKEN'] as const
+    const saved = keys.map((k) => process.env[k])
+    try {
+      process.env.SIMPLE_CODE_TASK = '/host/task.js'
+      process.env.SIMPLE_CODE_TASK_PORT = '51234'
+      process.env.SIMPLE_CODE_TASK_TOKEN = 'tok'
+      await injectLocalTools(dir, binDir)
+      for (const k of keys) expect(process.env[k]).toBeUndefined()
+    } finally {
+      for (const [i, k] of keys.entries()) {
+        const v = saved[i]
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
     }
   })
 })

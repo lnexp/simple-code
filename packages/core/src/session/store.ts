@@ -5,13 +5,26 @@ import type { AsyncCue, LiveMessage, Summary, SummaryStatus, UnloadedRef } from 
 import type { RegionSizes } from '../loop/regions.ts'
 import { estimateMessageTokens } from '../loop/tokens.ts'
 import { takeSegment } from '../loop/turns.ts'
+import { logRun } from '../runlog.ts'
 import type { RawSink } from '../tools/types.ts'
 import { bucketedRel, ensureBucketFile, migrateToBuckets } from './buckets.ts'
 import { cleanupLegacyRows } from './cleanup.ts'
+import { restoreHistoryOriginals } from './history-originals.ts'
 import { type Db, openDb, type SqlValue } from './db.ts'
 import { ensureGitIgnored } from './gitignore.ts'
 import { type Leaf, leafName, readLeavesByCovers, writeLeaf as writeLeafFile } from './leaf.ts'
 import { MIGRATIONS, SCHEMA } from './schema.sql.ts'
+import {
+  copySegmentRoots,
+  currentSegment,
+  mergeReadySegments,
+  openSegment,
+  pullableSegments,
+  registerLegacySegments,
+  segmentForTurn,
+  type SegmentRow,
+  TRUNK,
+} from './segments.ts'
 import { syncSearchIndex } from './search-index.ts'
 
 export const MEMORY_RELATIVE = join('.simple-code', 'memory')
@@ -124,6 +137,8 @@ export type Store = {
   pruneMessages(indices: number[]): void
   /** run loop 每条 assistant 响应开新 step（step-summary-rework §4.2） */
   beginStep(): number
+  /** 当前段还有号开新 step 吗（没有 = 这一轮把段写满了，下一轮开头换段） */
+  hasStepRoom(): boolean
   /** 一段（闭区间 step id）的全部消息，按落库顺序 */
   segmentMessages(segment: Segment): Message[]
   /**
@@ -232,7 +247,9 @@ export type Store = {
    *   SQL 里数一次**，不靠「返回条数 < limit」——那要假设没有并发写入，
    *   而后台摘要线程恰好会并发地翻行状态
    */
-  historyPage(cursor: number | null, limit: number): { rows: HistoryRow[]; next: number | null }
+  historyPage(cursor: number | null, limit: number, restoredIds?: readonly number[]): { rows: HistoryRow[]; next: number | null }
+  /** 回放基线用原文替换 live 存根；返回已展示行 id，分页不重复取。 */
+  historyOriginals(live: LiveMessage[]): { rows: LiveMessage[]; restoredIds: number[] }
   /**
    * 批查若干轮的 meta/耗时。给 webview 基线用：live 轮不走 historyPage
    * （那是 unloaded 翻页的查询），但页脚要的「当时模型·耗时」一样得从
@@ -243,14 +260,14 @@ export type Store = {
     { meta: TurnMeta | null; elapsedMs: number | null; finishedAt: number | null }
   >
   /**
-   * 最后一轮的完成时刻（epoch ms，= turn 开始 + 耗时）。null = 库里还没有 turn。
+   * 最近响应的恢复时刻（epoch ms）。null = 库里没有 assistant 回复。
    *
    * 只给缓存过期判断做**重启兜底**（提案 §12）：正常计时走 session 闭包里的
-   * lastResponseAt（响应结束时刻），只有重启后那份丢了才来读这里。原来是
-   * 最后一个 step 的**开始**时刻——TTL 是按模型配的（glm-5.3 是 5 分钟），
-   * 一轮跑几分钟的话开始口径天然把间隔算小、倾向误判过期，2026-09-20 换成
-   * 完成时刻。最后一轮被打断没落耗时（elapsed_ms null）时退回开始时刻——
-   * 被打断的那轮缓存多半也凉了，方向上可接受
+   * lastResponseAt（响应结束时刻）。assistant 在流结束后的 save 中建 step，
+   * steps.started_at 是回复落盘时刻，不是请求开始。兼容已有的轮完成时间，
+   * 两者取较新者：续接轮可能还留着上次中断的 ended_at，不能盖过新回复。
+   * 2026-10-26 某真实项目：未完成轮退回 turn.started_at，把 17.5 秒误算成 22 分钟。
+   * 最近 assistant 的口径参考 CC services/compact/microCompact.ts:434；step/轮取较新者为本项目兼容。
    */
   lastRespondedAt(): number | null
   /**
@@ -324,13 +341,15 @@ export type Store = {
    * 在同一位置原样渲染，重写 = 改写已发前缀
    */
   saveAsyncCue(turnId: number, cue: { stepId: number; after: number; lines: string[]; names: string[] }): void
-  /** 全部轮内注入（stepId → 锚点与成品行）。同 cues()：任务视角继承对话行 */
+  /** 动作联想（touch-cue.ts）：一步至多一条，同样 DO NOTHING、注入后不变 */
+  saveTouchCue(cue: { stepId: number; after: number; lines: string[]; names: string[] }): void
+  /** 全部轮内注入（stepId → 锚点与成品行），选择器与动作联想合并。同 cues()：任务视角继承对话行 */
   asyncCues(): Map<number, AsyncCue>
   /** 在场原文最早的 step（可见 live 消息的 MIN(step_id)），无则 null——recall 去重：
    *  覆盖/锚在它之后的东西，原文还在上下文里。存根也算（step 已 unloaded、
    *  工具输出换成了存根，对话文字仍在场）；卸载从最老的来，在场段是连续尾巴 */
   liveStepFloor(): number | null
-  /** 锚点 step ≥ fromStep 的轮内注入用过的名字（kind:name） */
+  /** 锚点 step ≥ fromStep 的轮内注入用过的名字（kind:name），两种注入都算 */
   asyncCuedNamesSince(fromStep: number): Set<string>
   /** 缝 (from, to) 开区间里有没有内容痕迹（可见消息/外主 steps）——跨缝合的第②③道保险 */
   gapHasContent(from: number, to: number): boolean
@@ -363,10 +382,6 @@ export type Store = {
    * 下次合并会把这些成员再吃一遍，一份历史进两个 L1
    */
   recordMerge(row: Omit<Summary, 'id' | 'owner' | 'turnFrom' | 'turnTo'>, memberIds: number[]): number
-  /** 四表 MAX(id)——任务跑超检查（task-v3 配额闸）的输入。任务会话里只数
-   *  **本段内**的号：对话 fork 后跳到段上方接着写，全库 max 越过段界是
-   *  常态，不是配额烧穿 */
-  maxIds(): { turns: number; steps: number; messages: number; summaries: number }
   /**
    * 生效（§9.1 的「生效」）。把所有「待生效」的塌缩换进来：子孙 → 0，
    * 链根 → 1，**一个事务、一次调用全部应用**（不是逐个合并地应用）。
@@ -382,155 +397,56 @@ export type Store = {
    * 各自过滤，两边条数才仍然对得上
    */
   close(): void
+  /**
+   * 主干视角（task-trunk 规则 10）：同一连接上 owner='trunk' 的 store，只用来
+   * 维护那套压好的摘要（summaries/gapHasContent/recordMerge/applyMerges）
+   */
+  trunk(): Store
+  /** 有没有可拉的段（已合回、别人的、号比自己当前段低、没拉过）——压缩点的触发条件之一 */
+  pullPending(): boolean
+  /** 压缩点调：把可拉的段的摘要复制成自己的（规则 5），返回复制的行数 */
+  pullSegments(): number
+  /**
+   * 段合回检查（规则 4）：full 且段内 step 全被摘要覆盖的段标 merged，主干接着
+   * 把所有没拷过的已合回段拷进来（规则 10）。返回主干这次新拷的行数。幂等
+   */
+  mergeSegments(): number
+  /** 取走投给本会话的任务回调（task-trunk 规则 12），按投递顺序。取即标记，
+   *  调用方负责把它们插进历史 */
+  takeTaskResults(): string[]
 }
 
 /**
- * 任务的会话域（task-v3）：同一个库里「我是谁、看得见哪些轮、新行分配在哪个
- * 号段」。主对话（无 scope）看得见 owner IS NULL 的一切；任务看得见继承上界
- * （forkTurn 含）以下的对话历史 + 自己 owner 的轮。关闭任务把 owner 还俗为
- * NULL，该段自动变成对话可见——可见性规则只此一条，没有第二种路径
+ * 任务的会话域：同一个库里「我是谁、看得见哪些轮」。主对话（无 scope）看得见
+ * owner IS NULL 的一切；任务只看自己 owner 的轮。step 号在各自的段里取
+ * （segments.ts，主任务也一样）；turns/messages/summaries 全局自增。
+ *
+ * forkTurn / inheritCeil 只有 task-v3 fork 出来、升级时还开着的老任务才非 0：
+ * 它们 fork 时复制了主任务那时的上下文（行归任务、轮与 step 是主任务的），
+ * 这批「继承的」行仍按 v3 的规则留在原地、由任务的私有摘要顶替。新任务（task-trunk）
+ * 两个都是 0，所有继承判据自然落空
  */
 export type TaskScope = {
   owner: string
-  /** 继承上界（含）：owner IS NULL 且 id ≤ 此值的轮对任务可见 */
+  /** 老任务的继承上界（含）：owner IS NULL 且 id ≤ 此值的轮对它可见。新任务 0 */
   forkTurn: number
-  /** 分配上界（不含）。turns 的上界正是 fork 时插的 reserved 行，占住 max */
-  turnCeil: number
-  /** 以下三轴分配域 (floor, ceil]：floor=fork 时主库该轴 max */
-  stepFloor: number
-  stepCeil: number
-  msgFloor: number
-  msgCeil: number
-  sumFloor: number
-  sumCeil: number
+  /** 老任务继承段的 step 上界（v3 manifest 的 stepFloor）。新任务 0 */
+  inheritCeil: number
 }
 
-/** 任务段配额用尽。跑到 beginTurn/save/addSummary 才发现——上抛为轮错误，
- *  任务只能关闭（docs/proposals/task-v3.md 配额表） */
+/** 一轮写出了段（段宽 10000，正常走不到）。上抛为轮错误 */
 export class SegmentFullError extends Error {
   constructor(axis: string) {
-    super(`任务段配额用尽（${axis}）——请关闭任务`)
+    super(`steps 号段用尽（${axis}）——这一轮写了太多步`)
   }
 }
 
-/** migrations 表里「这个任务的继承上下文已复制」的标记名 */
+/** migrations 表里「这个老任务的继承上下文已复制」的标记名（task-v3 遗产，关闭时清） */
 export const copyMarker = (owner: string): string => `task-context-copy:${owner}`
-
-/**
- * 把主任务此刻的上下文**复制一份归任务所有**（2026-09-23 用户定死的隔离
- * 原则，note task-context-isolation）：任务和主任务只共享数据库与文件，
- * 上下文各管各的——主任务之后压缩（卸载原文、摘要进场、合并）只改它自己
- * 的行，任务那份一个字不变；反过来也一样。
- *
- * 为什么复制而不是给原行打标记：主任务每次存盘整份 DELETE+INSERT
- * （replaceLive），行号存一次换一次，标记指向的行下一次就不存在了。
- *
- * 复制什么：
- * - messages：主任务 live 行（轮 ≤ forkTurn）→ 同 turn_id/step_id、
- *   owner=任务、id 取任务消息段。已卸载的历史不复制（两边都不再发给模型）。
- * - summaries：主任务 ready 行（covers_to ≤ stepFloor）里对上下文有用的
- *   ——链根、在场的、在场者的祖先；已被父行完全收编且不在场的老 L0/L1 不
- *   复制（父行覆盖范围包含它们）。superseded_by 映射到副本 id。
- *
- * 幂等：migrations 表记标记，已复制过直接返回；复制与标记在一个事务里。
- * 调用时机：forkTask 跳段之后、manifest 落盘之前（对话此刻静止）；老任务
- * （隔离之前开的）在 openStore 时补一次
- */
-export function ensureInheritedCopy(db: Db, scope: TaskScope): void {
-  const marker = copyMarker(scope.owner)
-  if (db.all(`SELECT 1 AS x FROM migrations WHERE name = ?`, marker).length > 0) return
-  db.transaction(() => copyInherited(db, scope, marker))
-}
-
-function copyInherited(db: Db, scope: TaskScope, marker: string): void {
-  const nextIn = (table: string, floor: number, ceil: number): (() => number) => {
-    let n =
-      db.all<{ n: number | null }>(`SELECT MAX(id) AS n FROM ${table} WHERE id > ? AND id <= ?`, floor, ceil)[0]
-        ?.n ?? floor
-    return () => {
-      n += 1
-      if (n > ceil) throw new SegmentFullError(table)
-      return n
-    }
-  }
-
-  const msgId = nextIn('messages', scope.msgFloor, scope.msgCeil)
-  const rows = db.all<{ turn_id: number; role: string; content_json: string; step_id: number | null }>(
-    `SELECT turn_id, role, content_json, step_id FROM messages
-     WHERE state = 'live' AND owner IS NULL
-       AND turn_id IN (SELECT id FROM turns WHERE owner IS NULL AND state != 'reserved' AND id <= ?)
-     ORDER BY turn_id, id`,
-    scope.forkTurn,
-  )
-  for (const r of rows) {
-    db.run(
-      `INSERT INTO messages(id, turn_id, role, content_json, step_id, owner) VALUES(?, ?, ?, ?, ?, ?)`,
-      msgId(),
-      r.turn_id,
-      r.role,
-      r.content_json,
-      r.step_id,
-      scope.owner,
-    )
-  }
-
-  type Row = SummaryRow
-  const all = db.all<Row>(
-    `SELECT id, level, covers_from, covers_to, text, status, in_context, superseded_by,
-            head, archive_path, name, owner
-     FROM summaries WHERE owner IS NULL AND status = 'ready' AND covers_to <= ?
-     ORDER BY id`,
-    scope.stepFloor,
-  )
-  const byId = new Map(all.map((r) => [r.id, r]))
-  const parentOf = (r: Row): Row | undefined =>
-    r.superseded_by === null ? undefined : byId.get(r.superseded_by)
-  const keep = new Set<number>()
-  for (const r of all) {
-    if (parentOf(r) === undefined) keep.add(r.id) // 链根（含父行未就绪的）
-    if (r.in_context === 1) {
-      // 在场的连同整条祖先链：父行「算好了等生效」时子孙还在场
-      for (let x: Row | undefined = r; x !== undefined && !keep.has(x.id); x = parentOf(x)) keep.add(x.id)
-      keep.add(r.id)
-    }
-  }
-  const sumId = nextIn('summaries', scope.sumFloor, scope.sumCeil)
-  const idMap = new Map<number, number>()
-  for (const r of all) if (keep.has(r.id)) idMap.set(r.id, sumId())
-  // 两遍：先插行、再连 superseded_by——外键开着，父行不一定先插
-  for (const r of all) {
-    const id = idMap.get(r.id)
-    if (id === undefined) continue
-    db.run(
-      `INSERT INTO summaries(id, level, covers_from, covers_to, text, status, in_context,
-                             superseded_by, head, archive_path, name, owner)
-       VALUES(?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
-      id,
-      r.level,
-      r.covers_from,
-      r.covers_to,
-      r.text,
-      r.status,
-      r.in_context,
-      r.head,
-      r.archive_path,
-      r.name,
-      scope.owner,
-    )
-  }
-  for (const r of all) {
-    const id = idMap.get(r.id)
-    const parent = r.superseded_by === null ? undefined : idMap.get(r.superseded_by)
-    if (id !== undefined && parent !== undefined) {
-      db.run(`UPDATE summaries SET superseded_by = ? WHERE id = ?`, parent, id)
-    }
-  }
-  db.run(`INSERT INTO migrations(name, ran_at) VALUES(?, datetime('now'))`, marker)
-}
 
 /** owner 是我们生成的 'task-<base36>'，进 SQL 片段前校验形状（防注入兜底） */
 const safeOwner = (owner: string): string => {
-  if (!/^task-[a-z0-9]+$/.test(owner)) throw new Error(`非法 owner: ${owner}`)
+  if (!/^task-[a-z0-9]+$/.test(owner) && owner !== TRUNK) throw new Error(`非法 owner: ${owner}`)
   return owner
 }
 
@@ -552,9 +468,6 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
   if (migrateToBuckets(dir) > 0) rewriteLegacyArchivePaths(db)
   dropUnfinishedSummaries(db)
   repairAppliedChains(db)
-  // 开库补一次 FTS 同步：老库首跑全量灌入（一次性），之后这里通常是
-  // 空操作——增量真正的落点是 save 尾部
-  syncSearchIndex(db)
 
   /**
    * **惰性创建**：open 的时候不建 turn，第一次 save 才建。
@@ -590,12 +503,38 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
   // 反过来先清洗的话，压实迁移在老库上选出的锚点跟这次不一样——两个一次性
   // 迁移之间有顺序依赖，不写下来下次就会有人按字母序重排
   cleanupLegacyRows(db)
+  // 老库登记段（task-trunk）：要在 backfillSteps 之后——段按已有 step 切
+  registerLegacySegments(db, folderPath)
+  // 开库补一次 FTS 同步：老库首跑全量灌入（一次性），之后这里通常是
+  // 空操作——增量真正的落点是 save 尾部。游标在段上，所以排在登记之后
+  syncSearchIndex(db)
+  return buildStore(db, folderPath, dir, turnsDir, opts.task ?? null, () => db.close())
+}
 
-  // ── task-v3 会话域派生物 ──
-  const scope = opts.task ?? null
-  // 老任务（上下文隔离之前开的）补一次复制。新任务 fork 时已在同一事务里
-  // 复制过（标记在），这里是空操作
-  if (scope) ensureInheritedCopy(db, scope)
+/** 主干的会话域（segments.ts TRUNK）：没有轮，只有一套摘要 */
+const TRUNK_SCOPE: TaskScope = { owner: TRUNK, forkTurn: 0, inheritCeil: 0 }
+
+/**
+ * 一个会话域视角下的 store。openStore 建主连接后调它；主干视角（`trunk()`）
+ * 共用同一连接再调一次——同进程第二个连接会撞锁（lesson
+ * sqlite-same-process-busy-timeout-useless），且主干只在这个进程里维护
+ */
+function buildStore(
+  db: Db,
+  folderPath: string,
+  dir: string,
+  turnsDir: string,
+  scope: TaskScope | null,
+  closeDb: () => void,
+): Store {
+  // ── 会话域派生物 ──
+  let trunkView: Store | null = null
+  /** 段的 owner 键（segments.ts）：主任务 ''，主干 'trunk' */
+  const segKey = scope?.owner ?? ''
+  /** 只拉号比自己当前段低的（规则 5）。主干没有请求前缀，全拉；还没开过段的
+   *  会话下一段必在一切之上，也全拉 */
+  const pullBelow = (): number =>
+    segKey === TRUNK ? Number.POSITIVE_INFINITY : (currentSegment(db, segKey)?.floor ?? Number.POSITIVE_INFINITY)
   // turns 表的可见条件（带别名 turns.，查询里 turns 无别名时替换掉前缀）
   // 对话侧要排除 reserved 锚（fork 占段头的行，owner=NULL 但没有内容）——
   // 不排的话 lastTurnId 会把它当「当前轮」
@@ -648,50 +587,22 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
   const forkTurnOf = scope?.forkTurn ?? null
   const isOwnTurn = (turnId: number): boolean =>
     forkTurnOf === null ? true : turnId > forkTurnOf
-  // 段内 id 分配器（只有任务会话用）。种子=段内现 max，会话内存量单调；
-  // 重开重播——号在段内即可，不留连续性承诺
-  const seed = (sql: string): number => db.all<{ n: number }>(sql)[0]?.n ?? 0
-  const alloc =
-    scope === null
-      ? null
-      : {
-          turn: (() => {
-            let n = seed(`SELECT COALESCE(MAX(id), ${scope.forkTurn}) AS n FROM turns
-                          WHERE id > ${scope.forkTurn} AND id < ${scope.turnCeil}`)
-            return () => {
-              n += 1
-              if (n >= scope.turnCeil) throw new SegmentFullError('turns')
-              return n
-            }
-          })(),
-          step: (() => {
-            let n = seed(`SELECT COALESCE(MAX(id), ${scope.stepFloor}) AS n FROM steps
-                          WHERE id > ${scope.stepFloor} AND id <= ${scope.stepCeil}`)
-            return () => {
-              n += 1
-              if (n > scope.stepCeil) throw new SegmentFullError('steps')
-              return n
-            }
-          })(),
-          msg: (() => {
-            let n = seed(`SELECT COALESCE(MAX(id), ${scope.msgFloor}) AS n FROM messages
-                          WHERE id > ${scope.msgFloor} AND id <= ${scope.msgCeil}`)
-            return () => {
-              n += 1
-              if (n > scope.msgCeil) throw new SegmentFullError('messages')
-              return n
-            }
-          })(),
-          sum: (() => {
-            let n = seed(`SELECT COALESCE(MAX(id), ${scope.sumFloor}) AS n FROM summaries
-                          WHERE id > ${scope.sumFloor} AND id <= ${scope.sumCeil}`)
-            return () => {
-              n += 1
-              if (n > scope.sumCeil) throw new SegmentFullError('summaries')
-              return n
-            }
-          })(),
-        }
+  // step 号在自己的段里取（segments.ts；主任务与任务一样）。段在轮开始时定
+  // （beginTurn → segmentForTurn），续接轮沿用当前段；还没有段（新库第一轮
+  // 之前就要建 step 的路径）就现开一个。种子 = 段内现 max，会话内单调
+  let stepSeg = currentSegment(db, segKey)
+  let stepSeed: number | null = null
+  const segTop = (seg: SegmentRow): number =>
+    db.all<{ n: number | null }>(`SELECT MAX(id) AS n FROM steps WHERE id > ? AND id <= ?`, seg.floor, seg.ceil)[0]?.n ??
+    seg.floor
+  const nextStepId = (): number => {
+    stepSeg ??= openSegment(db, segKey, folderPath)
+    const seg = stepSeg
+    stepSeed ??= segTop(seg)
+    stepSeed += 1
+    if (stepSeed > seg.ceil) throw new SegmentFullError(`段 ${seg.id}`)
+    return stepSeed
+  }
 
   let currentTurn: number | null = lastTurnId(db, turnCond)
   /** 当前 turn 的身份快照。beginTurn 写、save 的惰性建 turn 也读它 */
@@ -741,36 +652,57 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
     load: () => loadLive(db, msgVis),
 
     save: (messages) => {
-      if (alloc === null) currentTurn ??= createTurn(db, currentMeta)
-      else currentTurn ??= createTaskTurn(db, currentMeta, alloc.turn(), scope!.owner)
+      // 分段计时（2026-10-30 观测版）：真机每个工具步「llm 结束 → tool_run」
+      // 主线程被占 0.5–1.1s，loop_lag 1–2s 档每天上百条，save 是头号嫌疑但
+      // 没量过。先拿分段数字再决定改哪段（note loop-lag-is-macos-sleep）
+      const t0 = Date.now()
+      currentTurn ??= createTurn(db, currentMeta, scope?.owner ?? null)
       turnOf = attributeTurns(messages, turnOf, currentTurn)
       stepOf = attributeSteps(messages, turnOf, stepOf, currentStep ?? 0, () => {
         // currentStep 为 null 时 currentTurn 一定已就位（上面 ??= 保证）
-        currentStep = alloc === null ? createStep(db, currentTurn ?? 0) : createTaskStep(db, currentTurn ?? 0, alloc.step())
+        currentStep = createStep(db, currentTurn ?? 0, nextStepId())
         return currentStep
       })
-
-      replaceLive(db, turnOf, messages, stepOf, ownVis, forkTurnOf, alloc === null ? null : alloc.msg, scope?.owner ?? null)
+      const t1 = Date.now()
+      replaceLive(db, turnOf, messages, stepOf, ownVis, forkTurnOf, scope?.owner ?? null)
+      const t2 = Date.now()
       // 归档只追加没写过的。它是给模型 cat 的诊断材料（§9.3 第 ② 层），
       // 不是恢复来源——恢复读的是 SQLite。少写比重写整个文件好：
       // append-only 的文件崩溃时不会写坏
+      let chars = 0
       for (const [index, message] of messages.entries()) {
         const id = fingerprint(message)
+        chars += id.length
         if (archived.has(id)) continue
         archived.add(id)
         appendToArchive(turnsDir, turnOf[index] ?? currentTurn, message)
       }
+      const t3 = Date.now()
       // search 的 FTS 增量同步（search-index.ts）：新 step 聚合入倒排表。
       // 放 save 尾部——写路径只有宿主，CLI 查询只读，无并发写
       syncSearchIndex(db)
+      const t4 = Date.now()
+      logRun({
+        ev: 'store_save',
+        folder: folderPath,
+        ...(scope?.owner ? { owner: scope.owner } : {}),
+        msgs: messages.length,
+        chars,
+        ms: t4 - t0,
+        attr: t1 - t0,
+        live: t2 - t1,
+        archive: t3 - t2,
+        index: t4 - t3,
+      })
     },
 
     beginTurn: (meta) => {
       currentMeta = JSON.stringify(meta)
-      currentTurn =
-        alloc === null
-          ? createTurn(db, currentMeta)
-          : createTaskTurn(db, currentMeta, alloc.turn(), scope!.owner)
+      // 只在轮与轮之间切段（task-trunk 规则 3）：这一轮的 step 全落在这段里
+      const next = segmentForTurn(db, segKey, folderPath)
+      if (next.id !== stepSeg?.id) stepSeed = null
+      stepSeg = next
+      currentTurn = createTurn(db, currentMeta, scope?.owner ?? null)
       return currentTurn
     },
 
@@ -888,7 +820,7 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
           for (const r of ordered) {
             db.run(
               `INSERT INTO messages(id, turn_id, role, content_json, state, step_id, owner) VALUES(?, ?, ?, ?, 'unloaded', ?, ?)`,
-              alloc === null ? null : alloc.msg(),
+              null,
               r.turn_id,
               r.role,
               r.content_json,
@@ -901,12 +833,11 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
     },
 
     beginStep: () => {
-      currentStep =
-        alloc === null
-          ? createStep(db, currentTurn ?? createTurn(db, currentMeta))
-          : createTaskStep(db, currentTurn ?? createTaskTurn(db, currentMeta, alloc.turn(), scope!.owner), alloc.step())
+      currentStep = createStep(db, currentTurn ?? createTurn(db, currentMeta, scope?.owner ?? null), nextStepId())
       return currentStep
     },
+
+    hasStepRoom: () => stepSeg === null || segTop(stepSeg) < stepSeg.ceil,
 
     /** 段的消息集合（live 与 unloaded 都算），给摘要候选用 */
     segmentMessages: (segment) => segmentMessagesOf(db, segment),
@@ -925,7 +856,7 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
     segmentHeadUnloaded: (segment) =>
       // 任务视角的继承段一律算「已离场」，与 unloadedSteps 同口径——那段的
       // steps.unloaded 是主任务的账，主任务卸没卸跟任务无关
-      (scope !== null && segment.from <= scope.stepFloor) ||
+      (scope !== null && segment.from <= scope.inheritCeil) ||
       (db.all<{ u: number | null }>(`SELECT unloaded AS u FROM steps WHERE id = ?`, segment.from)[0]
         ?.u ?? 0) === 1,
 
@@ -1106,12 +1037,32 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
       )
     },
 
+    saveTouchCue: (cue) => {
+      db.run(
+        `INSERT INTO touch_cues(owner, step_id, after, lines, names, created_at) VALUES('', ?, ?, ?, ?, ?)
+         ON CONFLICT(owner, step_id) DO NOTHING`,
+        cue.stepId,
+        cue.after,
+        JSON.stringify(cue.lines),
+        JSON.stringify(cue.names),
+        new Date().toISOString(),
+      )
+    },
+
     asyncCues: () => {
       const out = new Map<number, AsyncCue>()
       for (const r of db.all<{ step_id: number; after: number; lines: string }>(
         `SELECT step_id, after, lines FROM async_cues WHERE owner = ''`,
       ))
         out.set(r.step_id, { after: r.after, lines: JSON.parse(r.lines) as string[] })
+      // 同一步两边都有：锚点同源（offerAsyncCue 一次算出），行拼在选择器之后
+      for (const r of db.all<{ step_id: number; after: number; lines: string }>(
+        `SELECT step_id, after, lines FROM touch_cues WHERE owner = ''`,
+      )) {
+        const lines = JSON.parse(r.lines) as string[]
+        const prev = out.get(r.step_id)
+        out.set(r.step_id, prev ? { after: prev.after, lines: [...prev.lines, ...lines] } : { after: r.after, lines })
+      }
       return out
     },
 
@@ -1122,16 +1073,28 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
 
     asyncCuedNamesSince: (fromStep) => {
       const names = new Set<string>()
-      for (const r of db.all<{ names: string }>(`SELECT names FROM async_cues WHERE owner = '' AND step_id >= ?`, fromStep))
-        for (const n of JSON.parse(r.names) as string[]) names.add(n)
+      for (const table of ['async_cues', 'touch_cues'])
+        for (const r of db.all<{ names: string }>(`SELECT names FROM ${table} WHERE owner = '' AND step_id >= ?`, fromStep))
+          for (const n of JSON.parse(r.names) as string[]) names.add(n)
       return names
     },
 
     lastRespondedAt: () => {
-      const row = db.all<{ started_at: string; elapsed_ms: number | null; ended_at: string | null }>(
-        `SELECT started_at, elapsed_ms, ended_at FROM turns WHERE ${turnCond} ORDER BY id DESC LIMIT 1`,
+      const row = db.all<{
+        started_at: string
+        elapsed_ms: number | null
+        ended_at: string | null
+        responded_at: string
+      }>(
+        `SELECT turns.started_at, elapsed_ms, ended_at, s.started_at AS responded_at
+         FROM steps s JOIN turns ON turns.id = s.turn_id
+         WHERE ${turnCond} AND EXISTS (
+           SELECT 1 FROM messages WHERE step_id = s.id AND role = 'assistant'
+         ) ORDER BY s.id DESC LIMIT 1`,
       )[0]
-      return row ? (finishedAtOf(row) ?? Date.parse(row.started_at)) : null
+      if (!row) return null
+      const respondedAt = Date.parse(row.responded_at)
+      return Math.max(respondedAt, finishedAtOf(row) ?? respondedAt)
     },
 
     liveTurnModels: () =>
@@ -1225,7 +1188,9 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
       return hit
     },
 
-    historyPage: (cursor, limit) => {
+    historyOriginals: (live) => restoreHistoryOriginals(db, live, scope?.owner ?? null),
+
+    historyPage: (cursor, limit, restoredIds = []) => {
       const params: SqlValue[] = []
       // JOIN turns 带出每轮的 meta。state/id 两张表都有，条件必须加 m. 前缀
       const own = `m.${ownerEq}`
@@ -1246,14 +1211,17 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
       }>(
         `SELECT m.id, m.turn_id AS turnId, m.role, m.content_json, t.meta, t.elapsed_ms, t.started_at, t.ended_at
          FROM messages m JOIN turns t ON t.id = m.turn_id
-         WHERE ${where} AND ${turnCondT} ORDER BY ${historyKeyDesc('m')} LIMIT ?`,
+         WHERE ${where} AND ${turnCondT}
+           AND m.id NOT IN (SELECT value FROM json_each(?))
+         ORDER BY ${historyKeyDesc('m')} LIMIT ?`,
         ...params,
+        JSON.stringify(restoredIds),
         limit,
       )
       // 翻回正序（老→新），prepend 的语义
       rows.reverse()
       const next =
-        rows.length > 0 && hasRowBelow(db, rows[0]?.id ?? 0, msgVis) ? (rows[0]?.id ?? null) : null
+        rows.length > 0 && hasRowBelow(db, rows[0]?.id ?? 0, msgVis, restoredIds) ? (rows[0]?.id ?? null) : null
       return {
         rows: rows.map((r) => ({
           id: r.id,
@@ -1314,52 +1282,34 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
     },
     summaries: () => loadSummaries(db, sumVis),
 
-    /** 缝 (from, to) 开区间里有没有内容痕迹：可见消息行，或外主（任务）的
-     * steps。pickMergeGroup 跨缝前的第②③道保险（第①道它自己拿 summaries
-     * 纯查）——任务活着时它的 step 落在对话看不见的预留段里，只有查
-     * steps 才挡得住「跨过去等任务合并回来、经历被 coversActive 收掉」
-     * 那条丢历史的路。任务关闭时 step 行被清（真库旧预留段实测 0 行），
-     * 死尾巴对它返回 false。 */
+    /** 缝 (from, to) 开区间里有没有内容痕迹：可见消息行，或外主（不是自己的
+     * 轮）的有消息的 steps。pickMergeGroup 跨缝前的第②③道保险（第①道它自己
+     * 拿 summaries 纯查）——别的会话的段还没合回、还没拉进来时，它的 step
+     * 在缝里，跨过去的话等它拉进来，经历摘要落在新节点 covers 里被
+     * coversActive 收掉。拉进来后缝被副本盖住，自然能合（task-trunk 规则 6）。
+     * 段尾没用完的号是死号（没有 step），返回 false */
     gapHasContent: (from: number, to: number) =>
       (
         db.all<{ hit: number }>(
           `SELECT (EXISTS(SELECT 1 FROM messages WHERE step_id > ? AND step_id < ? AND ${msgVis})
                 OR EXISTS(SELECT 1 FROM steps s JOIN turns t ON s.turn_id = t.id
-                           WHERE s.id > ? AND s.id < ? AND t.owner IS NOT NULL)) AS hit`,
+                           WHERE s.id > ? AND s.id < ? AND t.owner IS NOT ?
+                             AND EXISTS(SELECT 1 FROM messages m WHERE m.step_id = s.id))) AS hit`,
           from,
           to,
           from,
           to,
+          scope?.owner ?? null,
         )[0]?.hit === 1
       ),
 
     addSummary: (row) => {
       // owner 由 store 按自己的会话域填，不收调用方的——任务摘要器不知道
       // （也不该知道）自己跑在哪个视角里
-      if (alloc !== null) {
-        db.run(
-          `INSERT INTO summaries(id, level, covers_from, covers_to, text, status, in_context,
-                                 superseded_by, head, archive_path, name, owner)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          alloc.sum(),
-          row.level,
-          row.coversFrom,
-          row.coversTo,
-          row.text,
-          row.status,
-          row.inContext ? 1 : 0,
-          row.supersededBy,
-          row.head,
-          row.archivePath,
-          row.name,
-          scope!.owner,
-        )
-        return lastRowId(db)
-      }
       db.run(
         `INSERT INTO summaries(level, covers_from, covers_to, text, status, in_context,
                                superseded_by, head, archive_path, name, owner)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         row.level,
         row.coversFrom,
         row.coversTo,
@@ -1370,6 +1320,7 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
         row.head,
         row.archivePath,
         row.name,
+        scope?.owner ?? null,
       )
       return lastRowId(db)
     },
@@ -1431,7 +1382,7 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
            AND ${
              scope
                ? `((SELECT st.unloaded FROM steps st WHERE st.id = covers_from) = 1
-                  OR covers_to <= ${scope.stepFloor})`
+                  OR covers_to <= ${scope.inheritCeil})`
                : `(SELECT st.unloaded FROM steps st WHERE st.id = covers_from) = 1`
            }`,
         stepId,
@@ -1469,27 +1420,6 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
         name,
         id,
       )
-    },
-
-    maxIds: () => {
-      const max = (table: string, range: string): number =>
-        db.all<{ m: number | null }>(`SELECT MAX(id) AS m FROM ${table} ${range}`)[0]?.m ?? 0
-      if (scope === null)
-        return {
-          turns: max('turns', ''),
-          steps: max('steps', ''),
-          messages: max('messages', ''),
-          summaries: max('summaries', ''),
-        }
-      // 段内口径（2026-09-23 真机：fork 后对话只要说一句就跳到 turnCeil+1，
-      // 全库 max 口径让任务第一条消息就报「turns 段已满」）。空段回落到
-      // floor：「还一个号都没用」
-      return {
-        turns: max('turns', `WHERE id > ${scope.forkTurn} AND id < ${scope.turnCeil}`) || scope.forkTurn,
-        steps: max('steps', `WHERE id > ${scope.stepFloor} AND id <= ${scope.stepCeil}`) || scope.stepFloor,
-        messages: max('messages', `WHERE id > ${scope.msgFloor} AND id <= ${scope.msgCeil}`) || scope.msgFloor,
-        summaries: max('summaries', `WHERE id > ${scope.sumFloor} AND id <= ${scope.sumCeil}`) || scope.sumFloor,
-      }
     },
 
     recordMerge: (row, memberIds) => {
@@ -1587,16 +1517,66 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
       // 展开即可。**不能按 turn 归并**：一个 turn 的消息分属多个 step，
       // 合并收编的单位是 step，按 turn 剪会把同 turn 里还在 context 的
       // step 连带剪掉（就是级联 e2e 抓出来的那个洞）
+      // 只收库里真有的 step 号：号是稀疏的（每段跳 SEGMENT_WIDTH），逐号展开
+      // 高层行的区间会到千万级
       const steps = new Set<number>()
       for (const s of all) {
-        if (off.has(s.id)) {
-          for (let t = s.coversFrom; t <= s.coversTo; t++) steps.add(t)
-        }
+        if (!off.has(s.id)) continue
+        const real = db.all<{ id: number }>(
+          `SELECT id FROM steps WHERE id BETWEEN ? AND ?`,
+          s.coversFrom,
+          s.coversTo,
+        )
+        for (const { id } of real) steps.add(id)
       }
       return steps
     },
 
-    close: () => db.close(),
+    trunk: () => (trunkView ??= buildStore(db, folderPath, dir, turnsDir, TRUNK_SCOPE, () => {})),
+
+    pullPending: () => pullableSegments(db, segKey, pullBelow()).length > 0,
+
+    pullSegments: () => {
+      let rows = 0
+      db.transaction(() => {
+        for (const seg of pullableSegments(db, segKey, pullBelow()))
+          rows += copySegmentRoots(db, seg, segKey, (id) => headOfStep(db, id), folderPath)
+      })
+      return rows
+    },
+
+    mergeSegments: () => {
+      let rows = 0
+      db.transaction(() => {
+        mergeReadySegments(db, folderPath)
+        for (const seg of pullableSegments(db, TRUNK, Number.POSITIVE_INFINITY))
+          rows += copySegmentRoots(db, seg, TRUNK, (id) => headOfStep(db, id), folderPath)
+      })
+      return rows
+    },
+
+    takeTaskResults: () => {
+      const rows = db.all<{ id: number; text: string }>(
+        `SELECT id, text FROM task_results WHERE owner = ? AND taken_at IS NULL ORDER BY id`,
+        segKey,
+      )
+      if (rows.length === 0) return []
+      db.run(
+        `UPDATE task_results SET taken_at = ? WHERE id IN (${rows.map(() => '?').join(',')})`,
+        new Date().toISOString(),
+        ...rows.map((r) => r.id),
+      )
+      // 与 task_callback（投递）配对：投了没取 = 登记者一直没空闲/没跑
+      logRun({
+        ev: 'task_result_take',
+        folder: folderPath,
+        owner: segKey,
+        ids: rows.map((r) => r.id),
+      })
+      return rows.map((r) => r.text)
+    },
+
+    close: closeDb,
   }
 }
 
@@ -1722,7 +1702,6 @@ function replaceLive(
   /** 任务模式的 fork 界：继承消息（turn ≤ forkTurn，即 fork 时复制来的
    * 行）不删不重插，原地保留。null = 对话模式 */
   forkTurn: number | null,
-  nextMsgId: (() => number) | null,
   /** 新行的归属（messages.owner）。null = 主任务 */
   owner: string | null,
 ): void {
@@ -1730,21 +1709,8 @@ function replaceLive(
     db.run(`DELETE FROM messages WHERE state = 'live' AND ${deleteVis}`)
     for (const [index, message] of messages.entries()) {
       if (forkTurn !== null && !((turnOf[index] ?? 0) > forkTurn)) continue // 继承的：留在原地
-      if (nextMsgId !== null) {
-        const id = nextMsgId()
-        db.run(
-          `INSERT INTO messages(id, turn_id, role, content_json, step_id, owner) VALUES(?, ?, ?, ?, ?, ?)`,
-          id,
-          turnOf[index] ?? 0,
-          message.role,
-          JSON.stringify(message),
-          stepOf[index] ?? 0,
-          owner,
-        )
-        continue
-      }
       db.run(
-        `INSERT INTO messages(turn_id, role, content_json, step_id) VALUES(?, ?, ?, ?)`,
+        `INSERT INTO messages(turn_id, role, content_json, step_id, owner) VALUES(?, ?, ?, ?, ?)`,
         // 用这条消息**自己**的 turn，不是当前 turn——见 turnOf 的注释
         turnOf[index] ?? 0,
         message.role,
@@ -1752,35 +1718,25 @@ function replaceLive(
         // 换 provider 之后旧历史读不回来，而"能换 provider"正是这个项目的前提
         JSON.stringify(message),
         stepOf[index] ?? 0,
+        owner,
       )
     }
   })
 }
 
-function createTurn(db: Db, meta: string | null): number {
-  db.run(`INSERT INTO turns(started_at, meta) VALUES(?,?)`, new Date().toISOString(), meta)
+function createTurn(db: Db, meta: string | null, owner: string | null): number {
+  db.run(`INSERT INTO turns(started_at, meta, owner) VALUES(?,?,?)`, new Date().toISOString(), meta, owner)
   return lastRowId(db)
 }
 
-/** 任务会话版：显式段内 id + owner。对话走上面的自然分配（max+1=fork 时
- *  reserved 行之上）。两版分开写而不是参数化——热路径少一次分支判断 */
-function createTaskTurn(db: Db, meta: string | null, id: number, owner: string): number {
-  db.run(
-    `INSERT INTO turns(id, started_at, meta, owner) VALUES(?,?,?,?)`,
-    id,
-    new Date().toISOString(),
-    meta,
-    owner,
-  )
-  return id
-}
-
 /** 该 id 之下还有没有 unloaded 行。有 = 还有上一页（hasMore） */
-function hasRowBelow(db: Db, id: number, msgVis: string): boolean {
+function hasRowBelow(db: Db, id: number, msgVis: string, restoredIds: readonly number[] = []): boolean {
   return (
     db.all(
       `SELECT 1 AS x FROM messages m WHERE m.state = 'unloaded' AND ${msgVis}
+         AND m.id NOT IN (SELECT value FROM json_each(?))
          AND (${historyKey('m')}) < (SELECT ${historyKey('c')} FROM messages c WHERE c.id = ?) LIMIT 1`,
+      JSON.stringify(restoredIds),
       id,
     ).length > 0
   )
@@ -1834,12 +1790,8 @@ function lastStepId(db: Db, msgVis: string): number | null {
   return db.all<{ id: number }>(`SELECT id FROM steps WHERE ${msgVis} ORDER BY id DESC LIMIT 1`)[0]?.id ?? null
 }
 
-function createStep(db: Db, turnId: number): number {
-  db.run(`INSERT INTO steps(turn_id, started_at) VALUES(?, ?)`, turnId, new Date().toISOString())
-  return Number(db.all<{ id: number }>(`SELECT last_insert_rowid() AS id`)[0]?.id)
-}
-
-function createTaskStep(db: Db, turnId: number, id: number): number {
+/** step 号由调用方从自己的段里取（store 的 nextStepId，segments.ts） */
+function createStep(db: Db, turnId: number, id: number): number {
   db.run(`INSERT INTO steps(id, turn_id, started_at) VALUES(?,?,?)`, id, turnId, new Date().toISOString())
   return id
 }
@@ -2070,12 +2022,12 @@ function nextSegment(
   /** 「占着 context」只数自己的 live 行（messages.owner 判据，无别名） */
   ownerEq: string,
 ): Segment | null {
-  const covered = new Set(
-    db
-      .all<{ covers_from: number; covers_to: number }>(
-        `SELECT covers_from, covers_to FROM summaries WHERE ${sumVis}`,
-      )
-      .flatMap((r) => range(r.covers_from, r.covers_to)),
+  // 按区间判，不把 covers 逐号展开（同 0c46ea6 的两处）：step 号稀疏（每段跳
+  // SEGMENT_WIDTH），高层行跨度随段数涨——10-30 真库 4536 行跨度总和 670 万，
+  // 展开要 0.4–1s，每个 step 跑完都在主线程同步来一遍（step_persist kickMs）；
+  // 再涨下去过 V8 上限抛 RangeError，被 summarizeOnce 吞掉，摘要静默停摆
+  const covered = coverage(
+    db.all<{ covers_from: number; covers_to: number }>(`SELECT covers_from, covers_to FROM summaries WHERE ${sumVis}`),
   )
   // **排除整个正在跑的 turn，不是只排除最后一个 step。**
   //
@@ -2088,8 +2040,14 @@ function nextSegment(
   // 是完整的 turn，该切才切。**idle 时传 null**：那会儿最后一个 turn 也结束了，
   // 排除它等于让空闲摘要永远够不着最需要摘的那一轮
   const rows = db.all<{ id: number; turn_id: number; holds_context: number }>(
-    `SELECT s.id, s.turn_id, EXISTS(
-       SELECT 1 FROM messages m2 WHERE m2.step_id = s.id AND m2.state = 'live' AND m2.${ownerEq}
+    // holds_context 用非相关的 IN，先走 messages_live(state, id) 取出 live 行（几百条）
+    // 的 step_id。原来是逐个 step 的 EXISTS：走 messages_step 找到行后回表取
+    // state/owner，两列排在 content_json 之后，主任务 3 万多行约 109MB 溢出页每个
+    // step 跑完全读一遍；内存紧时页被系统回收，主线程卡在 pread 约 400ms
+    // （2026-10-31 实测，note kick-summary-sync-cost-480ms）。IN 撞上 NULL 得 NULL
+    // 而不是 0，下面判 === 1，与 EXISTS 同义
+    `SELECT s.id, s.turn_id, s.id IN (
+       SELECT m2.step_id FROM messages m2 WHERE m2.state = 'live' AND m2.${ownerEq}
      ) AS holds_context
      FROM steps s
      JOIN messages m ON m.step_id = s.id -- 空消息的 step 不当候选
@@ -2117,10 +2075,10 @@ function nextSegment(
     // **取第一段连续未覆盖的 step，遇到已覆盖的就断。** 直接 filter 掉已覆盖的
     // 会把两侧接起来，covers 就跨过一个洞了——洞不报错，只是那截历史从此
     // 既不在 context 里也不在任何摘要里
-    const start = steps.findIndex((s) => !covered.has(s.id))
+    const start = steps.findIndex((s) => !covered(s.id))
     if (start === -1) continue
     const rest = steps.slice(start)
-    const end = rest.findIndex((s) => covered.has(s.id))
+    const end = rest.findIndex((s) => covered(s.id))
     const run = end === -1 ? rest : rest.slice(0, end)
 
     const sized = run.map((s) => ({
@@ -2135,9 +2093,26 @@ function nextSegment(
   return null
 }
 
-/** 闭区间整数序列。给 covered 集合展开用 */
-function range(from: number, to: number): number[] {
-  return Array.from({ length: Math.max(0, to - from + 1) }, (_, i) => from + i)
+/** covers 区间并集的成员判定：排序、合并相交/相邻，二分查找 */
+function coverage(rows: { covers_from: number; covers_to: number }[]): (id: number) => boolean {
+  const merged: [number, number][] = []
+  for (const { covers_from: from, covers_to: to } of [...rows].sort((a, b) => a.covers_from - b.covers_from)) {
+    const last = merged[merged.length - 1]
+    if (last && from <= last[1] + 1) last[1] = Math.max(last[1], to)
+    else merged.push([from, to])
+  }
+  return (id) => {
+    let lo = 0
+    let hi = merged.length - 1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      const [from, to] = merged[mid] as [number, number]
+      if (id < from) hi = mid - 1
+      else if (id > to) lo = mid + 1
+      else return true
+    }
+    return false
+  }
 }
 
 /**

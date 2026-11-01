@@ -1,3 +1,4 @@
+import type { TaskDispatchRequest, TaskDispatchResponse, TaskModelsRequest, TaskModelsResponse } from '@simple-code/core'
 import { forwardBlock, forwardLine, getSession, logRun, scopeOf } from '@simple-code/core'
 import { existsSync, readFileSync, statSync as fsStatSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -8,6 +9,7 @@ import { renderHtml } from './html.ts'
 import { bestCandidate } from './openfile-resolve.ts'
 import type { ToHost } from './protocol.ts'
 import { createRouter, type Router } from './router.ts'
+import type { RobotFolderView } from './robot-feed.ts'
 import { remoteSettingsPath, syncRemoteSettings, type RemoteSyncResult } from './remote.ts'
 import { asSavedChoice, EFFORTS } from './saved-choice.ts'
 
@@ -48,6 +50,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
    */
   private remoteSync: Promise<RemoteSyncResult> | undefined
   private remoteCardShown = false
+
+  /** 桌面机器人的刷新钩子（robot.ts 设）：路由层状态变了、面板显隐变了 */
+  onRobotChange: (() => void) | undefined
 
   /**
    * `state` 是**工作区级**的 Memento（`context.workspaceState`）。选全局还是
@@ -184,6 +189,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         }),
       folders: () => folderList(),
       saveFolder: (f) => void this.state.update(FOLDER_KEY, f),
+      onChange: () => this.onRobotChange?.(),
     })
 
     // 上次选的文件夹可能不是 router 的 pick() 默认值（folders[0]）——
@@ -204,6 +210,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     view.webview.onDidReceiveMessage((msg: ToHost) => {
       this.router?.handle(msg)
     })
+    view.onDidChangeVisibility(() => this.onRobotChange?.())
 
     view.onDidDispose(() => {
       // **只在还是自己的时候才清。** 旧 view 的 dispose 可能在新 view 建好
@@ -211,6 +218,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       if (this.view !== view) return
       this.router?.detachAll() // 不 dispose：bridge 与 session 的生命周期见字段注释
       this.view = undefined
+      this.onRobotChange?.()
     })
   }
 
@@ -225,6 +233,34 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   setFolders(): void {
     this.router?.setFolders()
     this.watchSettings()
+  }
+
+  /** agent 派任务（task-bridge.ts 转来，task-trunk 规则 11）。面板没开过 =
+   *  没有路由也没有会话，派它的 bash 不可能在跑——兜底拒绝 */
+  dispatchFromAgent(req: TaskDispatchRequest): Promise<TaskDispatchResponse> {
+    return this.router?.dispatchFromAgent(req) ?? Promise.resolve({ ok: false, error: '面板还没打开' })
+  }
+
+  /** bin --models（规则 14）：root 所在目录的 taskModels。兜底同 dispatchFromAgent */
+  taskModels(req: TaskModelsRequest): Promise<TaskModelsResponse> {
+    return this.router?.taskModels(req) ?? Promise.resolve({ ok: false, error: '面板还没打开' })
+  }
+
+  // ── 桌面机器人（robot.ts）：面板没打开过 = 没有路由，也就没有任何事可提醒 ──
+  robotFolders(): RobotFolderView[] {
+    return this.router?.robotFolders() ?? []
+  }
+  robotShowing(): { folder: string; task: string | null } {
+    return this.router?.showing() ?? { folder: '', task: null }
+  }
+  panelVisible(): boolean {
+    return this.view?.visible ?? false
+  }
+  robotAllow(toolCallId: string): boolean {
+    return this.router?.allow(toolCallId) ?? false
+  }
+  robotFocus(folder: string, task: string | null): void {
+    this.router?.focus(folder, task)
   }
 
   /** settings.json 热重载的监听端：全局一份 + 每个工作区文件夹一份。

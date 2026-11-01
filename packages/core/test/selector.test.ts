@@ -213,10 +213,13 @@ describe('请求与解析', () => {
         'cd x && "$SIMPLE_CODE_LESSON" read env-pair; "${SIMPLE_CODE_EVENT}" read cue-zero',
       ),
       call('bash', '"$SIMPLE_CODE_NOTE" search prefix-guard'),
+      call('bash', '"$SIMPLE_CODE_NOTE" read same --type principle'),
+      call('bash', '"$SIMPLE_CODE_NOTE" --type goal read same'),
+      call('bash', '"$SIMPLE_CODE_NOTE" read new-lesson --type lesson'),
       call('view_image', '"$SIMPLE_CODE_SKILL" read deploy'),
     ])
     expect(got).toEqual(
-      new Set(['note:recall-llm-selector-pending', 'lesson:env-pair', 'event:cue-zero']),
+      new Set(['note:recall-llm-selector-pending', 'lesson:env-pair', 'event:cue-zero', 'principle:same', 'goal:same', 'lesson:new-lesson']),
     )
   })
 })
@@ -287,6 +290,20 @@ describe('落库（store）', () => {
     expect([...store.asyncCues()]).toEqual([[30, { after: 2, lines: ['行A'] }]])
     store.close()
   })
+  it('saveTouchCue：一步一条、可多步；同一步与选择器拼成一条（选择器在前）；名字两边都算已注入', async () => {
+    const store = openStore(await workspace())
+    store.saveAsyncCue(7, { stepId: 30, after: 2, lines: ['选A'], names: ['lesson:a'] })
+    store.saveTouchCue({ stepId: 30, after: 2, lines: ['触B'], names: ['note:b'] })
+    store.saveTouchCue({ stepId: 30, after: 2, lines: ['触B2'], names: ['note:b2'] })
+    store.saveTouchCue({ stepId: 32, after: 1, lines: ['触C'], names: ['note:c'] })
+    expect([...store.asyncCues()]).toEqual([
+      [30, { after: 2, lines: ['选A', '触B'] }],
+      [32, { after: 1, lines: ['触C'] }],
+    ])
+    expect([...store.asyncCuedNamesSince(31)]).toEqual(['note:c'])
+    expect(store.asyncCuedNamesSince(0)).toEqual(new Set(['lesson:a', 'note:b', 'note:c']))
+    store.close()
+  })
 })
 
 const textSse = (text: string) =>
@@ -322,13 +339,16 @@ describe('session e2e：异步注入', () => {
       m.content.some((c) => c.type === 'text' && c.text?.startsWith('〔recall·async〕')),
     )
 
-  const setup = async () => {
+  /** command：把 fixture 的 ls 换成别的（动作联想用） */
+  const setup = async (opts: { tail?: string } = {}) => {
     const { getSession } = await import('../src/session/session.ts')
     const { readFixture } = await import('./helpers.ts')
     const dir = await workspace()
     await mkdir(join(dir, '.simple-code', 'lessons'), { recursive: true })
     await writeLesson(dir, 'lesson-alpha', '改 alpha 前必读')
-    const toolSse = new TextDecoder().decode(await readFixture('anthropic-messages.tool-call.sse'))
+    await writeLesson(dir, 'lesson-ctl', '跑 alphactl 前必读')
+    const rawSse = new TextDecoder().decode(await readFixture('anthropic-messages.tool-call.sse'))
+    const toolSse = opts.tail ? rawSse.replace('"partial_json":"s\\"}"', `"partial_json":"s${opts.tail}\\"}"`) : rawSse
     const main: Body[] = []
     let selectorCalls = 0
     const impl = (async (_url: unknown, init?: RequestInit) => {
@@ -421,5 +441,27 @@ describe('session e2e：异步注入', () => {
       ).length
     expect(count(main[2]!)).toBe(1)
     expect(count(main.at(-1)!)).toBe(1) // 只有第一轮那条
+  })
+
+  it('动作联想：命令碰到 description 点名的程序 → 与选择器同一步拼成一条；下一步不重复；前缀守卫不报', async () => {
+    const { open, main } = await setup({ tail: '; alphactl' })
+    const session = await open()
+    const events: { type: string; message?: string }[] = []
+    for await (const ev of session.send('改一下 alpha')) events.push(ev as { type: string; message?: string })
+    await session.close()
+    expect(main).toHaveLength(3)
+    expect(recallIndex(main[0]!)).toBe(-1)
+    const at = recallIndex(main[1]!)
+    expect(at).toBe(main[1]!.messages.length - 1)
+    const text = main[1]!.messages[at]!.content.map((c) => c.text ?? '').join('')
+    expect(text).toBe(
+      '〔recall·async〕lesson lesson-alpha — 改 alpha 前必读\n〔recall·async〕lesson lesson-ctl — 跑 alphactl 前必读（触及: alphactl）',
+    )
+    // step 2 又跑了同一条命令：lesson-ctl 已在场，不再提
+    const touchLines = (body: Body) =>
+      body.messages.flatMap((m) => m.content).filter((c) => c.text?.includes('（触及: ')).length
+    expect(touchLines(main[2]!)).toBe(1)
+    expect(recallIndex(main[2]!)).toBe(at)
+    expect(events.filter((e) => e.type === 'error')).toEqual([])
   })
 })

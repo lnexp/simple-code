@@ -77,6 +77,12 @@ importers:
         specifier: ^5.0.6
         version: 5.0.6
 
+  packages/robot:
+    devDependencies:
+      '@types/vscode':
+        specifier: ~1.106.0
+        version: 1.106.0
+
   packages/vscode:
     dependencies:
       '@simple-code/core':

@@ -61,14 +61,18 @@ VS Code 多根窗口里每个 folder 是独立 session，上下文不串。
 - 宽搜/正则/多词混合直接 `grep memory 的 turns 目录`（jsonl 全量，不截断）
 - state.db（SQLite + FTS5）也有全文索引，sqlite3 直接查
 
-## 3. 结论记忆三件套（note / lesson / 索引）
+## 3. note 四类型（记录 / 教训 / 原则 / 目标）
 
 - **note**（`"$SIMPLE_CODE_NOTE" write/read/list`）：决策、约定、一次性事实，
-  一笔记一事。索引只收最近 20 条的 description——**索引里没有 ≠ 不存在**，
+  一笔记一事。四类型共用 2100 估算 token 预算——**索引里没有 ≠ 不存在**，
   `list` 能列全量。重要的当场写，别指望对话衰减后还记得
-- **lesson**（`"$SIMPLE_CODE_LESSON" write/read/search`）：调试教训。
-  同一症状失败 ≥2 次后做成，写入走五段 heredoc JSON
-- **三者的索引行常驻 system prompt，正文不常驻**（§1 常驻层）：所以
+- **lesson**（`"$SIMPLE_CODE_NOTE" write/read/search --type lesson`）：调试教训。
+  同一症状失败 ≥2 次后做成，写入走 Markdown 五段。
+- **principle / goal**：分别保存有依据的判断、当前工作的事/目标/边界/完成依据。
+  原则 candidate 经原话核实认可后 active，按 LRU 选；goal 用 current: true 指定唯一当前目标。
+  默认比例 general/lesson/principle/goal=35/10/20/35，可配置；goal 可借额但不增总量。
+  原则判断/边界与当前 goal 四节常驻，来源按需；旧目录原位兼容，新写 notes/<type>/。
+- **普通记录/教训索引常驻，正文按需读**（§1 常驻层）：所以
   note 的 description、lesson 的 name（name 即症状句）是被反复重读的那
   部分，写的时候当成「给未来的自己的检索线索」——「修了个 bug」这种没有
   检索价值，「症状 X 其实是原因 Y，别去查 Z」才有
@@ -106,6 +110,14 @@ VS Code 多根窗口里每个 folder 是独立 session，上下文不串。
   一次性子 agent（headless 审批恒拒绝，权限边界 = --root 值）。
   `mkdir 任务目录 + AGENTS.md 任务书 + sc > result &` 即并行子 agent，
   不是 core 机制
+- **派任务**（`"$SIMPLE_CODE_TASK" <<'MD' 任务书 MD`，首行当任务名）：
+  VS Code 宿主里可用（经本机派任务桥）。派出的就是普通任务——进任务条，
+  和用户开的一样跑、用户可切过去看/发消息/关闭；立即返回任务名，不等跑完，
+  不限数，同名自动编号。它只带主干的历史摘要，看不到你当前的对话，任务书
+  要自带上下文。派出那一轮结束时结果以 `〔任务结果〕任务名 · 状态` + 最后
+  一条回复原文插回你的上下文（你在跑就是下一个请求前，空闲就等下次说话），
+  只回调一次。经历按段合回主干，别的任务在压缩点拉到。终端 sc 里无桥
+  （退出码 2）
 - **view_image / webfetch / websearch**：看图（主模型无视觉时自动转述）、
   抓网页、搜索
 
@@ -150,7 +162,7 @@ protocol/contextWindow/maxTokens/thinking/effort/cacheTtlMs`，多模型注册
 `models[]`；记忆——`memory.stubTokens`（默认 16k，摘要进场水位）、
 `memory.hotLeaves`（默认 8）；工具——`envPassthrough`（bash 子进程可见
 的白名单）；`maxIterations`（默认
-500，单轮步数上限）；`sandbox`、timeout/输出上限系列。
+2000，单轮步数上限）；`sandbox`、timeout/输出上限系列。
 
 **生效时机**：建 session 时**只读一次**。改了配置：VS Code 侧
 FileSystemWatcher 标记 reload、跑到轮边界生效（跑着/挂审批不打断）；
@@ -189,7 +201,7 @@ sandbox 放宽（MCP 本就只认用户级 mcp.json）。`apiKey` 躺在全局 s
   state.db 的时间线），再怀疑缓存——教训库有这条
 - **turn 疑似没收口**：state.db turns 表的 elapsed_ms 为空 + 最后一条是
   assistant = 中断
-- 你上一次怎么栽的：`"$SIMPLE_CODE_LESSON" search <症状>`，**调试一轮没修
+- 你上一次怎么栽的：`"$SIMPLE_CODE_NOTE" search <症状> --type lesson`，**调试一轮没修
   好先查教训再继续猜**
 - **自查熔断**：同一命令原样连发会被 doomLoopGuard 熔断（阈值 3 次）——
   轮莫名断了先看是不是在硬撞同一个错，换姿势而不是重试

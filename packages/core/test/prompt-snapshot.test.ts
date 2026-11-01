@@ -94,6 +94,35 @@ async function touchDisk(dir: string) {
 }
 
 describe('system prompt 快照沿用（缓存热不重读）', () => {
+  it('goal 与旧 lesson 同进快照；热重建保旧、压缩点更新、超额报错保旧', async () => {
+    const w = await workspace()
+    const dir = join(w.dir, '.simple-code/notes/goal')
+    await mkdir(dir, { recursive: true })
+    await mkdir(join(w.dir, '.simple-code/lessons'), { recursive: true })
+    await writeFile(join(w.dir, '.simple-code/lessons/legacy.md'), '# 历史教训')
+    const body = (target: string) => `---\nstatus: active\ncurrent: true\n---\n## 这件事是什么\n跨请求协作\n## 目标\n${target}\n## 当前范围与边界\n不越权\n## 怎样算达到目标\n实际验证`
+    await writeFile(join(dir, 'now.md'), body('目标第一版'))
+    const first = await w.open([says('好')])
+    await collect(first.session.send('第一轮'))
+    expect(first.seen[0]?.system).toContain('目标第一版')
+    expect(first.seen[0]?.system).toContain('legacy')
+    await first.session.close()
+    await writeFile(join(dir, 'now.md'), body('目标第二版'))
+    const hot = await w.open([says('好'), says('好'), says('好')])
+    await collect(hot.session.send('第二轮'))
+    expect(hot.seen[0]?.system).toContain('目标第一版')
+    expect(hot.seen[0]?.system).not.toContain('目标第二版')
+    expect((await hot.session.compactNow()).ok).toBe(true)
+    await collect(hot.session.send('第三轮'))
+    expect(hot.seen[1]?.system).toContain('目标第二版')
+    await writeFile(join(dir, 'now.md'), body('中'.repeat(5000)))
+    const compact = await hot.session.compactNow()
+    expect(compact.ok && compact.errors.some(e => e.includes('note 总预算'))).toBe(true)
+    await collect(hot.session.send('第四轮'))
+    expect(hot.seen[2]?.system).toContain('目标第二版')
+    expect(hot.seen[2]?.system).not.toContain('中'.repeat(5000))
+    await hot.session.close()
+  })
   it('缓存热：切目录/重开面板这类重建沿用快照，磁盘上的新事件进不来', async () => {
     const w = await workspace() // cacheTtlMs 默认 3 小时，跑完一轮马上重建必然热
     const s1 = await w.open([says('好的')])
@@ -128,17 +157,7 @@ describe('system prompt 快照沿用（缓存热不重读）', () => {
     // 任务域写快照：模拟任务自己的 reloadSystem 在它的压缩点刷新四段。
     // 磁盘四段先变（archiver 落了新事件），任务读到的是新内容
     await touchDisk(w.dir)
-    const scope: TaskScope = {
-      owner: 'task-regress',
-      forkTurn: 1,
-      turnCeil: 100,
-      stepFloor: 0,
-      stepCeil: 100,
-      msgFloor: 0,
-      msgCeil: 100,
-      sumFloor: 0,
-      sumCeil: 100,
-    }
+    const scope: TaskScope = { owner: 'task-regress', forkTurn: 0, inheritCeil: 0 }
     const taskStore = openStore(w.dir, { task: scope })
     taskStore.writePromptSnapshot({
       agents: '# 约定 v2',
@@ -290,6 +309,46 @@ describe('用户级 AGENTS.md（~/.simple-code/AGENTS.md，2026-09-29）', () =>
     }
     return { project, home, open }
   }
+
+  it.each([1024, 4096])('首次加载两份 AGENTS 各用配置的 %i 额度', async (limit) => {
+    const user = `个人开始${'约'.repeat(2400)}个人结束`
+    const project = `项目开始${'定'.repeat(2400)}项目结束`
+    const w = await withUser(user)
+    await writeFile(join(w.home, 'settings.json'), JSON.stringify({ ...config(), memory: { agentsMaxTokens: limit } }))
+    await writeFile(join(w.project, 'AGENTS.md'), project)
+    const s = await w.open([says('好')])
+    await collect(s.session.send('你好'))
+    await s.session.close()
+    const system = s.seen[0]!.system!
+    if (limit === 4096) {
+      expect(system).toContain(user)
+      expect(system).toContain(project)
+      expect(system).not.toContain('此处已截断')
+    } else {
+      expect(system).not.toContain('个人结束')
+      expect(system).not.toContain('项目结束')
+      expect(system).toContain('~/.simple-code/AGENTS.md 超过 1024 token')
+      expect(system).toContain('⚠ AGENTS.md 超过 1024 token')
+    }
+  })
+
+  it('自定义额度在压缩点生效：用户级超额保旧，项目级超过默认值仍能刷新', async () => {
+    const w = await withUser('# 个人约定 v1')
+    await writeFile(join(w.home, 'settings.json'), JSON.stringify({ ...config(), memory: { agentsMaxTokens: 4096 } }))
+    const s = await w.open([says('好'), says('好')])
+    await collect(s.session.send('第一轮'))
+    await writeFile(join(w.home, 'AGENTS.md'), `个人超限${'约'.repeat(5000)}`)
+    const project = `项目新版${'定'.repeat(2400)}项目结尾`
+    await writeFile(join(w.project, 'AGENTS.md'), project)
+    const compact = await s.session.compactNow()
+    expect(compact.ok).toBe(true)
+    expect(compact.ok && compact.errors.join('\n')).toContain('4,096 token 上限')
+    await collect(s.session.send('第二轮'))
+    await s.session.close()
+    expect(s.seen[1]!.system).toContain('# 个人约定 v1')
+    expect(s.seen[1]!.system).not.toContain('个人超限')
+    expect(s.seen[1]!.system).toContain(project)
+  })
 
   it('两份都进：用户级在前、项目级在后，用户级段声明冲突以项目为准', async () => {
     const w = await withUser('# 个人约定：结论用简体中文')

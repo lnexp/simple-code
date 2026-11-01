@@ -73,11 +73,12 @@ export type ToHost =
   /** 输入框下的审批开关（approval.md §4.2 两态）。task：分支自己的开关
    *  （2026-09-22 拍板：审批配置跟分支走）；缺省 = 主干/folder 级 */
   | { type: 'setApprovalEnabled'; on: boolean; task?: string }
-  /** 用户点掉一个后台残留进程。宿主 TERM 后回一条 bg_processes 更新列表。
-   *  folder：该进程所属的 bridge——多根下 registry 各目录独立，pid 只在
+  /** 用户点掉一组后台残留进程（一条命令留下的整个进程组）。宿主 TERM 整组后
+   *  回一条 bg_processes 更新列表。
+   *  folder：该进程所属的 bridge——多根下 registry 各目录独立，pgid 只在
    *  原目录有账，不带 folder 会被路由到当前 bridge 而杀空（用户拍板：
    *  进程条按目录隔离显示，但跨目录的 × 必须打到正确的 bridge） */
-  | { type: 'bg_kill'; pid: number; folder?: string }
+  | { type: 'bg_kill'; pgid: number; folder?: string }
   /** 要一份上下文分区快照（点状态行「上下文 X」弹出面板）。响应是 regions。
    *  task：查分支的库——上下文环跟着分支走，不拿主干的数字骗人 */
   | { type: 'get_regions'; task?: string }
@@ -89,15 +90,18 @@ export type ToHost =
    * null——从最新的归档行起）。响应是一条 historyPage
    */
   | { type: 'fetchHistory'; cursor: number | null }
-  /** 分支：从最新回答 fork（`/task` 或分支条 + 按钮都走这）。主干在跑会被拒
-   *  （fork 要拷记忆库）。brief 是分支的第一条消息 */
-  | { type: 'task_dispatch'; brief: string }
+  /** 开任务并立刻跑（`/task`），不等主任务静止。brief 是任务的第一条消息；
+   *  from = 在哪个任务 tab 里开的（省略 = 主任务），登记为父任务（完成回调回给它） */
+  | { type: 'task_dispatch'; brief: string; from?: string }
+  /** 只输名称开空任务（任务条 + 按钮，规则 13）：建好 idle，先切模型再发第一条。
+   *  from 同 task_dispatch */
+  | { type: 'task_create'; name: string; from?: string }
   /** 记忆面板：取计数四元组 + 上次反思，响应一条 memory_data（reflect-trigger.md） */
   | { type: 'reflect_panel' }
   /** 点「反思」：以产品内置指令任务书开任务（不读文件、无 skill） */
-  | { type: 'reflect_start' }
+  | { type: 'reflect_start'; from?: string }
   /** 双选项的「关闭并重开」：关掉挂着的反思任务、起新的一次 */
-  | { type: 'reflect_reopen' }
+  | { type: 'reflect_reopen'; from?: string }
   /** 分支：往分支发消息（切换分支后输入框的目标）。分支跑着 = 插话入队
    *  （core 的 newInput 语义），空闲 = 起新一轮 */
   | { type: 'task_send'; task: string; text: string; images?: ImageInput[] }
@@ -108,6 +112,9 @@ export type ToHost =
   | { type: 'task_close'; name: string }
   /** 中断任务正在跑的轮（与对话的停止同一语义，通用控件） */
   | { type: 'task_stop'; name: string }
+  /** 面板正显示哪个任务（null = 主任务）。桌面机器人据此判「这条你看得到」，
+   *  不提醒（desktop-robot.md §5.1） */
+  | { type: 'view_task'; task: string | null }
 
 export type ToWebview =
   /** core 的事件**原样透传**，不在宿主侧翻译。翻译是 webview 的事 */
@@ -130,6 +137,8 @@ export type ToWebview =
       category: ApprovalCategory
       detail: string
       reason: string
+      /** multi 卡合并前各段的类别（core approval.ts）。桌面机器人据此判能否在它上面允许 */
+      parts?: ApprovalCategory[]
       /** 支持「始终允许」时的预览（会往 approval.json 记什么）。
        * 没有字段 = 该卡不出第三键（隐藏路径等不收敛场景）。
        * nonpath：该命令从第 from 位（0 基）位置参数起不判为路径
@@ -140,7 +149,7 @@ export type ToWebview =
         | { kind: 'nonpath'; lead: string; from: number }
         /** paths：multi 卡同质 external_dir 的批量目录（方案 1，
          * 2026-09-21）——按钮「始终允许这 N 个目录」 */
-        | { kind: 'paths'; dirs: string[] }
+        | { kind: 'paths'; dirs: string[]; hidden?: { path: string; write: boolean }[] }
         | { kind: 'hidden'; path: string; write: boolean }
     }
   /** 气泡关掉（答复/超时/中断）。webview 重载后收不到它——超时兜底在宿主 */
@@ -223,6 +232,8 @@ export type ToWebview =
       items: ChatItem[]
       contextTokens?: number
       lastTiming?: ChatView['lastTiming']
+      /** 排队中、core 还没投进历史的插话（ChatView.queued）；不带 = 没有 */
+      queued?: ChatView['queued']
     }
   /**
    * fetchHistory 的响应：更早的一页（正序，prepend 即可）。`next` 是下一页
@@ -247,7 +258,10 @@ export type ToWebview =
    * 分身任务的全量快照（有变化才发）。folder 由路由注入（approval 同款）：
    * 任务跟目录走，切走即清、切回由宿主镜像补发
    */
-  | { type: 'tasks'; tasks: TaskState[]; folder?: string; /** 分支上限（+ 入口的显隐判据，宿主是唯一真相） */ limit: number }
+  | { type: 'tasks'; tasks: TaskState[]; folder?: string }
+  /** 选中这个任务（null = 主任务）：桌面机器人上点了某条，宿主已切好目录
+   *  （desktop-robot.md §5.5）。同点任务条：选中 + 要基线 */
+  | { type: 'select_task'; task: string | null }
   /** 记忆面板的计数（reflect_panel 的响应） */
   | { type: 'memory_data'; stats: MemoryStats }
   /** 反思开任务的结果：ok = 受理（面板自动关）；失败留 reason 在面板里 */
@@ -263,6 +277,8 @@ export type ToWebview =
       /** 同 hydrate：底栏水位/上一轮用量，不带的话切回任务底栏清空 */
       contextTokens?: number
       lastTiming?: ChatView['lastTiming']
+      /** 同 hydrate */
+      queued?: ChatView['queued']
     }
 
 /** 任务的卡片状态（task-v3）。任务是**可交互的平行对话流**（2026-09-22

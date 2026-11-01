@@ -190,7 +190,7 @@ describe('后台进程条按目录隔离（用户拍板：互不干扰）', () =
   it('A 的进程只在 A 显示；B 的快照不进 A 的界面；切回 A 由 attach 重推', () => {
     const app = mount()
     app.send(state(A))
-    app.send({ type: 'bg_processes', folder: A, items: [{ pid: 42, command: 'python http.server 8123', startedAt: 1 }] })
+    app.send({ type: 'bg_processes', folder: A, items: [{ pgid: 42, pids: [42], label: '起服务', command: 'python http.server 8123', startedAt: 1 }] })
     expect(app.html()).toContain('http.server')
 
     // 切到 B：A 的进程条不跟来（切走即清）
@@ -198,14 +198,14 @@ describe('后台进程条按目录隔离（用户拍板：互不干扰）', () =
     expect(app.html()).not.toContain('http.server')
 
     // B 的快照进 B 界面；A 的不顶账（现在没有桶，只有当前清单）
-    app.send({ type: 'bg_processes', folder: B, items: [{ pid: 7, command: 'vitest watch', startedAt: 2 }] })
+    app.send({ type: 'bg_processes', folder: B, items: [{ pgid: 7, pids: [7], label: '跑测试', command: 'vitest watch', startedAt: 2 }] })
     expect(app.html()).toContain('vitest watch')
     expect(app.html()).not.toContain('http.server')
 
     // 切回 A：attach 重推 A 的清单（不是桶恢复）
     app.send(folders(A))
     expect(app.html()).not.toContain('http.server') // 清了，等 attach
-    app.send({ type: 'bg_processes', folder: A, items: [{ pid: 42, command: 'python http.server 8123', startedAt: 1 }] })
+    app.send({ type: 'bg_processes', folder: A, items: [{ pgid: 42, pids: [42], label: '起服务', command: 'python http.server 8123', startedAt: 1 }] })
     expect(app.html()).toContain('http.server')
     expect(app.html()).not.toContain('vitest watch')
   })
@@ -267,7 +267,6 @@ describe('切目录同批消息的守卫（2026-09-23 真机：分支条偶发�
           data: {
             type: 'tasks',
             folder: B,
-            limit: 3,
             tasks: [
               {
                 name: '调研分支',
@@ -303,7 +302,7 @@ describe('切目录恢复任务选中（B 方案：lastBranch 按目录记选中
     approvalOn: true,
   })
   const tasksMsg = (folder: string, names: string[]): ToWebview =>
-    ({ type: 'tasks', folder, limit: 3, tasks: names.map(taskState) })
+    ({ type: 'tasks', folder, tasks: names.map(taskState) })
 
   /** 点分支条选中任务——同真实交互（click → setBranch + task_open 补基线） */
   const select = (name: string): void => {
@@ -356,5 +355,35 @@ describe('切目录恢复任务选中（B 方案：lastBranch 按目录记选中
     // 主任务 tab 激活（任务已被关闭，选中作废）
     const tabs = document.querySelectorAll('.branch-strip .branch-tab')
     expect(tabs[0]?.getAttribute('data-active')).toBe('true')
+  })
+
+  /** 当前激活的 tab 文字 */
+  const activeTab = (): string =>
+    document.querySelector('.branch-strip .branch-tab[data-active="true"]')?.textContent ?? ''
+
+  it('桌面机器人跳转：宿主切回 A 后发 select_task，选中它而不是 A 上次选中的（desktop-robot.md §5.5）', () => {
+    const app = mount()
+    app.send(state(A))
+    app.send(tasksMsg(A, ['调研分支', 'DAG 运行记录']))
+    app.send(state(A))
+    select('调研分支') // A 上次选中的是它
+    app.send(folders(B))
+    app.send(state(B))
+    sent.length = 0
+    // 宿主 router.focus：switchTo 推的那批（folders/state/tasks）在前，select_task 在后
+    app.send(folders(A))
+    app.send(state(A))
+    app.send(tasksMsg(A, ['调研分支', 'DAG 运行记录']))
+    // 前提：不发 select_task 的话，恢复逻辑会把「调研分支」选回来
+    expect(activeTab()).toContain('调研分支')
+    app.send({ type: 'select_task', task: 'DAG 运行记录' })
+    expect(activeTab()).toContain('DAG 运行记录')
+    expect(sent).toContainEqual({ type: 'task_open', task: 'DAG 运行记录' })
+    // 选中变化报给宿主（机器人据此判「这条你看得到」）
+    expect(sent.at(-1)).toEqual({ type: 'view_task', task: 'DAG 运行记录' })
+    // 跳主任务：select_task null
+    app.send({ type: 'select_task', task: null })
+    expect(activeTab()).toContain('主任务')
+    expect(sent.at(-1)).toEqual({ type: 'view_task', task: null })
   })
 })

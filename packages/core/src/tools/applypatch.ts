@@ -9,6 +9,7 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { describeMismatch } from './applypatch-mismatch.ts'
 
 const BEGIN = '*** Begin Patch'
 const END = '*** End Patch'
@@ -124,8 +125,8 @@ export function parsePatch(raw: string): PatchHunk[] {
         chunkLineNo = i + 1
       }
       // 标记形的行（中间的 End Patch、多写的 Begin Patch）不走 lenient 收成
-      // 上下文——收进去会报「找不到要替换的行（第 1 行是…）」，而第 1 行明明
-      // 在文件里（2026-09-30 实案）。合法标记 Move to / End of File 已在上面处理
+      // 上下文——收进去会报「找不到要替换的行」，而补丁里的行明明都在文件里
+      // （2026-09-30 实案）。合法标记 Move to / End of File 已在上面处理
       if (line.startsWith('*** ')) {
         fail(
           i + 1,
@@ -274,11 +275,8 @@ function planUpdate(cwd: string, abs: string, h: UpdateHunk, jobs: Job[]): strin
   for (const c of h.chunks) {
     const at = seekSequence(file, c.oldLines, pos, c.endOfFile)
     if (at === undefined) {
-      throw new Error(
-        `${h.path}：找不到要替换的行（第 1 行是「${c.oldLines[0] ?? ''}」）。` +
-          '上下文必须与文件当前内容逐行一致；相邻的两处改动分成两个 @@ chunk，' +
-          '别把上一处的上下文重复写进下一处',
-      )
+      const earlier = pos > 0 ? seekSequence(file, c.oldLines, 0, false) : undefined
+      throw new Error(`${h.path}：${describeMismatch(file, c.oldLines, earlier)}`)
     }
     file = [...file.slice(0, at), ...c.newLines, ...file.slice(at + c.oldLines.length)]
     pos = at + c.newLines.length

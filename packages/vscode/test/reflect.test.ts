@@ -44,4 +44,22 @@ describe('REFLECT_TASK_BOOK', () => {
     expect(REFLECT_TASK_BOOK).toContain('list --all 只给索引行，不能代替主题 search --all')
     expect(REFLECT_TASK_BOOK).toContain("date '+%Y-%m-%d %H:%M:%S'")
   })
+
+  // 重复错误指标（note self-diagnosis-repeat-error-metric，2026-10-25 拍板）：
+  // 第四步之后、收尾之前；单独账本；首次 14 天基线；重复必附证据
+  it('第五步自我诊断：位置、账本路径、首次基线、三类判定', () => {
+    const check = REFLECT_TASK_BOOK.indexOf('## 第四步：自查与订正（必做）')
+    const diag = REFLECT_TASK_BOOK.indexOf('## 第五步：自我诊断（必做）')
+    const report = REFLECT_TASK_BOOK.indexOf('## 收尾（必做）')
+    expect(diag).toBeGreaterThan(check)
+    expect(report).toBeGreaterThan(diag)
+    expect(REFLECT_TASK_BOOK).toContain('.simple-code/diagnosis/self-diagnosis.md')
+    expect(REFLECT_TASK_BOOK).toContain('最近 14 天')
+    expect(REFLECT_TASK_BOOK).toContain('重复·没想起来')
+    expect(REFLECT_TASK_BOOK).toContain('重复·想起来没用上')
+    expect(REFLECT_TASK_BOOK).toContain('证据不足记「未判定」')
+    // 10-26 首跑：21 条「新错误」零检索、日期未核致误订正 t19412 → 每条附命令输出
+    expect(REFLECT_TASK_BOOK).toContain('没跑检索的不能判「新错误」')
+    expect(REFLECT_TASK_BOOK).toContain("grep -m1 '^created'")
+  })
 })

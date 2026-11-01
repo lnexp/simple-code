@@ -4,12 +4,10 @@ import type { TaskState } from '../src/protocol.ts'
 
 /** 色彩纪律同 ctx-panel（style.ts 顶部硬规则）：全部走 VS Code charts
  *  色变量，换主题自动跟随；回落色只在变量缺失时生效。
- *  条形图只讲体量：四个库一条一个、长度按总数等比（t172245 拍板，
- *  推翻堆叠可见性条 + 四元组行——信息全但乱，没有整体概念） */
+ *  条形图只讲体量，按分类总数等比分段，不堆叠可见性四元组。 */
 export function MemoryPanel({
   stats,
   reflectTask,
-  busy,
   error,
   onStart,
   onReopen,
@@ -18,8 +16,6 @@ export function MemoryPanel({
 }: {
   stats: MemoryStats | null
   reflectTask: TaskState | null
-  /** 主任务跑轮中——开不了新任务 */
-  busy: boolean
   /** dispatch 失败的理由（受理成功面板就关了，看不到） */
   error: string | null
   onStart: () => void
@@ -39,13 +35,15 @@ export function MemoryPanel({
   const running =
     reflectTask !== null && (reflectTask.status === 'running' || reflectTask.status === 'closing')
   const present = reflectTask !== null && !running
-  // 同上下文面板：一根整条按四库条数分段，下面每库一行只给总数与占比
+  // NOTE 工具入口统一，但四类分别展示；每条记录只计入一项。
   const libs =
     stats === null
       ? []
       : [
           { label: 'note', color: NOTE, n: stats.notes.total },
           { label: 'lesson', color: LESSON, n: stats.lessons.total },
+          { label: 'principle', color: PRINCIPLE, n: stats.principles.total },
+          { label: 'goal', color: GOAL, n: stats.goals.total },
           { label: 'event', color: EVENT, n: stats.events.total },
           { label: 'skill', color: TEAL, n: stats.skills },
         ]
@@ -56,10 +54,6 @@ export function MemoryPanel({
     running ? (
       <button type="button" className="ctx-compact" disabled>
         反思中…
-      </button>
-    ) : busy ? (
-      <button type="button" className="ctx-compact" disabled title="主任务运行中，等这轮跑完">
-        主任务运行中
       </button>
     ) : present ? (
       <span className="mem-choice">
@@ -142,5 +136,7 @@ export function MemoryPanel({
 /** 库身份色 */
 const NOTE = 'var(--vscode-charts-blue, #3794ff)'
 const LESSON = 'var(--vscode-charts-purple, #b180d7)'
+const PRINCIPLE = 'var(--vscode-charts-yellow, #cca700)'
+const GOAL = 'var(--vscode-charts-green, #89d185)'
 const EVENT = 'var(--vscode-charts-orange, #d18616)'
 const TEAL = 'var(--ctx-teal)'

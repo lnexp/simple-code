@@ -4,170 +4,216 @@
 
 <h1 align="center">SimpleCode</h1>
 
-<p align="center">A lightweight coding agent. Two entry points — the VS Code sidebar and the terminal — sharing one continuous context.</p>
+<p align="center">A long-term coding coworker. Two entry points: the VS Code sidebar and the terminal <code>sc</code>.</p>
 
-<p align="center"><a href="README.md">中文</a></p>
+<p align="center"><a href="https://github.com/lnexp/simple-code/blob/main/README.md">中文</a></p>
 
 ---
 
-## Overview
+## What it is
 
-SimpleCode (SC) is a coding agent: it takes a request, reads code, runs commands, edits files, and reports what was changed.
+SimpleCode (SC) is a coding agent: it takes a request, reads code, runs commands, edits files, and reports what it changed.
 
-Functionally it resembles its peers. The difference lies in two design principles that run through the entire product; every other trade-off is derived from them.
+SC does not aim to be the strongest at any single task. It aims to be a **long-term coworker** — the longer you work together on a project, the better it knows what you decided, what you rejected, and where it went wrong before. Everything is invested in three things:
 
-## Design principles
+- **Continuity: remember, and recall at the right moment.** An approach you rejected last week should not be offered again this week; the lesson from the time it broke the approval logic should surface by itself the next time it touches that file. SC has a single continuous context; decisions, lessons and event archives are written as files in your project, and relevant entries are surfaced to the agent by keyword and by the files it touches.
+- **Boundaries: trust matched to risk.** Reading and writing inside the workspace never interrupts you; crossing the boundary asks first; `git push` needs your approval by default; MCP secrets are expanded only inside the host process and are invisible to the agent's bash. Open where it is safe, nothing slips through where it is not.
+- **Verification: growth needs evidence.** Whether the collaboration keeps getting smoother cannot rest on a feeling. During reflection SC reviews the corrections you made in that period and counts **how often the same kind of mistake happened a second time**, recording it in a ledger file in your project.
+
+Equally clear is what it does not do: no "new session", no piling up features for single tasks, no long-term investment in working around a particular model's current weaknesses.
+
+## Design philosophy
+
+Two principles run through the whole product; the three points above are built on them.
 
 ### One session
 
-The product maintains exactly one continuous context. There is no "new chat".
+The product has exactly one continuous context. There is no "new session".
 
-Starting a new session does not solve the problem, it merely conceals it: the need for a fresh session arises precisely because the existing one has grown long, cluttered, or off track — and once a new one begins, every conclusion reached, every obstacle encountered, every convention established remains on an inaccessible side. SC lets the context metabolise instead: history is summarised automatically, reduced in resolution, offloaded to disk, and retrieved when required. **What degrades is resolution, not the data itself.**
+A new session does not solve the problem — it hides it. You want a fresh session because the current one grew too long, too messy, or drifted off topic; but after starting over, every conclusion, problem and agreement reached so far sits on the other side, out of reach. SC instead lets the context metabolize: older conversation is summarized automatically, reduced in resolution, and offloaded to disk, to be retrieved when needed. **What drops is resolution, not data.**
 
-This is made possible by **file system is memory**: memory resides neither in a vector database nor in a proprietary format, but in ordinary files on disk. Turns are written as JSONL, summaries as markdown, and conclusions, lessons and event archives as `.md` files under their respective directories. The agent retrieves memory with `grep`, `sed` and `cat` — no dedicated mechanism for "memory" is required, the file system being a thoroughly proven one already. It follows that all of it can be inspected and edited directly at any time.
+This rests on **file system is memory**: memory does not live in a vector database or a private format, but in ordinary files on disk. The conversation is written turn by turn as JSONL, summaries are markdown, and conclusions, lessons and event archives are `.md` files, one directory each. The agent searches its memory with `grep`, `sed` and `cat` — the file system is itself a battle-tested memory system. It also means a human can read and edit all of it at any time.
 
 ### One tool
 
-The model is exposed to a single tool: `bash`. (One and a half, strictly speaking — `view_image` also exists for reading images, since binary pixels cannot travel into the context through a pipe.)
+The model is given exactly one tool: `bash`. (Strictly, one and a half — there is also `view_image` for reading images, because binary pixels cannot travel through a pipe into the context.)
 
-The point of **bash only** is not a small number of tools, but that the tool surface should itself be a command line. Web fetching, patch application, memory retrieval, symbol lookup and MCP calls are all commands within bash rather than tool definitions injected into the context one by one. Three properties follow: they compose through pipes, they combine freely, and new commands require no change to the model's tool schema.
+The point of **bash only** is not "fewer tools", but that the tool surface itself should be the command line: web fetching, patch application, memory search, symbol lookup, MCP calls and image generation are all commands inside bash in SC, not tool definitions injected into the context one by one. They can be piped and combined freely, and adding a command never changes the model's tool list.
 
-The more fundamental reason is that the command line is the interface the model knows best. Inventing a new tool protocol for an agent requires the model to learn it; providing a shell requires nothing, as the model already knows one.
+The deeper reason: the command line is the interface models know best. Invent a new tool protocol for an agent and the model has to learn it; hand it a shell and it already knows how.
 
-## Installation
+## Quick start
 
-macOS and Linux are supported; on Windows, use WSL (the toolchain is designed for POSIX — native Windows is not supported).
+### 1. Install
 
-**VS Code extension**: search for `SimpleCode` in the Extensions panel. Model configuration is required before first use (see below).
+macOS and Linux are supported; on Windows, use it inside WSL.
 
-No separate Node.js installation is required: tool scripts (apply_patch, web search, memory, …) run on the host editor's built-in Node (VS Code / Cursor) by default and fall back to a system Node when one is present.
+Search for `SimpleCode` in the VS Code Extensions view and install it (Cursor, VSCodium and other editors install it from Open VSX under the same name). No separate Node.js install is needed; the tool scripts run on the editor's bundled Node.
 
-**Terminal command `sc`** (optional): on activation the extension creates command entries (including `sc`) under `~/.simple-code/bin/`. Add that directory to `PATH`:
+### 2. Configure a model
 
-```bash
-export PATH="$HOME/.simple-code/bin:$PATH"   # add to ~/.zshrc to persist
-```
-
-The entries are small scripts rewritten by the extension on every activation (they also run on the built-in Node), so the versioned extension directory needs no manual maintenance.
-
-A terminal does not inherit VS Code's settings, so any key referenced as `${ENV_VAR}` in the configuration must be exported in the shell, otherwise the first invocation fails:
-
-```bash
-export ZHIPU_API_KEY=...
-```
-
-## Configuration
-
-The configuration file is `~/.simple-code/settings.json`. **There is no default model; five fields are mandatory.** A missing field raises an error at startup rather than being guessed:
+Create `~/.simple-code/settings.json`. The example below uses DeepSeek over the OpenAI Chat Completions protocol:
 
 ```json
 {
-  "provider": "zhipu",
-  "model": "glm-5.3",
+  "provider": "deepseek",
+  "model": "deepseek-flash",
   "providers": {
-    "zhipu": {
-      "protocol": "anthropic-messages",
-      "baseUrl": "https://open.bigmodel.cn/api/anthropic",
-      "apiKey": "${ZHIPU_API_KEY}",
+    "deepseek": {
+      "protocol": "openai-chat",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKey": "${SIMPLE_CODE_API_KEY}",
       "models": {
-        "glm-5.3": { "contextWindow": 1000000 },
-        "glm-5.3-flash": { "contextWindow": 1000000, "capabilities": { "images": true } }
+        "deepseek-flash": { "contextWindow": 1000000 }
       }
     }
   }
 }
 ```
 
-- An `apiKey` of the form `${ENV_VAR}` reads the environment variable; any other value is treated literally
-- Three protocols are supported: `anthropic-messages`, `openai-responses`, `openai-chat`
-- Every model must declare `contextWindow`; the offload threshold is derived from it
-
-A complete example (reasoning effort, timeouts, memory tuning) is provided in [`settings.example.json`](settings.example.json), whose leading `$comment` documents each option and the reasoning behind it. Approval allowlists live in `~/.simple-code/approval.json` and MCP servers in `~/.simple-code/mcp.json`, not in settings.json.
-
-## Terminal usage
+Put the key in an environment variable — add it to `~/.zshrc` (bash users: `~/.bashrc`), then **fully quit and reopen VS Code**:
 
 ```bash
-sc                          # interactive session, /exit to quit
-sc "add the missing tests for utils.ts"   # single turn, then exits; suitable for scripts
-sc -m zhipu/glm-5.3 -e high "refactor this module"
-cat error.log | sc "what causes this error"
-sc --models                 # list available models
+export SIMPLE_CODE_API_KEY=sk-...
 ```
 
-`--models` also expands `${ENV}` references from the configuration, so the key must be exported as well.
+- **There is no default model**: `provider`, `model`, `protocol`, `baseUrl` and `apiKey` are required, and every model must set `contextWindow` (the offload trigger is derived from it). If anything is missing, startup fails — SC does not guess.
+- Write `baseUrl` up to, but not including, `/v1`; SC appends `/v1/chat/completions` itself. Any service compatible with that path is configured the same way.
+- Three protocols: `openai-chat`, `anthropic-messages`, `openai-responses`.
+- `apiKey` written as `${ENV_VAR_NAME}` is read from the environment; anything else is taken literally — don't put plaintext keys in the file.
+- For a complete example (multiple providers, reasoning effort, timeouts, memory parameters), see [`settings.example.json`](settings.example.json); the `$comment` block at the top explains every field.
 
-In one-shot mode **approvals are always denied**, as no one is present to grant them, confining activity to the workspace. This property also makes `sc` suitable as a sub-agent: create a directory, write a task brief, and run `sc > result.md &`.
+### 3. Start
 
-## Context and memory: One session in practice
+Click the SimpleCode icon in the sidebar and just say what you need, e.g. "look at this project's structure and run the tests". The first time a project is used, SC creates `.simple-code/` in its root, where all memory lives; SC adds it to `.git/info/exclude` automatically so it never gets committed by accident (your `.gitignore` is untouched).
 
-As a conversation grows, its earlier portions are compressed, and the compression is **tiered**:
+To have it follow your rules from day one, put an `AGENTS.md` in the project root (see "Conventions" below).
 
-| Tier | State | Available operations |
+## Memory
+
+### Tiered compression
+
+As the conversation grows, history is compressed **in tiers**:
+
+| Tier | State | What you can do |
 |---|---|---|
-| Hot | Full text present in context | Read directly |
-| Warm | Summary in context, full text offloaded to disk | Follow the summary's pointers back to the original |
-| Cold | Filed into event archives | Retrieve by event name or keyword |
+| Hot | Original text in the context | Read directly |
+| Warm | Summary in the context, original offloaded to disk | Follow the summary's pointer back to the original |
+| Cold | Archived as an event | Search by event name or keyword |
 
-Warm summaries carry the location of the original; cold archives carry the event name. **What remains in context is always a pointer to retrieval**, never the content itself.
+Warm summaries carry the location of the original; cold archives carry the event name — **what stays in the context is always the clue for finding it again**, not the content itself. Click "Context" in the bottom bar to see a snapshot of one request's tiers; when the agent is stopped you can trigger "compact now" from there.
 
-All of this resides within the project directory, predominantly as plain text:
+### Layout
+
+Everything lives inside the project directory, almost all plain text:
 
 ```
 .simple-code/
 ├── memory/
-│   ├── turns/000/turn-000123.jsonl   # every turn verbatim, complete, never truncated
-│   ├── summaries/                    # tiered summaries, markdown
+│   ├── turns/000/turn-000123.jsonl   # full transcript per turn, never truncated
+│   ├── summaries/                    # segment summaries, markdown
 │   └── state.db                      # SQLite: runtime index and full-text search
-├── events/                           # event archives, one file per event
-├── notes/                            # conclusions: decisions, conventions, one-off facts
-├── lessons/                          # lessons learned, one file per symptom
-└── approval.json                     # approval rules
+├── notes/                            # general records in the root
+│   ├── lesson/                       # lessons: one symptom per file
+│   ├── principle/                    # principles: judgment, scope and evidence
+│   └── goal/                         # goals: work, outcome, boundaries and completion criteria
+├── events/                           # event archives: one event per file
+├── skills/                           # skills: how to do a certain kind of task
+├── diagnosis/                        # self-diagnosis ledger
+├── tmp/                              # the agent's scratch files
+└── approval.json                     # project-level approval rules
 ```
 
-The SQLite file serves only as an **acceleration layer**, handling paging and full-text search. The same content is written turn by turn as JSONL, and **the plain-text copy is the authoritative one for both humans and the agent**: broad searches grep the turns directory directly, and any file opens in an editor. The database can be rebuilt; readability does not depend on it.
+SQLite is only an **acceleration layer**; the same content is also written turn by turn as JSONL, and **the plain-text copy is the source of truth**. The database can be rebuilt; readability never depends on it.
 
-## Multi-folder workspaces
+Use `"$SIMPLE_CODE_NOTE" list/read/search/write` with `--type general|lesson|principle|goal`.
+Legacy `lessons/` and `principles/` remain readable in place; upgrades do not move files or overwrite conflicts.
+The old LESSON command is removed. Set `current: true` and `status: active` on one goal to make it current;
+reading historical goals does not switch it. Use `paused` or `completed` for paused or finished goals.
+Principles start as `candidate`; activate only with verified user approval, and supersede rejected principles
+while preserving their evidence. The current goal and LRU-selected active principles enter system context
+at existing compaction points; evidence is read on demand. All four types share `memory.noteBudgetTokens`
+(2100 estimated tokens by default), with configurable `memory.noteRatios` of 35%/10%/20%/35%.
+The current goal may borrow other types' space without exceeding the total or truncating its boundaries.
 
-A VS Code workspace may contain several folders, and SC runs **an independent agent for each**: switched via the tab bar at the top, each with its own conversation history, memory directory, model selection and background processes.
+### Recalling at the right moment
 
-Crucially, **an agent that is switched away from does not stop**. It continues to run; only its UI updates cease to be pushed. History resides on disk, so switching back re-hydrates and resumes. A long task may therefore be started in folder A while other work proceeds in B, with results reviewed later.
+Remembering is easy; recalling when it matters is the hard part. SC surfaces hints in two places, both as `〔recall·async〕` lines after a tool result:
 
-The isolation is thorough: **approval prompts from background folders are not surfaced in the current view.** They wait in place, with a badge on the owning tab indicating how many are pending; switching to that folder reveals the cards and allows a response (after five minutes without one they are denied automatically; that command halts while the rest proceed). Background process status behaves likewise, showing only the current folder. This is a deliberate trade-off — an approval can only be judged against the surrounding conversation, and relocating the card to a view that lacks it would degrade that judgement, so only the signal that something awaits attention is carried across.
+- **By topic**: after you send a message, a side model compares it against the four note types, skills and events, picks the relevant entries, and matches history summaries using the keywords it produces.
+- **By action**: when a command the agent runs touches a file or program (e.g. editing `approval.ts`, running `gh`), entries whose description mentions it are surfaced as "read this first", marked "触及" (touched) at the end of the line.
 
-Each folder holds its own `.simple-code/`, so memory is isolated by construction. Model selection is likewise recorded per folder (`simpleCode.model:<path>`), allowing different models for a frontend project and a core project without interference.
+These are only hints; the agent decides whether to read them. **Off by default**: topic matching costs one extra side-model request per turn. Enable it with `"recall": { "mode": "on" }` in your settings (action hints follow the same switch).
 
-## Images
+### Conventions
 
-A screenshot is frequently more precise than a verbal description — the exact form of an error, the position of a misaligned button, the anomalous point on a chart. One image conveys more than three paragraphs. Accordingly, although the design philosophy is text in and text out, the image path remains open:
+`AGENTS.md` goes into the system prompt on every request. Put in it what is "used repeatedly and cannot be read from the code":
 
-- **Supplied by the user**: paste directly into the input field (Cmd+V). Dragging a file from the explorer is a distinct mechanism, producing a line of path text for the agent to read itself
-- **Read by the agent**: `view_image <path>` reads an image from disk; capturing a screenshot for it to inspect rendering is standard practice
-- **Images on the web**: those retrieved by `webfetch` enter the context alongside the text
+- `AGENTS.md` in the project root: this project's conventions and rejected proposals.
+- `~/.simple-code/AGENTS.md`: personal conventions shared across projects.
 
-Before transmission everything is resized to 2048px on the long edge and under 5MB, with the format detected from magic bytes rather than the extension (a `foo.png` containing jpeg data is not unusual, and an incorrect media type yields an immediate 4xx).
+Both are loaded, user-level first; on conflict the project wins. Each is capped at 2048 tokens and truncated beyond that — move what does not fit into notes.
 
-**Where the model lacks vision** — a common situation, as the strongest coding models do not necessarily read images, and `glm-5.3` in the configuration above is text-only — a vision model may be designated:
+### Reflection
 
-```json
-{ "visionModel": "glm-5.3-flash" }
-```
-
-(Across providers, use the full form: `"visionModel": { "provider": "provider-name", "model": "model-name" }`.)
-
-The image is first sent to the vision model and returned as prose — every piece of text transcribed verbatim, layout and geometry described, nothing inferred beyond what is visible — and that prose is delivered to the main model. **The main model therefore still receives text and emits text.** The philosophy remains intact, with a translation layer inserted at the boundary.
+The "Memory" button in the bottom bar opens the memory panel, where "Reflect" launches a background task that tidies notes, lessons and events: correcting stale entries, merging event fragments, writing an overview on one topic, and running a self-diagnosis — reviewing your corrections since the last reflection, deciding which were repeat mistakes ("it was in the library, yet happened again"), and recording them in `.simple-code/diagnosis/self-diagnosis.md`. It ends with a report — what it wrote, what it changed, what it dropped — which you can correct on the spot.
 
 ## Approvals
 
-The default policy: **unrestricted within the workspace, confirmation required beyond it**.
+Default rule: **free inside the workspace, ask before crossing the boundary**.
 
-- **Ordinary files inside the project**, read and write: executed directly, without interruption
-- **Outside the project**: both reads and writes require confirmation. For other projects' source, `~/.ssh` and `/etc`, the exposure lies on the read side; writing is not the only risk
-- **Hidden paths** (`.env`, `.ssh`, and mid-path cases such as `src/.env`): confirmation required. `.git` is exempt across its entire tree
-- **Network commands** and any command containing `$()`: confirmation required, with everyday commands such as `npm`, `pnpm`, `yarn`, `git` and `node` exempted
+- **Inside the project**: reads and writes run directly. Relative paths after `cd` (e.g. `cd packages && ls ..`) are judged by where they actually point.
+- **Outside the project**: both reads and writes ask — the leak surface of other projects' source, `~/.ssh` and `/etc` is on the read side. The user-level `~/.simple-code/settings.json` is outside the project too, so it asks as well.
+- **Hidden paths** (`.env`, `.ssh`, `.git`, and nested ones like `src/.env`): ask; only paths that actually exist are intercepted.
+- **`.simple-code/`**: `notes/ lessons/ events/ skills/ tmp/ diagnosis/` are free to read and write — the agent's self-improvement area; the rest is free to read but asks before writing — planting false memories into turn files is a real attack surface.
+- **Network commands** (`curl`, `wget`, `ssh`, `scp`, `rsync`, …), **interpreters** (`python`, `sudo`, `osascript`), and **commands with `$( )` or inline code such as `node -e`**: ask. `npm`, `pnpm`, `yarn` and `git` do go online but don't prompt in daily use.
+- **Publishing**: `git push` and `gh` always ask by default; `askCommands` in `approval.json` can add your own (e.g. a private deploy CLI).
 
-`.simple-code/` follows a separate rule: **reads permitted, writes confirmed**, irrespective of whether it lies inside the project. The costs are asymmetric — retrieving history and event archives is an operation the product itself encourages, and blocking it would conflict with the product's own mechanisms, whereas **planting fabricated memories in a turn file constitutes a genuine attack surface**, so writes require confirmation. Two exceptions apply: writing `settings.json` requires confirmation (the apiKey resides there), and writing under `lessons/` is permitted (the lessons library is the agent's own growth area).
+An approval card offers "always allow", recorded in `approval.json` by command shape (two copies: user-level `~/.simple-code/` and project-level `.simple-code/`).
 
-Approval cards offer an "always allow" option, recorded by command shape, with rules stored in `.simple-code/approval.json`.
+The approval switch in the bottom bar is on by default; turning it off approves **everything** directly (including `git push`) — useful when you are watching and don't want to be interrupted.
+
+## Terminal `sc`
+
+When the extension activates it creates command entry points in `~/.simple-code/bin/`; add it to your `PATH`:
+
+```bash
+export PATH="$HOME/.simple-code/bin:$PATH"
+```
+
+```bash
+sc                         # interactive chat, /exit to quit
+sc "add tests for utils.ts"   # run one turn and exit
+sc -m deepseek/deepseek-flash -e high "refactor this module"
+cat error.log | sc "what causes this error"
+sc --models                # list available models
+```
+
+It shares the same settings as the panel. Memory follows the directory: wherever you run it, it reads and writes that directory's `.simple-code/`. **Only one session can use a directory at a time** — while the panel has the project open, running `sc` in the same directory reports that it is already occupied by another simple-code process.
+
+The terminal does not inherit VS Code's environment, so keys referenced in your settings must be exported in the shell. In one-shot mode **approvals are always denied** (nobody is there to approve), confining it to the workspace — which also makes `sc` a good sub-agent: create a directory, write a task brief, `sc > result.md &`.
+
+## Multi-folder workspaces
+
+When a VS Code workspace has several folders, SC runs **an independent agent per folder**, switched via the tab bar at the top, each with its own history, memory, model choice and background processes. An agent you switch away from **keeps running** — start a long task in A and switch to B for something else.
+
+Approval cards from background folders do not pop up in the current view; the tab shows a pending badge, and you see and answer the card after switching over (auto-denied after 5 minutes without an answer) — approvals have to be judged in the context of the conversation, and moving them elsewhere only lowers the quality of that judgment.
+
+## Images and image generation
+
+- **Show it an image**: paste into the input box (Cmd/Ctrl+V); the agent can also read images from disk with `view_image`, or fetch images from web pages via `webfetch`. Images are compressed to at most 2048 px on the long edge and under 5 MB before sending.
+- **Declare whether a model can see images**: by default it is treated as unable. For models that can (such as `deepseek-flash` above), add `"capabilities": { "images": true }` to the model config.
+- **Main model without vision**: configure a vision model; images are first transcribed into text by it, then handed to the main model:
+
+  ```json
+  { "visionModel": { "provider": "provider name", "model": "model name" } }
+  ```
+
+- **Image generation**: once `imageModel` is configured (same shape as `visionModel`), the agent can generate images with `$SIMPLE_CODE_IMAGEGEN`; images are saved inside the project directory. Currently only services with the OpenAI image API (`/v1/images/generations`) are supported.
+
+## MCP
+
+MCP servers are configured in `~/.simple-code/mcp.json` (user-level only — a cloned repository cannot smuggle in executable commands through config); the agent calls them in bash via `$SIMPLE_CODE_MCP`. Write `${VAR}` in a remote server's `headers`; it is expanded only inside the host process, so the secret never enters the agent's bash environment.
 
 ## Development
 
@@ -175,7 +221,7 @@ Approval cards offer an "always allow" option, recorded by command shape, with r
 pnpm install
 pnpm test
 pnpm run build
-node scripts/deploy.mjs   # installs into ~/.vscode/extensions
+node scripts/deploy.mjs   # install into ~/.vscode/extensions
 ```
 
 ## License

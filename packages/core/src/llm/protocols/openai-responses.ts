@@ -190,6 +190,15 @@ function reduce(state: State, msg: SSEMessage): [State, LLMEvent[]] {
     case 'response.reasoning_summary.delta':
     case 'response.reasoning_summary_text.delta':
       return [state, [{ type: 'reasoning_delta', text: asString(ev.delta) }]]
+    // 一个 reasoning item 的摘要分多段（summary_index 0,1,2…），每段是一个
+    // 「**小标题**」。不分隔就首尾相接成 **A****B**，markdown 认不出加粗，
+    // 界面显示一串星号（2026-10-29，calllog/sse-a.txt 实测）。第二段起补
+    // 空行；CX 在这个事件上做同样的分段（on_reasoning_section_break）
+    case 'response.reasoning_summary_part.added':
+      return [
+        state,
+        Number(ev.summary_index) > 0 ? [{ type: 'reasoning_delta', text: '\n\n' }] : [],
+      ]
     case 'response.completed':
     case 'response.incomplete':
       return onCompleted(state, ev)

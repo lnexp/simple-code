@@ -154,6 +154,59 @@ CREATE TABLE IF NOT EXISTS async_cues (
   created_at TEXT NOT NULL,
   PRIMARY KEY (owner, turn_id)
 );
+
+-- 动作联想（touch-cue.ts）：命令碰到 description 点名的文件/程序就提一行。
+-- 一个 turn 可以有多条（每个工具步一条），所以不并进 async_cues（主键是
+-- turn，改主键要重建表，降级回老版本时它的 ON CONFLICT(turn) 会直接报错）。
+-- 锚点与渲染同 async_cues；同一步两边都有时装配期拼成一条，选择器在前
+CREATE TABLE IF NOT EXISTS touch_cues (
+  owner      TEXT NOT NULL DEFAULT '',
+  step_id    INTEGER NOT NULL,
+  after      INTEGER NOT NULL,
+  lines      TEXT NOT NULL,
+  names      TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (owner, step_id)
+);
+
+-- task-trunk（docs/proposals/task-trunk.md）：steps 号段。每个会话（主任务
+-- owner=''，任务 owner=任务 id）的 step 只在自己 open 的段里取号，(floor, ceil]。
+-- 一轮的 step 全在同一段（只在轮开始时切段）。state：open（在写）/ full
+-- （主人已切走，等摘要覆盖）/ merged（已合回主干，别的任务在压缩点拉它的摘要）。
+-- closed = 主人已关闭（关闭即合回，别的任务下一轮就切段来拉）。
+-- indexed_step / indexed_rowid：搜索索引每段一个游标（search-index.ts）
+CREATE TABLE IF NOT EXISTS segments (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner         TEXT NOT NULL,
+  step_floor    INTEGER NOT NULL,
+  step_ceil     INTEGER NOT NULL,
+  state         TEXT NOT NULL,
+  closed        INTEGER NOT NULL DEFAULT 0,
+  opened_at     TEXT NOT NULL,
+  merged_at     TEXT,
+  indexed_step  INTEGER,
+  indexed_rowid INTEGER
+);
+CREATE INDEX IF NOT EXISTS segments_owner ON segments(owner, state);
+
+-- 谁拉过哪段（owner 同 segments；主干 = 'trunk'）。一段对一个 owner 只拉一次
+CREATE TABLE IF NOT EXISTS segment_pulls (
+  owner      TEXT NOT NULL,
+  segment_id INTEGER NOT NULL,
+  pulled_at  TEXT NOT NULL,
+  PRIMARY KEY (owner, segment_id)
+);
+
+-- 任务完成回调的信箱（task-trunk 规则 12）：宿主在派出那一轮结束时写一行给
+-- 登记者（owner 同 segments：主任务 ''），登记者在下一个安全点取走、作为一条
+-- user 消息插到自己历史末尾（taken_at 置上）。表只是交接，正文落进 messages
+CREATE TABLE IF NOT EXISTS task_results (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner      TEXT NOT NULL,
+  text       TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  taken_at   TEXT
+);
 `
 
 /**

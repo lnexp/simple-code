@@ -356,7 +356,6 @@ describe('预设选择器', () => {
     ui.send({
       type: 'tasks',
       folder: '/tmp/x',
-      limit: 3,
       tasks: [
         {
           name: '分支',
@@ -390,7 +389,6 @@ describe('预设选择器', () => {
     ui.send({
       type: 'tasks',
       folder: '/tmp/x',
-      limit: 3,
       tasks: [
         {
           name: '分支',
