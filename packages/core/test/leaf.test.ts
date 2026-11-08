@@ -33,6 +33,50 @@ const sample = (over: Partial<Leaf> = {}): Leaf => ({
   ...over,
 })
 
+describe('owner 隔离（2026-11-06 fork 覆盖事故）', () => {
+  it('任务写叶子带 @tag，不覆盖主任务同 turn+from 的文件', async () => {
+    const dir = await workspace()
+    const base = sample()
+    writeLeaf(dir, base) // 主任务先写
+    writeLeaf(
+      dir,
+      sample({ name: '任务视角的摘要', body: '任务正文' }),
+      'fork 视野验证（1 分钟任务）',
+    )
+    // 主任务的文件原样
+    const mine = readLeaf(dir, base.turn, base.coversFrom)
+    expect(mine?.name).toBe('历史懒加载方案对齐')
+    expect(mine?.body).toContain('定方案')
+  })
+
+  it('主任务读不到任务的叶子（coversFrom 相同也不串）——事故的直接形态', async () => {
+    const dir = await workspace()
+    writeLeaf(dir, sample()) // 主任务
+    writeLeaf(dir, sample({ body: '任务正文' }), '某个任务')
+    const map = readLeavesByCovers(dir, [7330])
+    expect(map.get(7330)?.body).toContain('定方案')
+  })
+
+  it('任务读到自己的叶子', async () => {
+    const dir = await workspace()
+    const owner = '某个任务'
+    writeLeaf(dir, sample({ body: '任务正文' }), owner)
+    const map = readLeavesByCovers(dir, [7330], owner)
+    expect(map.get(7330)?.body).toBe('任务正文')
+  })
+
+  it('主任务与任务各自有叶子时，主任务视角拿自己的', async () => {
+    const dir = await workspace()
+    writeLeaf(dir, sample({ body: '主任务正文' }))
+    writeLeaf(dir, sample({ body: '任务正文' }), 't1')
+    writeLeaf(dir, sample({ body: 't2 的正文' }), 't2')
+    const mine = readLeavesByCovers(dir, [7330])
+    expect(mine.get(7330)?.body).toBe('主任务正文')
+    const t2 = readLeavesByCovers(dir, [7330], 't2')
+    expect(t2.get(7330)?.body).toBe('t2 的正文')
+  })
+})
+
 describe('叶子文件的读写', () => {
   it('**往返逐字相等**', () => {
     const leaf = sample()

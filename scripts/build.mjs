@@ -8,8 +8,8 @@
 // dist 是给分发和扩展用的（sc 走 $SIMPLE_CODE_SC / ~/.simple-code/bin/sc），
 // 不是开发入口。
 
-import { copyFile, readFile, writeFile, readdir, unlink } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
+import { copyFile, readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { build } from 'esbuild'
 
@@ -93,6 +93,20 @@ const TARGETS = [
     name: 'task-bin',
     entry: 'packages/cli/src/task-bin.ts',
     outfile: 'packages/cli/dist/task.js',
+    options: { platform: 'node', format: 'esm', target: 'node22' },
+  },
+  {
+    // task_send 互发（loop-interrupt.md 实现项 2）：列任务 / 按名发消息
+    name: 'task-send-bin',
+    entry: 'packages/cli/src/task-send.ts',
+    outfile: 'packages/cli/dist/task-send.js',
+    options: { platform: 'node', format: 'esm', target: 'node22' },
+  },
+  {
+    // 闹钟（loop-interrupt.md 实现项 3）：宿主层定时器，到点/条件满足给设它的会话发〔wake〕
+    name: 'wake-bin',
+    entry: 'packages/cli/src/wake.ts',
+    outfile: 'packages/cli/dist/wake.js',
     options: { platform: 'node', format: 'esm', target: 'node22' },
   },
   {
@@ -302,9 +316,26 @@ console.log('copied README.md + LICENSE (vscode package root)')
 // vsce 就带不上，$SIMPLE_CODE_* 指向空文件静默失败（event.js 漏过一次）
 // 显式清理旧产物，否则增量构建会把已退役命令打进下一版包。
 for (const dir of ['packages/cli/dist', 'packages/vscode/dist']) {
-  await unlink(`${root}${dir}/lesson.js`).catch(e => { if (e.code !== 'ENOENT') throw e })
+  await unlink(`${root}${dir}/lesson.js`).catch((e) => {
+    if (e.code !== 'ENOENT') throw e
+  })
 }
-for (const bin of ['webfetch.js', 'websearch.js', 'mcp.js', 'apply-patch.js', 'memory.js', 'note.js', 'skill.js', 'sc.js', 'lsp.js', 'event.js', 'imagegen.js', 'task.js']) {
+for (const bin of [
+  'webfetch.js',
+  'websearch.js',
+  'mcp.js',
+  'apply-patch.js',
+  'memory.js',
+  'note.js',
+  'skill.js',
+  'sc.js',
+  'lsp.js',
+  'event.js',
+  'imagegen.js',
+  'task.js',
+  'task-send.js',
+  'wake.js',
+]) {
   await copyFile(`${root}packages/cli/dist/${bin}`, `${root}packages/vscode/dist/${bin}`)
 }
 console.log('copied webfetch.js + websearch.js')

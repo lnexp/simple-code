@@ -229,7 +229,12 @@ describe('空响应', () => {
     let calls = 0
     const attempt = async function* (): AsyncIterable<LLMEvent> {
       calls++
-      yield { type: 'finish', reason: 'content-filter', usage: zeroUsage, refusal: { category: 'reasoning_extraction' } }
+      yield {
+        type: 'finish',
+        reason: 'content-filter',
+        usage: zeroUsage,
+        refusal: { category: 'reasoning_extraction' },
+      }
     }
     const events = await collect(requestWithRetry(attempt, FAST, new AbortController().signal))
     expect(calls).toBe(1)
@@ -345,7 +350,12 @@ describe('重试要写运行日志（runlog 接线）', () => {
         collect(requestWithRetry(b.attempt, FAST, new AbortController().signal, { model: 'm9' })),
       ).rejects.toBeInstanceOf(LLMStreamError)
       expect(calls.filter((c) => c.ev === 'llm_retry_giveup')).toEqual([
-        { ev: 'llm_retry_giveup', model: 'm9', attempt: FAST.maxAttempts, error: { kind: 'rate_limit', message: '429' } },
+        {
+          ev: 'llm_retry_giveup',
+          model: 'm9',
+          attempt: FAST.maxAttempts,
+          error: { kind: 'rate_limit', message: '429' },
+        },
       ])
 
       // 一把过 → 重试相关零行

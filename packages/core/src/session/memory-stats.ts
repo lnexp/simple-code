@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { GLOBAL_CONFIG_PATH } from '../config/load.ts'
 import { EVENTS_INDEX_LIMIT, eventsDir, loadEvents } from '../tools/events.ts'
-import { scanNoteFiles, type NoteType } from '../tools/note-files.ts'
+import { type NoteType, scanNoteFiles } from '../tools/note-files.ts'
 import { buildNoteBudget, DEFAULT_NOTE_BUDGET, type NoteBudgetConfig } from './note-budget.ts'
 
 /** 记忆面板的计数（docs/proposals/reflect-trigger.md §3.2）：真实可见性

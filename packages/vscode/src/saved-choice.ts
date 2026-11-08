@@ -22,5 +22,7 @@ export function asSavedChoice(value: unknown): SavedChoice | null {
   if (typeof provider !== 'string' || typeof model !== 'string') return null
   const valid = EFFORTS.find((e) => e === effort)
   const withPreset = typeof preset === 'string' ? { preset } : {}
-  return valid ? { provider, model, effort: valid, ...withPreset } : { provider, model, ...withPreset }
+  return valid
+    ? { provider, model, effort: valid, ...withPreset }
+    : { provider, model, ...withPreset }
 }

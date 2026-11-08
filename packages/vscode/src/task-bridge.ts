@@ -24,21 +24,39 @@ import {
   type TaskModelEntry,
   type TaskModelsRequest,
   type TaskModelsResponse,
+  type TaskSendListRequest,
+  type TaskSendListResponse,
+  type TaskSendRequest,
+  type TaskSendResponse,
+  type WakeRequest,
+  type WakeResponse,
 } from '@simple-code/core'
 
 /** 任务书上限：够写一份详尽的任务书；挡住误把整个文件灌进来 */
 const MAX_BRIEF_BYTES = 256 * 1024
 
-export type TaskDispatcher = (req: TaskDispatchRequest) => Promise<TaskDispatchResponse>
-export type TaskModelLister = (req: TaskModelsRequest) => Promise<TaskModelsResponse>
-export type TaskBridgeHandlers = { dispatch: TaskDispatcher; models: TaskModelLister }
+type TaskDispatcher = (req: TaskDispatchRequest) => Promise<TaskDispatchResponse>
+type TaskModelLister = (req: TaskModelsRequest) => Promise<TaskModelsResponse>
+type TaskSender = (req: TaskSendRequest) => Promise<TaskSendResponse>
+type TaskSendLister = (req: TaskSendListRequest) => Promise<TaskSendListResponse>
+type TaskBridgeHandlers = {
+  dispatch: TaskDispatcher
+  models: TaskModelLister
+  /** task_send 互发（loop-interrupt.md 实现项 2）：发消息（跑着=插话，停着=点火唤醒） */
+  send?: TaskSender
+  /** task_send 不带参数 = 列任务（agent 的任务视野） */
+  sendList?: TaskSendLister
+  /** $SIMPLE_CODE_WAKE 闹钟（loop-interrupt.md §5）：注册宿主层定时器 */
+  wake?: (req: WakeRequest) => WakeResponse
+}
 
 /** --model 的原文 → taskModels 里的一项（规则 14）：认 model 或 provider/model。
  *  不在列表里 / 光写 model 撞了两个 provider → 字符串（给 agent 看的拒绝原因） */
 export function pickTaskModel(list: TaskModelEntry[], name: string): TaskModelEntry | string {
   const hits = list.filter((t) => t.model === name || `${t.provider}/${t.model}` === name)
   if (hits.length === 1 && hits[0] !== undefined) return hits[0]
-  if (hits.length > 1) return `模型「${name}」在 taskModels 里有 ${hits.length} 个 provider，写成 provider/model`
+  if (hits.length > 1)
+    return `模型「${name}」在 taskModels 里有 ${hits.length} 个 provider，写成 provider/model`
   const known = list.map((t) => `${t.provider}/${t.model}`).join('、')
   return list.length === 0
     ? `没配 taskModels，派任务只能用配置默认模型（不写 --model）`
@@ -77,7 +95,10 @@ function readJson(req: IncomingMessage): Promise<Record<string, unknown> | null 
 export function createTaskBridge(opts: { token: string } & TaskBridgeHandlers): Server {
   return createServer((req, res) => {
     let root: string | undefined
-    const reply = (status: number, body: TaskDispatchResponse | TaskModelsResponse): void => {
+    const reply = (
+      status: number,
+      body: TaskDispatchResponse | TaskModelsResponse | TaskSendResponse | TaskSendListResponse,
+    ): void => {
       // 被拒的派任务在 agent 那边只是 bin 的一行报错，宿主这边也留一行
       if (!body.ok)
         logRun({ ev: 'task_bridge_reject', folder: root ?? null, status, error: body.error })
@@ -85,32 +106,105 @@ export function createTaskBridge(opts: { token: string } & TaskBridgeHandlers): 
       res.end(JSON.stringify(body))
     }
     // handler 抛错 = 宿主内部错：500，bin 照样拿到一行原因
-    const answer = async (fn: () => Promise<TaskDispatchResponse | TaskModelsResponse>): Promise<void> => {
+    const answer = async (
+      fn: () => Promise<
+        TaskDispatchResponse | TaskModelsResponse | TaskSendResponse | TaskSendListResponse
+      >,
+    ): Promise<void> => {
       try {
         reply(200, await fn())
       } catch (error) {
         reply(500, { ok: false, error: error instanceof Error ? error.message : String(error) })
       }
     }
-    if (req.method !== 'POST' || (req.url !== '/dispatch' && req.url !== '/models'))
+    if (
+      req.method !== 'POST' ||
+      (req.url !== '/dispatch' &&
+        req.url !== '/models' &&
+        req.url !== '/send' &&
+        req.url !== '/send-list' &&
+        req.url !== '/wake')
+    )
       return reply(404, { ok: false, error: '没有这条路由' })
     if (!tokenOk(req.headers[TASK_TOKEN_HEADER], opts.token))
       return reply(401, { ok: false, error: 'token 缺失或不对' })
     void readJson(req).then(async (parsed) => {
-      if (parsed === null) return reply(413, { ok: false, error: `任务书超过 ${MAX_BRIEF_BYTES / 1024}KB` })
+      if (parsed === null)
+        return reply(413, { ok: false, error: `任务书超过 ${MAX_BRIEF_BYTES / 1024}KB` })
       if (parsed === undefined) return reply(400, { ok: false, error: '请求体不是 JSON' })
-      const { brief, owner, model } = parsed
+      const { brief, owner, model, lean } = parsed
       const dir = typeof parsed.root === 'string' ? parsed.root : ''
       if (dir === '') return reply(400, { ok: false, error: '缺 root' })
       root = dir
       if (req.url === '/models') return answer(() => opts.models({ root: dir }))
+      // task_send（loop-interrupt.md 实现项 2）：列任务 / 发消息。可选
+      // handler——CLI 宿主没有 tasks 中心，不接这两条（bin 报无桥同款）
+      if (req.url === '/send-list') {
+        const { sendList } = opts
+        if (sendList === undefined) return reply(404, { ok: false, error: '该宿主不支持列任务' })
+        return answer(() => sendList({ root: dir }))
+      }
+      if (req.url === '/send') {
+        const { send } = opts
+        if (send === undefined) return reply(404, { ok: false, error: '该宿主不支持任务互发' })
+        const { task, text } = parsed
+        if (typeof task !== 'string' || task === '')
+          return reply(400, { ok: false, error: '缺任务名' })
+        if (typeof text !== 'string' || text.trim() === '')
+          return reply(400, { ok: false, error: '消息为空' })
+        return answer(() => send({ root: dir, task, text }))
+      }
+      if (req.url === '/wake') {
+        const { wake } = opts
+        if (wake === undefined) return reply(404, { ok: false, error: '该宿主不支持闹钟' })
+        const { afterMs, at, untilOk, everyMs, note, owner } = parsed
+        const num = (v: unknown): number | undefined =>
+          typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined
+        const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined)
+        const badNum = (v: unknown, what: string): boolean =>
+          v !== undefined &&
+          num(v) === undefined &&
+          (reply(400, { ok: false, error: `${what}要是正毫秒数` }), true)
+        if (badNum(afterMs, '--after ') || badNum(everyMs, '--every ')) return
+        const atV = str(at)
+        const untilOkV = str(untilOk)
+        const noteV = str(note)
+        if (at !== undefined && atV === undefined)
+          return reply(400, { ok: false, error: '--at 要是字符串' })
+        if (untilOk !== undefined && untilOkV === undefined)
+          return reply(400, { ok: false, error: '--until-ok 要是字符串' })
+        if (note !== undefined && noteV === undefined)
+          return reply(400, { ok: false, error: '--note 要是字符串' })
+        if (!validOwner(owner))
+          return reply(400, { ok: false, error: `非法 owner：${String(owner)}` })
+        return reply(
+          200,
+          wake({
+            root: dir,
+            owner,
+            ...(num(afterMs) !== undefined ? { afterMs: num(afterMs) as number } : {}),
+            ...(atV !== undefined ? { at: atV } : {}),
+            ...(untilOkV !== undefined ? { untilOk: untilOkV } : {}),
+            ...(num(everyMs) !== undefined ? { everyMs: num(everyMs) as number } : {}),
+            ...(noteV !== undefined ? { note: noteV } : {}),
+          }),
+        )
+      }
       if (typeof brief !== 'string' || brief.trim() === '')
         return reply(400, { ok: false, error: '任务书为空' })
       if (!validOwner(owner))
         return reply(400, { ok: false, error: `非法 owner：${String(owner)}` })
       if (model !== undefined && (typeof model !== 'string' || model === ''))
         return reply(400, { ok: false, error: '--model 后要写模型名' })
-      const req2: TaskDispatchRequest = { brief, root: dir, owner, ...(model !== undefined ? { model } : {}) }
+      if (lean !== undefined && typeof lean !== 'boolean')
+        return reply(400, { ok: false, error: 'lean 要是布尔' })
+      const req2: TaskDispatchRequest = {
+        brief,
+        root: dir,
+        owner,
+        ...(model !== undefined ? { model } : {}),
+        ...(lean === true ? { lean: true } : {}),
+      }
       return answer(() => opts.dispatch(req2))
     })
   })

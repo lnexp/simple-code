@@ -71,7 +71,6 @@ function TurnView({ turn, live, ...shared }: TurnProps) {
           section.kind === 'block' ? (
             shared.renderBlock(section.block, section.at)
           ) : (
-            // biome-ignore lint/suspicious/noArrayIndexKey: 一轮里的段只追加不重排
             <Folded key={`p${i}`} section={section} {...shared} />
           ),
         )
@@ -251,8 +250,6 @@ function StepText({
     [text, token],
   )
   return (
-    // biome-ignore lint/a11y/noStaticElementInteractions: 委托给 innerHTML 里的 <button class="tl-count">
-    // biome-ignore lint/a11y/useKeyWithClickEvents: 键盘路径由那个 <button> 自身保证
     <div
       className="tl-text markdown"
       onClick={(e) => {

@@ -1,8 +1,8 @@
 import type { BgProcessInfo, MemoryStats } from '@simple-code/core'
 import {
+  memo,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
-  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -16,9 +16,8 @@ import type {
   TaskState,
   ToWebview,
 } from '../src/protocol.ts'
-import { compactText, ContextPanel } from './ctx-panel.tsx'
-import { MemoryPanel } from './memory-panel.tsx'
 import { EffortPicker, FolderTabs, ModelPicker, PresetPicker } from './controls.tsx'
+import { ContextPanel, compactText } from './ctx-panel.tsx'
 import {
   composeWithAttachments,
   hasOsFileDrag,
@@ -32,18 +31,20 @@ import {
   type ChatView,
   emptyView,
   finishTurn,
-  patchFooter,
   fmtMs,
   fmtTok,
   groupItems,
   type ImageRef,
+  patchFooter,
   reduce,
   type SingleItem,
   splitTurns,
 } from './events.ts'
+import { nextPinned } from './follow.ts'
 import { MessageFooter } from './footer.tsx'
 import { renderMarkdown, splitOpenFence } from './markdown.ts'
-import { nextPinned } from './follow.ts'
+import { MemoryPanel } from './memory-panel.tsx'
+import { Menu } from './menu.tsx'
 import { findPathTokens } from './pathlink.ts'
 import { groupTurns } from './steps.ts'
 import { useThrottledText } from './throttle.ts'
@@ -64,7 +65,8 @@ type Controls = Pick<
   | 'preset'
   | 'presets'
   | 'imagesEnabled'
-  | 'approvalOn'
+  | 'attendance'
+  | 'summaryInContext'
   | 'contextWindow'
 >
 
@@ -75,7 +77,8 @@ const noControls: Controls = {
   effortOverridden: false,
   presets: [],
   imagesEnabled: false,
-  approvalOn: true,
+  attendance: 'attended' as const,
+  summaryInContext: true,
   contextWindow: 0,
 }
 
@@ -97,7 +100,11 @@ export function App() {
   const [ctxPending, setCtxPending] = useState(false)
   const [regions, setRegions] = useState<RegionsInfo | null>(null)
   /** 手动压缩（面板按钮）。带 task：结果只在它自己那个分支的面板上显示 */
-  const [compact, setCompact] = useState<{ task: string | null; busy: boolean; text: string | null }>({
+  const [compact, setCompact] = useState<{
+    task: string | null
+    busy: boolean
+    text: string | null
+  }>({
     task: null,
     busy: false,
     text: null,
@@ -122,6 +129,8 @@ export function App() {
   const [folder, setFolder] = useState('')
   /** 多根工作区的文件夹清单（design.md §7）。length > 1 才渲染顶部下拉 */
   const [folderList, setFolderList] = useState<FolderState[]>([])
+  /** folders 消息到过没有：区分「还没 attach」与「空窗口」（见主 return） */
+  const foldersSeen = useRef(false)
   /** 后台进程条按目录隔离（用户拍板）。切回时 attach 补推清单，切走即清 */
   const [bgItems, setBgItems] = useState<BgProcessInfo[]>([])
   /** 任务（task-v3）：卡片快照 + 各任务投影，跟 bg 同款目录隔离 */
@@ -228,6 +237,7 @@ export function App() {
    */
   const stopRequested = useRef(false)
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 空依赖是既定模式——监听只注册一次（lesson webview-empty-deps-closure-stale），需要的最新值走 ref 镜像
   useEffect(() => {
     const onMessage = (e: MessageEvent<ToWebview>) => {
       const msg = e.data
@@ -270,7 +280,8 @@ export function App() {
           ...(msg.preset === undefined ? {} : { preset: msg.preset }),
           presets: msg.presets,
           imagesEnabled: msg.imagesEnabled,
-          approvalOn: msg.approvalOn,
+          attendance: msg.attendance,
+          summaryInContext: msg.summaryInContext,
           contextWindow: msg.contextWindow,
         })
         // 跑完了（正常结束、中断、报错都走这条）——给页脚记时间
@@ -289,6 +300,7 @@ export function App() {
         if (!wasRunning.current && msg.running) stopRequested.current = false
         wasRunning.current = msg.running
       } else if (msg.type === 'folders') {
+        foldersSeen.current = true
         // 切换意图已表达：active 顶栏要跟随。之前只更新列表、不更新
         // folder state，切过去顶栏还挂着旧的文件夹名，[1] 以为没切换
         setFolderList(msg.folders)
@@ -298,8 +310,7 @@ export function App() {
         // 只显示当前目录的卡（用户拍板：彻底隔离）。后台目录的卡等用户
         // 切过去时 attach 重推——它 5 分钟超时 deny 是隔离语义的一部分
         if (msg.folder === folderRef.current) setApprovals((a) => [...a, msg])
-      }
-      else if (msg.type === 'approval_closed')
+      } else if (msg.type === 'approval_closed')
         // 关卡按 (folder, id)：后台文件夹的卡带 folder，active 的不带。
         // 两个 bridge 的 id 序列各自从 1 起，只看 id 会关错
         setApprovals((a) => a.filter((x) => x.id !== msg.id || x.folder !== msg.folder))
@@ -307,11 +318,20 @@ export function App() {
         // 只认当前目录的快照（router 对 active 也注入 folder）；后台目录
         // 的变化切回时 attach 会补推
         if (msg.folder === folderRef.current) setBgItems(msg.items)
-      }
-      else if (msg.type === 'tasks') {
+      } else if (msg.type === 'tasks') {
         // 同 bg_processes：folder 由路由注入，非当前目录的任务不看
         if (msg.folder === folderRef.current) {
           setTasks(msg.tasks)
+          // 选中任务的摘要开关以这批快照为准（乐观更新被宿主真值校正——
+          // 任务不存在/写失败时回弹）
+          const cur = branchRef.current
+          const t = cur === null ? undefined : msg.tasks.find((x) => x.name === cur)
+          if (t)
+            setControls((c) =>
+              c.summaryInContext === t.summaryInContext
+                ? c
+                : { ...c, summaryInContext: t.summaryInContext },
+            )
           // 切回恢复的选中在等这批快照：任务还活着就补基线（task_open
           // 幂等，见 bridge 779），不在就作废（branch 交回上面的守卫）
           const restore = restoreBranch.current
@@ -335,17 +355,13 @@ export function App() {
                 ...v,
                 [pending.name]: {
                   ...(v[pending.name] ?? emptyView()),
-                  items: [
-                    ...(v[pending.name]?.items ?? []),
-                    { kind: 'user', text: pending.text },
-                  ],
+                  items: [...(v[pending.name]?.items ?? []), { kind: 'user', text: pending.text }],
                 },
               }))
             post({ type: 'task_open', task: pending.name })
           }
         }
-      }
-      else if (msg.type === 'select_task') {
+      } else if (msg.type === 'select_task') {
         // 桌面机器人上点了某条（宿主已切好目录，本消息排在切目录那批之后）。
         // 同点任务条：选中 + 要基线。清掉两个「待自动选中」——它们是切目录/
         // 派任务前的意图，晚到的快照不该把用户刚点的再改回去
@@ -353,8 +369,7 @@ export function App() {
         pendingBranch.current = null
         setBranch(msg.task)
         if (msg.task !== null) post({ type: 'task_open', task: msg.task })
-      }
-      else if (msg.type === 'task_hydrate') {
+      } else if (msg.type === 'task_hydrate') {
         if (msg.folder === folderRef.current)
           setTaskViews((v) => ({
             ...v,
@@ -366,8 +381,7 @@ export function App() {
               queued: msg.queued ?? [],
             },
           }))
-      }
-      else if (msg.type === 'task_agent')
+      } else if (msg.type === 'task_agent')
         // 高频流（跟 agent 同级）：路由只放 active，不用再判 folder
         setTaskViews((v) => ({
           ...v,
@@ -403,7 +417,10 @@ export function App() {
   /** 开空任务（+ 按钮，规则 13）：输入是名称，开好 idle、自动选中——先切模型
    *  再发第一条。text 空 = 选中时不落用户气泡 */
   const createBranch = (name: string): void => {
-    pendingBranch.current = { name: name.split('\n', 1)[0]?.slice(0, 20).trim() || '任务', text: '' }
+    pendingBranch.current = {
+      name: name.split('\n', 1)[0]?.slice(0, 20).trim() || '任务',
+      text: '',
+    }
     post({ type: 'task_create', name, ...(branch !== null ? { from: branch } : {}) })
   }
 
@@ -430,7 +447,11 @@ export function App() {
         return {
           ...v,
           [name]: interject
-            ? { ...prev, queued: [...prev.queued, { ...item, interject: true }], turnStartedAt: Date.now() }
+            ? {
+                ...prev,
+                queued: [...prev.queued, { ...item, interject: true }],
+                turnStartedAt: Date.now(),
+              }
             : { ...prev, items: [...prev.items, item], turnStartedAt: Date.now() },
         }
       })
@@ -449,6 +470,22 @@ export function App() {
     )
     post({ type: 'send', text, ...(images.length > 0 ? { images } : {}) })
   }
+
+  // 空窗口（没有打开的文件夹）：~ 不能当工作区（v2 §2.2），没 folder
+  // 就没有会话——提示打开项目，不渲染对话主体（发消息会静默无响应）。
+  // folders 消息没到过（attach 前）不算空态，避免闪这条提示
+  if (foldersSeen.current && folderList.length === 0)
+    return (
+      <div className="app">
+        <div className="empty-folder">
+          <div className="empty-folder-title">此窗口没有打开的文件夹</div>
+          <div>
+            SC 以项目为单位工作（用户主目录 ~ 不能当工作区）。用 Open
+            Folder（⌘O）打开一个项目文件夹后，再回到这里对话。
+          </div>
+        </div>
+      </div>
+    )
 
   return (
     <div
@@ -507,11 +544,7 @@ export function App() {
         // title（2026-10-29 拍板：行内只有一行，长命令必截断，看不出东西）
         <div className="bg-strip">
           {bgItems.map((p) => (
-            <div
-              key={p.pgid}
-              className="bg-item"
-              title={`${p.command}\n\npid ${p.pids.join(' ')}`}
-            >
+            <div key={p.pgid} className="bg-item" title={`${p.command}\n\npid ${p.pids.join(' ')}`}>
               <span className="bg-dot" />
               <span className="bg-label">{p.label}</span>
               <span className="bg-meta">
@@ -521,9 +554,7 @@ export function App() {
                 type="button"
                 className="bg-kill"
                 aria-label="结束这组后台进程"
-                onClick={() =>
-                  post({ type: 'bg_kill', pgid: p.pgid, folder: folderRef.current })
-                }
+                onClick={() => post({ type: 'bg_kill', pgid: p.pgid, folder: folderRef.current })}
               >
                 ×
               </button>
@@ -545,7 +576,7 @@ export function App() {
           onClick={() => setBranch(null)}
         >
           {running && <span className="task-dot" data-status="running" />}
-         主任务
+          主任务
           <PendingBadge approvals={approvals} />
         </button>
         {tasks.map((t) => (
@@ -589,7 +620,11 @@ export function App() {
         <button
           type="button"
           className="branch-add"
-          title={branchDraft ? '正在开任务（点此取消）' : '开一个新任务（带已合回的历史摘要，不带当前对话）'}
+          title={
+            branchDraft
+              ? '正在开任务（点此取消）'
+              : '开一个新任务（带已合回的历史摘要，不带当前对话）'
+          }
           onClick={() => setBranchDraft(!branchDraft)}
         >
           {branchDraft ? '取消 ⑂' : '+ 任务'}
@@ -606,7 +641,9 @@ export function App() {
         </div>
       )}
       <Composer
-        running={branch === null ? running : tasks.find((x) => x.name === branch)?.status === 'running'}
+        running={
+          branch === null ? running : tasks.find((x) => x.name === branch)?.status === 'running'
+        }
         view={branch === null ? view : (taskViews[branch] ?? emptyView())}
         onOpenMemory={() => {
           // 记忆面板：开面板 + 拉计数（state 在 App，数据不进 ChatView——同 onOpenRegions）
@@ -633,7 +670,10 @@ export function App() {
             imagesEnabled: t.imagesEnabled,
             contextWindow: t.contextWindow,
             // 审批开关跟分支走（2026-09-22 拍板，推翻早前 folder 级口径）
-            approvalOn: t.approvalOn,
+            attendance: t.attendance,
+            // 历史摘要开关是 folder 级，但分支面板要用它渲染开关态——
+            // 借分支镜像带过来，切分支不掉状态
+            summaryInContext: t.summaryInContext,
           }
         })()}
         // Picker 的选择打到分支 session（setModel/setEffort 带 task）
@@ -682,8 +722,31 @@ export function App() {
         <ContextPanel
           info={regions}
           pending={ctxPending}
-          running={branch === null ? running : tasks.find((x) => x.name === branch)?.status === 'running'}
+          running={
+            branch === null ? running : tasks.find((x) => x.name === branch)?.status === 'running'
+          }
           compact={compact.task === branch ? compact : { busy: false, text: null }}
+          // 档位跟着当前分支：主任务读 controls（state 写入），任务读它
+          // 自己的 TaskState——controls 是主任务的账本，别拿它渲染任务面板
+          summaryInContext={
+            branch === null
+              ? controls.summaryInContext
+              : (tasks.find((x) => x.name === branch)?.summaryInContext ?? true)
+          }
+          onToggleSummary={(value) => {
+            // 乐观更新各写各的账本（宿主快照同值，替换无感）+ 目标带
+            // task——分支独立（2026-11-03）：任务的开关只动自己
+            if (branch === null) setControls((c) => ({ ...c, summaryInContext: value }))
+            else
+              setTasks((ts) =>
+                ts.map((t) => (t.name === branch ? { ...t, summaryInContext: value } : t)),
+              )
+            post({
+              type: 'set_summary_in_context',
+              value,
+              ...(branch !== null ? { task: branch } : {}),
+            })
+          }}
           onCompact={() => {
             setCompact({ task: branch, busy: true, text: null })
             post({ type: 'compact', ...(branch !== null ? { task: branch } : {}) })
@@ -696,8 +759,12 @@ export function App() {
           stats={memStats}
           reflectTask={tasks.find((x) => x.name === '反思') ?? null}
           error={memError}
-          onStart={() => post({ type: 'reflect_start', ...(branch !== null ? { from: branch } : {}) })}
-          onReopen={() => post({ type: 'reflect_reopen', ...(branch !== null ? { from: branch } : {}) })}
+          onStart={() =>
+            post({ type: 'reflect_start', ...(branch !== null ? { from: branch } : {}) })
+          }
+          onReopen={() =>
+            post({ type: 'reflect_reopen', ...(branch !== null ? { from: branch } : {}) })
+          }
           onView={() => {
             setMemOpen(false)
             post({ type: 'task_open', task: '反思' })
@@ -897,7 +964,11 @@ function Log({
     if (path) {
       e.preventDefault()
       const line = path.getAttribute('data-open-line')
-      post({ type: 'openFile', path: path.getAttribute('data-open-path') ?? '', ...(line ? { line: Number(line) } : {}) })
+      post({
+        type: 'openFile',
+        path: path.getAttribute('data-open-path') ?? '',
+        ...(line ? { line: Number(line) } : {}),
+      })
       return
     }
     const anchor = target.closest('a')
@@ -937,8 +1008,6 @@ function Log({
   )
 
   return (
-    // biome-ignore lint/a11y/noStaticElementInteractions: 事件委托不是交互元素，可交互的是渲染出来的 <a>
-    // biome-ignore lint/a11y/useKeyWithClickEvents: 键盘路径由 <a> 自身保证（Enter 激活走同一 click）
     <div className="log" ref={ref} onScroll={onScroll} onClick={onLogClick}>
       {history.loading && (
         <div className="history-loading">
@@ -962,7 +1031,6 @@ function Log({
       ))}
       {/* 排队中的插话：core 投进历史前一直在最下面（ChatView.queued） */}
       {view.queued.map((item, i) => (
-        // biome-ignore lint/suspicious/noArrayIndexKey: 排队气泡没有稳定 id；只从队首出队，按位置复用组件无副作用
         <MItem key={`q${i}`} item={item} streaming={false} model={model} />
       ))}
     </div>
@@ -993,7 +1061,11 @@ function PathText({ text }: { text: string }) {
     const seg = text.slice(tk.start, tk.end)
     const path = text.slice(tk.start, tk.pathEnd)
     out.push(
-      <a key={`p${tk.start}`} data-open-path={path} {...(tk.line !== undefined ? { 'data-open-line': tk.line } : {})}>
+      <a
+        key={`p${tk.start}`}
+        data-open-path={path}
+        {...(tk.line !== undefined ? { 'data-open-line': tk.line } : {})}
+      >
         {seg}
       </a>,
     )
@@ -1018,7 +1090,7 @@ export function UserBubble({ text }: { text: string }) {
     if (open) return
     const el = ref.current
     if (el) setClamped((c) => c || el.scrollHeight - el.clientHeight > 4)
-  }, [text, open])
+  }, [open])
   return (
     <div className="user-col">
       <div ref={ref} className={'user' + (open ? '' : ' user-clamp')}>
@@ -1053,7 +1125,6 @@ function Item({
           {item.images !== undefined && item.images.length > 0 && (
             <div className="user-images">
               {item.images.map((img, i) => (
-                // biome-ignore lint/suspicious/noArrayIndexKey: 与 composer 的 attach 条一致，i 只为 key 唯一性服务
                 <img
                   key={`u${i}`}
                   src={`data:${img.mimeType};base64,${img.data}`}
@@ -1329,7 +1400,6 @@ function Composer({
       {images.length > 0 && (
         <div className="attach">
           {images.map((img, i) => (
-            // biome-ignore lint/suspicious/noArrayIndexKey: 预览条随编辑增删，i 只为 key 唯一性服务
             <div key={`a${i}`} className="attach-thumb">
               <img src={`data:${img.mimeType};base64,${img.data}`} alt="待发送图片" data-zoom />
               <button
@@ -1346,7 +1416,6 @@ function Composer({
       {attached.length > 0 && (
         <div className="attach-files">
           {attached.map((p, i) => (
-            // biome-ignore lint/suspicious/noArrayIndexKey: 与图片预览条同构，i 只为 key 唯一性服务
             <div key={`f${i}`} className="file-chip" title={p}>
               <span className="file-chip-name">{p}</span>
               <button
@@ -1401,59 +1470,82 @@ function Composer({
             {fmtTok(view.lastTiming.inputTokens)} ↓{fmtTok(view.lastTiming.outputTokens)}
           </span>
         )}
-        {view.contextTokens > 0 && (
-          <button
-            type="button"
-            className="usage-ctx"
-            title="上下文分区分析"
-            onClick={onOpenRegions}
-          >
-            {controls.contextWindow > 0 && (
-              <ContextRing ratio={view.contextTokens / controls.contextWindow} />
-            )}
-            {/* 字和数字包在同一个 span 里：分成两个 flex 子项会多出 gap */}
-            <span>
-              <span className="bar-word">上下文 </span>
-              {fmtTok(view.contextTokens)}
-            </span>
-          </button>
-        )}
-        {/* 记忆面板入口：**无条件渲染**（上下文按钮是 contextTokens > 0 条件渲染，
-            冷启动不可达——这是它进 .bar 的全部理由，reflect-trigger.md §3.1） */}
+        {/* 上下文面板入口：**无条件渲染**（2026-11-03，原来 contextTokens > 0
+            才渲染——冷启动进不去面板，历史摘要开关也不可达）。数据后到：
+            环和数字等有了再显示，按钮本身先在 */}
+        <button type="button" className="usage-ctx" title="上下文分区分析" onClick={onOpenRegions}>
+          {/* 环无条件（2026-11-03 用户要求：冷启动也占位）；窗口没定下来
+              （contextWindow=0）时除零，那条才保留条件 */}
+          {controls.contextWindow > 0 && (
+            <ContextRing ratio={view.contextTokens / controls.contextWindow} />
+          )}
+          {/* 字和数字包在同一个 span 里：分成两个 flex 子项会多出 gap */}
+          <span>
+            <span className="bar-word">上下文 </span>
+            {view.contextTokens > 0 && fmtTok(view.contextTokens)}
+          </span>
+        </button>
+        {/* 记忆面板入口：无条件渲染。历史上它是唯一冷启动可达的入口
+            （reflect-trigger.md §3.1）；2026-11-03 起上下文按钮同样无条件，
+            但记忆先例的形状保留 */}
         <button type="button" className="usage-ctx" title="记忆面板" onClick={onOpenMemory}>
           <i className="codicon codicon-database" aria-hidden="true" />
           <span className="bar-word">记忆</span>
         </button>
         <div className="bar-right">
-          {/* 审批两态开关（approval.md §4.2）。关 = 触发即放行；默认开。
-              放在控件区最前：它是安全语义，和模型选择不是一类东西，
-              排最左让「现在关着」这个状态在扫一眼的视野里。
-              **不跟分支走**：审批是 folder 级安全开关，分支们共享同一个
-              审批面 */}
-          <button
-            type="button"
-            className={`approval-toggle${controls.approvalOn ? '' : ' is-off'}`}
+          {/* 审批三态（2026-11-04 拍板）：每次询问=弹卡等人（默认）；
+              一律拒绝=ask 立即按超时拒（模型读到「无人处理，非用户拒绝」，
+              卡不生成）；一律放行=触发即放行。跟分支走（各分支独立） */}
+          <Menu
+            icon={
+              controls.attendance === 'attended'
+                ? 'person'
+                : controls.attendance === 'unattended'
+                  ? 'circle-slash'
+                  : 'unlock'
+            }
+            cls="approval-toggle"
+            ariaLabel="审批"
+            label={
+              controls.attendance === 'attended'
+                ? '询问'
+                : controls.attendance === 'unattended'
+                  ? '拒绝'
+                  : '放行'
+            }
             title={
               task === undefined
-                ? '项目外/隐藏目录/网络命令执行前要不要问你'
-                : `分支「${task}」的审批开关（各分支独立）`
+                ? '审批：每次询问=弹卡等你；一律拒绝=不弹卡全拒；一律放行=不弹卡全放'
+                : `分支「${task}」的审批（各分支独立）`
             }
-            onClick={() =>
+            options={[
+              {
+                key: 'attended',
+                label: '询问',
+                selected: controls.attendance === 'attended',
+                payload: 'attended',
+              },
+              {
+                key: 'unattended',
+                label: '拒绝',
+                selected: controls.attendance === 'unattended',
+                payload: 'unattended',
+              },
+              {
+                key: 'off',
+                label: '放行',
+                selected: controls.attendance === 'off',
+                payload: 'off',
+              },
+            ]}
+            onPick={(mode) =>
               post({
-                type: 'setApprovalEnabled',
-                on: !controls.approvalOn,
+                type: 'setAttendance',
+                mode,
                 ...(task !== undefined ? { task } : {}),
               })
             }
-          >
-            {/* 图标跟着状态换（闭锁↔开锁），不是只换颜色：关掉守门是件该
-                一眼看见的事，形状变化比颜色变化更容易被扫到 */}
-            <i
-              className={`codicon codicon-${controls.approvalOn ? 'lock' : 'unlock'}`}
-              aria-hidden
-            />
-            {controls.approvalOn ? '开' : '关'}
-          </button>
+          />
           {/* 模型/深度/预设跟分支走：选择带 task 打到分支 session */}
           <EffortPicker
             effort={controls.effort}
@@ -1536,7 +1628,15 @@ const ContextRing = ({ ratio }: { ratio: number }) => {
         : 'var(--vscode-charts-green, #89d185)'
   return (
     <svg className="usage-ring" width="16" height="16" viewBox="0 0 18 18" aria-hidden>
-      <circle cx="9" cy="9" r={r} fill="none" stroke="currentColor" strokeWidth="2.5" opacity="0.25" />
+      <circle
+        cx="9"
+        cy="9"
+        r={r}
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.5"
+        opacity="0.25"
+      />
       <circle
         cx="9"
         cy="9"

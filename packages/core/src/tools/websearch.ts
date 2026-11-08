@@ -29,9 +29,20 @@ export type WebsearchConfig = {
  * 上游端点与认证头：官方端点 key 在 URL 上；自定义端点（url）key 走
  * Bearer 头；都没有 = 匿名层。直连（bin 无代理）与凭据代理共用这一套
  */
-export function websearchEndpoint(config: WebsearchConfig): { url: string; headers: Record<string, string> } {
-  if (config.url) return { url: config.url, headers: config.exaApiKey ? { authorization: `Bearer ${config.exaApiKey}` } : {} }
-  if (config.exaApiKey) return { url: `https://mcp.exa.ai/mcp?exaApiKey=${encodeURIComponent(config.exaApiKey)}`, headers: {} }
+export function websearchEndpoint(config: WebsearchConfig): {
+  url: string
+  headers: Record<string, string>
+} {
+  if (config.url)
+    return {
+      url: config.url,
+      headers: config.exaApiKey ? { authorization: `Bearer ${config.exaApiKey}` } : {},
+    }
+  if (config.exaApiKey)
+    return {
+      url: `https://mcp.exa.ai/mcp?exaApiKey=${encodeURIComponent(config.exaApiKey)}`,
+      headers: {},
+    }
   return { url: 'https://mcp.exa.ai/mcp', headers: {} }
 }
 
@@ -40,7 +51,10 @@ export function websearchEndpoint(config: WebsearchConfig): { url: string; heade
  * 情况」）；文件存在但 JSON 坏了抛——静默等于悄悄把计费路径切回免费层。
  * exaApiKey 的 ${VAR} 按 env 展开，变量缺失抛（同理不能静默降级）
  */
-export async function readWebsearchConfig(path: string, env: NodeJS.ProcessEnv = process.env): Promise<WebsearchConfig> {
+export async function readWebsearchConfig(
+  path: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<WebsearchConfig> {
   let cfg: WebsearchConfig
   try {
     cfg = JSON.parse(await readFile(path, 'utf8')) as WebsearchConfig

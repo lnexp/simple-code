@@ -1,5 +1,5 @@
-import { useEffect } from 'react'
 import type { MemoryStats } from '@simple-code/core'
+import { useEffect } from 'react'
 import type { TaskState } from '../src/protocol.ts'
 
 /** 色彩纪律同 ctx-panel（style.ts 顶部硬规则）：全部走 VS Code charts
@@ -50,35 +50,34 @@ export function MemoryPanel({
   const total = libs.reduce((s, l) => s + l.n, 0)
   const pct = (n: number): number => (total > 0 ? (n / total) * 100 : 0)
 
-  const action =
-    running ? (
-      <button type="button" className="ctx-compact" disabled>
-        反思中…
+  const action = running ? (
+    <button type="button" className="ctx-compact" disabled>
+      反思中…
+    </button>
+  ) : present ? (
+    <span className="mem-choice">
+      <button type="button" className="ctx-compact" onClick={onView}>
+        去查看
       </button>
-    ) : present ? (
-      <span className="mem-choice">
-        <button type="button" className="ctx-compact" onClick={onView}>
-          去查看
-        </button>
-        <button
-          type="button"
-          className="ctx-compact"
-          onClick={onReopen}
-          title="关掉挂着的反思任务、起新的一次（跳过上次报告的过目）"
-        >
-          关闭并重开
-        </button>
-      </span>
-    ) : (
       <button
         type="button"
         className="ctx-compact"
-        onClick={onStart}
-        title="以任务形态跑一次记忆整理（内置指令，后台执行，报告后挂起待过目）"
+        onClick={onReopen}
+        title="关掉挂着的反思任务、起新的一次（跳过上次报告的过目）"
       >
-        反思
+        关闭并重开
       </button>
-    )
+    </span>
+  ) : (
+    <button
+      type="button"
+      className="ctx-compact"
+      onClick={onStart}
+      title="以任务形态跑一次记忆整理（内置指令，后台执行，报告后挂起待过目）"
+    >
+      反思
+    </button>
+  )
 
   return (
     <div className="ctx-mask" onClick={onClose} role="presentation">

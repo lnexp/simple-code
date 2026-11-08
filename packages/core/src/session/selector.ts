@@ -20,8 +20,8 @@ import { decayCutoff } from '../tools/decay.ts'
 import { eventSignal, loadEvents } from '../tools/events.ts'
 import { scanNoteFiles } from '../tools/note-files.ts'
 import { noteFileSignal } from '../tools/note-library.ts'
-import { noteEligible } from './note-budget.ts'
 import { listSkills } from '../tools/skill.ts'
+import { noteEligible } from './note-budget.ts'
 
 export type SelectorCandidate = {
   kind: 'lesson' | 'note' | 'principle' | 'goal' | 'skill' | 'event'
@@ -99,12 +99,18 @@ export function loadSelectorCandidates(root: string): SelectorCandidate[] {
     a: { name: string; created?: string | undefined },
     b: { name: string; created?: string | undefined },
   ) => (a.created ?? '').localeCompare(b.created ?? '') || a.name.localeCompare(b.name)
-  for (const c of scanNoteFiles(root).filter(noteEligible)
+  for (const c of scanNoteFiles(root)
+    .filter(noteEligible)
     .map((n) => ({ ...n, created: n.meta.created }))
     .sort(byCreated)) {
     const signal = noteFileSignal(c)
-    if ((c.type === 'general' || c.type === 'lesson') && signal !== null && signal < decayCutoff()) continue
-    out.push({ kind: c.type === 'general' ? 'note' : c.type, name: c.name, text: c.meta.description ?? '' })
+    if ((c.type === 'general' || c.type === 'lesson') && signal !== null && signal < decayCutoff())
+      continue
+    out.push({
+      kind: c.type === 'general' ? 'note' : c.type,
+      name: c.name,
+      text: c.meta.description ?? '',
+    })
   }
   for (const line of listSkills(root)) {
     // 只认「name  [项目|用户]  描述」行（与 searchSkills 同判据）：空库提示
@@ -205,13 +211,13 @@ export function parseSelection(raw: string, candidates: SelectorCandidate[]): Se
       .replace(/^\s*(?:[-•]|\d+[.、)])\s*/, '')
       .trim()
       .split(/\s+/)
-    const kindWord = words.find(
-      (w) => w in SECTION_HEAD,
-    )
+    const kindWord = words.find((w) => w in SECTION_HEAD)
     for (const word of words) {
       const hit =
         candidates.find((c) => c.name === word && c.kind === kindWord) ??
-        (candidates.filter((c) => c.name === word).length === 1 ? candidates.find((c) => c.name === word) : undefined)
+        (candidates.filter((c) => c.name === word).length === 1
+          ? candidates.find((c) => c.name === word)
+          : undefined)
       if (hit && !out.includes(hit)) out.push(hit)
     }
   }

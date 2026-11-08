@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
+
+import type { MemoryStats } from '@simple-code/core'
 import { act, createElement } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, describe, expect, it } from 'vitest'
-import type { MemoryStats } from '@simple-code/core'
 import type { ToHost, ToWebview } from '../src/protocol.ts'
 import { App } from '../webview/App.tsx'
 
@@ -120,7 +121,7 @@ describe('记忆面板接线', () => {
     // 六项互斥计数，四种 note 类型不再合并或重复叠加。
     expect(html).toContain('共 242 条') // 69+43+2+1+125+2
     expect(html).toContain('ctx-stack')
-    const rows = [...host!.querySelectorAll('.ctx-row')].map(row => ({
+    const rows = [...host!.querySelectorAll('.ctx-row')].map((row) => ({
       label: row.querySelector('.ctx-label')?.textContent,
       count: row.querySelector('.ctx-num')?.textContent,
       pct: row.querySelector('.ctx-pct')?.textContent,

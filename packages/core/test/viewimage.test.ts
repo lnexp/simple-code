@@ -2,9 +2,9 @@ import { mkdtemp, rm, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mulberry32, makePng } from './make-png.ts'
-import { createViewImageTool } from '../src/tools/viewimage.ts'
 import type { ToolContext } from '../src/tools/types.ts'
+import { createViewImageTool } from '../src/tools/viewimage.ts'
+import { makePng, mulberry32 } from './make-png.ts'
 
 let root: string
 const ctx = (): ToolContext => ({ root, signal: new AbortController().signal })
@@ -55,7 +55,11 @@ describe('view_image / 读图', () => {
     const cases: Array<[string, Buffer, string]> = [
       ['a.jpg', Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00]), 'image/jpeg'],
       ['a.gif', Buffer.from('GIF89axxxx'), 'image/gif'],
-      ['a.webp', Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP')]), 'image/webp'],
+      [
+        'a.webp',
+        Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP')]),
+        'image/webp',
+      ],
     ]
     for (const [name, bytes, mime] of cases) {
       await writeFile(join(root, name), bytes)
@@ -120,10 +124,7 @@ describe('view_image / 视觉转述（vision relay）', () => {
         return '弹层左缘溢出视口 61px。'
       },
     }
-    const out = await createViewImageTool().execute(
-      { path: 'r.png', focus: '弹层位置' },
-      relayCtx,
-    )
+    const out = await createViewImageTool().execute({ path: 'r.png', focus: '弹层位置' }, relayCtx)
     expect(out.isError).toBe(false)
     expect(out.output).toContain('[视觉转述]')
     expect(out.output).toContain('弹层左缘溢出视口')

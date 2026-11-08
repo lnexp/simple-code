@@ -36,7 +36,7 @@ const approval = (toolCallId: string) => ({
   id: 1,
   command: 'curl x',
   toolCallId,
-  category: 'network_cmd' as const,
+  category: 'ask_rule' as const,
   detail: '',
   reason: '网络命令',
 })

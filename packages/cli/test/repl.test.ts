@@ -777,11 +777,11 @@ describe('审批答复解析（createApproval）', () => {
       return p
     }
     const q = {
-      command: 'curl https://x',
+      command: 'cat /etc/hosts',
       toolCallId: 't1',
-      category: 'network_cmd' as const,
-      detail: 'curl',
-      reason: '网络命令',
+      category: 'external_dir' as const,
+      detail: '/etc/hosts',
+      reason: '读项目外路径',
     }
     expect(await ask(q, 'n 别用 curl，用 webfetch')).toEqual({ deny: '别用 curl，用 webfetch' })
     expect(await ask(q, 'N')).toBe('deny')
@@ -799,8 +799,11 @@ describe('审批答复解析（createApproval）', () => {
     const shared = createApproval({ err: () => {}, info: () => {} } as never)
     shared.attach(rl)
     const q = {
-      command: 'curl a', toolCallId: 't', category: 'network_cmd' as const,
-      detail: 'curl', reason: '网络命令',
+      command: 'curl a',
+      toolCallId: 't',
+      category: 'external_dir' as const,
+      detail: '/etc/hosts',
+      reason: '读项目外路径',
     }
     const p1 = shared.requestApproval(q)
     ;(rl as unknown as { emit: (e: string, v: string) => void }).emit('line', 'y')
@@ -1016,7 +1019,6 @@ describe('斜杠命令 /model /effort', () => {
     expect(fetchStub.models()[1]).toBe('v')
   })
 })
-
 
 const tick = (): Promise<void> => new Promise((r) => setImmediate(r))
 /** onReady 要等 session 建立 + readline 建好——一拍不够 */

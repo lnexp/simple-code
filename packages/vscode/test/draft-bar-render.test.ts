@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 // 复现：点 + 任务（setBranchDraft(true)）→ 草稿条渲染是否崩
-import { describe, expect, it, vi } from 'vitest'
-import React from 'react'
+
+import React, { act } from 'react'
 import { createRoot } from 'react-dom/client'
-import { act } from 'react'
+import { describe, expect, it, vi } from 'vitest'
 
 vi.mock('./vscode.ts', () => ({ post: vi.fn(), onMessage: vi.fn(() => () => {}) }))
 
@@ -19,8 +19,8 @@ describe('开任务草稿条渲染', () => {
         root.render(React.createElement(App))
       })
       // App 渲染后模拟点击 + 任务——webview 里该按钮 title 是「从最新回答 fork」
-      const btn = Array.from(document.querySelectorAll('button')).find(
-        (b) => (b.textContent ?? '').includes('+ 任务'),
+      const btn = Array.from(document.querySelectorAll('button')).find((b) =>
+        (b.textContent ?? '').includes('+ 任务'),
       )
       expect(btn, '找到 + 任务按钮').toBeTruthy()
       await act(async () => {
@@ -47,7 +47,9 @@ describe('开任务草稿条渲染', () => {
     await act(async () => {
       root.render(React.createElement(App))
     })
-    const btn = Array.from(document.querySelectorAll('button')).find((b) => (b.textContent ?? '').includes('+ 任务'))
+    const btn = Array.from(document.querySelectorAll('button')).find((b) =>
+      (b.textContent ?? '').includes('+ 任务'),
+    )
     await act(async () => {
       btn?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     })

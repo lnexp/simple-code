@@ -100,9 +100,9 @@ export type ChatItem =
 export type ChatView = {
   items: ChatItem[]
   /**
-    * 上次请求的观测面板（底栏那行）。timing 事件给时延、step_finish 给
-    * in/out——两个事件各补一半，后到的合并不覆盖先到的一半
-    */
+   * 上次请求的观测面板（底栏那行）。timing 事件给时延、step_finish 给
+   * in/out——两个事件各补一半，后到的合并不覆盖先到的一半
+   */
   lastTiming: { ttftMs: number; totalMs: number; inputTokens: number; outputTokens: number } | null
   /**
    * 当前上下文占用。**取最后一步的输入量，不是累加**——累加的是「一共发了
@@ -160,7 +160,10 @@ export function reduce(view: ChatView, agentEv: AgentEvent, now: number): ChatVi
       // 另发一个 progress update 块（官方文档 thinking#progress-updates），
       // display=summarized 下与思考块不可区分，分开画就是一次调用两行「已思考」
       return view.items.at(-1)?.kind === 'reasoning'
-        ? patchLast(view, ({ endedAt: _, ...r }) => ({ ...r, text: r.text === '' ? '' : `${r.text}\n\n` }))
+        ? patchLast(view, ({ endedAt: _, ...r }) => ({
+            ...r,
+            text: r.text === '' ? '' : `${r.text}\n\n`,
+          }))
         : append(view, { kind: 'reasoning', text: '', startedAt: now })
     case 'reasoning_delta':
       return appendText(view, 'reasoning', agentEv.text, now)
@@ -171,7 +174,7 @@ export function reduce(view: ChatView, agentEv: AgentEvent, now: number): ChatVi
         id: agentEv.id,
         name: agentEv.name,
         desc: '',
-      command: '',
+        command: '',
         output: '',
         failed: false,
         startedAt: now,
@@ -265,7 +268,10 @@ export function reduce(view: ChatView, agentEv: AgentEvent, now: number): ChatVi
       return earlyDesc(view, agentEv.id, agentEv.partial)
 
     case 'model_switch':
-      return insertBeforeLastUser(view, { kind: 'divider', text: switchText(agentEv.from, agentEv.to) })
+      return insertBeforeLastUser(view, {
+        kind: 'divider',
+        text: switchText(agentEv.from, agentEv.to),
+      })
 
     case 'task_result':
       return append(view, parseTaskResult(agentEv.text) ?? { kind: 'notice', text: agentEv.text })
@@ -362,7 +368,9 @@ export function finishTurn(
   now: number = Date.now(),
 ): ChatView {
   const at = view.items.findLastIndex((item) => item.kind === 'assistant')
-  const stopped: ChatItem[] = interrupted ? [{ kind: 'notice', text: '已中断', resumable: true }] : []
+  const stopped: ChatItem[] = interrupted
+    ? [{ kind: 'notice', text: '已中断', resumable: true }]
+    : []
   if (at === -1) return { ...view, items: [...view.items, ...stopped], turnStartedAt: null }
   const items = [...view.items]
   items[at] = {
@@ -416,7 +424,8 @@ const append = (view: ChatView, item: ChatItem): ChatView => ({
 })
 
 /** 回放时两段思考接成一段：中间空一行，有一边是空的就不加（实时流在 reasoning_start 接） */
-const joinReasoning = (a: string, b: string): string => (a === '' || b === '' ? a + b : `${a}\n\n${b}`)
+const joinReasoning = (a: string, b: string): string =>
+  a === '' || b === '' ? a + b : `${a}\n\n${b}`
 
 /**
  * 往最后一条同类条目上追加文本。类型对不上就新建一条——`text_delta` 先于
@@ -431,10 +440,7 @@ function appendText(
   const last = view.items.at(-1)
   if (last?.kind !== kind) {
     // reasoning 走这里 = delta 抢在 start 前面（不该发生），墙钟记当前
-    return append(
-      view,
-      kind === 'reasoning' ? { kind, text, startedAt: now } : { kind, text },
-    )
+    return append(view, kind === 'reasoning' ? { kind, text, startedAt: now } : { kind, text })
   }
   return {
     ...view,
@@ -518,7 +524,9 @@ function partialDesc(raw: string): string | null {
   }
 }
 
-function withoutRaw(tool: Extract<ChatItem, { kind: 'tool' }>): Extract<ChatItem, { kind: 'tool' }> {
+function withoutRaw(
+  tool: Extract<ChatItem, { kind: 'tool' }>,
+): Extract<ChatItem, { kind: 'tool' }> {
   const { rawInput: _drop, ...rest } = tool
   return rest
 }
@@ -598,7 +606,9 @@ const isInterjectBlock = (block: Block): boolean =>
 const isNoticeBlock = (block: Block): boolean =>
   block.kind === 'single' &&
   // task_result：空闲时插在轮尾的任务回调，同 notice 留在折叠外（不然连同最终回答一起被折进「处理过程」）
-  (block.item.kind === 'notice' || block.item.kind === 'divider' || block.item.kind === 'task_result')
+  (block.item.kind === 'notice' ||
+    block.item.kind === 'divider' ||
+    block.item.kind === 'task_result')
 const isAssistantBlock = (block: Block): boolean =>
   block.kind === 'single' && block.item.kind === 'assistant'
 
@@ -724,6 +734,9 @@ export function hydrateItems(
     meta?: FooterMeta | null
     elapsedMs?: number | null
     finishedAt?: number | null
+    /** fold 窗口版（2026-11-06）标记：stepId 在恢复窗口外的存根行。
+     * 连续段聚合成一条「已摘要」占位，不逐行渲染 */
+    stubbed?: boolean
   })[],
 ): ChatItem[] {
   const items: ChatItem[] = []
@@ -733,11 +746,24 @@ export function hydrateItems(
   /** 每行处理**前** items 的长度（循环开头记，continue 跳不到）。行 i 的
    *  产出区间 = [rowStarts[i], rowStarts[i+1])；页脚在轮的区间内定位 */
   const rowStarts: number[] = []
+  let stubRun = 0
 
   for (let r = 0; r < rows.length; r++) {
     rowStarts.push(items.length)
     const message = rows[r]
     if (!message) continue
+    if (message.stubbed) {
+      stubRun++
+      continue
+    }
+    if (stubRun > 0) {
+      items.push({
+        kind: 'notice',
+        text: `上方 ${stubRun} 行已摘要折叠——重开面板可查看完整历史`,
+        resumable: false,
+      })
+      stubRun = 0
+    }
     if (message.turnId !== undefined && !turnStarts.has(message.turnId)) {
       turnStarts.set(message.turnId, items.length)
     }
@@ -776,7 +802,8 @@ export function hydrateItems(
           if (isStub(part.text) || part.text === '') continue
           // 相邻的思考块并成一行，与实时流同口径（reasoning_start 的注释）
           const prev = items.at(-1)
-          if (prev?.kind === 'reasoning') items[items.length - 1] = { ...prev, text: joinReasoning(prev.text, part.text) }
+          if (prev?.kind === 'reasoning')
+            items[items.length - 1] = { ...prev, text: joinReasoning(prev.text, part.text) }
           else items.push({ kind: 'reasoning', text: part.text })
         } else if (part.type === 'tool_call') {
           const command = commandOf(part.input)
@@ -824,7 +851,7 @@ export function hydrateItems(
           id: part.toolCallId,
           name: 'bash',
           desc: '',
-      command: '',
+          command: '',
           output: part.output,
           failed: part.isError,
           ...(thumbs ? { images: thumbs } : {}),
@@ -865,6 +892,14 @@ export function hydrateItems(
       // 实时路：中断轮本来也没有页脚
       ...(row.finishedAt != null ? { finishedAt: row.finishedAt } : {}),
     }
+  }
+  if (stubRun > 0) {
+    // 尾部整段存根（窗口截断在轮中间）：占位收尾
+    items.push({
+      kind: 'notice',
+      text: `上方 ${stubRun} 行已摘要折叠——重开面板可查看完整历史`,
+      resumable: false,
+    })
   }
   return stubbed.size > 0 ? items.filter((i) => !stubbed.has(i)) : items
 }

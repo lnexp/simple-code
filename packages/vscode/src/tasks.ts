@@ -1,20 +1,20 @@
+import type { Effort, ImageInput, ModelRef } from '@simple-code/core'
 import {
   type AgentEvent,
-  type ApprovalCategory,
-  type Session,
-  type SetTimer,
+  type ApprovalAsk,
+  createTask,
   finalizeTask,
   flipTaskLive,
-  createTask,
   lastTaskReply,
   listTaskManifests,
   logRun,
   postTaskResult,
+  type Session,
+  type SetTimer,
   type TaskManifest,
   taskResultText,
-  writeTaskManifest,
-  scopeOf,
   watchIdle,
+  writeTaskManifest,
 } from '@simple-code/core'
 import {
   type ChatItem,
@@ -23,9 +23,8 @@ import {
   hydrateItems,
   replayWithUsers,
 } from '../webview/events.ts'
-import type { Effort, ModelRef } from '@simple-code/core'
-import type { TaskState, ToWebview } from './protocol.ts'
-import { turnTracker, type RobotTaskView, type TurnEnd } from './robot-feed.ts'
+import type { Attendance, TaskState, ToWebview } from './protocol.ts'
+import { type RobotTaskView, type TurnEnd, turnTracker } from './robot-feed.ts'
 
 /**
  * 任务中枢（task-trunk，docs/proposals/task-trunk.md；前身 task-v3）。
@@ -56,37 +55,41 @@ import { turnTracker, type RobotTaskView, type TurnEnd } from './robot-feed.ts'
  * `rehydrate`（attach 调）补 `task_hydrate` 基线——和 bridge 的主镜像
  * 同一套 pattern（baseItems + replay + fold 重读 historyRows）。
  */
-export type TaskApprovalQ = {
-  command: string
-  toolCallId: string
-  category: ApprovalCategory
-  detail: string
-  reason: string
-  parts?: ApprovalCategory[]
-  always?:
-    | { kind: 'lead'; lead: string }
-    | { kind: 'path'; dir: string }
-    | { kind: 'nonpath'; lead: string; from: number }
-    | { kind: 'paths'; dirs: string[]; hidden?: { path: string; write: boolean }[] }
-    | { kind: 'hidden'; path: string; write: boolean }
-  task?: string
-}
-export type TaskApprovalResult = 'allow' | 'always' | 'deny' | 'timeout' | { deny: string }
+/** 载荷类型走 core 的 ApprovalAsk（2026-11-05 收敛：四处各写一份漏改过） */
+export type TaskApprovalQ = ApprovalAsk
+type TaskApprovalResult = 'allow' | 'always' | 'deny' | 'timeout' | { deny: string }
 
 /** 分支的模型选择持久化（键 = 任务目录，panel 层注 Memento 实现）。
  *  分支 session 是 core 的 getSession——saveChoice 是 bridge 层概念，
  *  分支的存取走这里。get 返回 null = 没存过（用配置默认） */
-export type TaskChoice = { provider: string; model: string; effort?: string; preset?: string }
+type TaskChoice = { provider: string; model: string; effort?: string; preset?: string }
 export type TaskChoiceStore = {
   get(dir: string): TaskChoice | null
   set(dir: string, choice: TaskChoice): void
 }
 
-export type TaskDeps = {
+/** 分支级「历史摘要」开关的持久化（2026-11-03 用户拍板：每个任务独立，
+ *  不联动）。键 = owner，与 choiceStore 同一模式；null = 没覆盖过、跟
+ *  主任务（folder 配置）走 */
+export type TaskSummaryStore = {
+  get(owner: string): boolean | null
+  set(owner: string, value: boolean): void
+}
+
+type TaskDeps = {
   folder: string
   post: (msg: ToWebview) => void
   /** 分支模型选择的持久化（2026-09-22 拍板：分支持久化）。不传 = 内存态 */
   choiceStore?: TaskChoiceStore
+  /** 分支级历史摘要开关的持久化。不传 = 全部跟主任务（联动退回 folder 级） */
+  summaryStore?: TaskSummaryStore
+  /** 任务级审批值守态的持久化（owner 键，2026-11-04）：不传 = 内存态 */
+  attendanceStore?: {
+    get: (owner: string) => Attendance | null
+    set: (owner: string, mode: Attendance) => void
+  }
+  /** 主任务当前值——没建 session 又没覆盖过的任务显示这个（新任务默认跟主任务） */
+  defaultSummaryInContext: () => boolean
   /** 任务 session 工厂（skipLock 已含）：同一个库、同一个 root，owner 域 */
   session: (
     task: TaskManifest,
@@ -100,7 +103,7 @@ export type TaskDeps = {
   pokeMain?: () => void
 }
 
-export type TaskOutcome = { ok: boolean; error?: string }
+type TaskOutcome = { ok: boolean; error?: string }
 
 type Run = {
   name: string
@@ -136,14 +139,21 @@ type Run = {
    *  unhandled rejection，界面毫无痕迹）。常驻视图直到用户下一次发话——
    *  放 replay 里会被轮末 fold 清掉，一闪而过 */
   notices: string[]
+  /** 本轮输入里含 agent 的 task-send（内存态，reload 即丢——与闹钟同款
+   *  不持久化哲学）：轮结束投递「回复」回调唤醒 parent。用户 UI 手打的
+   *  轮不置位、维持静默（callback 一次性只管首轮，规则 12） */
+  agentTouched?: boolean
+  /** 用户参与过（manifest.userTouched 的内存镜像 + send 时置位）：
+   *  robot 完成提醒只对它弹——agent 派、无人参与的任务静默回调主任务 */
+  userTouched?: boolean
   /** 本轮的错误事件（core 把轮内错误作为 error 事件产出、不抛）。轮末
    *  fold 清空 replay，错误事件跟着消失——视图上就是「发了没反应」
    *  （2026-09-23 真机：PrefixBrokenError 在任务里一闪而过）。常驻到用户
    *  下一次发话，同 notices */
   turnErrors: string[]
-  /** 分支自己的审批开关（2026-09-22 拍板：审批配置跟分支走）。内存态，
-   *  对齐主干（主干的开关也不持久化） */
-  approvalOn: boolean
+  /** 分支自己的审批值守态（2026-09-22 拍板：审批配置跟分支走；2026-11-04
+   *  三态化 + owner 键持久化，对齐模型/深度的 choiceStore 模式） */
+  attendance: Attendance
   /** 底栏的水位与上一轮用量（首字/总耗时/↑↓）。fold 清空 replay 前从镜像
    *  里接住——它们是 ChatView 字段、不在 items 里，hydrateItems 重建不出来；
    *  不存的话切走再切回（task_hydrate 整体替换）底栏就没了（2026-09-23 真机）。
@@ -163,15 +173,20 @@ export const readModel = (session: Session): ModelRef => {
 }
 
 /** 任务第一条消息前的轻量框架：系统提示词与对话共享（root 相同），只补一句它的
- *  处境——上下文只有主干那套已合回的历史摘要，看不到开它的任务最近在聊什么 */
-export const frameBrief = (name: string, text: string): string =>
-  `（task-${name}：你是一个独立任务。你的上下文只有已合回的历史摘要，看不到开你的那个任务最近的对话——按任务书干活。你的经历会合回历史，别的任务之后能看到。）\n\n${text}`
+ *  处境——上下文只有主干那套已合回的历史摘要，看不到开它的任务最近在聊什么。
+ *  forkTurn 例外只剩 v3 遗产任务（升级时还开着的老 fork 任务，带着继承现场）：
+ *  身份与起点要说清——「被排出来执行的任务、工作从任务书开始」，否则模型把
+ *  现场当自己的对话延续（真项目教训，--fork 功能已于 2026-11-06 取消） */
+export const frameBrief = (name: string, text: string, fork = false): string =>
+  fork
+    ? `（task-${name}：你是一个被排出来独立执行的任务。你前面的对话是主任务的现场（fork 复制带来的背景，供你理解任务书里指代的方案与细节）；你的工作从下面的任务书开始。你的经历会合回历史。）\n\n${text}`
+    : `（task-${name}：你是一个独立任务。你的上下文只有已合回的历史摘要，看不到开你的那个任务最近的对话——按任务书干活。你的经历会合回历史，别的任务之后能看到。）\n\n${text}`
 
 /** database is locked 的让线程退避重试（150/300/450ms，共 3 次）。同进程
  *  单线程下 busy_timeout 的同步等待等不来持锁者让出（COMMIT 也排在本线程
  *  队列里），只能让出线程再试——对话摘要器的事务毫秒级，几乎必过（2026-09-23
  *  实测 dispatch 撞摘要器写库必炸）。其他错重试无益，原样抛 */
-export async function retryLocked<T>(fn: () => T | Promise<T>): Promise<T> {
+async function retryLocked<T>(fn: () => T | Promise<T>): Promise<T> {
   for (let i = 1; ; i++) {
     try {
       return await fn()
@@ -210,7 +225,13 @@ export function createTaskCenter(deps: TaskDeps) {
           r.session !== null &&
           (r.session.config.model.capabilities.images || r.session.config.vision !== null),
         contextWindow: r.session?.config.model.contextWindow ?? 0,
-        approvalOn: r.approvalOn,
+        attendance: r.attendance,
+        // 分支自己的档位：session 的内存 config（setSummaryInContext 改过
+        // 或建立时读回过）；没建 session 的看有没有持久化覆盖，都没有跟主任务
+        summaryInContext:
+          r.session?.config.config.memory.summaryInContext ??
+          deps.summaryStore?.get(r.manifest.owner) ??
+          deps.defaultSummaryInContext(),
       }
     })
 
@@ -238,7 +259,10 @@ export function createTaskCenter(deps: TaskDeps) {
     // 不是 webview 本地追加：hydrate 基线是单一真相，本地追加会被下一次
     // hydrate 冲掉
     if (r.status === 'error' && r.error !== undefined) {
-      view = { ...view, items: [...view.items, { kind: 'notice', text: r.error, errorKind: '任务出错' }] }
+      view = {
+        ...view,
+        items: [...view.items, { kind: 'notice', text: r.error, errorKind: '任务出错' }],
+      }
     }
     for (const text of r.notices)
       view = { ...view, items: [...view.items, { kind: 'notice', text, errorKind: '插话失败' }] }
@@ -297,7 +321,8 @@ export function createTaskCenter(deps: TaskDeps) {
    * reload 后的任务还没点开），信箱等它下次跑时取
    */
   const deliver = async (task: string, parent: string, text: string): Promise<void> => {
-    const target = parent === '' ? null : ([...runs.values()].find((x) => x.manifest.owner === parent) ?? null)
+    const target =
+      parent === '' ? null : ([...runs.values()].find((x) => x.manifest.owner === parent) ?? null)
     if (parent !== '' && (target === null || target.status === 'closing')) {
       logRun({ ev: 'task_callback', folder: deps.folder, task, parent, skipped: 'parent_closed' })
       return
@@ -309,28 +334,45 @@ export function createTaskCenter(deps: TaskDeps) {
       return
     }
     logRun({ ev: 'task_callback', folder: deps.folder, task, parent, chars: text.length })
+    // 点火（docs/loop-interrupt.md 实现项 1）：登记者停着时回调到达即唤醒
+    // （开新 turn），任务登记者与主任务同语义——tasks.send 的停着分支就是
+    // runLoop 点火，回调本体由 core send 入口的 takeTaskResults 吸收，排在
+    // 〔task〕点火消息之前。跑着的照旧 absorb（插话语义，轮末自取）
     if (target === null) deps.pokeMain?.()
-    else absorb(target)
+    else if (target.status === 'running') absorb(target)
+    else send(target.name, '〔task〕子任务回调到达')
   }
 
   /** 派出那一轮结束：定状态、标已回调（manifest）、投递。over = 恢复路径给定
    *  的状态与回复（reload 打断了那一轮） */
   const callback = (r: Run, over?: { status: string; reply: string }): void => {
+    const failed =
+      r.stopRequested || r.status === 'closing' || r.status === 'error' || r.turnErrors.length > 0
+    // 追加轮回调（2026-11-05 用户实测炸出：agent 续派后任务静默结束）：成功
+    // 态标「回复」与首轮「完成」区分；出错/被停止照实，安全比文案优先
+    const replyRound = r.manifest.callback !== 'pending' && r.agentTouched === true
     const status =
       over?.status ??
       (r.stopRequested || r.status === 'closing'
         ? '被停止'
         : r.status === 'error' || r.turnErrors.length > 0
           ? `出错：${r.error ?? r.turnErrors.at(-1) ?? ''}`
-          : '完成')
+          : replyRound && !failed
+            ? '回复'
+            : '完成')
+    r.agentTouched = false
     r.manifest = { ...r.manifest, callback: 'done' }
     // 关闭中不写：close 收尾会删 manifest，这里写回去任务就「复活」了
     if (r.status !== 'closing') writeTaskManifest(deps.folder, r.manifest)
-    void deliver(r.name, r.manifest.parent ?? '', taskResultText(r.name, status, over?.reply ?? r.lastText))
+    void deliver(
+      r.name,
+      r.manifest.parent ?? '',
+      taskResultText(r.name, status, over?.reply ?? r.lastText),
+    )
   }
 
   /** 跑一轮。text = 本轮输入（第一轮带分身框架句）。轮与轮之间 idle 等输入 */
-  const runLoop = async (r: Run, text: string): Promise<void> => {
+  const runLoop = async (r: Run, text: string, images?: ImageInput[]): Promise<void> => {
     let session: Session | null = null
     r.stopRequested = false
     r.startedAt = Date.now()
@@ -338,7 +380,7 @@ export function createTaskCenter(deps: TaskDeps) {
     try {
       session = await ensureSession(r)
       if (session === null) return
-      for await (const ev of session.send(firstOf(r, text))) {
+      for await (const ev of session.send(firstOf(r, text), images)) {
         const at = Date.now()
         turn.see(ev)
         // 后台进程快照不是聊天条目（bridge 主循环同款姿势）：折成独立消息
@@ -393,8 +435,9 @@ export function createTaskCenter(deps: TaskDeps) {
         deps.post(msg)
         postMs = lap()
       }
-      // 派出那一轮结束：回调登记者一次（规则 12）
-      if (r.manifest.callback === 'pending') callback(r)
+      // 派出那一轮结束：回调登记者一次（规则 12）；agent 续派触发的轮次
+      // 同样投递（「回复」），否则追加指令的产出静默丢（2026-11-05）
+      if (r.manifest.callback === 'pending' || r.agentTouched === true) callback(r)
       // 跑完一轮 arm 空闲摘要（config 0 = 关）：分身的多 turn 经历不摘的话
       // 全程 live，merge 收尾段口径会把整段吞掉（fork-merge.md §4.6）
       if (r.status !== 'closing') r.idle?.arm()
@@ -420,7 +463,7 @@ export function createTaskCenter(deps: TaskDeps) {
     const { awaitingFirstMessage: _, ...rest } = r.manifest
     r.manifest = rest
     writeTaskManifest(deps.folder, r.manifest)
-    return frameBrief(r.name, text)
+    return frameBrief(r.name, text, r.manifest.forkTurn !== undefined)
   }
 
   /** 分支 session 的惰性建立（fork 即建、恢复的分支第一次被用到才建）。
@@ -432,39 +475,44 @@ export function createTaskCenter(deps: TaskDeps) {
         deps.requestApproval({ ...q, task: r.name })
       const attempt = async (): Promise<Session | null> => {
         const s = await deps.session(r.manifest, labeled)
-          r.session = s
-          r.idle = watchIdle(s, deps.setTimer)
-          // 上次建立失败留下的 error 态（open 重试成功的路径）清回 idle——
-          // 否则会话好了 tab 还挂红点、视图还挂错误条。dispatch 路径此时是
-          // running，不动
-          if (r.status === 'error') {
-            r.status = 'idle'
-            delete r.error
-          }
-          // 持久化的模型选择读回（键 = owner，reload 后任务配置还在）
-          const saved = deps.choiceStore?.get(r.manifest.owner) ?? r.choice
-          if (saved) {
-            try {
-              s.setModel(saved)
-              if (saved.effort !== undefined) s.setEffort(saved.effort as Effort)
-              if (r.choice) persistChoice(r, s)
-            } catch {
-              /* 失效的选择（模型删了）：走配置默认，restore 的 setModel 抛
+        r.session = s
+        r.idle = watchIdle(s, deps.setTimer)
+        // 分支级历史摘要开关读回：有覆盖才动 config——没覆盖过的任务跟
+        // loadConfig 出来的 folder 值（主任务面板上切的就是它）
+        const summary = deps.summaryStore?.get(r.manifest.owner)
+        if (summary !== null && summary !== undefined)
+          s.config.config.memory.summaryInContext = summary
+        // 上次建立失败留下的 error 态（open 重试成功的路径）清回 idle——
+        // 否则会话好了 tab 还挂红点、视图还挂错误条。dispatch 路径此时是
+        // running，不动
+        if (r.status === 'error') {
+          r.status = 'idle'
+          delete r.error
+        }
+        // 持久化的模型选择读回（键 = owner，reload 后任务配置还在）
+        const saved = deps.choiceStore?.get(r.manifest.owner) ?? r.choice
+        if (saved) {
+          try {
+            s.setModel(saved)
+            if (saved.effort !== undefined) s.setEffort(saved.effort as Effort)
+            if (r.choice) persistChoice(r, s)
+          } catch {
+            /* 失效的选择（模型删了）：走配置默认，restore 的 setModel 抛
                  过的自愈路径在 session 层——这里静默即可 */
-            }
-            delete r.choice
           }
-          // 现在就刷一次基线：historyRows 是 fork 点前的主干历史——第一轮
-          // 还在跑时切过去（task_open），基线里就有主干历史 + 分支增量。
-          // 刷完推一次：open() 常抢在建会话前推了空基线，这里补上真的。
-          // **只刷 baseItems，不走 fold**：fold 会清 pendingTexts，而此刻
-          // send 还没开始（runLoop 先 await 这里），用户消息既不在
-          // historyRows 也不在 replay——清掉它第一轮全程看不见自己发的
-          // 话（2026-09-23 真机；reload 后首条 task_send 同理）
-          r.baseItems = hydrateItems(s.historyRows())
-          deps.post(hydrateMsg(r))
-          postTasks() // 控件状态从 null 变实——刷新一次
-          return s
+          delete r.choice
+        }
+        // 现在就刷一次基线：historyRows 是 fork 点前的主干历史——第一轮
+        // 还在跑时切过去（task_open），基线里就有主干历史 + 分支增量。
+        // 刷完推一次：open() 常抢在建会话前推了空基线，这里补上真的。
+        // **只刷 baseItems，不走 fold**：fold 会清 pendingTexts，而此刻
+        // send 还没开始（runLoop 先 await 这里），用户消息既不在
+        // historyRows 也不在 replay——清掉它第一轮全程看不见自己发的
+        // 话（2026-09-23 真机；reload 后首条 task_send 同理）
+        r.baseItems = hydrateItems(s.historyRows())
+        deps.post(hydrateMsg(r))
+        postTasks() // 控件状态从 null 变实——刷新一次
+        return s
       }
       r.sessionP = retryLocked(attempt).catch((error: unknown) => {
         // 终态失败不能吞成静默的 null：runLoop 对 null 裸 return，任务
@@ -513,7 +561,11 @@ export function createTaskCenter(deps: TaskDeps) {
       notices: [],
       turnErrors: [],
       usage: { contextTokens: 0, lastTiming: null },
-      approvalOn: true,
+      // 持久化的值守态读回（owner 键，2026-11-04）——不依赖 session 建
+      // 立：任务恢复是惰性的，卡在快照上就能对值守。无记录默认拒绝
+      // （2026-11-05 拍板：子任务不该用审批卡打扰用户）
+      attendance: deps.attendanceStore?.get(manifest.owner) ?? 'unattended',
+      userTouched: manifest.userTouched === true,
     })
   }
   // 派出那一轮被 reload 打断（manifest 还是 pending）：恢复时补一次「被停止」
@@ -541,7 +593,10 @@ export function createTaskCenter(deps: TaskDeps) {
   const taken = (name: string): boolean => runs.has(name) || forking.has(name)
 
   const dispatch = (brief: string, parent?: string): Promise<string | null> =>
-    dispatchNamed(nameOf(brief), brief, { via: 'user', ...(parent !== undefined ? { parent } : {}) })
+    dispatchNamed(nameOf(brief), brief, {
+      via: 'user',
+      ...(parent !== undefined ? { parent } : {}),
+    })
 
   /** 只输名称开空任务（「+ 任务」，规则 13）：建好进任务条、idle，不跑——用户
    *  先切模型（setModel 照常建会话、按 owner 存选择）再发第一条消息 */
@@ -559,16 +614,26 @@ export function createTaskCenter(deps: TaskDeps) {
     brief: string,
     parent: string,
     choice?: TaskChoice,
+    lean?: boolean,
   ): Promise<{ name: string } | { error: string }> => {
     const base = nameOf(brief)
     let name = base
     for (let i = 2; taken(name); i++) name = `${base} ${i}`
-    const error = await dispatchNamed(name, brief, { via: 'agent', parent, ...(choice ? { choice } : {}) })
+    const error = await dispatchNamed(name, brief, {
+      via: 'agent',
+      parent,
+      ...(choice ? { choice } : {}),
+      ...(lean ? { lean: true } : {}),
+    })
     return error === null ? { name } : { error }
   }
 
   /** 开任务并立刻跑第一轮（任务书即第一条消息） */
-  const dispatchNamed = async (name: string, brief: string, opts: OpenOpts): Promise<string | null> => {
+  const dispatchNamed = async (
+    name: string,
+    brief: string,
+    opts: OpenOpts,
+  ): Promise<string | null> => {
     const r = await openRun(name, opts)
     if (typeof r === 'string') return r
     r.status = 'running'
@@ -581,7 +646,14 @@ export function createTaskCenter(deps: TaskDeps) {
   }
 
   /** via：谁派的——用户（+ 任务、/task）还是 agent（$SIMPLE_CODE_TASK），进 runlog */
-  type OpenOpts = { via: 'user' | 'agent'; parent?: string; awaitingFirstMessage?: true; choice?: TaskChoice }
+  type OpenOpts = {
+    via: 'user' | 'agent'
+    parent?: string
+    awaitingFirstMessage?: true
+    choice?: TaskChoice
+    /** --lean（2026-11-03）：精简上下文——只保常驻+floor+live，压缩=硬切 */
+    lean?: true
+  }
 
   /** 建任务、进 runs（还不跑、不推快照）。字符串 = 拒绝原因 */
   const openRun = async (name: string, opts: OpenOpts): Promise<Run | string> => {
@@ -600,6 +672,8 @@ export function createTaskCenter(deps: TaskDeps) {
         createTask(deps.folder, name, {
           ...(register ? { parent } : {}),
           ...(opts.awaitingFirstMessage ? { awaitingFirstMessage: true } : {}),
+          // 用户开的任务用户自己会看 robot 总览；完成提醒本来面向的就是它
+          ...(via === 'user' ? { userTouched: true } : {}),
         }),
       )
     } catch (error) {
@@ -615,6 +689,10 @@ export function createTaskCenter(deps: TaskDeps) {
     } finally {
       forking.delete(name)
     }
+    // --lean（2026-11-03）：落 store（键 = owner），ensureSession 建立
+    // 时读回——任务从第一轮起就是精简上下文。fork 复制进库的主干摘要
+    // 照常在库里（recall 候选面不变），只是不进发请求的装配
+    if (opts.lean) deps.summaryStore?.set(manifest.owner, false)
     const run: Run = {
       name,
       manifest,
@@ -630,7 +708,9 @@ export function createTaskCenter(deps: TaskDeps) {
       notices: [],
       turnErrors: [],
       usage: { contextTokens: 0, lastTiming: null },
-      approvalOn: true,
+      // 2026-11-05 拍板：子任务默认拒绝审批——审批卡不找用户，
+      // 算不出的就按「无人处理」拒（想人工值守，任务卡上切「询问」）
+      attendance: 'unattended',
       ...(opts.choice ? { choice: opts.choice } : {}),
     }
     runs.set(name, run)
@@ -654,10 +734,27 @@ export function createTaskCenter(deps: TaskDeps) {
   /** 往分支发消息（切过去继续打字，2026-09-22 拍板）。running = core 的
    *  插话路径（session.send 入队 + 软中断，返回空流——消费它才触发入队）；
    *  空闲/出错 = 起新一轮。返回 null = 已受理 */
-  const send = (name: string, text: string): string | null => {
+  const send = (
+    name: string,
+    text: string,
+    images?: ImageInput[],
+    via?: 'agent',
+  ): string | null => {
     const r = runs.get(name)
     if (!r) return `没有任务「${name}」`
     if (r.status === 'closing') return `任务「${name}」正在关闭，不能再发消息`
+    if (via === 'agent') {
+      // 观测补全（2026-11-05）：task_send 此前不写 runlog，续派是盲区
+      logRun({ ev: 'task_send', folder: deps.folder, task: name, chars: text.length })
+      r.agentTouched = true
+    } else {
+      // 用户手打 = 参与过（2026-11-06）：这个任务从现在起完成时重新弹 robot
+      r.userTouched = true
+      if (r.manifest.userTouched !== true) {
+        r.manifest = { ...r.manifest, userTouched: true }
+        writeTaskManifest(deps.folder, r.manifest)
+      }
+    }
     // 用户接着说话 = 看过了上次没送达的提示、上一轮的错误，清掉
     r.notices = []
     r.turnErrors = []
@@ -671,7 +768,7 @@ export function createTaskCenter(deps: TaskDeps) {
         // null：建会话失败，任务已进 error 态并出了错误条——这里只把
         // 没送达的气泡撤掉
         if (session === null) throw null
-        for await (const ev of session.send(text)) {
+        for await (const ev of session.send(text, images)) {
           // 正常是空流（插话即返回）。万一不是（状态竞态），照常镜像不丢事件
           const at = Date.now()
           r.replay.push({ ev, at })
@@ -693,7 +790,7 @@ export function createTaskCenter(deps: TaskDeps) {
     r.status = 'running'
     r.pendingTexts = [{ text, pos: r.replay.length }]
     postTasks()
-    void runLoop(r, text)
+    void runLoop(r, text, images)
     return null
   }
 
@@ -743,12 +840,14 @@ export function createTaskCenter(deps: TaskDeps) {
 
   /** 分支自己的审批开关（内存态，对齐主干）。没这个分支给 true（fail-closed
    *  不了的折中：分支没了卡片也答不了，卡 5 分钟超时 deny） */
-  const approvalOnOf = (name: string): boolean => runs.get(name)?.approvalOn ?? true
+  const attendanceOf = (name: string): Attendance => runs.get(name)?.attendance ?? 'unattended'
 
-  const setApprovalOn = (name: string, on: boolean): void => {
+  const setAttendance = (name: string, mode: Attendance): void => {
     const r = runs.get(name)
     if (!r) return
-    r.approvalOn = on
+    r.attendance = mode
+    // owner 键持久化（面板 Memento）：任务重开/重启后值守态跟人走
+    deps.attendanceStore?.set(r.manifest.owner, mode)
     postTasks()
   }
 
@@ -757,6 +856,17 @@ export function createTaskCenter(deps: TaskDeps) {
     const r = runs.get(name)
     if (!r) return null
     return ensureSession(r)
+  }
+
+  /** 分支级「历史摘要」开关（2026-11-03 改独立：任务各自为政，不联动）。
+   *  活 session 的内存 config 改掉（装配点每轮现读，下一轮生效）+
+   *  持久化（没建 session 的任务切了也记得）+ 刷新卡片镜像 */
+  const setSummaryInContext = (name: string, value: boolean): void => {
+    const r = runs.get(name)
+    if (!r) return
+    deps.summaryStore?.set(r.manifest.owner, value)
+    if (r.session) r.session.config.config.memory.summaryInContext = value
+    postTasks()
   }
 
   /** 手动压缩的目标。返回字符串 = 拒绝原因。关闭中的不压：关闭流程自己在
@@ -810,7 +920,13 @@ export function createTaskCenter(deps: TaskDeps) {
             await session.summarizeIdle()
           } catch (error) {
             failures++
-            logRun({ ev: 'task_close_summary_fail', folder: deps.folder, task: name, i, error: String(error) })
+            logRun({
+              ev: 'task_close_summary_fail',
+              folder: deps.folder,
+              task: name,
+              i,
+              error: String(error),
+            })
           }
           // 债 = 摘要器挑不出段（session.summaryDebt，与 summarizeIdle 同一
           // 判据——原来这里是 task.ts 里同构的第二份 SQL，判据演进会漂移）
@@ -846,14 +962,15 @@ export function createTaskCenter(deps: TaskDeps) {
 
   const stop = (name: string): boolean => {
     const r = runs.get(name)
-    if (!r || r.status !== 'running') return false
+    if (r?.status !== 'running') return false
     r.stopRequested = true
     void r.sessionP?.then((s) => s?.interrupt('task_stop')).catch(() => {})
     return true
   }
 
   /** 任务名 → owner（登记父任务用）。省略或已不在 = 主任务 '' */
-  const ownerOf = (name?: string): string => (name === undefined ? '' : (runs.get(name)?.manifest.owner ?? ''))
+  const ownerOf = (name?: string): string =>
+    name === undefined ? '' : (runs.get(name)?.manifest.owner ?? '')
 
   /** 任一分身在跑（folder tab 绿点用——分身干活也算这个目录在忙） */
   const anyRunning = (): boolean => {
@@ -867,14 +984,28 @@ export function createTaskCenter(deps: TaskDeps) {
     dispatchUnique,
     create,
     ownerOf,
+    /** owner → 任务名（唤醒的定向投递用）。null = 没有这个 owner 的任务 */
+    nameOfOwner: (owner: string): string | null =>
+      ([...runs.values()].find((r) => r.manifest.owner === owner) ?? { name: null }).name ?? null,
     send,
     open,
     sessionOf,
+    setSummaryInContext,
     compactTarget,
-    approvalOnOf,
-    setApprovalOn,
+    attendanceOf,
+    setAttendance,
     setModel,
     setEffort,
+    /** task_send 列任务（loop-interrupt.md 实现项 2）：agent 的任务视野——
+     *  名字、状态、最近一句。数据与机器人总览同源（runs） */
+    listOverview: () =>
+      [...runs.values()]
+        .filter((r) => r.status !== 'closing')
+        .map((r) => ({
+          name: r.name,
+          status: r.status,
+          lastLine: r.lastText.split('\n', 1)[0]?.slice(0, 120) ?? '',
+        })),
     close,
     stop,
     states,
@@ -887,6 +1018,7 @@ export function createTaskCenter(deps: TaskDeps) {
           running: r.status === 'running',
           startedAt: r.startedAt ?? null,
           lastTurn: r.lastTurn ?? null,
+          userTouched: r.userTouched === true,
         })),
     /** attach（ready/切回）时补发：任务快照 + 各任务面板基线。
      *  空清单不发——webview 的任务态是目录切换即清的，attach 面对的是
@@ -904,7 +1036,6 @@ export function createTaskCenter(deps: TaskDeps) {
       runs.clear()
     },
   }
-
 }
 
 export type TaskCenter = ReturnType<typeof createTaskCenter>

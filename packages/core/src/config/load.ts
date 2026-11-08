@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve as resolvePath } from 'node:path'
 import type { z } from 'zod'
@@ -6,7 +6,7 @@ import type { Protocol } from '../llm/protocol.ts'
 import { resolveProtocol } from '../llm/registry.ts'
 import type { Effort, Request } from '../llm/types.ts'
 import { deepMerge, stripDenied } from './denylist.ts'
-import { expandEnv } from './env.ts'
+import { expandEnv, expandTilde } from './env.ts'
 import { type Config, configSchema, type ModelSpec } from './schema.ts'
 
 export const GLOBAL_CONFIG_PATH = join(homedir(), '.simple-code', 'settings.json')
@@ -19,6 +19,28 @@ export const MCP_CONFIG_PATH = join(homedir(), '.simple-code', 'mcp.json')
  *  bash 白名单 env 运行，宿主变量不在里面，key 只能落明文进文件） */
 export const WEBSEARCH_CONFIG_PATH = join(homedir(), '.simple-code', 'websearch.json')
 export const WORKSPACE_CONFIG_RELATIVE = join('.simple-code', 'settings.json')
+
+/**
+ * 上下文面板「历史摘要」开关的落盘（2026-11-03）：写进**项目级**
+ * `.simple-code/settings.json` 的 `memory.summaryInContext`。只动这一个键
+ * ——先读原文件、改键、整份写回，没配过的项目顺手建文件。调用方
+ * （bridge）同时改内存里的 config 对象，下一轮装配即生效；这里只管持久化
+ */
+export async function writeWorkspaceSummaryInContext(root: string, value: boolean): Promise<void> {
+  const path = join(root, '.simple-code', 'settings.json')
+  let json: Record<string, unknown> = {}
+  try {
+    json = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>
+  } catch {
+    // 不存在或损坏都从空对象起——损坏的文件这里直接覆盖掉有点狠，但
+    // strict schema 本来就会拒绝它，保持「面板开关能用」优先
+  }
+  const memory = (json.memory ?? {}) as Record<string, unknown>
+  memory.summaryInContext = value
+  json.memory = memory
+  await mkdir(join(root, '.simple-code'), { recursive: true })
+  await writeFile(path, JSON.stringify(json, null, 2) + '\n', 'utf8')
+}
 
 export type LoadedConfig = {
   config: Config
@@ -112,13 +134,18 @@ export type ImageModel = { model: string; baseUrl: string; apiKey: string }
  * 解析 `imageModel`：未配置返回 null（调用方报「未配置」）；provider 不存在
  * 抛错。model 不校验是否登记在 provider.models——生图模型不是对话模型
  */
-export function resolveImageModel(config: Config, env: NodeJS.ProcessEnv = process.env): ImageModel | null {
+export function resolveImageModel(
+  config: Config,
+  env: NodeJS.ProcessEnv = process.env,
+): ImageModel | null {
   const ref = config.imageModel
   if (ref === null) return null
   const provider = config.providers[ref.provider]
   if (!provider) {
     const known = Object.keys(config.providers).join(' / ') || '(一个都没配)'
-    throw new Error(`imageModel 的 provider "${ref.provider}" 不在 providers 里。已配置的：${known}`)
+    throw new Error(
+      `imageModel 的 provider "${ref.provider}" 不在 providers 里。已配置的：${known}`,
+    )
   }
   return { model: ref.model, baseUrl: provider.baseUrl, apiKey: expandEnv(provider.apiKey, env) }
 }
@@ -143,6 +170,14 @@ export async function loadConfig(
   folderPath: string,
   options: LoadOptions = {},
 ): Promise<LoadedConfig> {
+  // ~ 工作区禁令（v2 §2.2，2026-11-04 拍板）：home 当工作区会让「项目内」
+  // 豁免罩住整个用户目录——~/.ssh、~/.zshrc 全变成「项目内隐藏路径」。
+  // 提前报错而不是静默放行，用户把文件夹指到具体项目即可
+  if (resolvePath(folderPath) === homedir()) {
+    throw new Error(
+      `工作区不能是用户主目录（~）：这会让项目内豁免罩住整个 home。\n请打开一个具体的项目文件夹。`,
+    )
+  }
   const globalPath = options.globalPath ?? GLOBAL_CONFIG_PATH
   const workspacePath = join(folderPath, WORKSPACE_CONFIG_RELATIVE)
 
@@ -180,9 +215,9 @@ async function readJson(path: string, required = false): Promise<unknown> {
     // 放在共用加载入口：面板、终端对话和 --models 都需要首次运行指引。
     throw new Error(
       `还没有配置文件：${path}\n\n` +
-      `请按快速开始创建配置：\nhttps://github.com/lnexp/simple-code#快速开始\n\n` +
-      `配置中可用 \${SIMPLE_CODE_API_KEY} 引用密钥环境变量，别把 key 写进文件。\n` +
-      `设置变量后，终端需在当前 shell 导出；VS Code 请完全退出后重新打开。`,
+        `请按快速开始创建配置：\nhttps://github.com/lnexp/simple-code#快速开始\n\n` +
+        `配置中可用 \${SIMPLE_CODE_API_KEY} 引用密钥环境变量，别把 key 写进文件。\n` +
+        `设置变量后，终端需在当前 shell 导出；VS Code 请完全退出后重新打开。`,
     )
   }
   try {
@@ -218,6 +253,10 @@ function resolve(
   /** 当前选中的参数预设（ModelRef.preset）。undefined = 用模型本体 */
   preset?: string,
 ): LoadedConfig {
+  // ~ 路径在解析入口统一展开：loadSdk 的 isAbsolute 校验、model-fetch
+  // 拿到的都已是展开后的绝对路径。写回 settings 的是原 json，不受影响
+  if (config.claudeAgentSdkPath) config.claudeAgentSdkPath = expandTilde(config.claudeAgentSdkPath)
+
   const provider = config.providers[config.provider]
   if (!provider) {
     const known = Object.keys(config.providers).join(' / ') || '(一个都没配)'
@@ -236,7 +275,9 @@ function resolve(
   // 买了 1h 缓存，过期判定就至少 1 小时——否则 5 分钟后照样 stale 压缩，1h 白买。
   // cacheTtlMs 是模型级、preset 改不了，只能从最终的 cacheTtl 推（2026-10-23）
   const model =
-    request.cacheTtl === '1h' ? { ...picked, cacheTtlMs: Math.max(picked.cacheTtlMs, 3_600_000) } : picked
+    request.cacheTtl === '1h'
+      ? { ...picked, cacheTtlMs: Math.max(picked.cacheTtlMs, 3_600_000) }
+      : picked
 
   const protocol = resolveProtocol(provider.protocol)
   if (model.claudeAgentSdk) {
@@ -299,11 +340,15 @@ function checkTaskModels(config: Config): void {
     const provider = config.providers[t.provider]
     if (!provider) {
       const known = Object.keys(config.providers).join(' / ') || '(一个都没配)'
-      throw new Error(`taskModels[${i}] 的 provider "${t.provider}" 不在 providers 里。已配置的：${known}`)
+      throw new Error(
+        `taskModels[${i}] 的 provider "${t.provider}" 不在 providers 里。已配置的：${known}`,
+      )
     }
     if (!provider.models[t.model]) {
       const known = Object.keys(provider.models).join(' / ') || '(一个都没配)'
-      throw new Error(`taskModels[${i}] "${t.model}" 不在 provider "${t.provider}" 的 models 里。已配置的：${known}`)
+      throw new Error(
+        `taskModels[${i}] "${t.model}" 不在 provider "${t.provider}" 的 models 里。已配置的：${known}`,
+      )
     }
   })
 }
@@ -320,9 +365,10 @@ function resolveSideModel(
   ref: string | { provider: string; model: string; effort?: Request['effort'] | undefined },
   config: Config,
   ctx: { env: NodeJS.ProcessEnv; warnings: string[] },
-  main: SideModel,
+  _main: SideModel,
 ): SideModel {
-  const [providerName, modelName] = typeof ref === 'string' ? [config.provider, ref] : [ref.provider, ref.model]
+  const [providerName, modelName] =
+    typeof ref === 'string' ? [config.provider, ref] : [ref.provider, ref.model]
   const provider = config.providers[providerName]
   if (!provider) {
     const known = Object.keys(config.providers).join(' / ') || '(一个都没配)'

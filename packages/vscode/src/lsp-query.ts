@@ -44,16 +44,22 @@ export async function handleQuery(exec: Exec, req: LspRequest): Promise<string> 
   const fsPath = file
   const providerCmd = COMMANDS[cmd]
   if (providerCmd !== undefined) {
-    const res = await exec(providerCmd, { scheme: 'file', path: fsPath } as any, { line: line - 1, character: col - 1 } as any)
+    const res = await exec(
+      providerCmd,
+      { scheme: 'file', path: fsPath } as any,
+      { line: line - 1, character: col - 1 } as any,
+    )
     if (cmd === 'symbols') {
       const lines = formatSymbols(res ?? [])
       return lines.length > 0 ? lines.join('\n') : '无结果：该文件没有语言服务，或文件为空'
     }
     if (cmd === 'hover') {
-      const texts = (res ?? []).map((h: any) => {
-        const c = Array.isArray(h.contents) ? h.contents : [h.contents]
-        return c.map((x: any) => (typeof x === 'string' ? x : x?.value ?? '')).join('\n')
-      }).filter(Boolean)
+      const texts = (res ?? [])
+        .map((h: any) => {
+          const c = Array.isArray(h.contents) ? h.contents : [h.contents]
+          return c.map((x: any) => (typeof x === 'string' ? x : (x?.value ?? ''))).join('\n')
+        })
+        .filter(Boolean)
       return texts.length > 0 ? texts.join('\n---\n') : '无结果：该位置没有 hover 信息'
     }
     const locs = (res ?? []).map(loc).filter((s: string) => !s.startsWith('?'))
@@ -64,7 +70,11 @@ export async function handleQuery(exec: Exec, req: LspRequest): Promise<string> 
     // outgoing 没有内置 execute 命令（实测 not found）。prepare 能拿 item
     // 但展开不了方向——等上游补命令再上真调用层级；眼下用 refs 近似：
     // 定义处全部引用 = 调用方的超集（含类型引用），标注清楚不冒充精确
-    const viaRefs = await exec('vscode.executeReferenceProvider', { scheme: 'file', path: fsPath } as any, { line: line - 1, character: col - 1 } as any)
+    const viaRefs = await exec(
+      'vscode.executeReferenceProvider',
+      { scheme: 'file', path: fsPath } as any,
+      { line: line - 1, character: col - 1 } as any,
+    )
     const locs = (viaRefs ?? []).map(loc).filter((s: string) => !s.startsWith('?'))
     return locs.length > 0
       ? `（近似——宿主未公开调用层级展开命令，以下是全部引用，含类型引用）\n${locs.join('\n')}`

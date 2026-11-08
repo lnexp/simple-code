@@ -1,5 +1,5 @@
 import { WEBSEARCH_CONFIG_PATH } from '../config/load.ts'
-import { readWebsearchConfig, websearchEndpoint, type WebsearchConfig } from '../tools/websearch.ts'
+import { readWebsearchConfig, type WebsearchConfig, websearchEndpoint } from '../tools/websearch.ts'
 import type { RouteResolver } from './credential-proxy.ts'
 
 /** websearch 路由路径。websearch-bin 写死同一字面量 */
@@ -19,4 +19,5 @@ export function websearchRoutes(load: () => Promise<WebsearchConfig>): RouteReso
 }
 
 /** 每次请求现读（改了 websearch.json 不用 reload），宿主进程 env 展开 */
-export const loadWebsearchConfig = (): Promise<WebsearchConfig> => readWebsearchConfig(WEBSEARCH_CONFIG_PATH)
+export const loadWebsearchConfig = (): Promise<WebsearchConfig> =>
+  readWebsearchConfig(WEBSEARCH_CONFIG_PATH)

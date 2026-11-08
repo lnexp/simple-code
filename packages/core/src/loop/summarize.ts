@@ -1,7 +1,7 @@
-import { estimateMessageTokens } from './tokens.ts'
 import type { Message, Part, Request } from '../llm/types.ts'
 import type { LiveMessage, Summary } from './assemble.ts'
 import { INDEX_LINE_MAX_CHARS } from './index-cap.ts'
+import { estimateMessageTokens } from './tokens.ts'
 
 /**
  * L0 摘要：把一个 turn 压成一两句「想做什么 + 工具返回了什么」（design.md §9.6）。
@@ -12,7 +12,7 @@ import { INDEX_LINE_MAX_CHARS } from './index-cap.ts'
  */
 
 /** 一个待摘要的 turn */
-export type Candidate = { turnId: number; messages: Message[] }
+type Candidate = { turnId: number; messages: Message[] }
 
 /**
  * 挑下一个该摘要的 turn：**最老的、还没有摘要行的、且不是当前 turn 的**。
@@ -263,7 +263,7 @@ export function cleanSummaryText(raw: string): string {
  * 一个可合并的组：连续、都已生效的一批摘要。通常同层；同层凑不满时是跨层
  * 兜底组（方案 D），`level` = 成员最高层，新节点 = level + 1
  */
-export type MergeGroup = {
+type MergeGroup = {
   level: number
   members: Summary[]
 }
@@ -628,11 +628,15 @@ export function activateBeyondStubZone(opts: {
   // 只防一件事：与在场摘要重叠（重复顶替同一段）。高层优先——同一段有 L1
   // 和未合并的 L0 并存时，先进 L1，L0 随之被判重叠
   const active = all.filter((s) => s.inContext).map((s) => [s.coversFrom, s.coversTo] as const)
-  const overlapsActive = (s: Summary) => active.some(([from, to]) => from <= s.coversTo && to >= s.coversFrom)
-  const orphans = ready.filter((s) => liveIn(s).length === 0).sort((a, b) => b.level - a.level || a.coversFrom - b.coversFrom)
+  const overlapsActive = (s: Summary) =>
+    active.some(([from, to]) => from <= s.coversTo && to >= s.coversFrom)
+  const orphans = ready
+    .filter((s) => liveIn(s).length === 0)
+    .sort((a, b) => b.level - a.level || a.coversFrom - b.coversFrom)
   for (const summary of orphans) {
     if (overlapsActive(summary)) continue
-    if (opts.activateSummary(summary.coversFrom)) active.push([summary.coversFrom, summary.coversTo])
+    if (opts.activateSummary(summary.coversFrom))
+      active.push([summary.coversFrom, summary.coversTo])
   }
 
   if (ceiling === 0) return
@@ -650,7 +654,8 @@ export function activateBeyondStubZone(opts: {
   // 15M 号 1.2s/587MB，过 V8 Set 上限约 1677 万直接抛 RangeError）。
   // live × 链根 都只有几百
   const roots = opts.summaries().filter((s) => s.supersededBy === null)
-  const coveredBy = (id: number): boolean => roots.some((s) => s.coversFrom <= id && id <= s.coversTo)
+  const coveredBy = (id: number): boolean =>
+    roots.some((s) => s.coversFrom <= id && id <= s.coversTo)
   const uncovered = opts.live.some((entry, index) => index < ceiling && !coveredBy(entry.stepId))
   if (uncovered) opts.kick?.()
 }
@@ -685,4 +690,3 @@ function stubCeiling(
   }
   return 0
 }
-

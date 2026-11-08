@@ -65,10 +65,7 @@ export function usageRatio(estimate: number, real: unknown): number | null {
  * 纯 canonical `Message`，`state='unloaded'` 那类库里的标记跟着 store 留在
  * session 层，跨不过来。`isStubbed` 那边同样是按文本判的，两处口径一致。
  */
-export function regionSizes(
-  request: Request,
-  floor?: ReadonlySet<Message>,
-): RegionSizes {
+export function regionSizes(request: Request, floor?: ReadonlySet<Message>): RegionSizes {
   const sizes: RegionSizes = {
     overhead: overheadTokens(request),
     cold: 0,
@@ -110,12 +107,20 @@ const summaryText = (message: Message): string =>
  * 多少」看起来比实际好。宁可让 ③ 偏大一点——它本来就是被怀疑没起作用的那个区
  * （§13.4 ③），高估不会让人误以为它有效。
  */
-function isStubPart(part: Part): boolean {
+export function isStubPart(part: Part): boolean {
   if (part.type === 'tool_result') return isStubbed(part.output)
   if (part.type !== 'tool_call') return false
   const command = (part.input as { command?: unknown } | null)?.command
   return typeof command === 'string' && isStubbed(command)
 }
+
+/** 整条消息是否存根（2026-11-03）：lean 装配过滤用的全口径——text part
+ *  的存根形态（正文 + 行尾〔已卸载〕通知）∪ tool_result.output /
+ *  tool_call.command 尾部（isStubPart，记账同款）。两任实现各漏一半的
+ *  教训：只看 text part 漏掉 tool 存根（真机 38k 条卸载几乎全是），
+ *  只用 isStubPart 漏掉 text 存根 */
+export const isStubMessage = (message: Message): boolean =>
+  message.parts.some((p) => (p.type === 'text' && isStubbed(p.text)) || isStubPart(p))
 
 /**
  * 工具定义走 `tool_call` 这个分支不是取巧：它们序列化出去就是密集 JSON，

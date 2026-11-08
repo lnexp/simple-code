@@ -1,6 +1,12 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
-import { createServer, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import {
+  createServer,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { expandEnvTemplate } from '../config/env.ts'
 import { MCP_CONFIG_PATH } from '../config/load.ts'
@@ -24,7 +30,11 @@ import { loadWebsearchConfig, websearchRoutes } from './websearch-route.ts'
  * 一条路由解析出的上游。headers 已展开、键名小写。body：钉死的 JSON 字段，
  * 覆盖调用方给的同名字段（生图的 model 由配置定，bin 选不了）
  */
-export type ProxyRoute = { url: string; headers: Record<string, string>; body?: Record<string, unknown> }
+export type ProxyRoute = {
+  url: string
+  headers: Record<string, string>
+  body?: Record<string, unknown>
+}
 /** 路径+方法 → 上游。undefined = 不在路由表（403）；抛错 = 配置错（500，消息只含变量名） */
 export type RouteResolver = (path: string, method: string) => Promise<ProxyRoute | undefined>
 type Log = (ev: Record<string, unknown>) => void
@@ -34,11 +44,28 @@ export type CredentialProxyOptions = { token: string; resolve: RouteResolver; lo
 const METHODS = new Set(['GET', 'POST', 'DELETE'])
 /** 入站不转发：逐跳头、长度/压缩交给 fetch 重算，以及任何调用方自带的凭据 */
 const DROP_REQUEST = new Set([
-  'host', 'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade',
-  'te', 'trailer', 'content-length', 'accept-encoding', 'authorization', 'cookie', PROXY_TOKEN_HEADER,
+  'host',
+  'connection',
+  'keep-alive',
+  'proxy-connection',
+  'transfer-encoding',
+  'upgrade',
+  'te',
+  'trailer',
+  'content-length',
+  'accept-encoding',
+  'authorization',
+  'cookie',
+  PROXY_TOKEN_HEADER,
 ])
 /** 出站不回传：fetch 已解压，原长度/编码头会让客户端按错的格式读 */
-const DROP_RESPONSE = new Set(['content-encoding', 'content-length', 'transfer-encoding', 'connection', 'keep-alive'])
+const DROP_RESPONSE = new Set([
+  'content-encoding',
+  'content-length',
+  'transfer-encoding',
+  'connection',
+  'keep-alive',
+])
 
 export function createCredentialProxy(opts: CredentialProxyOptions): Server {
   return createServer((req, res) => {
@@ -65,14 +92,21 @@ async function readBody(req: IncomingMessage): Promise<Uint8Array<ArrayBuffer>> 
 }
 
 /** 把路由钉死的字段叠进调用方的 JSON 体。不是 JSON 对象就抛（转 400） */
-function pinBody(raw: Uint8Array<ArrayBuffer>, pinned: Record<string, unknown>): Uint8Array<ArrayBuffer> {
+function pinBody(
+  raw: Uint8Array<ArrayBuffer>,
+  pinned: Record<string, unknown>,
+): Uint8Array<ArrayBuffer> {
   const parsed: unknown = JSON.parse(Buffer.from(raw).toString('utf8'))
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('请求体须是 JSON 对象')
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed))
+    throw new Error('请求体须是 JSON 对象')
   return new Uint8Array(Buffer.from(JSON.stringify({ ...parsed, ...pinned })))
 }
 
 /** 入站头去掉 DROP_REQUEST 与将要注入的同名头，再叠上路由的头 */
-export function forwardHeaders(incoming: IncomingHttpHeaders, inject: Record<string, string>): Record<string, string> {
+export function forwardHeaders(
+  incoming: IncomingHttpHeaders,
+  inject: Record<string, string>,
+): Record<string, string> {
   const out: Record<string, string> = {}
   for (const [key, value] of Object.entries(incoming)) {
     if (value === undefined || DROP_REQUEST.has(key) || Object.hasOwn(inject, key)) continue
@@ -99,7 +133,11 @@ async function pipeResponse(upstream: Response, res: ServerResponse): Promise<nu
   return bytes
 }
 
-async function forward(req: IncomingMessage, res: ServerResponse, route: ProxyRoute): Promise<[number, number]> {
+async function forward(
+  req: IncomingMessage,
+  res: ServerResponse,
+  route: ProxyRoute,
+): Promise<[number, number]> {
   let body = req.method === 'POST' ? await readBody(req) : undefined
   if (body && route.body) {
     try {
@@ -140,15 +178,28 @@ function worthLogging(method: string | undefined, status: number): boolean {
   return !(method === 'GET' && status === 405)
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse, opts: CredentialProxyOptions): Promise<void> {
+async function handle(
+  req: IncomingMessage,
+  res: ServerResponse,
+  opts: CredentialProxyOptions,
+): Promise<void> {
   const started = Date.now()
   const path = (req.url ?? '/').split('?')[0] ?? '/'
   const log = (status: number, bytes = 0): void => {
     if (worthLogging(req.method, status))
-      opts.log?.({ ev: 'proxy_req', path, method: req.method, status, ms: Date.now() - started, bytes })
+      opts.log?.({
+        ev: 'proxy_req',
+        path,
+        method: req.method,
+        status,
+        ms: Date.now() - started,
+        bytes,
+      })
   }
-  if (!tokenOk(req.headers[PROXY_TOKEN_HEADER], opts.token)) return log(reject(res, 401, 'token 缺失或不对'))
-  if (!METHODS.has(req.method ?? '')) return log(reject(res, 403, `不允许的方法 ${req.method ?? ''}`))
+  if (!tokenOk(req.headers[PROXY_TOKEN_HEADER], opts.token))
+    return log(reject(res, 401, 'token 缺失或不对'))
+  if (!METHODS.has(req.method ?? ''))
+    return log(reject(res, 403, `不允许的方法 ${req.method ?? ''}`))
   let route: ProxyRoute | undefined
   try {
     route = await opts.resolve(path, req.method ?? '')
@@ -180,7 +231,10 @@ async function readMcpServers(path: string): Promise<McpServers> {
  * `/mcp/<server>` → mcp.json 里该 server 的 url 与 headers。每次请求现读，
  * 改了 mcp.json 不用 reload。stdio 型与未配置的 server 都不在路由表
  */
-export function mcpRoutes(read: () => Promise<McpServers>, env: NodeJS.ProcessEnv = process.env): RouteResolver {
+export function mcpRoutes(
+  read: () => Promise<McpServers>,
+  env: NodeJS.ProcessEnv = process.env,
+): RouteResolver {
   return async (path) => {
     const m = /^\/mcp\/([^/]+)$/.exec(path)
     if (!m?.[1]) return undefined
@@ -189,7 +243,10 @@ export function mcpRoutes(read: () => Promise<McpServers>, env: NodeJS.ProcessEn
     const cfg = Object.hasOwn(servers, name) ? servers[name] : undefined
     if (!cfg || !isHttpServer(cfg)) return undefined
     const headers = Object.fromEntries(
-      Object.entries(cfg.headers ?? {}).map(([k, v]) => [k.toLowerCase(), expandEnvTemplate(v, env)]),
+      Object.entries(cfg.headers ?? {}).map(([k, v]) => [
+        k.toLowerCase(),
+        expandEnvTemplate(v, env),
+      ]),
     )
     return { url: cfg.url, headers }
   }

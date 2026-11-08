@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { ensureBucketFile, listBucketFiles, resolveBucketFile, turnBucket } from './buckets.ts'
@@ -52,7 +53,17 @@ const pad = (n: number): string => String(n).padStart(6, '0')
  * turn 号仍保留在最前面：和 `turns/000/turn-000087.jsonl` 对得上，人和模型都能
  * 一眼看出这个叶子讲的是哪一轮。
  */
-export const leafName = (turn: number, from: number): string => `turn-${pad(turn)}-s${pad(from)}.md`
+/**
+ * owner 隔离（2026-11-06 fork 覆盖事故）：任务写的叶子带 owner 短哈希后缀，
+ * 主任务（owner = ''）不带——与全部现存文件兼容。事故：fork 任务压缩继承行
+ * 时与主任务写到同一文件名（turn+from 相同），覆盖了主任务的摘要正文，
+ * 炸出 PrefixBrokenError（前缀守卫三次）。
+ */
+const ownerTag = (owner: string): string =>
+  owner === '' ? '' : `@${createHash('sha1').update(owner).digest('hex').slice(0, 8)}`
+
+export const leafName = (turn: number, from: number, owner = ''): string =>
+  `turn-${pad(turn)}-s${pad(from)}${ownerTag(owner)}.md`
 
 export const leafPath = (dir: string, turn: number, from: number): string =>
   join(dir, SUMMARIES, turnBucket(turn), leafName(turn, from))
@@ -134,10 +145,10 @@ function parseCovers(raw: string | undefined): [number | null, number | null] {
   return [from, to]
 }
 
-export function writeLeaf(dir: string, leaf: Leaf): void {
+export function writeLeaf(dir: string, leaf: Leaf, owner = ''): void {
   // ensureBucketFile 顺手建桶目录，这里不用再 mkdir summaries/
   writeFileSync(
-    ensureBucketFile(dir, SUMMARIES, leafName(leaf.turn, leaf.coversFrom)),
+    ensureBucketFile(dir, SUMMARIES, leafName(leaf.turn, leaf.coversFrom, owner)),
     formatLeaf(leaf),
     'utf8',
   )
@@ -159,13 +170,16 @@ export function readLeaf(dir: string, turn: number, from: number): Leaf | null {
  * `readdir` 定位、只读命中的那几个——`listLeaves` 会把叶子全读一遍，而热区
  * 只要两三个（§4.4），每轮请求都全读是白花的 IO。
  */
-export function readLeavesByCovers(dir: string, froms: number[]): Map<number, Leaf> {
+export function readLeavesByCovers(dir: string, froms: number[], owner = ''): Map<number, Leaf> {
   const out = new Map<number, Leaf>()
   if (froms.length === 0) return out
   const files = listBucketFiles(dir, SUMMARIES, '.md') // 平铺 + 桶两层合并
   for (const from of froms) {
-    const suffix = `-s${pad(from)}.md`
-    const file = files.find((f) => f.endsWith(suffix))
+    // owner 视角：任务的叶子带 @tag 后缀，主任务（空 owner）必须排除它们，
+    // 否则 @tag 文件 endsWith('-sXXX.md') 恰好也成立（后缀在 .md 之前）——
+    // 事故里主任务热区读到的就是任务的叶子
+    const suffix = owner === '' ? `-s${pad(from)}.md` : `-s${pad(from)}${ownerTag(owner)}.md`
+    const file = files.find((f) => f.endsWith(suffix) && (owner !== '' || !f.includes('@')))
     if (file === undefined) continue
     try {
       const leaf = parseLeaf(readFileSync(file, 'utf8'))

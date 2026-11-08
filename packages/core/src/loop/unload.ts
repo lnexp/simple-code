@@ -66,8 +66,9 @@ export function unloadMessage(msg: Message, opts: ClipOptions): Message {
   return {
     ...msg,
     parts: msg.parts
-      
-      .filter((part) => !(drop && part.type === 'reasoning')).map((part) => unloadPart(part, opts)),
+
+      .filter((part) => !(drop && part.type === 'reasoning'))
+      .map((part) => unloadPart(part, opts)),
   }
 }
 
@@ -140,7 +141,8 @@ function clipOutput(text: string, opts: ClipOptions): string {
   const head = headEnd > 0 ? rawHead.slice(0, headEnd) : rawHead
   const rawTail = body.slice(body.length - tailChars)
   const tailStart = rawTail.indexOf('\n')
-  const tail = tailStart >= 0 && tailStart < rawTail.length - 1 ? rawTail.slice(tailStart + 1) : rawTail
+  const tail =
+    tailStart >= 0 && tailStart < rawTail.length - 1 ? rawTail.slice(tailStart + 1) : rawTail
   const omitted = body.length - head.length - tail.length
   const clipped = `${head}\n# …（省略 ${omitted} 字符）…\n${tail}\n# [已卸载，完整内容见 ${opts.archive}]`
   return clipped.length < text.length ? clipped : text

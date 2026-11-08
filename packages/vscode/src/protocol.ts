@@ -1,6 +1,6 @@
 import type {
   AgentEvent,
-  ApprovalCategory,
+  ApprovalAsk,
   BgProcessInfo,
   CompactResult,
   Effort,
@@ -27,6 +27,10 @@ import type { ChatItem, ChatView } from '../webview/events.ts'
  * 向扩展请求有返回值的操作，加 id 配对是为不存在的需求付复杂度。
  * 见 vscode-impl.md §5.2
  */
+
+/** 审批值守三态（2026-11-04 拍板）：有人值守=弹卡等人；无人值守=ask 一律
+ * 按无人处理拒（模型读到「当前无人处理审批，不是用户拒绝」）；关闭=触发即放行 */
+export type Attendance = 'attended' | 'unattended' | 'off'
 
 export type ToHost =
   /**
@@ -72,7 +76,7 @@ export type ToHost =
     }
   /** 输入框下的审批开关（approval.md §4.2 两态）。task：分支自己的开关
    *  （2026-09-22 拍板：审批配置跟分支走）；缺省 = 主干/folder 级 */
-  | { type: 'setApprovalEnabled'; on: boolean; task?: string }
+  | { type: 'setAttendance'; mode: Attendance; task?: string }
   /** 用户点掉一组后台残留进程（一条命令留下的整个进程组）。宿主 TERM 整组后
    *  回一条 bg_processes 更新列表。
    *  folder：该进程所属的 bridge——多根下 registry 各目录独立，pgid 只在
@@ -82,6 +86,10 @@ export type ToHost =
   /** 要一份上下文分区快照（点状态行「上下文 X」弹出面板）。响应是 regions。
    *  task：查分支的库——上下文环跟着分支走，不拿主干的数字骗人 */
   | { type: 'get_regions'; task?: string }
+  /** 上下文面板「历史摘要」开关（2026-11-03）。task：分支独立（改该任务
+   *  session 的内存 config + 持久化）；缺省 = 主任务（folder 级，写项目
+   *  .simple-code/settings.json）。下一轮装配生效 */
+  | { type: 'set_summary_in_context'; value: boolean; task?: string }
   /** 手动压缩（上下文分析面板的按钮，2026-10-17）。task：压分支；缺省 = 主任务。
    *  响应是 compact_result。只在停止时能压，跑着的 session 由 core 拒绝 */
   | { type: 'compact'; task?: string }
@@ -122,36 +130,18 @@ export type ToWebview =
    *  镜像用同一个值，切回重放时秒表起点不漂 */
   | { type: 'agent'; event: AgentEvent; at: number }
   /** 要审批的命令到了，渲染成气泡等 approval_reply */
-  | {
+  | ({
       type: 'approval_request'
       /** 超时自动拒绝的墙钟时刻（bridge 的 setTimer 同款口径）。
        * 卡上倒计时用；attach 重推的是同一对象，剩余时间自动变短 */
       expiresAt: number
       /** 发卡的是哪个文件夹——后台跑着的轮弹的卡带这个，卡片上标注 */
       folder?: string
-      /** 分身任务弹的卡带这个：任务名。卡片标注来源，面板内过滤也靠它 */
-      task?: string
       id: number
-      command: string
-      toolCallId: string
-      category: ApprovalCategory
-      detail: string
-      reason: string
-      /** multi 卡合并前各段的类别（core approval.ts）。桌面机器人据此判能否在它上面允许 */
-      parts?: ApprovalCategory[]
-      /** 支持「始终允许」时的预览（会往 approval.json 记什么）。
-       * 没有字段 = 该卡不出第三键（隐藏路径等不收敛场景）。
-       * nonpath：该命令从第 from 位（0 基）位置参数起不判为路径
-       * （元素寻址工具的误拦采集） */
-      always?:
-        | { kind: 'lead'; lead: string }
-        | { kind: 'path'; dir: string }
-        | { kind: 'nonpath'; lead: string; from: number }
-        /** paths：multi 卡同质 external_dir 的批量目录（方案 1，
-         * 2026-09-21）——按钮「始终允许这 N 个目录」 */
-        | { kind: 'paths'; dirs: string[]; hidden?: { path: string; write: boolean }[] }
-        | { kind: 'hidden'; path: string; write: boolean }
-    }
+      /** 载荷（ApprovalAsk）：command/toolCallId/category/detail/reason/
+       * parts/always/task——core types.ts 唯一权威，四处消费收敛于此
+       * （2026-11-05：曾经各写一份，拆 lead 时漏改过 bridge） */
+    } & ApprovalAsk)
   /** 气泡关掉（答复/超时/中断）。webview 重载后收不到它——超时兜底在宿主 */
   /** folder：非 active 文件夹的卡关掉时路由层标注，webview 按 (folder,id) 关卡 */
   | { type: 'approval_closed'; id: number; folder?: string }
@@ -201,8 +191,10 @@ export type ToWebview =
        */
       preset?: string
       presets: string[]
-      /** 审批开关当前值。开关是宿主内存态，webview 重载后靠这条恢复 */
-      approvalOn: boolean
+      /** 审批值守态（2026-11-04 三态拍板）。宿主内存态，webview 重载后靠这条恢复 */
+      attendance: Attendance
+      /** 历史摘要开关当前值（memory.summaryInContext，folder 级） */
+      summaryInContext: boolean
       /**
        * 贴图通道可用：当前模型直收图，或配了 visionModel（非视觉模型下贴图
        * 走转述，与 view_image 同口径）。两者都不满足才拦粘贴——那时图发
@@ -306,7 +298,9 @@ export type TaskState = {
   imagesEnabled: boolean
   contextWindow: number
   /** 分支自己的审批开关（内存态，对齐主干） */
-  approvalOn: boolean
+  attendance: Attendance
+  /** 历史摘要开关（folder 级，主任务与分支同值——见 protocol 上面那条） */
+  summaryInContext: boolean
 }
 
 /** 单个文件夹的显示状态：路径 + 它的轮是否在跑（后台轮的 ● 标记） */

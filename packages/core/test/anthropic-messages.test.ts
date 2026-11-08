@@ -211,18 +211,27 @@ describe('anthropic-messages / parseStream', () => {
       throw new Error('没抛')
     }
     expect(
-      await caught({ type: 'bad_response_status_code', message: '上游服务错误[502]: bad response status code 502' }),
+      await caught({
+        type: 'bad_response_status_code',
+        message: '上游服务错误[502]: bad response status code 502',
+      }),
     ).toMatchObject({ kind: 'unknown', retryable: true })
-    expect(await caught({ type: '<nil>', message: 'No available accounts: no available accounts' })).toMatchObject({
+    expect(
+      await caught({ type: '<nil>', message: 'No available accounts: no available accounts' }),
+    ).toMatchObject({
       retryable: true,
     })
-    expect(await caught({ message: 'handshake timed out after 15000ms' })).toMatchObject({ retryable: true })
+    expect(await caught({ message: 'handshake timed out after 15000ms' })).toMatchObject({
+      retryable: true,
+    })
     // 对照组：流内也能认出的不可恢复错误，不能因为 status=0 就被放行重试
     expect(await caught({ type: 'authentication_error', message: 'bad key' })).toMatchObject({
       kind: 'auth',
       retryable: false,
     })
-    expect(await caught({ type: 'invalid_request_error', message: 'model not found' })).toMatchObject({
+    expect(
+      await caught({ type: 'invalid_request_error', message: 'model not found' }),
+    ).toMatchObject({
       kind: 'invalid_request',
       retryable: false,
     })
@@ -425,7 +434,9 @@ describe('anthropic-messages / 缓存断点', () => {
     const wireTools = b.tools as Record<string, unknown>[]
     expect(wireTools[0]).not.toHaveProperty('cache_control')
     expect(wireTools.at(-1)?.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
-    expect(messagesOf({ cacheTtl: '1h', messages: [text('甲')] })[0]?.content[0]?.cache_control).toEqual({
+    expect(
+      messagesOf({ cacheTtl: '1h', messages: [text('甲')] })[0]?.content[0]?.cache_control,
+    ).toEqual({
       type: 'ephemeral',
       ttl: '1h',
     })

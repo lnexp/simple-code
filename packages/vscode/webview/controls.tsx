@@ -73,7 +73,9 @@ export function ModelPicker({
       options={options}
       // payload 直接带 ModelRef，不用下标/拼接串反查——模型名本身可以含
       // `/`，拼了还要猜从哪断（同 core ModelRef 的理由）
-      onPick={(choice) => post({ type: 'setModel', choice, ...(task !== undefined ? { task } : {}) })}
+      onPick={(choice) =>
+        post({ type: 'setModel', choice, ...(task !== undefined ? { task } : {}) })
+      }
     />
   )
 }
@@ -137,12 +139,13 @@ export function PresetPicker({
       onPick={(name) =>
         post({
           type: 'setModel',
-          choice: name === undefined
-            ? { provider: current.provider, model: current.model }
-            : { ...current, preset: name },
+          choice:
+            name === undefined
+              ? { provider: current.provider, model: current.model }
+              : { ...current, preset: name },
           ...(task !== undefined ? { task } : {}),
         })
-     }
+      }
     />
   )
 }
@@ -235,13 +238,7 @@ export function EffortPicker({
  * 切换不打断后台轮（B 方案，用户拍板）——tab 只决定记忆存哪、UI 显示
  * 哪条上下文，agent 照样能 cd 到别的文件夹干活，tooltip 讲明这一点。
  */
-export function FolderTabs({
-  folders,
-  active,
-}: {
-  folders: FolderState[]
-  active: string
-}) {
+export function FolderTabs({ folders, active }: { folders: FolderState[]; active: string }) {
   const base = (p: string): string => p.split('/').filter(Boolean).pop() ?? p
   const rowRef = useRef<HTMLDivElement>(null)
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([])
@@ -295,7 +292,9 @@ export function FolderTabs({
       {shown.map((f, i) => (
         <button
           key={f.path}
-          ref={(el) => { tabRefs.current[i] = el }}
+          ref={(el) => {
+            tabRefs.current[i] = el
+          }}
           className={'folder-tab' + (f.path === active ? ' active' : '')}
           title={`${f.path}\n切换只换记忆和显示，不拦 agent 访问别的文件夹`}
           onClick={() => post({ type: 'switchFolder', folder: f.path })}
@@ -317,17 +316,19 @@ export function FolderTabs({
           label="»"
           title="更多文件夹"
           ariaLabel="更多文件夹"
-          options={overflow.map((f): MenuOption<string> => ({
-            key: f.path,
-            label: base(f.path),
-            ...(f.pendingApprovals > 0
-              ? { sub: `⚠ ${f.pendingApprovals} 个待审批` }
-              : f.running
-                ? { sub: '● 跑着' }
-                : {}),
-            selected: f.path === active,
-            payload: f.path,
-          }))}
+          options={overflow.map(
+            (f): MenuOption<string> => ({
+              key: f.path,
+              label: base(f.path),
+              ...(f.pendingApprovals > 0
+                ? { sub: `⚠ ${f.pendingApprovals} 个待审批` }
+                : f.running
+                  ? { sub: '● 跑着' }
+                  : {}),
+              selected: f.path === active,
+              payload: f.path,
+            }),
+          )}
           onPick={(folder) => post({ type: 'switchFolder', folder })}
         />
       )}
@@ -339,7 +340,9 @@ export function FolderTabs({
       {overflow.map((f, i) => (
         <button
           key={f.path}
-          ref={(el) => { tabRefs.current[shown.length + i] = el }}
+          ref={(el) => {
+            tabRefs.current[shown.length + i] = el
+          }}
           className="folder-tab tab-shadow"
           aria-hidden
           tabIndex={-1}

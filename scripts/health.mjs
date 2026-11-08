@@ -4,7 +4,7 @@
 // 每天人肉跑的 python（2026-10-08 起逐日重复），2026-10-16 固化。
 // 只读，不写任何东西。
 
-import { readFileSync, existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -15,8 +15,13 @@ if (!existsSync(file)) {
   process.exit(1)
 }
 
-const short = (f) => f.replace(/^\/Users\/[^/]+/, '~').split('/').pop() || f
-const pct = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor((sorted.length * p) / 100))]
+const short = (f) =>
+  f
+    .replace(/^\/Users\/[^/]+/, '~')
+    .split('/')
+    .pop() || f
+const pct = (sorted, p) =>
+  sorted[Math.min(sorted.length - 1, Math.floor((sorted.length * p) / 100))]
 
 const folder = {} // 项目活动
 const anomalous = {} // 异常事件: [count, sample]
@@ -68,7 +73,8 @@ for (const line of readFileSync(file, 'utf8').split('\n')) {
       lags.push(Number(e.ms) || 0)
       break
     case 'recall_select': {
-      const r = (recall[f] ??= { select: 0, unparsed: 0, noKw: 0, ms: [], inject: 0 })
+      if (!recall[f]) recall[f] = { select: 0, unparsed: 0, noKw: 0, ms: [], inject: 0 }
+      const r = recall[f]
       r.select++
       if ('unparsed' in e || 'error' in e) r.unparsed++
       if (!('keywords' in e)) r.noKw++
@@ -76,7 +82,8 @@ for (const line of readFileSync(file, 'utf8').split('\n')) {
       break
     }
     case 'recall_inject': {
-      const r = (recall[f] ??= { select: 0, unparsed: 0, noKw: 0, ms: [], inject: 0 })
+      if (!recall[f]) recall[f] = { select: 0, unparsed: 0, noKw: 0, ms: [], inject: 0 }
+      const r = recall[f]
       r.inject++
       break
     }
@@ -90,7 +97,18 @@ for (const line of readFileSync(file, 'utf8').split('\n')) {
       break
     }
     case 'llm_usage': {
-      const m = (cache[e.model ?? '?'] ??= { req: 0, rewrite: 0, input: 0, read: 0, write: 0, output: 0 })
+      const key = e.model ?? '?'
+      if (!cache[key]) {
+        cache[key] = {
+          req: 0,
+          rewrite: 0,
+          input: 0,
+          read: 0,
+          write: 0,
+          output: 0,
+        }
+      }
+      const m = cache[key]
       m.req++
       m.input += Number(e.input) || 0
       m.read += Number(e.cacheRead) || 0
@@ -107,7 +125,9 @@ console.log(`# 健康巡检 ${date}\n`)
 
 console.log('## 项目活动')
 for (const [f, s] of Object.entries(folder).sort((a, b) => b[1].llm - a[1].llm)) {
-  console.log(`  ${f.padEnd(20)} llm ${String(s.llm).padStart(5)}  tool ${String(s.toolRun).padStart(4)}  fail ${s.toolFail}`)
+  console.log(
+    `  ${f.padEnd(20)} llm ${String(s.llm).padStart(5)}  tool ${String(s.toolRun).padStart(4)}  fail ${s.toolFail}`,
+  )
 }
 
 console.log('\n## 异常事件')
@@ -125,7 +145,9 @@ console.log('\n## loop_lag')
 if (!lags.length) console.log('  零记录')
 else {
   const big = lags.filter((m) => m > 60_000)
-  console.log(`  ${lags.length} 条，>60s ${big.length} 条，最大 ${Math.round(Math.max(...lags) / 1000)}s（大值多为 macOS 睡眠，见 note loop-lag-is-macos-sleep）`)
+  console.log(
+    `  ${lags.length} 条，>60s ${big.length} 条，最大 ${Math.round(Math.max(...lags) / 1000)}s（大值多为 macOS 睡眠，见 note loop-lag-is-macos-sleep）`,
+  )
 }
 
 console.log('\n## recall')
@@ -145,9 +167,14 @@ for (const [cat, d] of Object.entries(approval).sort()) {
   const tot = d.allow + d.always + d.deny + d.noResult
   askTot += tot
   okTot += d.allow + d.always
-  console.log(`  ${cat.padEnd(14)} 弹 ${String(tot).padStart(3)}  放行 ${d.allow + d.always}  拒绝 ${d.deny}  无结果 ${d.noResult}`)
+  console.log(
+    `  ${cat.padEnd(14)} 弹 ${String(tot).padStart(3)}  放行 ${d.allow + d.always}  拒绝 ${d.deny}  无结果 ${d.noResult}`,
+  )
 }
-if (askTot) console.log(`  放行率 ${Math.round((okTot / askTot) * 100)}%（放行率高≠误弹：ask_rule 类是用户自设的确认流程）`)
+if (askTot)
+  console.log(
+    `  放行率 ${Math.round((okTot / askTot) * 100)}%（放行率高≠误弹：ask_rule 类是用户自设的确认流程）`,
+  )
 else console.log('  零弹卡')
 
 console.log('\n## 缓存健康（write>0 且 read=0 的请求数 = rewrite）')

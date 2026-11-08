@@ -220,7 +220,10 @@ describe('装配', () => {
   })
 
   it('模型状态行：配了 visionModel 时说明走转述', async () => {
-    const { dir, globalPath } = await workspace({ ...CONFIG, visionModel: { provider: 'p', model: 'm' } })
+    const { dir, globalPath } = await workspace({
+      ...CONFIG,
+      visionModel: { provider: 'p', model: 'm' },
+    })
     const s = scripted([says('好')])
     const session = await getSession(dir, {
       globalPath,
@@ -334,7 +337,11 @@ describe('AGENTS.md', () => {
   it('作废的 note（status: superseded）不进索引', async () => {
     const system = await systemAfterRound(async (dir) => {
       await mkdir(join(dir, '.simple-code', 'notes'), { recursive: true })
-      await writeFile(join(dir, '.simple-code', 'notes', 'live.md'), '---\nname: live\ndescription: 现行结论\n---\n\n# L', 'utf8')
+      await writeFile(
+        join(dir, '.simple-code', 'notes', 'live.md'),
+        '---\nname: live\ndescription: 现行结论\n---\n\n# L',
+        'utf8',
+      )
       await writeFile(
         join(dir, '.simple-code', 'notes', 'old.md'),
         '---\nname: old\ndescription: 旧结论\nstatus: superseded\nby: live\n---\n\n# O',
@@ -379,7 +386,9 @@ describe('AGENTS.md', () => {
 
   it('**产品工具约定：bin 注入了才进 system，条件拼**', async () => {
     // system prompt 是约定唯一不会衰减的载体（AGENTS.md 属于项目，这条属于产品）
-    const withPatch = await systemAfterRound(undefined, { SIMPLE_CODE_APPLY_PATCH: '/x/apply-patch.js' })
+    const withPatch = await systemAfterRound(undefined, {
+      SIMPLE_CODE_APPLY_PATCH: '/x/apply-patch.js',
+    })
     expect(withPatch).toContain('## 工具约定')
     expect(withPatch).toContain('SIMPLE_CODE_APPLY_PATCH')
     expect(withPatch).not.toContain('SIMPLE_CODE_MEMORY')

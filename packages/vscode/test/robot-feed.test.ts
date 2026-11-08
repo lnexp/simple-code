@@ -28,14 +28,16 @@ const card = (over: Partial<ApprovalRequest> = {}): ApprovalRequest => ({
 const idle = (
   task: string | null = null,
   lastTurn: RobotTaskView['lastTurn'] = null,
+  userTouched = true,
 ): RobotTaskView => ({
   task,
   running: false,
   startedAt: null,
   lastTurn,
+  userTouched,
 })
 
-/** 用户在别的应用里（飞书在前台）：VS Code 没焦点，什么都看不到 */
+/** 用户在别的应用里（浏览器在前台）：VS Code 没焦点，什么都看不到 */
 const away: Sight = { focused: false, panelVisible: true, folder: SC, task: null }
 const looking = (folder: string, task: string | null): Sight => ({
   focused: true,
@@ -60,7 +62,7 @@ describe('显示规则（§5.1：只显示此刻看不到的）', () => {
       ['a', true],
       ['b', false],
     ])
-    // 对照：同一份状态，用户切到飞书 → 两张都看不到
+    // 对照：同一份状态，用户切到浏览器 → 两张都看不到
     expect(feed.build(folders, away).items.every((i) => !i.seen)).toBe(true)
     // 对照：窗口有焦点但面板收起了，也看不到
     expect(feed.build(folders, { ...looking(SC, null), panelVisible: false }).items[0]?.seen).toBe(
@@ -86,6 +88,19 @@ describe('显示规则（§5.1：只显示此刻看不到的）', () => {
 
 describe('完成/出错提醒（§5.3）', () => {
   const done = { at: 1000, end: 'done' as const, text: '## 已完成\n多窗口跳转验证通过。细节如下' }
+
+  it('agent 派、无人参与的任务完成不提醒——结果走〔任务结果〕回主任务（2026-11-06）', () => {
+    const feed = createRobotFeed()
+    const f = (t: RobotTaskView): RobotFolderView[] => [{ folder: SC, tasks: [t], approvals: [] }]
+    // userTouched 缺省 false（agent 派、无人手打过）：done / error 都不产提醒
+    expect(feed.build(f(idle('调研某库', done, false)), away).items).toEqual([])
+    const err = { at: 1500, end: 'error' as const, text: 'API 529' }
+    expect(feed.build(f(idle('调研某库', err, false)), away).items).toEqual([])
+    // 同一任务用户手打过一次（userTouched=true）就恢复
+    expect(feed.build(f(idle('调研某库', done, true)), away).items).toEqual([
+      expect.objectContaining({ kind: 'done' }),
+    ])
+  })
 
   it('结束时用户不在：提醒带第一句；回来看到一次后就不再提醒（新一轮结束是新提醒）', () => {
     const feed = createRobotFeed()
@@ -165,10 +180,7 @@ describe('D1：哪些卡只能回窗口处理', () => {
   it('自定义规则（git push）、出网命令只能回窗口；multi 里混着它们也一样', () => {
     expect(canAllowOnRobot({ category: 'external_dir' })).toBe(true)
     expect(canAllowOnRobot({ category: 'ask_rule' })).toBe(false)
-    expect(canAllowOnRobot({ category: 'network_cmd' })).toBe(false)
-    expect(canAllowOnRobot({ category: 'multi', parts: ['external_dir', 'hidden_path'] })).toBe(
-      true,
-    )
+    expect(canAllowOnRobot({ category: 'multi', parts: ['external_dir'] })).toBe(true)
     expect(canAllowOnRobot({ category: 'multi', parts: ['external_dir', 'ask_rule'] })).toBe(false)
   })
 

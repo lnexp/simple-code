@@ -1,14 +1,14 @@
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   clip,
   findMemoryRoot,
-  runLog,
   parseLines,
   parseStepRange,
   renderTurn,
+  runLog,
   runSearch,
   runShow,
   splitSteps,
@@ -87,7 +87,9 @@ describe('renderTurn / parseStepRange', () => {
         { type: 'reasoning', text: '思考'.repeat(400) },
         { type: 'tool_call', name: 'bash', input: { command: 'cat a.ts'.repeat(60) } },
       ]),
-      jline('user', [{ type: 'tool_result', toolCallId: 'c1', output: 'o'.repeat(5000), isError: true }]),
+      jline('user', [
+        { type: 'tool_result', toolCallId: 'c1', output: 'o'.repeat(5000), isError: true },
+      ]),
     ].join('\n'),
   )
 
@@ -120,8 +122,17 @@ describe('runShow / runSearch（真文件）', () => {
   beforeEach(async () => {
     const t1 = [
       jline('user', [{ type: 'text', text: '当时聊了 pickOldestSteps 的粒度' }]),
-      jline('assistant', [{ type: 'tool_call', name: 'bash', input: { command: 'grep pickOldestSteps run.ts' } }]),
-      jline('user', [{ type: 'tool_result', toolCallId: 'c', output: 'function pickOldestSteps(){}', isError: false }]),
+      jline('assistant', [
+        { type: 'tool_call', name: 'bash', input: { command: 'grep pickOldestSteps run.ts' } },
+      ]),
+      jline('user', [
+        {
+          type: 'tool_result',
+          toolCallId: 'c',
+          output: 'function pickOldestSteps(){}',
+          isError: false,
+        },
+      ]),
     ].join('\n')
     await writeFile(join(root, '.simple-code/memory/turns/turn-000001.jsonl'), t1)
     const t2 = [
@@ -169,7 +180,8 @@ describe('runShow / runSearch（真文件）', () => {
     const hits = await runSearch(root, 'pickoldeststeps')
     const wheres = hits.map((h) => h.where)
     expect(wheres).toContain('turn-000001:step1')
-    expect(wheres).toContain('turn-000002:step2')
+    // reasoning 不进检索（只搜 text/tool_call/output/summary）
+    expect(wheres).not.toContain('turn-000002:step2')
     expect(wheres).toContain('summaries/turn-000001-s000001.md:4')
     const textHit = hits.find((h) => h.kind === 'text')
     expect(textHit?.excerpt).toContain('粒度')

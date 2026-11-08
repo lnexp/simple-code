@@ -28,7 +28,9 @@ try {
   } else if (sub === 'read' && target) {
     console.log(readSkill(root, target))
   } else {
-    console.log('用法：skill list | skill read <name> | skill search <关键词>（编辑走 "$SIMPLE_CODE_APPLY_PATCH"；用户级 ~/.simple-code 写走 bash 保留审批）')
+    console.log(
+      '用法：skill list | skill read <name> | skill search <关键词>（编辑走 "$SIMPLE_CODE_APPLY_PATCH"；用户级 ~/.simple-code 写走 bash 保留审批）',
+    )
     process.exitCode = sub === 'help' ? 0 : 1
   }
 } catch (e) {

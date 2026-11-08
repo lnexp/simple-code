@@ -1,17 +1,17 @@
 import { join } from 'node:path'
-import * as vscode from 'vscode'
 import {
   ensureDocCopy,
   ensureShims,
   logRun,
-  startCredentialProxy,
   type ShimEntry,
+  startCredentialProxy,
 } from '@simple-code/core'
-import { startLspBridge } from './lsp-bridge.ts'
-import { startTaskBridge } from './task-bridge.ts'
+import * as vscode from 'vscode'
 import { watchLoopLag } from './loop-lag.ts'
+import { startLspBridge } from './lsp-bridge.ts'
 import { ChatPanel } from './panel.ts'
 import { installRobot, startRobot } from './robot.ts'
+import { startTaskBridge } from './task-bridge.ts'
 
 /**
  * 全部 bin 名（→ dist 里同名 .js）。DOC 例外：只读的文档，不是可执行。
@@ -20,8 +20,19 @@ import { installRobot, startRobot } from './robot.ts'
  * （LSP 只读、固定语义，非 APPLY_PATCH 那种内容决定路径的例外）
  */
 const BINS = [
-  'WEBFETCH', 'WEBSEARCH', 'MCP', 'APPLY_PATCH', 'MEMORY',
-  'NOTE', 'EVENT', 'SKILL', 'LSP', 'IMAGEGEN', 'TASK',
+  'WEBFETCH',
+  'WEBSEARCH',
+  'MCP',
+  'APPLY_PATCH',
+  'MEMORY',
+  'NOTE',
+  'EVENT',
+  'SKILL',
+  'LSP',
+  'IMAGEGEN',
+  'TASK',
+  'TASK_SEND',
+  'WAKE',
 ] as const
 
 /**
@@ -89,13 +100,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const [major = 0, minor = 0] = vscode.version.split('.').map(Number)
   const engineTooOld = !(major > 1 || (major === 1 && minor >= 106))
   const noSecondarySidebar = engineTooOld || vscode.env.uriScheme === 'cursor'
-  void vscode.commands.executeCommand('setContext', 'simpleCode.noSecondarySidebar', noSecondarySidebar)
+  void vscode.commands.executeCommand(
+    'setContext',
+    'simpleCode.noSecondarySidebar',
+    noSecondarySidebar,
+  )
 
   const panel = new ChatPanel(context.extensionUri, context.workspaceState)
   // 派任务桥（task-trunk 规则 11）：bin 经 127.0.0.1 + token 把任务书交给面板
   const taskServer = startTaskBridge({
     dispatch: (req) => panel.dispatchFromAgent(req),
     models: (req) => panel.taskModels(req),
+    send: (req) => Promise.resolve(panel.taskSend(req)),
+    sendList: (req) => Promise.resolve(panel.taskSendList(req)),
+    wake: (req) => panel.wake(req),
   })
   context.subscriptions.push(
     // 桥跟着扩展走：停用即关，端口随 env 消失，bin 侧明确报不可达
@@ -105,10 +123,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     watchLoopLag((ev) => logRun(ev)),
     ...ChatPanel.viewTypes.map((viewType) =>
       vscode.window.registerWebviewViewProvider(viewType, panel, {
-      // 面板切走再切回来时不重建 webview。没有它，用户点一下别的活动栏图标
-      // 再回来就是空白 + 重新初始化，正在跑的对话看起来「消失」了
+        // 面板切走再切回来时不重建 webview。没有它，用户点一下别的活动栏图标
+        // 再回来就是空白 + 重新初始化，正在跑的对话看起来「消失」了
         webviewOptions: { retainContextWhenHidden: true },
-      })),
+      }),
+    ),
     panel,
     // 桌面机器人（desktop-robot.md）：只在本机 macOS 连；面板在哪一侧决定展开命令
     startRobot(panel, {

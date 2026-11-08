@@ -22,7 +22,11 @@ const run = (config: string) => {
   delete env.SC_TEST_MISSING_KEY
   return spawnSync(
     process.execPath,
-    ['--disable-warning=ExperimentalWarning', join(repo, 'packages/cli/src/websearch-bin.ts'), '查询'],
+    [
+      '--disable-warning=ExperimentalWarning',
+      join(repo, 'packages/cli/src/websearch-bin.ts'),
+      '查询',
+    ],
     { encoding: 'utf8', env },
   )
 }
@@ -31,7 +35,9 @@ describe('websearch bin：配置错只报一行', () => {
   it('引用的环境变量没设', () => {
     const r = run('{"exaApiKey": "${SC_TEST_MISSING_KEY}"}')
     expect(r.status).toBe(2)
-    expect(r.stderr.trim()).toBe('websearch 配置错误（~/.simple-code/websearch.json）：配置引用了环境变量 SC_TEST_MISSING_KEY，但它没有设置（或为空）')
+    expect(r.stderr.trim()).toBe(
+      'websearch 配置错误（~/.simple-code/websearch.json）：配置引用了环境变量 SC_TEST_MISSING_KEY，但它没有设置（或为空）',
+    )
   }, 30_000)
 
   it('JSON 写坏', () => {

@@ -50,7 +50,10 @@ const POLL_MS = 250
  * 时新旧扩展宿主交接同理。等不到释放才是真冲突（另一个窗口开着这个目录），
  * 那时再报错，文案和原来一样
  */
-export async function acquireLock(folderPath: string, opts: { waitMs?: number } = {}): Promise<Lock> {
+export async function acquireLock(
+  folderPath: string,
+  opts: { waitMs?: number } = {},
+): Promise<Lock> {
   const path = join(folderPath, LOCK_RELATIVE)
   const deadline = Date.now() + (opts.waitMs ?? WAIT_MS)
   let existing: LockFile | null
@@ -58,9 +61,9 @@ export async function acquireLock(folderPath: string, opts: { waitMs?: number } 
     await mkdir(dirname(path), { recursive: true })
     existing = await readLock(path)
     if (!(existing && isAlive(existing))) break
-    if (Date.now() >= deadline)
-      throw new LockHeldError(path, existing.pid, existing.startedAt)
+    if (Date.now() >= deadline) throw new LockHeldError(path, existing.pid, existing.startedAt)
     await new Promise((resolve) => setTimeout(resolve, POLL_MS))
+    // biome-ignore lint/correctness/noConstantCondition: 轮询等锁是故意死循环，退出条件在循环体内
   } while (true)
 
   const mine: LockFile = { pid: process.pid, startedAt: processStartedAt(process.pid) }

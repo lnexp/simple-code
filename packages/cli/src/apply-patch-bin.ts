@@ -27,7 +27,7 @@ async function readStdin(): Promise<string> {
 
 const raw = process.argv[2] ?? (await readStdin())
 if (raw.trim() === '') {
-  process.stderr.write('用法：apply_patch <<\'PATCH\' … PATCH（补丁文本从 stdin 读）\n')
+  process.stderr.write("用法：apply_patch <<'PATCH' … PATCH（补丁文本从 stdin 读）\n")
   process.exit(2)
 }
 try {

@@ -1,5 +1,4 @@
-import { mkdir } from 'node:fs/promises'
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -91,26 +90,50 @@ PATCH`)
   it('update 里夹了中间的 *** End Patch（多文件各写一对 Begin/End）：报语法错误，不当上下文吃进 chunk', () => {
     // 2026-09-30 实案：曾被 lenient 收成上下文行，报「找不到要替换的行（第 1 行是…）」，
     // 而第 1 行在文件里明明存在——真正对不上的是 chunk 末尾这行
-    const two = '*** Begin Patch\n*** Update File: a\n@@\n ctx\n+x\n*** End Patch\n*** Update File: b\n@@\n ctx\n+y\n*** End Patch'
+    const two =
+      '*** Begin Patch\n*** Update File: a\n@@\n ctx\n+x\n*** End Patch\n*** Update File: b\n@@\n ctx\n+y\n*** End Patch'
     expect(() => parsePatch(two)).toThrow(/补丁第 6 行：.*\*\*\* End Patch.*一对 Begin\/End/)
-    expect(() => parsePatch('*** Begin Patch\n*** Update File: a\n@@\n ctx\n*** Begin Patch\n+x\n*** End Patch')).toThrow(
-      /补丁第 5 行/,
-    )
+    expect(() =>
+      parsePatch(
+        '*** Begin Patch\n*** Update File: a\n@@\n ctx\n*** Begin Patch\n+x\n*** End Patch',
+      ),
+    ).toThrow(/补丁第 5 行/)
     // End of File / Move to 仍是合法标记
-    expect(parsePatch('*** Begin Patch\n*** Update File: a\n*** Move to: b\n@@\n ctx\n+x\n*** End of File\n*** End Patch')).toHaveLength(1)
+    expect(
+      parsePatch(
+        '*** Begin Patch\n*** Update File: a\n*** Move to: b\n@@\n ctx\n+x\n*** End of File\n*** End Patch',
+      ),
+    ).toHaveLength(1)
   })
   it('报错行号是 1 起算的真实行号（曾为 0 起算下标，少 1）', () => {
     // 第 3 行：Add 里混入普通行
-    expect(() => parsePatch('*** Begin Patch\n*** Add File: x\nhello\n*** End Patch')).toThrow(/补丁第 3 行/)
+    expect(() => parsePatch('*** Begin Patch\n*** Add File: x\nhello\n*** End Patch')).toThrow(
+      /补丁第 3 行/,
+    )
     // 第 3 行：End of File 不在 chunk 内
-    expect(() => parsePatch('*** Begin Patch\n*** Update File: x\n*** End of File\n*** End Patch')).toThrow(/补丁第 3 行/)
+    expect(() =>
+      parsePatch('*** Begin Patch\n*** Update File: x\n*** End of File\n*** End Patch'),
+    ).toThrow(/补丁第 3 行/)
     // 第 3 行：chunk（@@ 所在行）没有上下文
-    expect(() => parsePatch('*** Begin Patch\n*** Update File: x\n@@\n+a\n*** End Patch')).toThrow(/补丁第 3 行/)
+    expect(() => parsePatch('*** Begin Patch\n*** Update File: x\n@@\n+a\n*** End Patch')).toThrow(
+      /补丁第 3 行/,
+    )
     // 第 3 行：隐式 chunk 起始行
-    expect(() => parsePatch('*** Begin Patch\n*** Update File: x\n+a\n*** End Patch')).toThrow(/补丁第 3 行/)
+    expect(() => parsePatch('*** Begin Patch\n*** Update File: x\n+a\n*** End Patch')).toThrow(
+      /补丁第 3 行/,
+    )
     // 结尾缺 End：指最后一个非空行（第 2 行），不指末尾换行后的空串
     expect(() => parsePatch('*** Begin Patch\n*** Delete File: x\n')).toThrow(/补丁第 2 行/)
     expect(() => parsePatch('*** Begin Patch\n*** Delete File: x')).toThrow(/补丁第 2 行/)
+    // 2026-11-06 真机（反思任务）：结尾打成 *** End of Patch，报错文案没带
+    // 实际内容，模型三次对照不出「差一个 of」——报错把实际最后一行 echo 出来
+    expect(() => parsePatch('*** Begin Patch\n*** Delete File: x\n*** End of Patch')).toThrow(
+      /实际最后一行是「\*\*\* End of Patch」/,
+    )
+    // 长正文行截断到 60 字符，空行如实说空
+    expect(() => parsePatch('*** Begin Patch\n*** Delete File: x\n' + 'a'.repeat(80))).toThrow(
+      /实际最后一行是「a{60}…」/,
+    )
   })
 })
 
@@ -124,7 +147,9 @@ describe('applyPatch 应用', () => {
       await writeFile(target, 'a\nb\n', 'utf8')
       const summary = await applyPatch(
         root,
-        ['*** Begin Patch', `*** Update File: ${target}`, '@@', '-b', '+B', '*** End Patch'].join('\n'),
+        ['*** Begin Patch', `*** Update File: ${target}`, '@@', '-b', '+B', '*** End Patch'].join(
+          '\n',
+        ),
       )
       expect(summary).toContain('settings.json +1/-1')
       expect(await readFile(target, 'utf8')).toBe('a\nB\n')
@@ -136,7 +161,9 @@ describe('applyPatch 应用', () => {
   })
   it('update：多 chunk 顺序替换，摘要 +N/-M', async () => {
     await W('m.ts', 'one\ntwo\nthree\nfour\nfive\n')
-    const out = await applyPatch(root, `*** Begin Patch
+    const out = await applyPatch(
+      root,
+      `*** Begin Patch
 *** Update File: m.ts
 @@
 -one
@@ -145,14 +172,17 @@ describe('applyPatch 应用', () => {
 -four
 +FOUR
 +FOUR2
-*** End Patch`)
+*** End Patch`,
+    )
     expect(await R('m.ts')).toBe('ONE\ntwo\nthree\nFOUR\nFOUR2\nfive\n')
     expect(out).toBe('m.ts +3/-2')
   })
 
   it('chunk 之间不回退：第二处改动在第一处之后找（相同上下文不会误伤第一处）', async () => {
     await W('dup.ts', 'head\nx\nhead\nx\n')
-    await applyPatch(root, `*** Begin Patch
+    await applyPatch(
+      root,
+      `*** Begin Patch
 *** Update File: dup.ts
 @@
  x
@@ -160,41 +190,51 @@ describe('applyPatch 应用', () => {
 @@
  x
 +y2
-*** End Patch`)
+*** End Patch`,
+    )
     expect(await R('dup.ts')).toBe('head\nx\ny1\nhead\nx\ny2\n')
   })
 
   it('End of File 锚：末尾追加', async () => {
     await W('t.txt', 'a\nb\n')
-    await applyPatch(root, `*** Begin Patch
+    await applyPatch(
+      root,
+      `*** Begin Patch
 *** Update File: t.txt
 @@
  b
 +tail
 *** End of File
-*** End Patch`)
+*** End Patch`,
+    )
     expect(await R('t.txt')).toBe('a\nb\ntail\n')
   })
 
   it('CRLF 文件靠二级模糊（trimEnd 吃 \\r）匹配成功', async () => {
     await W('crlf.txt', 'a\r\nb\r\n')
-    await applyPatch(root, `*** Begin Patch
+    await applyPatch(
+      root,
+      `*** Begin Patch
 *** Update File: crlf.txt
 @@
 -b
 +B
-*** End Patch`)
+*** End Patch`,
+    )
     expect(await R('crlf.txt')).toBe('a\r\nB\n')
   })
 
   it('add 建新文件（含新目录、末尾换行）；delete 删文件', async () => {
     await W('gone.txt', 'bye\n')
-    const out = await applyPatch(root, `*** Begin Patch
+    const out = await applyPatch(
+      root,
+      `*** Begin Patch
 *** Add File: deep/new/a.txt
 +one
 +two
 *** Delete File: gone.txt
-*** End Patch`)
+*** End Patch`,
+    )
     expect(out).toContain('deep/new/a.txt +2/-0')
     expect(await R('deep/new/a.txt')).toBe('one\ntwo\n')
     await expect(stat(join(root, 'gone.txt'))).rejects.toThrow()
@@ -202,13 +242,16 @@ describe('applyPatch 应用', () => {
 
   it('Move to：写新路径删旧路径', async () => {
     await W('old.ts', 'a\n')
-    await applyPatch(root, `*** Begin Patch
+    await applyPatch(
+      root,
+      `*** Begin Patch
 *** Update File: old.ts
 *** Move to: dir/new.ts
 @@
 -a
 +b
-*** End Patch`)
+*** End Patch`,
+    )
     expect(await R('dir/new.ts')).toBe('b\n')
     await expect(stat(join(root, 'old.ts'))).rejects.toThrow()
   })
@@ -217,7 +260,9 @@ describe('applyPatch 应用', () => {
     await W('ok.txt', 'fine\n')
     await W('bad.txt', 'actual\n')
     await expect(
-      applyPatch(root, `*** Begin Patch
+      applyPatch(
+        root,
+        `*** Begin Patch
 *** Update File: ok.txt
 @@
  fine
@@ -226,7 +271,8 @@ describe('applyPatch 应用', () => {
 @@
  not-in-file
 + x
-*** End Patch`),
+*** End Patch`,
+      ),
     ).rejects.toThrow(/bad\.txt：找不到要替换的行——首行「not-in-file」在文件里找不到/)
     // ok.txt 不该被改——补丁是整体的，第二块失败第一块也不落盘
     expect(await R('ok.txt')).toBe('fine\n')
@@ -238,7 +284,10 @@ describe('applyPatch 应用', () => {
   describe('找不到上下文：指出第一处不一致', () => {
     const fails = async (file: string, body: string): Promise<string> => {
       await W('f.txt', file)
-      const err = await applyPatch(root, `*** Begin Patch\n*** Update File: f.txt\n${body}\n*** End Patch`).catch((e: Error) => e)
+      const err = await applyPatch(
+        root,
+        `*** Begin Patch\n*** Update File: f.txt\n${body}\n*** End Patch`,
+      ).catch((e: Error) => e)
       expect(err).toBeInstanceOf(Error)
       expect(await R('f.txt')).toBe(file)
       return (err as Error).message
@@ -250,12 +299,19 @@ describe('applyPatch 应用', () => {
         '@@\n /**\n- * went to reasoning. Re-think (only the steps needed to reach\n+ * new',
       )
       expect(msg).toContain('前 1 行对上了文件第 2 行')
-      expect(msg).toContain('补丁：「 * went to reasoning. Re-think (only the steps needed to reach」')
-      expect(msg).toContain('文件第 3 行：「 * went to reasoning. Re-think (only the steps needed to reach the」')
+      expect(msg).toContain(
+        '补丁：「 * went to reasoning. Re-think (only the steps needed to reach」',
+      )
+      expect(msg).toContain(
+        '文件第 3 行：「 * went to reasoning. Re-think (only the steps needed to reach the」',
+      )
     })
 
     it('漏抄中间一行（某真实项目 t775 漏 @Test）：文件那一行就是被漏掉的', async () => {
-      const msg = await fails('  }\n\n  @Test\n  void foo() {\n', '@@\n   }\n \n-  void foo() {\n+  void bar() {')
+      const msg = await fails(
+        '  }\n\n  @Test\n  void foo() {\n',
+        '@@\n   }\n \n-  void foo() {\n+  void bar() {',
+      )
       expect(msg).toContain('前 2 行对上了文件第 1–2 行')
       expect(msg).toContain('文件第 3 行：「  @Test」')
     })
@@ -265,8 +321,12 @@ describe('applyPatch 应用', () => {
         "a\n      await tool.execute({ command: 'xcli get f.pptx /slide[2]', cwd: root }, ctx)\nb\n",
         "@@\n-      await tool.execute({ command: 'xli get f.pptx /slide[2]', cwd: root }, ctx)\n+      x",
       )
-      expect(msg).toContain("首行「      await tool.execute({ command: 'xli get f.pptx /slide[2]', cwd: root }, ctx)」在文件里找不到")
-      expect(msg).toContain("最像的是文件第 2 行：「      await tool.execute({ command: 'xcli get f.pptx /slide[2]', cwd: root }, ctx)」")
+      expect(msg).toContain(
+        "首行「      await tool.execute({ command: 'xli get f.pptx /slide[2]', cwd: root }, ctx)」在文件里找不到",
+      )
+      expect(msg).toContain(
+        "最像的是文件第 2 行：「      await tool.execute({ command: 'xcli get f.pptx /slide[2]', cwd: root }, ctx)」",
+      )
     })
 
     it('首行找不到也没有近似行：提示先重读文件', async () => {

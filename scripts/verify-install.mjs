@@ -35,15 +35,28 @@ const scanOnce = () => {
   const hits = []
   for (const f of files) {
     for (const line of readFileSync(join(logsDir, f), 'utf8').split('\n')) {
-      if (!line.includes('"ext_activate"')) continue // 快速预筛，避免逐行 JSON.parse
-      try { hits.push(JSON.parse(line)) } catch { /* 截断行：下一天文件里会有完整的 */ }
+      // 按 ev 字段形态预筛：行内容里出现关键词（recall 的 keywords、
+      // 错误文本）会被裸 includes 误伤（2026-11-08 实证：一条
+      // recall_select 的 keywords 含 ext_activate，脚本报 version=undefined）
+      if (!line.includes('"ev":"ext_activate"')) continue
+      try {
+        const ev = JSON.parse(line)
+        if (ev.ev === 'ext_activate') hits.push(ev)
+      } catch {
+        /* 截断行：下一天文件里会有完整的 */
+      }
     }
   }
   return hits.at(-1)
 }
 
 const pidAlive = (pid) => {
-  try { process.kill(pid, 0); return true } catch { return false }
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
 }
 
 const waitArg = process.argv.indexOf('--wait')
@@ -60,14 +73,18 @@ for (;;) {
 }
 
 if (!last) {
-  console.error('✗ 日志里没有 ext_activate 事件——装的还是旧版本（0.1.5 之前的构建没有这行），或 reload 未发生')
+  console.error(
+    '✗ 日志里没有 ext_activate 事件——装的还是旧版本（0.1.5 之前的构建没有这行），或 reload 未发生',
+  )
   process.exit(1)
 }
 const alive = pidAlive(last.pid)
 const match = last.version === localVersion
 console.log(`最新 ext_activate: version=${last.version} pid=${last.pid} at=${last.at}`)
 if (!match) {
-  console.error(`✗ 最新激活的是 ${last.version}，本地构建是 ${localVersion}——reload 未生效或装错了目录`)
+  console.error(
+    `✗ 最新激活的是 ${last.version}，本地构建是 ${localVersion}——reload 未生效或装错了目录`,
+  )
   console.error('  下一步：exthost 日志时间戳核对（教训 reload-claims-verify-exthost-timestamps）')
   process.exit(1)
 }
@@ -78,7 +95,9 @@ if (Date.parse(last.at) <= installedAt) {
   process.exit(1)
 }
 if (!alive) {
-  console.error(`⚠ version 匹配（${localVersion}）但 pid ${last.pid} 已退出——可能又 reload 过一次；重跑本脚本看最新一条`)
+  console.error(
+    `⚠ version 匹配（${localVersion}）但 pid ${last.pid} 已退出——可能又 reload 过一次；重跑本脚本看最新一条`,
+  )
   process.exit(1)
 }
 console.log(`✓ 扩展 ${localVersion} 正在运行（pid ${last.pid}）`)

@@ -43,7 +43,7 @@ export type SegmentRow = {
 const COLS = `id, owner, step_floor AS floor, step_ceil AS ceil, state, closed`
 
 /** owner 键 → summaries/messages 的 owner 列值（主任务是 NULL） */
-export const rowOwner = (key: string): string | null => (key === '' ? null : key)
+const rowOwner = (key: string): string | null => (key === '' ? null : key)
 
 const num = (db: Db, sql: string, ...p: (string | number | null)[]): number =>
   db.all<{ n: number | null }>(sql, ...p)[0]?.n ?? 0
@@ -58,7 +58,7 @@ export function currentSegment(db: Db, key: string): SegmentRow | null {
 }
 
 /** 段内已用 step 数（「用满」的尺子）。messages 不能当尺子：每次存盘整份重插、重新占号 */
-export function usedSteps(db: Db, seg: SegmentRow): number {
+function usedSteps(db: Db, seg: SegmentRow): number {
   return num(db, `SELECT COUNT(*) AS n FROM steps WHERE id > ? AND id <= ?`, seg.floor, seg.ceil)
 }
 
@@ -121,7 +121,7 @@ export function segmentForTurn(db: Db, key: string, folder: string): SegmentRow 
 }
 
 /** 段内有自己消息、却没被自己 ready 摘要覆盖的 step 数。0 = 可以合回（规则 4） */
-export function uncoveredSteps(db: Db, seg: SegmentRow): number {
+function uncoveredSteps(db: Db, seg: SegmentRow): number {
   const owner = rowOwner(seg.owner)
   const steps = db
     .all<{ id: number }>(
@@ -222,7 +222,7 @@ export function pullableSegments(db: Db, key: string, below: number): SegmentRow
 }
 
 /** 段里每条摘要行原样写进来要补的头部与路径（store.ts headOfStep） */
-export type HeadOf = (stepId: number) => { text: string; archivePath: string }
+type HeadOf = (stepId: number) => { text: string; archivePath: string }
 
 type SumRow = {
   id: number

@@ -15,7 +15,7 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { decayCutoff, decayNotice, parseStamp, splitByDecay } from './decay.ts'
+import { decayNotice, parseStamp, splitByDecay } from './decay.ts'
 import { stampLastRead } from './last-read.ts'
 import { matchTerms, splitSearchTerms } from './search-terms.ts'
 import { localStamp } from './timestamp.ts'
@@ -323,7 +323,9 @@ export function mergeEvents(root: string, newName: string, oldNames: string[]): 
   const description = [...new Set(olds.map((o) => o.meta.description).filter(Boolean))].join('；')
   const now = localStamp()
   // 新→旧排：appendProgress 落笔落进第一个「## 进展」段，即最新一节
-  olds.sort((a, b) => (b.meta.updated ?? b.meta.created ?? '').localeCompare(a.meta.updated ?? a.meta.created ?? ''))
+  olds.sort((a, b) =>
+    (b.meta.updated ?? b.meta.created ?? '').localeCompare(a.meta.updated ?? a.meta.created ?? ''),
+  )
   const head =
     `---\nname: ${merged}\ndescription: ${description}\n` +
     `created: ${pick('created', false) ?? now}\nupdated: ${now}\n` +
@@ -333,7 +335,7 @@ export function mergeEvents(root: string, newName: string, oldNames: string[]): 
   const body = olds
     .map((o) => o.text.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, '').trim())
     .join('\n\n')
-  writeFileSync(to, head + body + '\n', 'utf8')
+  writeFileSync(to, `${head + body}\n`, 'utf8')
   for (const o of olds) rmSync(join(dir, `${o.name}.md`))
   return `已合并 ${olds.map((o) => o.name).join(' + ')} → ${merged}（正文全保留，旧文件已移除，前身行在文件头）`
 }

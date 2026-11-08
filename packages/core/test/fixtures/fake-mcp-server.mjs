@@ -2,10 +2,7 @@
 // 工具：echo(text) 回显；add(a,b) 求和；未知工具 → isError
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import {
-  ListToolsRequestSchema,
-  CallToolRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js'
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 
 const s = new Server({ name: 'fake', version: '0.0.0' }, { capabilities: { tools: {} } })
 s.setRequestHandler(ListToolsRequestSchema, () => ({
@@ -32,8 +29,7 @@ s.setRequestHandler(ListToolsRequestSchema, () => ({
 }))
 s.setRequestHandler(CallToolRequestSchema, (req) => {
   const a = req.params.arguments ?? {}
-  if (req.params.name === 'echo')
-    return { content: [{ type: 'text', text: `echo: ${a.text}` }] }
+  if (req.params.name === 'echo') return { content: [{ type: 'text', text: `echo: ${a.text}` }] }
   if (req.params.name === 'add')
     return { content: [{ type: 'text', text: String(Number(a.a) + Number(a.b)) }] }
   return { isError: true, content: [{ type: 'text', text: `unknown tool ${req.params.name}` }] }

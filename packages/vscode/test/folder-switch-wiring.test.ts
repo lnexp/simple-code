@@ -55,7 +55,7 @@ const state = (folder: string, running = false): ToWebview => ({
   models: [{ provider: 'p', model: 'm1' }],
   effort: 'high',
   effortOverridden: false,
-      presets: [],
+  presets: [],
   approvalOn: true,
   imagesEnabled: false,
   contextWindow: 0,
@@ -111,8 +111,16 @@ describe('秒表起点随事件走（④：镜像重放带真钟，不靠 webvie
       app,
       A,
       [
-      { kind: 'user', text: '跑个 sleep' },
-      { kind: 'tool', id: 't1', name: 'bash', command: 'sleep 30', output: '', failed: false, startedAt: Date.now() - 5000 },
+        { kind: 'user', text: '跑个 sleep' },
+        {
+          kind: 'tool',
+          id: 't1',
+          name: 'bash',
+          command: 'sleep 30',
+          output: '',
+          failed: false,
+          startedAt: Date.now() - 5000,
+        },
       ],
       true,
     )
@@ -125,8 +133,16 @@ describe('秒表起点随事件走（④：镜像重放带真钟，不靠 webvie
       app,
       A,
       [
-      { kind: 'user', text: '跑个 sleep' },
-      { kind: 'tool', id: 't1', name: 'bash', command: 'sleep 30', output: '', failed: false, startedAt: Date.now() - 5000 },
+        { kind: 'user', text: '跑个 sleep' },
+        {
+          kind: 'tool',
+          id: 't1',
+          name: 'bash',
+          command: 'sleep 30',
+          output: '',
+          failed: false,
+          startedAt: Date.now() - 5000,
+        },
       ],
       true,
     )
@@ -190,7 +206,13 @@ describe('后台进程条按目录隔离（用户拍板：互不干扰）', () =
   it('A 的进程只在 A 显示；B 的快照不进 A 的界面；切回 A 由 attach 重推', () => {
     const app = mount()
     app.send(state(A))
-    app.send({ type: 'bg_processes', folder: A, items: [{ pgid: 42, pids: [42], label: '起服务', command: 'python http.server 8123', startedAt: 1 }] })
+    app.send({
+      type: 'bg_processes',
+      folder: A,
+      items: [
+        { pgid: 42, pids: [42], label: '起服务', command: 'python http.server 8123', startedAt: 1 },
+      ],
+    })
     expect(app.html()).toContain('http.server')
 
     // 切到 B：A 的进程条不跟来（切走即清）
@@ -198,14 +220,24 @@ describe('后台进程条按目录隔离（用户拍板：互不干扰）', () =
     expect(app.html()).not.toContain('http.server')
 
     // B 的快照进 B 界面；A 的不顶账（现在没有桶，只有当前清单）
-    app.send({ type: 'bg_processes', folder: B, items: [{ pgid: 7, pids: [7], label: '跑测试', command: 'vitest watch', startedAt: 2 }] })
+    app.send({
+      type: 'bg_processes',
+      folder: B,
+      items: [{ pgid: 7, pids: [7], label: '跑测试', command: 'vitest watch', startedAt: 2 }],
+    })
     expect(app.html()).toContain('vitest watch')
     expect(app.html()).not.toContain('http.server')
 
     // 切回 A：attach 重推 A 的清单（不是桶恢复）
     app.send(folders(A))
     expect(app.html()).not.toContain('http.server') // 清了，等 attach
-    app.send({ type: 'bg_processes', folder: A, items: [{ pgid: 42, pids: [42], label: '起服务', command: 'python http.server 8123', startedAt: 1 }] })
+    app.send({
+      type: 'bg_processes',
+      folder: A,
+      items: [
+        { pgid: 42, pids: [42], label: '起服务', command: 'python http.server 8123', startedAt: 1 },
+      ],
+    })
     expect(app.html()).toContain('http.server')
     expect(app.html()).not.toContain('vitest watch')
   })
@@ -219,7 +251,16 @@ describe('后台进程条按目录隔离（用户拍板：互不干扰）', () =
       A,
       [
         { kind: 'user', text: '问' },
-        { kind: 'tool', id: 't1', name: 'bash', command: 'echo hi', output: 'hi', failed: false, startedAt: 1, endedAt: 2 },
+        {
+          kind: 'tool',
+          id: 't1',
+          name: 'bash',
+          command: 'echo hi',
+          output: 'hi',
+          failed: false,
+          startedAt: 1,
+          endedAt: 2,
+        },
       ],
       true,
     )
@@ -301,8 +342,11 @@ describe('切目录恢复任务选中（B 方案：lastBranch 按目录记选中
     contextWindow: 0,
     approvalOn: true,
   })
-  const tasksMsg = (folder: string, names: string[]): ToWebview =>
-    ({ type: 'tasks', folder, tasks: names.map(taskState) })
+  const tasksMsg = (folder: string, names: string[]): ToWebview => ({
+    type: 'tasks',
+    folder,
+    tasks: names.map(taskState),
+  })
 
   /** 点分支条选中任务——同真实交互（click → setBranch + task_open 补基线） */
   const select = (name: string): void => {
@@ -319,7 +363,9 @@ describe('切目录恢复任务选中（B 方案：lastBranch 按目录记选中
     select('调研分支')
     expect(app.html()).toContain('调研分支')
     // 点击本身就该发一次 task_open（选中即补基线）
-    expect(sent.filter((m) => m.type === 'task_open')).toEqual([{ type: 'task_open', task: '调研分支' }])
+    expect(sent.filter((m) => m.type === 'task_open')).toEqual([
+      { type: 'task_open', task: '调研分支' },
+    ])
 
     // 切到 B：落主任务（B 没记过选中）
     app.send(folders(B))

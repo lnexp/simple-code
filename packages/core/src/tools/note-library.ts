@@ -1,6 +1,7 @@
 /** 四类型共用检索/写入；旧格式只读时不强制满足新写入格式。 */
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { estimateTextTokens } from '../loop/tokens.ts'
 import { decayCutoff, decayNotice, parseStamp } from './decay.ts'
 import { LESSON_SECTIONS } from './lesson.ts'
 import { type NoteFile, type NoteType, noteWritePath, scanNoteFiles } from './note-files.ts'
@@ -9,6 +10,8 @@ import { localStamp } from './timestamp.ts'
 
 type QueryOptions = { type?: NoteType; all?: boolean }
 type WriteInput = { name: string; title: string; description: string; body: string }
+
+export const GOAL_SECTIONS = ['这件事是什么', '目标', '当前范围与边界', '怎样算达到目标'] as const
 
 export function noteFileSignal(file: NoteFile): number | null {
   // 历史 lesson 缺 lastRead 时一直使用 mtime，不能因统一类型改用旧 created 将其隐藏。
@@ -96,7 +99,7 @@ export function validateNoteBody(body: string, type: NoteType): void {
     general: [],
     lesson: LESSON_SECTIONS.map((s) => s.label),
     principle: ['判断', '适用边界', '依据'],
-    goal: ['这件事是什么', '目标', '当前范围与边界', '怎样算达到目标'],
+    goal: GOAL_SECTIONS,
   }
   const missing = required[type].filter((section) => !noteSection(body, section))
   // 旧手工原则使用「来源与推导」，可读和生效均接受；不要求为升级重写真实文件。
@@ -127,5 +130,17 @@ export function writeTypedNote(
   const text = `---\nname: ${name}\ntype: ${type}\ndescription: ${description}\nstatus: ${status}\ncreated: ${localStamp()}\n---\n\n# ${input.title.trim()}\n\n${input.body.trim()}\n`
   mkdirSync(dirname(path), { recursive: true })
   writeFileSync(path, text, { encoding: 'utf8', flag: 'wx' })
-  return `已写入 ${path}（${type}/${name}）`
+  const result = `已写入 ${path}（${type}/${name}）`
+  if (type === 'goal') {
+    // goal 是唯一整条常驻的内容，写超了常驻区会截断（note-budget.ts）。
+    // 写入时就算给 agent 看，别等 session 建立时才发现
+    const est = estimateTextTokens(
+      `### ${name}\n` +
+        GOAL_SECTIONS.map((s) => `#### ${s}\n${noteSection(input.body, s)}`).join('\n'),
+    )
+    if (est > 2100)
+      // schema.ts noteBudgetTokens 默认值，改动需同步
+      return `${result}\n⚠ 渲染约 ${est} tokens，超过 note 总预算默认 2100——常驻区会截断，请当场精简（进展细节移事件档案，目标与边界保留要点）`
+  }
+  return result
 }

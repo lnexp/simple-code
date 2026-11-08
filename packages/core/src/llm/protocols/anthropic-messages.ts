@@ -52,9 +52,7 @@ function buildRequest(req: Request, ctx: ProviderContext) {
       // system.0.cache_control.ttl 被拒）。自己打了网关就不注入——探针
       // /tmp/ttlprobe/probe9：A 不打=400、B 自打 1h=200、C 5m 同款=200。
       // 没配 cacheTtl 时不打，请求体与以前逐字节一致
-      ...(req.cacheTtl && i === req.tools.length - 1
-        ? { cache_control: cacheControl(req) }
-        : {}),
+      ...(req.cacheTtl && i === req.tools.length - 1 ? { cache_control: cacheControl(req) } : {}),
     })),
     thinking:
       req.thinking === 'adaptive'
@@ -352,7 +350,12 @@ function onMessageDelta(state: State, ev: Record<string, unknown>): [State, LLME
   // message_delta 的 usage 只带输出侧字段，输入侧必须保留 message_start 的值。
   // 直接覆盖会把 input 清零，而且不报错——只是 token 统计悄悄变小
   return [
-    { ...state, stopReason, ...(refusal ? { refusal } : {}), usage: toUsage(ev.usage, state.usage) },
+    {
+      ...state,
+      stopReason,
+      ...(refusal ? { refusal } : {}),
+      usage: toUsage(ev.usage, state.usage),
+    },
     [],
   ]
 }
@@ -417,7 +420,11 @@ function toError(err: Record<string, unknown>, status: number): ProtocolError {
   // 或空：9-16 起 13 次全被判 unknown、首次失败即放弃。代价：真不可恢复的
   // （如「渠道未启用」）多等一轮退避（默认约 30 秒）才报错。kind 保持
   // unknown 不改，日志里分类照实
-  return { kind, message, retryable: kind === 'rate_limit' || kind === 'server' || kind === 'unknown' }
+  return {
+    kind,
+    message,
+    retryable: kind === 'rate_limit' || kind === 'server' || kind === 'unknown',
+  }
 }
 
 function errorKind(type: string, message: string, status: number): ProtocolError['kind'] {

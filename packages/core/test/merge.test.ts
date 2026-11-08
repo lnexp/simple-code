@@ -301,7 +301,9 @@ describe('挑合并组', () => {
 
   it('跨层照样不跨真断点：缝里有内容就断开', () => {
     const levels = [2, 1, 0, 3, 1, 0]
-    const items = levels.map((level, i) => s({ id: i + 1, level, coversFrom: i * 100 + 1, coversTo: i * 100 + 10 }))
+    const items = levels.map((level, i) =>
+      s({ id: i + 1, level, coversFrom: i * 100 + 1, coversTo: i * 100 + 10 }),
+    )
     // 所有缝都有内容 → 每条自成一段，凑不出 3 条
     expect(pickMergeGroup(items, 3, () => true)).toBeNull()
     // 缝都是死缝 → 能链
@@ -313,7 +315,6 @@ describe('挑合并组', () => {
     expect(pickMergeGroup(items, 3)).toBeNull()
   })
 })
-
 
 describe('渲染与请求', () => {
   it('输入带 step 范围和归档路径——上层节点要记住原文去哪找', () => {

@@ -21,13 +21,23 @@ import { loadSelectorCandidates, type SelectorCandidate } from './selector.ts'
 const EXT = '(?:ts|tsx|mjs|cjs|js|py|json|sql|sh|toml)'
 const FILE_RE = new RegExp(`((?:[\\w.\\-]+/)*[\\w\\-]+(?:\\.[\\w\\-]+)*\\.${EXT})(?![\\w\\-])`, 'g')
 /** 几乎每个包都有一份，点名它等于没点名 */
-const GENERIC = new Set(['package.json', 'settings.json', 'tsconfig.json', 'approval.json', 'mcp.json', 'index.ts', 'types.ts'])
+const GENERIC = new Set([
+  'package.json',
+  'settings.json',
+  'tsconfig.json',
+  'approval.json',
+  'mcp.json',
+  'index.ts',
+  'types.ts',
+])
 /** 单独出现不算命令名（带子命令时照样生成「git push」这类键） */
 const STOP = new Set(
-  ('cd ls cat echo printf grep egrep rg sed awk head tail wc sort uniq cut tr xargs find mkdir rm cp mv touch ln ' +
+  (
+    'cd ls cat echo printf grep egrep rg sed awk head tail wc sort uniq cut tr xargs find mkdir rm cp mv touch ln ' +
     'chmod test true false date sleep env export set unset source eval exec for while if then do done fi case esac ' +
     'read wait kill ps tee diff file stat which basename dirname realpath python python3 node bash sh zsh pnpm npm ' +
-    'git open time cmp md5 jq less more vim nano code').split(' '),
+    'git open time cmp md5 jq less more vim nano code'
+  ).split(' '),
 )
 /** 包一层再跑真程序：取下一个词 */
 const WRAPPERS = new Set(['npx', 'sudo', 'time', 'exec', 'command', 'env', 'nohup'])
@@ -35,11 +45,11 @@ const PER_CALL = 2
 
 const baseOf = (p: string): string => p.slice(p.lastIndexOf('/') + 1)
 const clip = (s: string, n: number): string => (s.length <= n ? s : `${s.slice(0, n)}…`)
-const escape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const escRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
-export type RepoIndex = ReadonlyMap<string, readonly string[]>
-export type TouchEntry = { c: SelectorCandidate; files: string[]; desc: string }
-export type TouchHit = { c: SelectorCandidate; via: string }
+type RepoIndex = ReadonlyMap<string, readonly string[]>
+type TouchEntry = { c: SelectorCandidate; files: string[]; desc: string }
+type TouchHit = { c: SelectorCandidate; via: string }
 
 /** git ls-files 的结果按文件名分桶 */
 export function indexRepo(paths: readonly string[]): RepoIndex {
@@ -49,12 +59,18 @@ export function indexRepo(paths: readonly string[]): RepoIndex {
 }
 
 function fileTokens(text: string): string[] {
-  return [...text.matchAll(FILE_RE)].map((m) => m[1]!.replace(/^\.\//, '')).filter((t) => !GENERIC.has(baseOf(t)))
+  return [...text.matchAll(FILE_RE)]
+    .map((m) => m[1]!.replace(/^\.\//, ''))
+    .filter((t) => !GENERIC.has(baseOf(t)))
 }
 
 /** 每轮建一次：预先抽出 description 里点名的文件 */
 export function indexTouchEntries(candidates: readonly SelectorCandidate[]): TouchEntry[] {
-  return candidates.map((c) => ({ c, files: fileTokens(c.text), desc: c.text.replace(/\s+/g, ' ').trim() }))
+  return candidates.map((c) => ({
+    c,
+    files: fileTokens(c.text),
+    desc: c.text.replace(/\s+/g, ' ').trim(),
+  }))
 }
 
 /** 命令里提到、且能落到仓库真实文件的路径 */
@@ -67,7 +83,8 @@ function touchedPaths(command: string, repo: RepoIndex): string[] {
       if (same.length === 1) out.add(same[0]!)
       continue
     }
-    for (const p of same) if (p === tok || p.endsWith(`/${tok}`) || tok.endsWith(`/${p}`)) out.add(p)
+    for (const p of same)
+      if (p === tok || p.endsWith(`/${tok}`) || tok.endsWith(`/${p}`)) out.add(p)
   }
   return [...out]
 }
@@ -81,7 +98,8 @@ function commandKeys(command: string): string[] {
   const keys: string[] = []
   for (const seg of body.split(/&&|\|\||[;|\n`(]|\$\(/)) {
     const words = seg.trim().split(/\s+/)
-    while (words.length > 0 && (/^[A-Za-z_]\w*=/.test(words[0]!) || WRAPPERS.has(words[0]!))) words.shift()
+    while (words.length > 0 && (/^[A-Za-z_]\w*=/.test(words[0]!) || WRAPPERS.has(words[0]!)))
+      words.shift()
     const prog = baseOf(words[0] ?? '')
     // 小写开头：EOF/PATCH 这类 heredoc 定界符漏网时不当程序
     if (!/^[a-z][\w.+-]*$/.test(prog)) continue
@@ -94,9 +112,13 @@ function commandKeys(command: string): string[] {
 
 function matchOne(command: string, entries: readonly TouchEntry[], repo: RepoIndex): TouchHit[] {
   // 读库命令（note read 等）：正在看记忆，不是在碰代码
-  if (/SIMPLE_CODE_(NOTE|LESSON|EVENT|MEMORY)/.test(command) && !command.includes('APPLY_PATCH')) return []
+  if (/SIMPLE_CODE_(NOTE|LESSON|EVENT|MEMORY)/.test(command) && !command.includes('APPLY_PATCH'))
+    return []
   const paths = touchedPaths(command, repo)
-  const keys = commandKeys(command).map((k) => ({ k, re: new RegExp(`(?<![\\w./-])${escape(k)}(?![\\w-])`, 'i') }))
+  const keys = commandKeys(command).map((k) => ({
+    k,
+    re: new RegExp(`(?<![\\w./-])${escRe(k)}(?![\\w-])`, 'i'),
+  }))
   const hits: TouchHit[] = []
   for (const e of entries) {
     const file = e.files.find((f) => paths.some((p) => p === f || p.endsWith(`/${f}`)))
@@ -117,12 +139,16 @@ export function matchTouch(
   const fresh = entries.filter((e) => !exclude.has(`${e.c.kind}:${e.c.name}`))
   const out = new Map<string, TouchHit>()
   for (const command of commands)
-    for (const h of matchOne(command, fresh, repo)) if (!out.has(`${h.c.kind}:${h.c.name}`)) out.set(`${h.c.kind}:${h.c.name}`, h)
+    for (const h of matchOne(command, fresh, repo))
+      if (!out.has(`${h.c.kind}:${h.c.name}`)) out.set(`${h.c.kind}:${h.c.name}`, h)
   return [...out.values()]
 }
 
 export function renderTouch(hits: readonly TouchHit[]): string[] {
-  return hits.map((h) => `〔recall·async〕${h.c.kind} ${h.c.name} — ${clip(h.c.text.replace(/\s+/g, ' ').trim(), 80)}（触及: ${h.via}）`)
+  return hits.map(
+    (h) =>
+      `〔recall·async〕${h.c.kind} ${h.c.name} — ${clip(h.c.text.replace(/\s+/g, ' ').trim(), 80)}（触及: ${h.via}）`,
+  )
 }
 
 /** 每轮建一次（session 按 turn 缓存）：仓库文件表 + note/lesson 条目。
@@ -130,13 +156,20 @@ export function renderTouch(hits: readonly TouchHit[]): string[] {
 export function loadTouchContext(folder: string): { repo: RepoIndex; entries: TouchEntry[] } {
   let paths: string[] = []
   try {
-    paths = execFileSync('git', ['ls-files'], { cwd: folder, encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'ignore'] })
+    paths = execFileSync('git', ['ls-files'], {
+      cwd: folder,
+      encoding: 'utf8',
+      maxBuffer: 64 << 20,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
       .split('\n')
       .filter(Boolean)
   } catch {
     paths = []
   }
-  const candidates = loadSelectorCandidates(folder).filter((c) => c.kind !== 'skill' && c.kind !== 'event')
+  const candidates = loadSelectorCandidates(folder).filter(
+    (c) => c.kind !== 'skill' && c.kind !== 'event',
+  )
   return { repo: indexRepo(paths), entries: indexTouchEntries(candidates) }
 }
 
@@ -146,7 +179,10 @@ export function stepCommands(messages: readonly Message[]): string[] {
     const m = messages[i]!
     if (m.role !== 'assistant') continue
     return m.parts.flatMap((p) => {
-      const command = p.type === 'tool_call' && p.name === 'bash' ? (p.input as { command?: unknown } | null)?.command : undefined
+      const command =
+        p.type === 'tool_call' && p.name === 'bash'
+          ? (p.input as { command?: unknown } | null)?.command
+          : undefined
       return typeof command === 'string' ? [command] : []
     })
   }

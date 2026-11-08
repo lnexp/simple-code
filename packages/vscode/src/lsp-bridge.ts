@@ -20,10 +20,20 @@ export function startLspBridge(): Server {
   // 参数真对象化：query 层（可测）传 plain object，宿主要 vscode.Uri/Position
   // 实例——shape 判断而不是 instanceof（query 层构造的就这两种形状）
   const materialize = (arg: unknown): unknown => {
-    if (arg && typeof arg === 'object' && 'scheme' in (arg as object) && 'path' in (arg as object)) {
+    if (
+      arg &&
+      typeof arg === 'object' &&
+      'scheme' in (arg as object) &&
+      'path' in (arg as object)
+    ) {
       return vscode.Uri.file((arg as { path: string }).path)
     }
-    if (arg && typeof arg === 'object' && 'line' in (arg as object) && 'character' in (arg as object)) {
+    if (
+      arg &&
+      typeof arg === 'object' &&
+      'line' in (arg as object) &&
+      'character' in (arg as object)
+    ) {
       const p = arg as { line: number; character: number }
       return new vscode.Position(p.line, p.character)
     }
@@ -40,11 +50,16 @@ export function startLspBridge(): Server {
         const { cmd, file, line, col } = JSON.parse(Buffer.concat(chunks).toString()) as LspRequest
         const uri = vscode.Uri.file(file)
         // 相对路径兜底：bin 侧已 resolve，这里只防手滑传了相对路径
-        const abs = uri.scheme === 'file' && file.startsWith('/') ? file : vscode.Uri.joinPath(vscode.workspace.workspaceFolders?.[0]?.uri ?? uri, file).fsPath
+        const abs =
+          uri.scheme === 'file' && file.startsWith('/')
+            ? file
+            : vscode.Uri.joinPath(vscode.workspace.workspaceFolders?.[0]?.uri ?? uri, file).fsPath
         // 语言服务只对「宿主感知过的文档」响应——没打开过的文件 TS server
         // 懒启动、execute*Provider 返回空（实测首跑 symbols 全空）。先
         // openTextDocument 轻量加载（不弹窗口），缓存过的文档零开销
-        await Promise.resolve(vscode.workspace.openTextDocument(vscode.Uri.file(abs))).catch(() => undefined)
+        await Promise.resolve(vscode.workspace.openTextDocument(vscode.Uri.file(abs))).catch(
+          () => undefined,
+        )
         // 冷启动：openTextDocument 只让 server「开始」加载项目，tsconfig/
         // 依赖解析要时间——就绪前的查询合法地返回空。对「无结果」退避
         // 重试两档（实测大项目 tsserver 初始化 1-3s），就绪后零重试开销
@@ -57,7 +72,12 @@ export function startLspBridge(): Server {
         }
         res.end(JSON.stringify({ ok: true, text }))
       } catch (error) {
-        res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }))
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        )
       }
     })
   })

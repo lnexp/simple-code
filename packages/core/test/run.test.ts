@@ -1,16 +1,17 @@
-import { describe, expect, it, vi } from 'vitest'
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { describe, expect, it, vi } from 'vitest'
 import type { AgentEvent } from '../src/events.ts'
 import type { LLMEvent } from '../src/llm/events.ts'
 import { LLMStreamError } from '../src/llm/protocol.ts'
 import type { Capabilities, Message, Request, Usage } from '../src/llm/types.ts'
 import type { Summary } from '../src/loop/assemble.ts'
+import { PrefixBrokenError } from '../src/loop/prefix-guard.ts'
 import type { RegionSizes } from '../src/loop/regions.ts'
+import { relayHit, relaySave } from '../src/loop/relay-cache.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
 import { type LoopContext, type LoopDeps, run } from '../src/loop/run.ts'
-import { relayHit, relaySave } from '../src/loop/relay-cache.ts'
 import { estimateMessageTokens } from '../src/loop/tokens.ts'
 import type { Tool, ToolContext, ToolOutput } from '../src/tools/types.ts'
 import { makePng, mulberry32 } from './make-png'
@@ -77,6 +78,8 @@ async function drive(options: {
   reloadSystem?: LoopDeps['reloadSystem']
   /** 注入 deps.kickSummary，观测水位检查催没催摘要 */
   kickSummary?: LoopDeps['kickSummary']
+  /** 注入 deps.prefixGuard：观测守卫违规走哪个分支 */
+  prefixGuard?: LoopDeps['prefixGuard']
 }): Promise<Harness> {
   const scripted = scriptedStream(options.rounds ?? [])
   const tools = options.tools ?? [fakeTool('bash')]
@@ -99,6 +102,7 @@ async function drive(options: {
     ...(options.reloadSystem ? { reloadSystem: options.reloadSystem } : {}),
     ...(options.kickSummary ? { kickSummary: options.kickSummary } : {}),
     ...(options.memory ? { memory: options.memory } : {}),
+    ...(options.prefixGuard ? { prefixGuard: options.prefixGuard } : {}),
   }
   const ctx: LoopContext = {
     messages: options.messages ?? [{ role: 'user', parts: [{ type: 'text', text: '跑一下' }] }],
@@ -120,12 +124,42 @@ async function drive(options: {
 
 const kinds = (events: AgentEvent[]) => events.map((e) => e.type)
 
+describe('前缀守卫违规的收口（2026-11-06 三缺口之一）', () => {
+  it('PrefixBrokenError → error 事件带 kind=prefix_broken，ctx.lastErrorMessage 记下', async () => {
+    const h = await drive({
+      rounds: [says('甲')],
+      prefixGuard: {
+        allowRewrite: () => {},
+        check: () => {
+          throw new PrefixBrokenError('上下文前缀在非压缩点被改写：messages 第 38 条起不同。', {
+            part: 'messages',
+            index: 38,
+            prevLength: 315,
+            nextLength: 317,
+            dumpPath: null,
+          })
+        },
+      },
+    })
+    const error = h.events.find((e) => e.type === 'error')
+    expect(error).toMatchObject({ type: 'error', kind: 'prefix_broken', retryable: false })
+    expect((error as { message: string }).message).toContain('非压缩点')
+    expect(h.ctx.lastErrorMessage).toContain('非压缩点')
+  })
+})
+
 describe('基本回合', () => {
   it('模型只说话时跑一轮就停', async () => {
     const h = await drive({ rounds: [says('好的')] })
 
     expect(h.requests()).toBe(1)
-    expect(kinds(h.events)).toEqual(['text_start', 'text_delta', 'text_end', 'request_timing', 'step_finish'])
+    expect(kinds(h.events)).toEqual([
+      'text_start',
+      'text_delta',
+      'text_end',
+      'request_timing',
+      'step_finish',
+    ])
     expect(h.ctx.messages.at(-1)).toEqual({
       role: 'assistant',
       parts: [{ type: 'text', text: '好的' }],
@@ -310,9 +344,7 @@ describe('基本回合', () => {
     })
 
     expect(ran).toBe(1)
-    const call = h.ctx.messages
-      .flatMap((m) => m.parts)
-      .find((p) => p.type === 'tool_call')
+    const call = h.ctx.messages.flatMap((m) => m.parts).find((p) => p.type === 'tool_call')
     expect(call).toMatchObject({ name: 'bash' })
   })
 
@@ -350,9 +382,7 @@ describe('基本回合', () => {
     })
 
     expect(hits).toEqual(['wrapped'])
-    const call = h.ctx.messages
-      .flatMap((m) => m.parts)
-      .find((p) => p.type === 'tool_call')
+    const call = h.ctx.messages.flatMap((m) => m.parts).find((p) => p.type === 'tool_call')
     expect(call).toMatchObject({ name: 'mcp__client__bash' })
   })
 })
@@ -657,7 +687,13 @@ describe('健壮性', () => {
     let executed = 0
     const h = await drive({
       rounds: [calls('t1'), calls('t2'), calls('t3'), calls('t4')],
-      tools: [fakeTool('bash', async () => ({ output: `rows=${++executed}`, exitCode: 0, isError: false }))],
+      tools: [
+        fakeTool('bash', async () => ({
+          output: `rows=${++executed}`,
+          exitCode: 0,
+          isError: false,
+        })),
+      ],
     })
     expect(executed).toBe(4)
     expect(h.events.some((e) => e.type === 'error' || e.type === 'tool_error')).toBe(false)
@@ -667,7 +703,9 @@ describe('健壮性', () => {
     let executed = 0
     const h = await drive({
       rounds: [[...calls('t1'), ...calls('t2'), ...calls('t3')]],
-      tools: [fakeTool('bash', async () => ({ output: `ran${++executed}`, exitCode: 0, isError: false }))],
+      tools: [
+        fakeTool('bash', async () => ({ output: `ran${++executed}`, exitCode: 0, isError: false })),
+      ],
     })
     expect(executed).toBe(0) // 第 1 个执行前就够数
     const results = h.ctx.messages.filter((m) => m.role === 'tool').flatMap((m) => m.parts)
@@ -679,7 +717,11 @@ describe('健壮性', () => {
     // 同名但 input 不同 → 不拦。反过来也测：两次相同之后插一次不同，再两次
     // 相同——尾部连续段只有 2，不拦
     let executed = 0
-    const tool = fakeTool('bash', async () => ({ output: `ran${++executed}`, exitCode: 0, isError: false }))
+    const tool = fakeTool('bash', async () => ({
+      output: `ran${++executed}`,
+      exitCode: 0,
+      isError: false,
+    }))
     const ok = await drive({
       rounds: [calls('t1', 'bash', { command: 'a' }), calls('t2', 'bash', { command: 'b' })],
       tools: [tool],
@@ -781,11 +823,17 @@ describe('输出被 max_tokens 截断', () => {
     try {
       const h = await drive({ root, rounds: [starved('想了很多很多字'), says('答案')] })
       const prompt = h.sent[1]?.messages.findLast((m) => m.role === 'user')
-      expect(prompt?.parts).toEqual([{
-        type: 'text',
-        text: '本次输出达到长度上限，尚未生成正文。请把任务拆成小步骤，先完成一个可验证的步骤，再根据结果继续。',
-      }])
-      expect(h.ctx.messages.some((m) => m.parts.some((p) => p.type === 'reasoning' && p.text === '想了很多很多字'))).toBe(true)
+      expect(prompt?.parts).toEqual([
+        {
+          type: 'text',
+          text: '本次输出达到长度上限，尚未生成正文。请把任务拆成小步骤，先完成一个可验证的步骤，再根据结果继续。',
+        },
+      ])
+      expect(
+        h.ctx.messages.some((m) =>
+          m.parts.some((p) => p.type === 'reasoning' && p.text === '想了很多很多字'),
+        ),
+      ).toBe(true)
       expect(existsSync(join(root, '.simple-code', 'tmp', 'truncated-reasoning-0.md'))).toBe(false)
       expect(h.requests()).toBe(2)
     } finally {
@@ -819,9 +867,12 @@ describe('输出被 max_tokens 截断', () => {
       maxIterations: 20, // 8 次请求 + 4 次续写各占一轮，默认 10 不够
       rounds: [
         // 命令各不相同：同参同结果连做 3 次会被 doomLoopGuard 熔断
-        starved('想'), calls('t1', 'bash', { command: 'echo 1' }),
-        starved('想'), calls('t2', 'bash', { command: 'echo 2' }),
-        starved('想'), calls('t3', 'bash', { command: 'echo 3' }),
+        starved('想'),
+        calls('t1', 'bash', { command: 'echo 1' }),
+        starved('想'),
+        calls('t2', 'bash', { command: 'echo 2' }),
+        starved('想'),
+        calls('t3', 'bash', { command: 'echo 3' }),
         starved('想'),
         says('做完了'),
       ],
@@ -908,7 +959,9 @@ const stubby = (seq: number): Message => ({
       type: 'tool_call',
       id: `stub-${seq}`,
       name: 'bash',
-      input: { command: `head-${seq}\n# [已卸载，完整内容见 .simple-code/memory/raw/turn-${seq}.txt]` },
+      input: {
+        command: `head-${seq}\n# [已卸载，完整内容见 .simple-code/memory/raw/turn-${seq}.txt]`,
+      },
     },
     { type: 'tool_result', toolCallId: `stub-${seq}`, output: '', isError: false },
   ],
@@ -920,7 +973,6 @@ const stubby = (seq: number): Message => ({
  * 只在压缩点发生——测它们的用例要先让这一步成为压缩点
  */
 const COMPACTION_POINT = { lastResponseAt: () => 0, now: () => 1e12 } as const
-
 
 function spyMemory(over: Partial<NonNullable<LoopDeps['memory']>> = {}) {
   const calls: number[][] = []
@@ -946,7 +998,7 @@ function spyMemory(over: Partial<NonNullable<LoopDeps['memory']>> = {}) {
     // 默认大值=水位检查不触发；要测三级递进第二级的用例自己覆盖成小值
     stubTokens: 1e9,
     stubSteps: 1e9,
-        // 测试里关掉余量，让预算就是 contextWindow - maxTokens，好算
+    // 测试里关掉余量，让预算就是 contextWindow - maxTokens，好算
     safetyMargin: 0,
     keepHeadChars: 20,
     // 阈值压到 0：这些用例造的夹具是几十到几百字符的合成消息，
@@ -1060,7 +1112,13 @@ describe('上下文卸载', () => {
     // token，真实是估算的 2 倍 → 估算只能数到 300 → 短 + 下标 3，下标 2 出局
     const m = spyMemory({ floorTokens: 100_000, targetRatio: 1, tokenRatio: () => 2 })
     await drive({
-      messages: [bulky('user', 300), bulky('assistant', 300), bulky('user', 300), bulky('assistant', 300), { role: 'user', parts: [{ type: 'text', text: '短' }] }],
+      messages: [
+        bulky('user', 300),
+        bulky('assistant', 300),
+        bulky('user', 300),
+        bulky('assistant', 300),
+        { role: 'user', parts: [{ type: 'text', text: '短' }] },
+      ],
       memory: m.memory,
       rounds: [says('好的')],
       maxTokens: 400,
@@ -1169,9 +1227,33 @@ describe('上下文卸载', () => {
     // 摘要进场，1、2 的不进。跨界的（covers 1..2）也不进——半存根半摘要
     // 没有意义
     const summaries = [
-      { id: 11, level: 0, coversFrom: 0, coversTo: 0, status: 'ready', inContext: false, supersededBy: null },
-      { id: 12, level: 0, coversFrom: 1, coversTo: 1, status: 'ready', inContext: false, supersededBy: null },
-      { id: 13, level: 0, coversFrom: 1, coversTo: 2, status: 'ready', inContext: false, supersededBy: null },
+      {
+        id: 11,
+        level: 0,
+        coversFrom: 0,
+        coversTo: 0,
+        status: 'ready',
+        inContext: false,
+        supersededBy: null,
+      },
+      {
+        id: 12,
+        level: 0,
+        coversFrom: 1,
+        coversTo: 1,
+        status: 'ready',
+        inContext: false,
+        supersededBy: null,
+      },
+      {
+        id: 13,
+        level: 0,
+        coversFrom: 1,
+        coversTo: 2,
+        status: 'ready',
+        inContext: false,
+        supersededBy: null,
+      },
     ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>
     const m = spyMemory({
       ...COMPACTION_POINT,
@@ -1226,9 +1308,33 @@ describe('上下文卸载', () => {
     // 区里装得下一条、装不下两条。stubby(2) 在区里，stubby(0)/stubby(1) 在区外
     const oneStub = estimateMessageTokens(stubby(0).parts)
     const summaries = [
-      { id: 11, level: 0, coversFrom: 0, coversTo: 0, status: 'ready', inContext: false, supersededBy: null },
-      { id: 12, level: 0, coversFrom: 1, coversTo: 1, status: 'ready', inContext: false, supersededBy: null },
-      { id: 13, level: 0, coversFrom: 2, coversTo: 2, status: 'ready', inContext: false, supersededBy: null },
+      {
+        id: 11,
+        level: 0,
+        coversFrom: 0,
+        coversTo: 0,
+        status: 'ready',
+        inContext: false,
+        supersededBy: null,
+      },
+      {
+        id: 12,
+        level: 0,
+        coversFrom: 1,
+        coversTo: 1,
+        status: 'ready',
+        inContext: false,
+        supersededBy: null,
+      },
+      {
+        id: 13,
+        level: 0,
+        coversFrom: 2,
+        coversTo: 2,
+        status: 'ready',
+        inContext: false,
+        supersededBy: null,
+      },
     ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>
     const m = spyMemory({
       ...COMPACTION_POINT,
@@ -1255,9 +1361,33 @@ describe('上下文卸载', () => {
     // activateByZone 的话这里是 []
     const oneStub = estimateMessageTokens(stubby(0).parts)
     const summaries = [
-      { id: 11, level: 0, coversFrom: 0, coversTo: 0, status: 'ready', inContext: false, supersededBy: null },
-      { id: 12, level: 0, coversFrom: 1, coversTo: 1, status: 'ready', inContext: false, supersededBy: null },
-      { id: 13, level: 0, coversFrom: 2, coversTo: 2, status: 'ready', inContext: false, supersededBy: null },
+      {
+        id: 11,
+        level: 0,
+        coversFrom: 0,
+        coversTo: 0,
+        status: 'ready',
+        inContext: false,
+        supersededBy: null,
+      },
+      {
+        id: 12,
+        level: 0,
+        coversFrom: 1,
+        coversTo: 1,
+        status: 'ready',
+        inContext: false,
+        supersededBy: null,
+      },
+      {
+        id: 13,
+        level: 0,
+        coversFrom: 2,
+        coversTo: 2,
+        status: 'ready',
+        inContext: false,
+        supersededBy: null,
+      },
     ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>
     const m = spyMemory({
       ...COMPACTION_POINT,
@@ -1282,11 +1412,24 @@ describe('上下文卸载', () => {
     const m = spyMemory({
       stubTokens: 1,
       stubSteps: 1e9,
-      summaries: () => [
-        { id: 31, level: 0, coversFrom: 0, coversTo: 0, status: 'ready', inContext: false, supersededBy: null },
-      ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>,
+      summaries: () =>
+        [
+          {
+            id: 31,
+            level: 0,
+            coversFrom: 0,
+            coversTo: 0,
+            status: 'ready',
+            inContext: false,
+            supersededBy: null,
+          },
+        ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>,
     })
-    await drive({ messages: [stubby(0), bulky('user', 10)], memory: m.memory, rounds: [says('好的')] })
+    await drive({
+      messages: [stubby(0), bulky('user', 10)],
+      memory: m.memory,
+      rounds: [says('好的')],
+    })
     expect(m.activated).toEqual([])
   })
 
@@ -1325,9 +1468,18 @@ describe('上下文卸载', () => {
       ...COMPACTION_POINT,
       stubTokens: 1e9,
       stubSteps: 1,
-      summaries: () => [
-        { id: 21, level: 0, coversFrom: 0, coversTo: 0, status: 'ready', inContext: false, supersededBy: null },
-      ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>,
+      summaries: () =>
+        [
+          {
+            id: 21,
+            level: 0,
+            coversFrom: 0,
+            coversTo: 0,
+            status: 'ready',
+            inContext: false,
+            supersededBy: null,
+          },
+        ] as unknown as ReturnType<ReturnType<typeof spyMemory>['memory']['summaries']>,
     })
     await drive({
       messages: [text(0), text(1), { role: 'user', parts: [{ type: 'text', text: '问' }] }],
@@ -1556,7 +1708,11 @@ describe('缓存过期触发（提案 §12）', () => {
     const mod = await import('../src/runlog.ts')
     const spy = vi.spyOn(mod, 'logRun').mockImplementation((ev) => void calls.push(ev))
     try {
-      const m = spyMemory({ now: () => 0, lastResponseAt: () => -4 * 60 * 60 * 1000, consumeMergePending: () => true })
+      const m = spyMemory({
+        now: () => 0,
+        lastResponseAt: () => -4 * 60 * 60 * 1000,
+        consumeMergePending: () => true,
+      })
       await drive({ messages: three(), memory: m.memory, rounds: [says('好的')] })
       const ev = calls.find((c) => c.ev === 'unload_trigger')
       expect(ev).toMatchObject({ reason: 'stale', mergePending: true })
@@ -2360,7 +2516,12 @@ describe('四个区的记账（提案 §13）', () => {
     // 行和请求对不上号（比如错记成上一次的）这里就会红
     const m = spyMemory()
     const zero: Usage = { ...usage(), inputTokens: 0, outputTokens: 0 }
-    const first: Usage = { ...usage(), inputTokens: 3, cacheReadInputTokens: 50, cacheCreationInputTokens: 7 }
+    const first: Usage = {
+      ...usage(),
+      inputTokens: 3,
+      cacheReadInputTokens: 50,
+      cacheCreationInputTokens: 7,
+    }
     await drive({
       messages: [{ role: 'user', parts: [{ type: 'text', text: '跑一下' }] }],
       memory: m.memory,
@@ -2529,7 +2690,6 @@ function scriptedStream(rounds: StreamEvent[][]) {
   return { stream, seen, requests: () => seen.length }
 }
 
-
 describe('relay 转述缓存盘上层（relay-cache.ts，方案 B 2026-09-24）', () => {
   const image = { type: 'image' as const, data: 'aGk=', mimeType: 'image/png' }
 
@@ -2625,11 +2785,20 @@ function ctxRelayText(root: string, data: string): string {
 describe('拒答透传（finish.refusal → error 事件，2026-09-27 欠账补测）', () => {
   it('content-filter 带详情：yield 不可重试 error，消息含 category/explanation', async () => {
     const h = await drive({
-      rounds: [[
-        { type: 'finish', reason: 'content-filter', usage: usage(), refusal: { category: 'harm_category', explanation: '涉及敏感内容' } },
-      ]],
+      rounds: [
+        [
+          {
+            type: 'finish',
+            reason: 'content-filter',
+            usage: usage(),
+            refusal: { category: 'harm_category', explanation: '涉及敏感内容' },
+          },
+        ],
+      ],
     })
-    const err = h.events.find((e) => e.type === 'error') as { message: string; retryable: boolean } | undefined
+    const err = h.events.find((e) => e.type === 'error') as
+      | { message: string; retryable: boolean }
+      | undefined
     expect(err).toBeDefined()
     expect(err!.retryable).toBe(false)
     expect(err!.message).toContain('harm_category')

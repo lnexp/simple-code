@@ -31,7 +31,8 @@ const toolItem = (over: Partial<Parameters<typeof ToolRow>[0]['tool']> = {}) =>
     ...over,
   }) as Parameters<typeof ToolRow>[0]['tool']
 
-const render = (over = {}) => renderToStaticMarkup(createElement(ToolRow, { tool: toolItem(over), onReply: () => {} }))
+const render = (over = {}) =>
+  renderToStaticMarkup(createElement(ToolRow, { tool: toolItem(over), onReply: () => {} }))
 
 describe('对照组：确认测试真的渲染了东西', () => {
   /**
@@ -231,9 +232,10 @@ describe('审批卡挂在工具行下方（approval.md §4.2 位置 + 样式）'
     detail: '~/.ssh/id_rsa',
     reason: '要触碰项目外路径',
   }
-  const renderWithApproval = () => renderToStaticMarkup(
-    createElement(ToolRow, { tool: toolItem({ id: 't1' }), approval, onReply: () => {} }),
-  )
+  const renderWithApproval = () =>
+    renderToStaticMarkup(
+      createElement(ToolRow, { tool: toolItem({ id: 't1' }), approval, onReply: () => {} }),
+    )
 
   it('审批卡与工具行同根渲染（上下相邻），不在别处', () => {
     const out = renderWithApproval()

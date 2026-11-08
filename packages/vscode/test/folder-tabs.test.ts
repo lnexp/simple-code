@@ -44,10 +44,7 @@ function mount(folders: FolderState[], active: string) {
 
 describe('平铺 tab 渲染', () => {
   it('每个文件夹一个 tab，active 的带高亮类', () => {
-    const host = mount(
-      [folder('/w/a'), folder('/w/b'), folder('/w/c')],
-      '/w/b',
-    )
+    const host = mount([folder('/w/a'), folder('/w/b'), folder('/w/c')], '/w/b')
     const tabs = [...host.querySelectorAll('.folder-tab')]
     expect(tabs.map((t) => t.textContent)).toEqual(['a', 'b', 'c'])
     expect(tabs[1]?.className).toContain('active')
@@ -55,10 +52,7 @@ describe('平铺 tab 渲染', () => {
   })
 
   it('跑着的文件夹带状态点，静态的不带', () => {
-    const host = mount(
-      [folder('/w/a', true), folder('/w/b')],
-      '/w/a',
-    )
+    const host = mount([folder('/w/a', true), folder('/w/b')], '/w/a')
     const dots = [...host.querySelectorAll('.folder-tab .tab-dot')]
     expect(dots).toHaveLength(1)
     expect(dots[0]?.getAttribute('aria-label')).toBe('跑着')
@@ -70,9 +64,9 @@ describe('单击切换接线', () => {
     const host = mount([folder('/w/a'), folder('/w/b')], '/w/a')
     const before = vi.mocked(post).mock.calls.length
     act(() => {
-      host.querySelectorAll('.folder-tab')[1]?.dispatchEvent(
-        new MouseEvent('click', { bubbles: true }),
-      )
+      host
+        .querySelectorAll('.folder-tab')[1]
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     })
     const calls = vi.mocked(post).mock.calls
     expect(calls.length).toBe(before + 1)
@@ -111,10 +105,7 @@ describe('溢出折叠（mock 宽度）', () => {
 
   it('放不下的折进「»」，激活的从溢出区提升到平铺末位', () => {
     install()
-    const host = mount(
-      [folder('/w/a'), folder('/w/b'), folder('/w/c'), folder('/w/d')],
-      '/w/d',
-    )
+    const host = mount([folder('/w/a'), folder('/w/b'), folder('/w/c'), folder('/w/d')], '/w/d')
     // 溢出菜单的触发器存在（还有折进去的）
     expect(host.querySelector('.folder-overflow')).not.toBeNull()
     // 平铺区：a、d。d 是 active 从溢出区提升，b（平铺末位）给它让位
@@ -129,10 +120,7 @@ describe('溢出折叠（mock 宽度）', () => {
 
   it('active 在平铺区时不换位——位置稳定（肌肉记忆）', () => {
     install()
-    const host = mount(
-      [folder('/w/a'), folder('/w/b'), folder('/w/c'), folder('/w/d')],
-      '/w/b',
-    )
+    const host = mount([folder('/w/a'), folder('/w/b'), folder('/w/c'), folder('/w/d')], '/w/b')
     const tabs = [...host.querySelectorAll('.folder-tab:not(.tab-shadow)')]
     expect(tabs.map((t) => t.textContent)).toEqual(['a', 'b'])
   })

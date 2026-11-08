@@ -134,7 +134,10 @@ function summaryFetch(text = '摘要内容') {
   const impl = (async (_url: string, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
     const msgs = Array.isArray(body.messages) ? (body.messages as { content?: unknown }[]) : []
-    const first = typeof msgs[0]?.content === 'string' ? msgs[0].content : JSON.stringify(msgs[0]?.content ?? '')
+    const first =
+      typeof msgs[0]?.content === 'string'
+        ? msgs[0].content
+        : JSON.stringify(msgs[0]?.content ?? '')
     const isArchive = first.includes('[event-classify]')
     ;(isArchive ? archiveBodies : bodies).push(body)
     if (gated) await new Promise<void>((r) => (release = r))

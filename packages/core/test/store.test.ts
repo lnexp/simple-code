@@ -5,8 +5,8 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Message, Part } from '../src/llm/types.ts'
 import { listBucketFiles, resolveBucketFile } from '../src/session/buckets.ts'
-import { createTask, scopeOf } from '../src/session/task.ts'
 import { lastRegionLine, MEMORY_RELATIVE, openStore, type Store } from '../src/session/store.ts'
+import { createTask, scopeOf } from '../src/session/task.ts'
 
 const dirs: string[] = []
 afterEach(async () => {
@@ -64,6 +64,35 @@ function readTurnIds(dir: string): number[] {
   db.close()
   return rows.map((r) => r.turn_id)
 }
+
+describe('迁移（2026-11-06 messages_restore 索引）', () => {
+  it('新库打开后 messages_restore 索引在——fold 的原文恢复不走 owner 全扫', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'sc-idx-'))
+    try {
+      const store = openStore(dir)
+      const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'))
+      const idx = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='messages'")
+        .all() as { name: string }[]
+      db.close()
+      store.close()
+      expect(idx.map((r) => r.name)).toContain('messages_restore')
+      // 查询计划不退化成 messages 表全扫（owner 单列索引在 379MB 真库上
+      // 命中 4 万行回表过滤，fold 每轮 1.4s）
+      const db2 = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'))
+      const plan = db2
+        .prepare(
+          "EXPLAIN QUERY PLAN SELECT id FROM messages WHERE state='unloaded' AND owner IS NULL AND step_id IN (SELECT value FROM json_each('[1]'))",
+        )
+        .all() as { detail: string }[]
+      db2.close()
+      const text = plan.map((r) => String(r.detail)).join('\n')
+      expect(text).not.toMatch(/SCAN messages/)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
 
 describe('落盘与读回', () => {
   it('重启后历史一字不差', async () => {
@@ -180,7 +209,7 @@ describe('turns/ 归档', () => {
     // §9.8：「模型要用 cat 读它们——放进 SQLite 就 cat 不出来了」
     const dir = await workspace()
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('查一下'), assistantSays('好的')])
 
     const files = listBucketFiles(join(dir, MEMORY_RELATIVE), 'turns', '.jsonl')
@@ -198,7 +227,7 @@ describe('turns/ 归档', () => {
     // 每次 save 都整个重写的话，一轮十次 save 就是十份重复
     const dir = await workspace()
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
 
     store.save([userSays('一')])
     store.save([userSays('一'), assistantSays('二')])
@@ -234,7 +263,7 @@ describe('turns/ 归档', () => {
 
     const first = [userSays('第一轮'), assistantSays('答一')]
     store.save(first)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([...first, userSays('第二轮'), assistantSays('答二')])
     store.close()
 
@@ -255,7 +284,7 @@ describe('turns/ 归档', () => {
     store.save([userSays('第一轮'), assistantSays('答一')])
     store = reopen(dir, store)
 
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('第一轮'), assistantSays('答一'), userSays('第二轮')])
     store.close()
 
@@ -269,9 +298,9 @@ describe('turns/ 归档', () => {
     const dir = await workspace()
     const store = openStore(dir)
 
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('第一轮')])
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('第一轮'), userSays('第二轮')])
 
     const files = listBucketFiles(join(dir, MEMORY_RELATIVE), 'turns', '.jsonl')
@@ -443,7 +472,12 @@ describe('历史分页（historyPage）', () => {
     store.unload([1]) // 答1 被卸载：原文进 unloaded
     store.save([userSays('问1'), assistantSays('答1存根')]) // 存根回到 live
     store.beginTurn({ model: 'p/m', effort: null })
-    store.save([userSays('问1'), assistantSays('答1存根'), userSays('问2'), assistantSays('答2原文')])
+    store.save([
+      userSays('问1'),
+      assistantSays('答1存根'),
+      userSays('问2'),
+      assistantSays('答2原文'),
+    ])
     store.unload([3]) // 答2 先卸载——它的 id 比下面才翻的问1 小
     store.pruneMessages([0, 1]) // 第一轮被合并顶替：问1 从没卸载过、答1 是存根副本
     store.close()
@@ -467,18 +501,39 @@ describe('历史分页（historyPage）', () => {
     const dir = await workspace()
     const store = openStore(dir)
     store.beginTurn({ model: 'p/m', effort: null })
-    store.save([userSays('问'), callsTool('c1', 'ls'), toolReturns('c1', '输出原文'), userSays('继续')])
+    store.save([
+      userSays('问'),
+      callsTool('c1', 'ls'),
+      toolReturns('c1', '输出原文'),
+      userSays('继续'),
+    ])
     store.unload([2]) // 输出早卸：id 小于 问/命令/继续
-    store.save([userSays('问'), callsTool('c1', 'ls'), toolReturns('c1', '输出存根'), userSays('继续')])
+    store.save([
+      userSays('问'),
+      callsTool('c1', 'ls'),
+      toolReturns('c1', '输出存根'),
+      userSays('继续'),
+    ])
     store.pruneMessages([0, 1, 2, 3])
     store.close()
 
     const reopened = openStore(dir)
     const show = (r: { parts: Part[] }) => {
       const p = r.parts[0]
-      return p?.type === 'text' ? p.text : p?.type === 'tool_call' ? 'call' : p?.type === 'tool_result' ? p.output : '?'
+      return p?.type === 'text'
+        ? p.text
+        : p?.type === 'tool_call'
+          ? 'call'
+          : p?.type === 'tool_result'
+            ? p.output
+            : '?'
     }
-    expect(reopened.historyPage(null, 10).rows.map(show)).toEqual(['问', 'call', '输出原文', '继续'])
+    expect(reopened.historyPage(null, 10).rows.map(show)).toEqual([
+      '问',
+      'call',
+      '输出原文',
+      '继续',
+    ])
     reopened.close()
   })
 })
@@ -518,7 +573,7 @@ describe('卸载', () => {
     // 路径拼错不会报错，只是模型 cat 不到——而那时已经离卸载很远了
     const dir = await workspace()
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('一'), assistantSays('二')])
 
     const [ref] = store.unload([0])
@@ -553,7 +608,7 @@ describe('卸载', () => {
     const dir = await workspace()
     const store = openStore(dir)
     store.save([userSays('一'), assistantSays('二')])
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('一'), assistantSays('二'), userSays('三')])
 
     store.unload([0]) // 卸掉第一条
@@ -573,7 +628,7 @@ describe('卸载', () => {
     // 模型会看到同一段对话出现两次
     const dir = await workspace()
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('一'), userSays('二'), userSays('三'), userSays('四')])
 
     store.unload([0, 1])
@@ -608,7 +663,10 @@ describe('卸载', () => {
     }
     store.save([userSays('问'), original])
     store.unload([1])
-    const stub = { role: 'assistant' as const, parts: [{ type: 'text' as const, text: '回答正文' }] }
+    const stub = {
+      role: 'assistant' as const,
+      parts: [{ type: 'text' as const, text: '回答正文' }],
+    }
     store.markStubs([stub])
     store.save([userSays('问'), stub, userSays('新')])
     store.close()
@@ -625,7 +683,7 @@ describe('卸载', () => {
     // 归档里缺一段。跳过是不报错的，比重复更难发现
     const dir = await workspace()
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('一'), userSays('二'), userSays('三'), userSays('四')])
 
     store.unload([0, 1, 2]) // live 只剩 1 条，比已归档的 4 条短
@@ -799,9 +857,9 @@ describe('摘要（3b-1）', () => {
     // 只是从「卡着一行 pending」变成「一行都没有」，一样是洞
     const dir = await workspace()
     let store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('问一'), assistantSays('答一')])
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('问一'), assistantSays('答一'), userSays('问二')])
 
     const first = store.nextSegmentToSummarize(1_000_000, null)
@@ -833,14 +891,20 @@ describe('摘要（3b-1）', () => {
 
     const first = store.nextSegmentToSummarize(1_000_000, null)
     expect(first).not.toBeNull() // 前提：本来就有候选
-    store.addSummary(draft({ coversFrom: first?.from ?? 0, coversTo: first?.to ?? 0, inContext: false }))
-    store.addSummary(draft({ coversFrom: 10_000_000_000, coversTo: 20_000_000_000, inContext: false }))
+    store.addSummary(
+      draft({ coversFrom: first?.from ?? 0, coversTo: first?.to ?? 0, inContext: false }),
+    )
+    store.addSummary(
+      draft({ coversFrom: 10_000_000_000, coversTo: 20_000_000_000, inContext: false }),
+    )
 
     const second = store.nextSegmentToSummarize(1_000_000, null)
     expect(second).not.toBeNull()
     expect(second?.turn).not.toBe(first?.turn)
     // 对照组：两轮都盖住 → 没有候选
-    store.addSummary(draft({ coversFrom: second?.from ?? 0, coversTo: second?.to ?? 0, inContext: false }))
+    store.addSummary(
+      draft({ coversFrom: second?.from ?? 0, coversTo: second?.to ?? 0, inContext: false }),
+    )
     expect(store.nextSegmentToSummarize(1_000_000, null)).toBeNull()
     store.close()
   })
@@ -856,8 +920,12 @@ describe('摘要（3b-1）', () => {
     store.save([userSays('问一'), assistantSays('答一'), userSays('问二'), assistantSays('答二')])
 
     const first = store.nextSegmentToSummarize(1_000_000, null)
-    store.addSummary(draft({ level: 1, coversFrom: first?.from ?? 0, coversTo: 20_000_000_000, inContext: false }))
-    store.addSummary(draft({ coversFrom: first?.from ?? 0, coversTo: first?.to ?? 0, inContext: false }))
+    store.addSummary(
+      draft({ level: 1, coversFrom: first?.from ?? 0, coversTo: 20_000_000_000, inContext: false }),
+    )
+    store.addSummary(
+      draft({ coversFrom: first?.from ?? 0, coversTo: first?.to ?? 0, inContext: false }),
+    )
     expect(store.nextSegmentToSummarize(1_000_000, null)).toBeNull()
     store.close()
   })
@@ -922,7 +990,7 @@ describe('摘要（3b-1）', () => {
     const store = openStore(dir)
     store.save([userSays('第一轮')])
     const first = readTurnIds(dir)[0] as number
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('第一轮'), userSays('第二轮')])
 
     const withTurns = store.withTurns([userSays('第一轮'), userSays('第二轮')])
@@ -1089,7 +1157,7 @@ describe('回填出来的 step 认领 unloaded 标志', () => {
     // 存根，context 里滞留 1151 条存根 ≈ 250k token
     const dir = await workspace()
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('一'), assistantSays('二'), userSays('三')])
     store.unload([0, 1]) // 前两条原文离开 context
     store.save([userSays('一截断'), assistantSays('二截断'), userSays('三')])
@@ -1113,7 +1181,7 @@ describe('回填出来的 step 认领 unloaded 标志', () => {
     // 摘要会给还在 context 里的原文直接翻 in_context，历史凭空消失
     const dir = await workspace()
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('一'), assistantSays('二')])
     stripSteps(dir)
     store.close()
@@ -1133,7 +1201,7 @@ describe('摘要候选优先给还占着 context 的 turn', () => {
     // 一次空闲一段要几千次 tick 才轮到真正占地方的那个
     const dir = await workspace()
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('老一'), assistantSays('老二')])
     store.unload([0, 1])
     // 存根被合并剪掉：老 turn 的行全是 `unloaded`，一条 live 都不剩。这是
@@ -1141,7 +1209,7 @@ describe('摘要候选优先给还占着 context 的 turn', () => {
     // 的话老 turn 照样占着 context。**归属数组要跟着缩**，所以走 pruneMessages
     // 而不是直接 save 一个短数组（后者会让新消息认领老 step，一条 stale 都不剩）
     store.pruneMessages([0, 1])
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('新一'), assistantSays('新二')])
     store.close()
 
@@ -1197,7 +1265,12 @@ describe('摘要候选优先给还占着 context 的 turn', () => {
       .map((row) => String(row.detail))
       .join('\n')
     db.close()
-    expect(plan).toMatch(/SEARCH m2 USING (COVERING )?INDEX messages_live \(state=\?\)/)
+    // 2026-11-06 messages_restore(owner,state,step_id) 索引加入后 m2 改走它
+    // （COVERING，索引内定位 owner+state，一样不回表）——本意是「不逐 step
+    // 回表读消息行」，两种走法都满足
+    expect(plan).toMatch(
+      /SEARCH m2 USING (COVERING )?INDEX messages_(live|restore)/,
+    )
     expect(plan).not.toMatch(/CORRELATED/)
   })
 })
@@ -1206,7 +1279,7 @@ describe('摘要碰头即上岗', () => {
   /** 一个 turn 两个 step，外加一条覆盖 1-2 的 ready 摘要 */
   const twoStepTurn = (dir: string) => {
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('一'), assistantSays('二')])
     store.addSummary({
       level: 0,
@@ -1308,7 +1381,7 @@ function buildBacklog(dir: string, rounds: number): Store {
   const store = openStore(dir)
   const history: Message[] = []
   for (let i = 1; i <= rounds; i++) {
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     history.push(
       userSays(`问题${i}`.padEnd(60, '内容')),
       assistantSays(`回答${i}`.padEnd(60, '内容')),
@@ -1372,10 +1445,10 @@ describe('一次性压实积压（compactLegacyBacklog）', () => {
     // 不报错，只是索引树的粒度整个错了：叶子数量 = step 数而不是 turn 数
     const dir = await workspace()
     const store = openStore(dir)
-    const t1 = store.beginTurn({ model: "p/m", effort: null })
+    const t1 = store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('问一'), assistantSays('答一')])
     store.save([userSays('问一'), assistantSays('答一'), assistantSays('再答')])
-    const t2 = store.beginTurn({ model: "p/m", effort: null })
+    const t2 = store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('问一'), assistantSays('答一'), assistantSays('再答'), userSays('问二')])
 
     const steps = stepIdsOf(dir)
@@ -1397,9 +1470,9 @@ describe('一次性压实积压（compactLegacyBacklog）', () => {
     // 不是 store 自己猜
     const dir = await workspace()
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('问一'), assistantSays('答一')])
-    const last = store.beginTurn({ model: "p/m", effort: null })
+    const last = store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('问一'), assistantSays('答一'), userSays('问二'), assistantSays('答二')])
 
     // 跑着的时候够不着；空闲下来就够得着
@@ -1476,7 +1549,7 @@ describe('一次性压实积压（compactLegacyBacklog）', () => {
     // 没有这个对照，「无条件卸掉 cutoff 之前的」在小库上会把刚说的话也卸了
     const dir = await workspace()
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('一'), assistantSays('二')])
     store.close()
 
@@ -1518,9 +1591,9 @@ describe('remapMessages：normalizeHistory 增删之后归属跟着走', () => {
     const dir = await workspace()
     const store = openStore(dir)
     // 两轮，各自的 turn 不同——只有一个 turn 的话「错一位」看不出来
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('第一轮问'), assistantSays('第一轮答')])
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     const history = [userSays('第一轮问'), assistantSays('第一轮答'), userSays('第二轮问')]
     store.save(history)
     const before = readTurnIds(dir)
@@ -1541,9 +1614,9 @@ describe('remapMessages：normalizeHistory 增删之后归属跟着走', () => {
   it('**对照：不 remap 的话就整体错一位**——证明上面那条测的是真行为', async () => {
     const dir = await workspace()
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('第一轮问'), assistantSays('第一轮答')])
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     const history = [userSays('第一轮问'), assistantSays('第一轮答'), userSays('第二轮问')]
     store.save(history)
     const before = readTurnIds(dir)
@@ -1567,9 +1640,9 @@ describe('remapMessages：normalizeHistory 增删之后归属跟着走', () => {
     // 「新插入」去继承前一条归属。而卸载每轮都在发生
     const dir = await workspace()
     const store = openStore(dir)
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('第一轮问'), assistantSays('第一轮答')])
-    store.beginTurn({ model: "p/m", effort: null })
+    store.beginTurn({ model: 'p/m', effort: null })
     store.save([userSays('第一轮问'), assistantSays('第一轮答'), userSays('第二轮问')])
     const before = readTurnIds(dir)
 

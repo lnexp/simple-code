@@ -56,7 +56,7 @@ const state: ToWebview = {
   models: [],
   effort: null,
   effortOverridden: false,
-      presets: [],
+  presets: [],
   approvalOn: true,
   imagesEnabled: false,
   contextWindow: 0,

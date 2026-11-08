@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -63,7 +63,10 @@ describe('关键词匹配引擎（2026-10-14 换芯：n-gram → 模型关键词
   it('topK 封顶 + excludeNames 去重（占名额的在入场前就排掉）', () => {
     const out = matchSummaries(candidates, ['构建'], { topK: 2 })
     expect(out.names).toEqual(['t1', 't3'])
-    const deduped = matchSummaries(candidates, ['构建'], { topK: 2, excludeNames: new Set(out.names) })
+    const deduped = matchSummaries(candidates, ['构建'], {
+      topK: 2,
+      excludeNames: new Set(out.names),
+    })
     expect(deduped.lines).toEqual([]) // 剩下的 t2 本来就零命中
   })
 })
@@ -71,15 +74,90 @@ describe('关键词匹配引擎（2026-10-14 换芯：n-gram → 模型关键词
 describe('候选加载', () => {
   it('只有 summary，且只进不在场的', () => {
     const summaries: Summary[] = [
-      { id: 1, level: 0, coversFrom: 100, coversTo: 110, turnFrom: 10, turnTo: 10, name: '在场段', text: '', status: 'ready', owner: null, inContext: true, supersededBy: null, head: '在场的开头', archivePath: null },
-      { id: 2, level: 0, coversFrom: 200, coversTo: 210, turnFrom: 20, turnTo: 20, name: '暗段标题', text: '', status: 'ready', owner: null, inContext: false, supersededBy: null, head: '暗段的开头', archivePath: null },
+      {
+        id: 1,
+        level: 0,
+        coversFrom: 100,
+        coversTo: 110,
+        turnFrom: 10,
+        turnTo: 10,
+        name: '在场段',
+        text: '',
+        status: 'ready',
+        owner: null,
+        inContext: true,
+        supersededBy: null,
+        head: '在场的开头',
+        archivePath: null,
+      },
+      {
+        id: 2,
+        level: 0,
+        coversFrom: 200,
+        coversTo: 210,
+        turnFrom: 20,
+        turnTo: 20,
+        name: '暗段标题',
+        text: '',
+        status: 'ready',
+        owner: null,
+        inContext: false,
+        supersededBy: null,
+        head: '暗段的开头',
+        archivePath: null,
+      },
       // 跨 turn 的写成 t起-止（2026-09-30 起 turn 号；之前是 t<起始 step id>）
-      { id: 3, level: 0, coversFrom: 300, coversTo: 390, turnFrom: 30, turnTo: 33, name: '跨段', text: '', status: 'ready', owner: null, inContext: false, supersededBy: null, head: '跨段开头', archivePath: null },
+      {
+        id: 3,
+        level: 0,
+        coversFrom: 300,
+        coversTo: 390,
+        turnFrom: 30,
+        turnTo: 33,
+        name: '跨段',
+        text: '',
+        status: 'ready',
+        owner: null,
+        inContext: false,
+        supersededBy: null,
+        head: '跨段开头',
+        archivePath: null,
+      },
       // 内部节点不进：name 空、head 取自首成员，候选文本是首成员的子集——
       // 与它一起撞中、名字不同去重拦不住（2026-09-30 实测最近 70 轮 15 轮重复）
-      { id: 4, level: 1, coversFrom: 200, coversTo: 390, turnFrom: 20, turnTo: 33, name: '', text: '路由行', status: 'ready', owner: null, inContext: false, supersededBy: null, head: '暗段的开头', archivePath: null },
+      {
+        id: 4,
+        level: 1,
+        coversFrom: 200,
+        coversTo: 390,
+        turnFrom: 20,
+        turnTo: 33,
+        name: '',
+        text: '路由行',
+        status: 'ready',
+        owner: null,
+        inContext: false,
+        supersededBy: null,
+        head: '暗段的开头',
+        archivePath: null,
+      },
       // 覆盖到在场原文（coversTo ≥ liveFloor）：L0 已写好未进场，原文就在上下文里
-      { id: 5, level: 0, coversFrom: 495, coversTo: 505, turnFrom: 50, turnTo: 50, name: '在场原文段', text: '', status: 'ready', owner: null, inContext: false, supersededBy: null, head: '近轮开头', archivePath: null },
+      {
+        id: 5,
+        level: 0,
+        coversFrom: 495,
+        coversTo: 505,
+        turnFrom: 50,
+        turnTo: 50,
+        name: '在场原文段',
+        text: '',
+        status: 'ready',
+        owner: null,
+        inContext: false,
+        supersededBy: null,
+        head: '近轮开头',
+        archivePath: null,
+      },
     ]
     const candidates = loadCueCandidates(summaries, 500)
     expect(new Set(candidates.map((c) => c.kind))).toEqual(new Set(['summary']))
@@ -102,7 +180,11 @@ describe('cue 渲染（装配纯函数——cues 表历史行继续渲染）', (
   })
 
   it('cue 行贴在该 turn 的 user 消息尾部；没 cue 的 turn 原样', () => {
-    const messages = [live(1, 'user', '问题一'), live(1, 'assistant', '答'), live(2, 'user', '问题二')]
+    const messages = [
+      live(1, 'user', '问题一'),
+      live(1, 'assistant', '答'),
+      live(2, 'user', '问题二'),
+    ]
     const cues = new Map([[1, ['〔recall〕note x — 描述（命中: y）']]])
     const out = assembleContext(messages, [], new Map(), cues)
     expect(out[0]).toEqual({
@@ -125,9 +207,14 @@ describe('cue 渲染（装配纯函数——cues 表历史行继续渲染）', (
 })
 
 describe('关键词撞摘要（session e2e）', () => {
-  type Body = { system?: unknown; messages: { role: string; content: { type: string; text?: string }[] }[] }
+  type Body = {
+    system?: unknown
+    messages: { role: string; content: { type: string; text?: string }[] }[]
+  }
   const recallIndex = (body: Body) =>
-    body.messages.findIndex((m) => m.content.some((c) => c.type === 'text' && c.text?.startsWith('〔recall·async〕')))
+    body.messages.findIndex((m) =>
+      m.content.some((c) => c.type === 'text' && c.text?.startsWith('〔recall·async〕')),
+    )
 
   const setup = async () => {
     const { getSession } = await import('../src/session/session.ts')
@@ -152,7 +239,10 @@ describe('关键词撞摘要（session e2e）', () => {
       main.push(body)
       // 第二轮起换成 ls -a：同一个 ls 跨轮连续三次会被死循环熔断（按
       // 历史判，重开会话也算）
-      const tool = main.length > 3 ? toolSse.replace('"partial_json":"s\\"}"', '"partial_json":"s -a\\"}"') : toolSse
+      const tool =
+        main.length > 3
+          ? toolSse.replace('"partial_json":"s\\"}"', '"partial_json":"s -a\\"}"')
+          : toolSse
       return new Response(main.length % 3 === 0 ? textSse('完成') : tool)
     }) as unknown as typeof fetch
     const globalPath = join(dir, 'settings.json')
@@ -160,7 +250,12 @@ describe('关键词撞摘要（session e2e）', () => {
       provider: 'p',
       model: 'm',
       providers: {
-        p: { protocol: 'anthropic-messages', baseUrl: 'https://example.invalid', apiKey: 'k', models: { m: { contextWindow: 100_000 } } },
+        p: {
+          protocol: 'anthropic-messages',
+          baseUrl: 'https://example.invalid',
+          apiKey: 'k',
+          models: { m: { contextWindow: 100_000 } },
+        },
       },
       memory: { idleSummarizeDelayMs: 0 },
     }
@@ -239,7 +334,10 @@ function seedDarkSummary(dir: string): void {
 const textSse = (text: string): ReadableStream<Uint8Array> =>
   new ReadableStream({
     start(controller) {
-      const json = JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text } })
+      const json = JSON.stringify({
+        type: 'content_block_delta',
+        delta: { type: 'text_delta', text },
+      })
       controller.enqueue(
         new TextEncoder().encode(
           `event: message_start\ndata: {"type":"message_start"}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}\n\nevent: content_block_delta\ndata: ${json}\n\nevent: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`,

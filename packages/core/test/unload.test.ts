@@ -184,7 +184,13 @@ describe('裁剪幂等', () => {
 })
 
 describe('输出留头 + 留尾（2026-09-28 方案 C：命令 200 / 输出头 100 + 尾 100）', () => {
-  const C: ClipOptions = { threshold: 0, keepHeadChars: 200, outputHeadChars: 100, outputTailChars: 100, archive: ARCHIVE }
+  const C: ClipOptions = {
+    threshold: 0,
+    keepHeadChars: 200,
+    outputHeadChars: 100,
+    outputTailChars: 100,
+    archive: ARCHIVE,
+  }
   // 真实形状：开头是无关报错，结论在最后一行（本项目 t16495「类型检查与相关测试」）
   const testRun = [
     "error TS5058: The specified path does not exist: 'packages/vscode/webview/tsconfig.json'.",
@@ -232,7 +238,9 @@ describe('输出留头 + 留尾（2026-09-28 方案 C：命令 200 / 输出头 1
   })
 
   it('没配头尾时退回只留头（旧行为，测试夹具与旧配置不受影响）', () => {
-    const out = outputOf(unloadMessage(toolResult(testRun), { threshold: 0, keepHeadChars: 100, archive: ARCHIVE }))
+    const out = outputOf(
+      unloadMessage(toolResult(testRun), { threshold: 0, keepHeadChars: 100, archive: ARCHIVE }),
+    )
     expect(out).not.toContain('424 passed')
     expect(out).not.toContain('省略')
   })

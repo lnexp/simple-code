@@ -27,7 +27,7 @@ function arg(name: string): string | undefined {
   return i === -1 ? undefined : process.argv[i + 1]
 }
 
-const [sub, target, ...rest] = process.argv.slice(2)
+const [sub, target, ..._rest] = process.argv.slice(2)
 
 if (sub === 'show' && target) {
   try {
@@ -57,19 +57,23 @@ if (sub === 'show' && target) {
     }
     process.stdout.write(`（${hits.length} 处命中）\n`)
   } catch (err) {
-    process.stderr.write(`memory search 失败：${err instanceof Error ? err.message : String(err)}\n`)
+    process.stderr.write(
+      `memory search 失败：${err instanceof Error ? err.message : String(err)}\n`,
+    )
     process.exit(1)
   }
-  } else {
-    try {
-      if (sub === 'log') {
-        process.stdout.write(`${await runLog(process.cwd(), { n: arg('-n') === undefined ? undefined : Number(arg('-n')) })}\n`)
-        process.exit(0)
-      }
-    } catch (err) {
-      process.stderr.write(`memory log 失败：${err instanceof Error ? err.message : String(err)}\n`)
-      process.exit(1)
+} else {
+  try {
+    if (sub === 'log') {
+      process.stdout.write(
+        `${await runLog(process.cwd(), { n: arg('-n') === undefined ? undefined : Number(arg('-n')) })}\n`,
+      )
+      process.exit(0)
     }
-    process.stderr.write(`${usage}\n`)
+  } catch (err) {
+    process.stderr.write(`memory log 失败：${err instanceof Error ? err.message : String(err)}\n`)
+    process.exit(1)
+  }
+  process.stderr.write(`${usage}\n`)
   process.exit(2)
 }

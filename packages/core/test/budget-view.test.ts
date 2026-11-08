@@ -98,7 +98,7 @@ async function runOnce(options: {
       markResponded: () => {},
       stubTokens: 1e9,
       stubSteps: 1e9,
-        floorTokens: 1,
+      floorTokens: 1,
       // 0 是为了让预算就是窗口本身，用例里的数字直接可推算
       safetyMargin: 0,
       clipThresholdChars: 1_000,

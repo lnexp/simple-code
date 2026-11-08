@@ -1,7 +1,7 @@
-import { useEffect } from 'react'
 import type { CompactResult } from '@simple-code/core'
-import { fmtTok } from './events.ts'
+import { useEffect } from 'react'
 import type { RegionsInfo } from '../src/protocol.ts'
+import { fmtTok } from './events.ts'
 
 /**
  * 上下文分析面板（方案 A，2026-09-11 拍板）：点底栏「上下文 X」弹出，
@@ -16,6 +16,8 @@ export function ContextPanel({
   pending,
   running,
   compact,
+  summaryInContext,
+  onToggleSummary,
   onCompact,
   onClose,
 }: {
@@ -26,6 +28,10 @@ export function ContextPanel({
   running: boolean
   /** 手动压缩：busy = 已发出等结果；text = 结果文案（null = 还没按过） */
   compact: { busy: boolean; text: string | null }
+  /** 精简上下文开关当前值（memory.summaryInContext 的反：true = 摘要在场
+   *  的标准装配。协议字段沿旧名，UI 语义按「精简」正着显示） */
+  summaryInContext: boolean
+  onToggleSummary: (value: boolean) => void
   onCompact: () => void
   onClose: () => void
 }) {
@@ -43,29 +49,14 @@ export function ContextPanel({
       <div className="ctx-empty">{pending ? '取数中…' : '还没有记录——跑一轮对话后可看'}</div>
     ) : (
       <>
-        <div className="ctx-head">
-          {/* 标题行右侧的小按钮：说明进 title，面板里只留结果 / 运行中提示 */}
-          <div className="ctx-title-row">
-            <div className="ctx-title">上下文分析</div>
-            <button
-              type="button"
-              className="ctx-compact"
-              disabled={running || compact.busy}
-              onClick={onCompact}
-              title={running ? '运行中，停止后才能压缩' : '归档保底区外的原文、换入摘要；下次请求全价重写缓存'}
-            >
-              {compact.busy ? '压缩中…' : '立即压缩'}
-            </button>
-          </div>
-          <div className="ctx-sub">
-            {fmtTok(info.contextWindow)} 窗口 · 用 <b>{pct(usedOf(info), info.contextWindow)}</b>
-            {raw && !isCalibrated(raw) && '（估算）'}
-            <span className="ctx-at">{fmtAt(info.at)}</span>
-          </div>
-          {(running || compact.text) && (
-            <div className="ctx-hint">{running ? '运行中，停止后才能压缩' : compact.text}</div>
-          )}
+        <div className="ctx-sub">
+          {fmtTok(info.contextWindow)} 窗口 · 用 <b>{pct(usedOf(info), info.contextWindow)}</b>
+          {raw && !isCalibrated(raw) && '（估算）'}
+          <span className="ctx-at">{fmtAt(info.at)}</span>
         </div>
+        {(running || compact.text) && (
+          <div className="ctx-hint">{running ? '运行中，停止后才能压缩' : compact.text}</div>
+        )}
         {/* 总览堆叠条：各区按**真实比例**依次排开，剩下露出的底色就是空闲。
             旧版每行一根 `min(pct,8)*4` 的短条是错的——70% 的空闲和 8.5%
             的未卸载画出来一样长，看图得到的结论是反的。空闲不进堆叠
@@ -97,6 +88,41 @@ export function ContextPanel({
         aria-label="上下文分析"
         onClick={(e) => e.stopPropagation()}
       >
+        {/* 标题行常驻（2026-11-03）：冷启动、token 为 0 时两个按钮也要能点
+            ——开关是 folder 级配置，跟有没有数据无关。此前整个 ctx-head
+            藏在数据非空分支里，空态只剩一句提示（记忆面板 V2 同款的结构
+            退化，这次一起修掉） */}
+        <div className="ctx-head">
+          {/* 标题行右侧的小按钮：说明进 title，面板里只留结果 / 运行中提示 */}
+          <div className="ctx-title-row">
+            <div className="ctx-title">上下文分析</div>
+            <button
+              type="button"
+              className="ctx-compact"
+              onClick={() => onToggleSummary(!summaryInContext)}
+              title={
+                summaryInContext
+                  ? '标准装配（摘要在场）。开启精简后只保常驻区 + 保底区 + 当前轮：摘要、存根都不进上下文，压缩=硬切（库与 recall 不变）；下一轮生效'
+                  : '精简中：只保常驻区 + 保底区 + 当前轮。关闭回到标准装配（摘要索引区 + 存根区进场）；下一轮生效'
+              }
+            >
+              精简上下文：{summaryInContext ? '关' : '开'}
+            </button>
+            <button
+              type="button"
+              className="ctx-compact"
+              disabled={running || compact.busy}
+              onClick={onCompact}
+              title={
+                running
+                  ? '运行中，停止后才能压缩'
+                  : '归档保底区外的原文、换入摘要；下次请求全价重写缓存'
+              }
+            >
+              {compact.busy ? '压缩中…' : '立即压缩'}
+            </button>
+          </div>
+        </div>
         {body}
       </div>
     </div>
@@ -151,10 +177,18 @@ function rowsOf(info: RegionsInfo): Row[] {
 }
 
 const usedOf = (info: RegionsInfo): number =>
-  info.overhead + info.cold + info.warm + info.hot + info.stub + info.floor + info.live + info.maxTokens
+  info.overhead +
+  info.cold +
+  info.warm +
+  info.hot +
+  info.stub +
+  info.floor +
+  info.live +
+  info.maxTokens
 
 const REGION_KEYS = ['overhead', 'cold', 'warm', 'hot', 'stub', 'floor', 'live'] as const
-const estimateOf = (info: RegionsInfo): number => REGION_KEYS.reduce((sum, key) => sum + info[key], 0)
+const estimateOf = (info: RegionsInfo): number =>
+  REGION_KEYS.reduce((sum, key) => sum + info[key], 0)
 
 /**
  * 各区按真实 usage 同比例缩放（2026-09-29 拍板）。估算器是字符密度法，
@@ -180,5 +214,7 @@ const pct = (used: number, window_: number): string => `${((used / window_) * 10
 
 const fmtAt = (iso: string): string => {
   const d = new Date(iso)
-  return Number.isNaN(d.getTime()) ? '' : `${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  return Number.isNaN(d.getTime())
+    ? ''
+    : `${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }

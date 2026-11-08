@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
-import { type Photon, resizeImageParts, stripImagesWhenUnsupported, thumbnailDataUrl } from '../src/llm/resizer'
+import {
+  type Photon,
+  resizeImageParts,
+  stripImagesWhenUnsupported,
+  thumbnailDataUrl,
+} from '../src/llm/resizer'
 import type { ImagePart, Message, Part } from '../src/llm/types'
 import { makePng, mulberry32 } from './make-png'
 
@@ -130,12 +135,7 @@ describe('stripImagesWhenUnsupported', () => {
       [
         {
           role: 'user',
-          parts: [
-            text('看这两张'),
-            image('D-RELAYED'),
-            image('D-MISSED'),
-            image('D-FAILED'),
-          ],
+          parts: [text('看这两张'), image('D-RELAYED'), image('D-MISSED'), image('D-FAILED')],
         },
       ],
       { images: false },
@@ -151,8 +151,13 @@ describe('stripImagesWhenUnsupported', () => {
 })
 
 describe('tool_result 附图（洞①②回归：字段不是 part，曾被 strip/resize 双双漏掉）', () => {
-  const toolPart = (images: ImagePart[]): Part =>
-    ({ type: 'tool_result', toolCallId: 't1', output: '图片 image/png，10 字节', isError: false, images })
+  const toolPart = (images: ImagePart[]): Part => ({
+    type: 'tool_result',
+    toolCallId: 't1',
+    output: '图片 image/png，10 字节',
+    isError: false,
+    images,
+  })
 
   it('strip：不支持时 images 消失，占位进 output（每张一行）', () => {
     const [msg] = stripImagesWhenUnsupported(
@@ -161,7 +166,9 @@ describe('tool_result 附图（洞①②回归：字段不是 part，曾被 stri
     )
     const part = msg?.parts[0] as { images?: unknown } | undefined
     expect(part?.images).toBeUndefined()
-    expect(part && 'output' in part ? part.output : '').toContain('[图片已省略：当前模型不支持图片输入]')
+    expect(part && 'output' in part ? part.output : '').toContain(
+      '[图片已省略：当前模型不支持图片输入]',
+    )
     expect((part as { output: string }).output.match(/图片已省略/g)).toHaveLength(2)
   })
 

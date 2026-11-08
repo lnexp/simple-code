@@ -24,8 +24,10 @@ describe('扩展清单', () => {
   it('**面板挂在右侧副侧边栏**', () => {
     // VS Code 主位置是副侧边栏；activitybar 那份是 Cursor 专用（Cursor 拒
     // 第三方副栏容器）。完整历史在 package.json 的 $comment
-    expect(Object.keys(pkg.contributes.viewsContainers).sort())
-      .toEqual(['activitybar', 'secondarySidebar'])
+    expect(Object.keys(pkg.contributes.viewsContainers).sort()).toEqual([
+      'activitybar',
+      'secondarySidebar',
+    ])
   })
 
   it('双注册互斥：两套 view 都带 when，且条件互补', () => {

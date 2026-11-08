@@ -4,10 +4,11 @@
  * 只测分流本身：turns/state.db 落 memoryRoot、配置仍读 root。任务的引擎
  * 测试在 task.test.ts。
  */
-import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
+
+import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { existsSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { getSession } from '../src/session/session.ts'
 import { readFixture } from './helpers.ts'

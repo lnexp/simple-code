@@ -19,8 +19,14 @@ import type { LoadedConfig } from '../config/load.ts'
 import { sendRequest } from '../llm/client.ts'
 import type { LLMEvent } from '../llm/events.ts'
 import { logRun } from '../runlog.ts'
-import { emptyAccumulator, accumulate, finishAccumulator } from './accumulate.ts'
-import { appendProgress, createEvent, listEvents, renameEvent, updateDescription } from '../tools/events.ts'
+import {
+  appendProgress,
+  createEvent,
+  listEvents,
+  renameEvent,
+  updateDescription,
+} from '../tools/events.ts'
+import { accumulate, emptyAccumulator, finishAccumulator } from './accumulate.ts'
 
 export type ArchiveSummary = {
   name: string
@@ -66,7 +72,13 @@ export async function runEventArchive(opts: {
   let acc = emptyAccumulator()
   let finish: Extract<LLMEvent, { type: 'finish' }> | undefined
   const stream = sendRequest(
-    { ...config.summary.request, model: config.summary.name, system: CLASSIFY_SYSTEM, tools: [], messages: [{ role: 'user', parts: [{ type: 'text', text: user }] }] },
+    {
+      ...config.summary.request,
+      model: config.summary.name,
+      system: CLASSIFY_SYSTEM,
+      tools: [],
+      messages: [{ role: 'user', parts: [{ type: 'text', text: user }] }],
+    },
     {
       protocol: config.summary.protocol,
       provider: {
@@ -110,14 +122,25 @@ export async function runEventArchive(opts: {
   const names = new Set(
     roster
       .split('\n')
-      .map((l) => l.replace(/^[-·]\s*/, '').split(' — ')[0]?.trim())
+      .map((l) =>
+        l
+          .replace(/^[-·]\s*/, '')
+          .split(' — ')[0]
+          ?.trim(),
+      )
       .filter((n): n is string => !!n && !n.startsWith('（')),
   )
   const stepRange = `${summary.coversFrom}–${summary.coversTo}`
 
   // match 必须在清单里——拼错名不当新建处理（防变相碎片化），本批跳过记日志
   if (parsed.match !== null && !names.has(parsed.match)) {
-    logRun({ ev: 'archive', folder: root, action: 'skip-bad-match', match: parsed.match, steps: stepRange })
+    logRun({
+      ev: 'archive',
+      folder: root,
+      action: 'skip-bad-match',
+      match: parsed.match,
+      steps: stepRange,
+    })
     return { action: 'skip-bad-match', match: parsed.match }
   }
   if (!parsed.progress.trim()) {
@@ -132,10 +155,21 @@ export async function runEventArchive(opts: {
     // 已存在同名 → 并入（分类器重复立档的兜底）
     if (names.has(parsed.name)) {
       appendProgress(root, parsed.name, parsed.progress, stepRange)
-      logRun({ ev: 'archive', folder: root, action: 'append-existing', match: parsed.name, steps: stepRange })
+      logRun({
+        ev: 'archive',
+        folder: root,
+        action: 'append-existing',
+        match: parsed.name,
+        steps: stepRange,
+      })
       return { action: 'append-existing', match: parsed.name }
     }
-    createEvent(root, { name: parsed.name, description: parsed.description, firstProgress: parsed.progress, stepRange })
+    createEvent(root, {
+      name: parsed.name,
+      description: parsed.description,
+      firstProgress: parsed.progress,
+      stepRange,
+    })
     logRun({ ev: 'archive', folder: root, action: 'create', match: parsed.name, steps: stepRange })
     return { action: 'create', match: parsed.name }
   }
@@ -145,7 +179,12 @@ export async function runEventArchive(opts: {
   if (parsed.rename) {
     const msg = renameEvent(root, parsed.match, parsed.rename)
     const ok = msg.startsWith('已改名')
-    logRun({ ev: 'archive', folder: root, action: ok ? 'rename' : 'rename-failed', match: `${parsed.match} -> ${parsed.rename}` })
+    logRun({
+      ev: 'archive',
+      folder: root,
+      action: ok ? 'rename' : 'rename-failed',
+      match: `${parsed.match} -> ${parsed.rename}`,
+    })
     if (ok) target = parsed.rename
   }
   appendProgress(root, target, parsed.progress, stepRange)
@@ -155,7 +194,13 @@ export async function runEventArchive(opts: {
 }
 
 /** 容错解析：剥 ```json 围栏，取第一个 {...} 平衡块 */
-type ClassifyOut = { match: string | null; progress: string; name?: string | undefined; description?: string | undefined; rename?: string | undefined }
+type ClassifyOut = {
+  match: string | null
+  progress: string
+  name?: string | undefined
+  description?: string | undefined
+  rename?: string | undefined
+}
 function parseClassifyJson(text: string): ClassifyOut {
   const stripped = text.replace(/```(?:json)?/g, '').trim()
   const start = stripped.indexOf('{')
@@ -173,7 +218,8 @@ function parseClassifyJson(text: string): ClassifyOut {
             progress: typeof o.progress === 'string' ? o.progress : '',
             name: typeof o.name === 'string' ? o.name : undefined,
             description: typeof o.description === 'string' ? o.description : undefined,
-            rename: typeof o.rename === 'string' && o.rename.trim() !== '' ? o.rename.trim() : undefined,
+            rename:
+              typeof o.rename === 'string' && o.rename.trim() !== '' ? o.rename.trim() : undefined,
           }
         } catch {
           return { match: null, progress: '' }

@@ -36,12 +36,20 @@ describe('openai-chat / 序列化', () => {
     const out = body({
       system: '',
       messages: [
-      { role: 'user', parts: [{ type: 'text', text: '继续' }], at: 't' } as Message,
-      { role: 'assistant', parts: [{ type: 'reasoning', text: '想了 12k 字被截断' }], at: 't' } as Message,
+        { role: 'user', parts: [{ type: 'text', text: '继续' }], at: 't' } as Message,
+        {
+          role: 'assistant',
+          parts: [{ type: 'reasoning', text: '想了 12k 字被截断' }],
+          at: 't',
+        } as Message,
       ],
     }).messages as Record<string, unknown>[]
     expect(out).toHaveLength(2)
-    expect(out[1]).toEqual({ role: 'assistant', content: '', reasoning_content: '想了 12k 字被截断' })
+    expect(out[1]).toEqual({
+      role: 'assistant',
+      content: '',
+      reasoning_content: '想了 12k 字被截断',
+    })
   })
 
   it('什么都没有的 assistant 消息仍整条跳过', () => {
@@ -59,10 +67,14 @@ describe('openai-chat / 序列化', () => {
     const out = body({
       system: '',
       messages: [
-      { role: 'assistant', parts: [
-        { type: 'reasoning', text: '想过了' },
-        { type: 'text', text: '答案' },
-      ], at: 't' } as Message,
+        {
+          role: 'assistant',
+          parts: [
+            { type: 'reasoning', text: '想过了' },
+            { type: 'text', text: '答案' },
+          ],
+          at: 't',
+        } as Message,
       ],
     }).messages as Record<string, unknown>[]
     expect(out).toHaveLength(1)
@@ -410,9 +422,15 @@ describe('openai-chat / parseError', () => {
 
   it('流内错误（status 0）归不上类 → 可重试；认得出的照旧不重试', () => {
     // 流里 `ev.error` 走同一个 toError、status 传 0。真机原文见 runlog 9-18
-    expect(err(0, '', '上游服务错误[503]: No available accounts')).toMatchObject({ kind: 'unknown', retryable: true })
+    expect(err(0, '', '上游服务错误[503]: No available accounts')).toMatchObject({
+      kind: 'unknown',
+      retryable: true,
+    })
     expect(err(0, 'invalid_api_key')).toMatchObject({ kind: 'auth', retryable: false })
-    expect(err(0, 'context_length_exceeded')).toMatchObject({ kind: 'context_overflow', retryable: false })
+    expect(err(0, 'context_length_exceeded')).toMatchObject({
+      kind: 'context_overflow',
+      retryable: false,
+    })
   })
 })
 
@@ -445,6 +463,30 @@ describe('tool_result 带图：换道（web-tools D4）', () => {
         ],
       },
     ])
+  })
+
+  it('多个 tool_result 其中一个带图：合成 user 排在全部 tool 消息之后（2026-11-07 远端 400 修复）', () => {
+    // 远端 deepseek-flash 实证：[tool, user(图), tool] 中间夹 user 被网关
+    // 拒「insufficient tool messages following tool_calls message」——
+    // view_image + bash 并行调用、第一个带图时旧实现正好产出这种序列
+    const messages = wireMessages([
+      {
+        role: 'tool',
+        parts: [
+          {
+            type: 'tool_result',
+            toolCallId: 'call_0',
+            output: '图片 image/png，123 字节',
+            isError: false,
+            images: [{ type: 'image', data: 'QUJD', mimeType: 'image/png' }],
+          },
+          { type: 'tool_result', toolCallId: 'call_1', output: 'ok', isError: false },
+        ],
+      },
+    ]).filter((m) => m.role !== 'system')
+    expect(messages.map((m) => m.role)).toEqual(['tool', 'tool', 'user'])
+    expect(messages[0]).toEqual({ role: 'tool', tool_call_id: 'call_0', content: '图片 image/png，123 字节' })
+    expect(messages[1]).toEqual({ role: 'tool', tool_call_id: 'call_1', content: 'ok' })
   })
 
   it('纯文本：不插合成消息——回归', () => {

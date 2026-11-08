@@ -2,6 +2,7 @@
 /**
  * "$SIMPLE_CODE_TASK" "<任务书>"  或  "$SIMPLE_CODE_TASK" <<'MD' … MD（stdin）
  * "$SIMPLE_CODE_TASK" --model <名> <<'MD' … MD   指定模型（规则 14，只认 taskModels 里的）
+ * "$SIMPLE_CODE_TASK" --lean <<'MD' … MD        精简上下文（只保常驻+floor+live，压缩=硬切）
  * "$SIMPLE_CODE_TASK" --models                    列出可选模型与用途
  *
  * 派一个并行任务（task-trunk 规则 11）：把任务书 POST 给 VS Code 宿主的本机桥
@@ -40,27 +41,52 @@ async function readStdin(): Promise<string> {
 }
 
 const USAGE =
-  `用法："$SIMPLE_CODE_TASK" [--model <名>] "<任务书>"，或 "$SIMPLE_CODE_TASK" [--model <名>] <<'MD' … MD。` +
+  `用法："$SIMPLE_CODE_TASK" [--model <名>] [--lean] "<任务书>"，或 "$SIMPLE_CODE_TASK" [--model <名>] <<'MD' … MD。` +
   `任务书首行当任务名；"$SIMPLE_CODE_TASK" --models 列出可选模型\n`
 
-/** 拆出 --model <名> / --models，剩下的是任务书参数。null = --model 后没跟名字 */
-export function parseArgs(argv: string[]): { model?: string; list: boolean; rest: string[] } | null {
+/** 拆出 --model <名> / --models / --lean / --help，剩下的是任务书参数。
+ *  null = --model 后没跟名字。--help 之外以 -- 开头的裸参（没有值语义的）
+ *  一并按用法输出——2026-11-05 实案：模型把 --help 当任务书派了个空任务 */
+export function parseArgs(argv: string[]): {
+  model?: string
+  list: boolean
+  rest: string[]
+  lean?: true
+  help?: true
+} | null {
   const rest: string[] = []
   let model: string | undefined
+  let lean = false
   let list = false
+  let help = false
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] ?? ''
     if (a === '--models') list = true
     else if (a === '--model') {
       model = argv[++i]
       if (model === undefined || model === '') return null
-    } else rest.push(a)
+    } else if (a === '--lean') lean = true
+    else if (a === '--help' || a === '-h') help = true
+    // 认识的 flag 之外的裸 --：按用法输出（防把 --help 这类当任务书派空任务）
+    else if (a.startsWith('--') && a !== '--') help = true
+    else rest.push(a)
   }
-  return { ...(model !== undefined ? { model } : {}), list, rest }
+  return {
+    ...(model !== undefined ? { model } : {}),
+    ...(lean ? { lean: true } : {}),
+    ...(help ? { help: true } : {}),
+    list,
+    rest,
+  }
 }
 
 /** POST 给桥。失败（连不上/超时/坏 JSON）返回错误文案 */
-async function call<T>(port: string, token: string, path: string, body: unknown): Promise<T | string> {
+async function call<T>(
+  port: string,
+  token: string,
+  path: string,
+  body: unknown,
+): Promise<T | string> {
   try {
     const res = await fetch(`http://127.0.0.1:${port}${path}`, {
       method: 'POST',
@@ -109,6 +135,10 @@ export async function taskMain(
     process.stderr.write(`--model 后要写模型名。${USAGE}`)
     return 3
   }
+  if (args.help) {
+    process.stdout.write(USAGE)
+    return 0
+  }
   const brief = args.list ? '' : (args.rest.length > 0 ? args.rest.join(' ') : await stdin()).trim()
   if (!args.list && brief === '') {
     process.stderr.write(USAGE)
@@ -129,6 +159,7 @@ export async function taskMain(
     root,
     owner: env.SIMPLE_CODE_OWNER ?? '',
     ...(args.model !== undefined ? { model: args.model } : {}),
+    ...(args.lean ? { lean: true } : {}),
   })
   if (typeof body === 'string') {
     process.stderr.write(body)
@@ -139,7 +170,8 @@ export async function taskMain(
     return 1
   }
   process.stdout.write(
-    `已派出任务「${body.name}」。它在任务条里独立跑，派出那一轮结束时结果以〔任务结果〕消息回到这里。\n`,
+    `已派出任务「${body.name}」。它在任务条里独立跑，派出那一轮结束时结果以〔任务结果〕消息回到这里。` +
+      '\n',
   )
   return 0
 }

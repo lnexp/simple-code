@@ -3,6 +3,9 @@ import { dirname, join, resolve } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
 import { listTypedNotes, searchTypedNotes, writeTypedNote } from '../src/tools/note-library.ts'
 
+const goalBody = (text: string) =>
+  `## 这件事是什么\n事\n## 目标\n${text}\n## 当前范围与边界\n不可越权\n## 怎样算达到目标\n有证据`
+
 const roots: string[] = []
 function root() {
   mkdirSync('.simple-code/tmp/note-library-tests', { recursive: true })
@@ -48,6 +51,23 @@ it('严格写入格式不妨碍旧文件读搜，新原则为候选，旧名不�
   expect(text).toContain('type: principle')
   expect(() => writeTypedNote(r, { ...input, body }, 'principle')).toThrow('已存在')
   expect(searchTypedNotes(r, '历史裸正文')).toContain('old')
+})
+
+it('goal 写入超预算当场提醒（2026-11-03：别等 session 建立时才截断）', () => {
+  const r = root()
+  const small = writeTypedNote(
+    r,
+    { name: 'ok-goal', title: '合规目标', description: 'd', body: goalBody('短') },
+    'goal',
+  )
+  expect(small).not.toContain('⚠')
+  const big = writeTypedNote(
+    r,
+    { name: 'big-goal', title: '膨胀目标', description: 'd', body: goalBody('长'.repeat(6000)) },
+    'goal',
+  )
+  expect(big).toContain('已写入')
+  expect(big).toContain('超过 note 总预算默认 2100')
 })
 
 it('状态和时间收起沿用语义，原则不按年龄收起', () => {

@@ -27,7 +27,7 @@ const state: ToWebview = {
   effortOverridden: false,
   presets: [],
   imagesEnabled: true,
-  approvalOn: true,
+  attendance: 'attended',
   contextWindow: 256000,
 }
 
@@ -41,7 +41,7 @@ const taskState = (name: string) => ({
   presets: [],
   imagesEnabled: false,
   contextWindow: 0,
-  approvalOn: true,
+  attendance: 'attended',
 })
 
 const card = (id: number, task?: string, folder = FOLDER): ToWebview => ({
@@ -51,9 +51,9 @@ const card = (id: number, task?: string, folder = FOLDER): ToWebview => ({
   id,
   toolCallId: `c${id}`,
   command: `cat .env.${id}`,
-  category: 'hidden_path',
+  category: 'external_dir',
   detail: '.env',
-  reason: '要触碰隐藏路径：.env',
+  reason: '要读项目外路径：/tmp/x/.env',
   ...(task === undefined ? {} : { task }),
 })
 

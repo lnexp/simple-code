@@ -139,7 +139,10 @@ describe('扩展构建产物', () => {
       // 同码不同 md5 的产物（2026-09-27 实案：374a/cb4d/7fe6 三版），
       // 「md5 一致 = 装机一致」的判据被 cwd 漂移污染。根相对（不带
       // ../ 前缀）是钉死后的唯一形态，出现 ../../ 前缀即 define 回归
-      for (const f of ['packages/vscode/dist/extension.cjs', 'packages/companion/dist/extension.cjs']) {
+      for (const f of [
+        'packages/vscode/dist/extension.cjs',
+        'packages/companion/dist/extension.cjs',
+      ]) {
         expect(readFileSync(`${root}${f}`, 'utf8')).not.toContain('"../../node_modules/')
       }
     })

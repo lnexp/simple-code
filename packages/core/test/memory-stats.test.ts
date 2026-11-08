@@ -30,7 +30,8 @@ for (let i = 1; i <= 25; i++) note(`n${String(i).padStart(2, '0')}`)
 
 // lessons 3 条（无 front matter 要求，文件数即可）
 mkdirSync(join(root, '.simple-code', 'lessons'), { recursive: true })
-for (const n of ['l1', 'l2', 'l3']) writeFileSync(join(root, '.simple-code', 'lessons', `${n}.md`), '# x\n')
+for (const n of ['l1', 'l2', 'l3'])
+  writeFileSync(join(root, '.simple-code', 'lessons', `${n}.md`), '# x\n')
 
 // 新旧位置的相同 lesson 只算一次；principle/goal 独立计数。
 mkdirSync(join(root, '.simple-code', 'notes', 'lesson'), { recursive: true })
@@ -38,8 +39,14 @@ writeFileSync(join(root, '.simple-code', 'notes', 'lesson', 'l1.md'), '# x\n')
 for (const type of ['principle', 'goal']) {
   const dir = join(root, '.simple-code', 'notes', type)
   mkdirSync(dir, { recursive: true })
-  const sections = type === 'principle' ? ['判断', '适用边界', '依据'] : ['这件事是什么', '目标', '当前范围与边界', '怎样算达到目标']
-  writeFileSync(join(dir, 'active.md'), `---\nstatus: active\n${type === 'goal' ? 'current: true\n' : ''}---\n${sections.map(s => `## ${s}\nx`).join('\n')}`)
+  const sections =
+    type === 'principle'
+      ? ['判断', '适用边界', '依据']
+      : ['这件事是什么', '目标', '当前范围与边界', '怎样算达到目标']
+  writeFileSync(
+    join(dir, 'active.md'),
+    `---\nstatus: active\n${type === 'goal' ? 'current: true\n' : ''}---\n${sections.map((s) => `## ${s}\nx`).join('\n')}`,
+  )
   writeFileSync(join(dir, 'gone.md'), '---\nstatus: superseded\n---\n')
 }
 
@@ -59,7 +66,8 @@ mkdirSync(join(root, '.simple-code', 'skills', 'alpha'), { recursive: true })
 writeFileSync(join(root, '.simple-code', 'skills', 'alpha', 'SKILL.md'), '# alpha\n')
 mkdirSync(join(globalDir, 'skills', 'beta'), { recursive: true })
 writeFileSync(join(globalDir, 'skills', 'beta', 'SKILL.md'), '# beta\n')
-for (const d of ['000', '001']) mkdirSync(join(root, '.simple-code', 'memory', 'summaries', d), { recursive: true })
+for (const d of ['000', '001'])
+  mkdirSync(join(root, '.simple-code', 'memory', 'summaries', d), { recursive: true })
 writeFileSync(join(root, '.simple-code', 'memory', 'summaries', '000', 'a.md'), 'x')
 writeFileSync(join(root, '.simple-code', 'memory', 'summaries', '000', 'b.md'), 'x')
 writeFileSync(join(root, '.simple-code', 'memory', 'summaries', '001', 'c.md'), 'x')
@@ -69,7 +77,9 @@ describe('computeMemoryStats', () => {
     const s = computeMemoryStats(root, globalDir)
     expect(s.notes.total).toBe(27)
     expect(s.notes.superseded).toBe(1)
-    expect(s.notes.visible).toBe(buildNoteBudget(root).selected.filter(f => f.type === 'general').length)
+    expect(s.notes.visible).toBe(
+      buildNoteBudget(root).selected.filter((f) => f.type === 'general').length,
+    )
     expect(s.notes.hidden).toBe(26 - s.notes.visible)
     expect(s.principles).toEqual({ total: 2, visible: 1, hidden: 0, superseded: 1 })
     expect(s.goals).toEqual({ total: 2, visible: 1, hidden: 0, superseded: 1 })

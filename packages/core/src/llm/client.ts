@@ -1,3 +1,5 @@
+import { logRun } from '../runlog.ts'
+import { describeError } from '../tools/describe.ts'
 import { isContentEvent, type LLMEvent, type RefusalDetail, type SSEMessage } from './events.ts'
 import {
   LLMStreamError,
@@ -6,9 +8,7 @@ import {
   type ProviderContext,
 } from './protocol.ts'
 import { parseSSE } from './protocols/utils/sse.ts'
-import { logRun } from '../runlog.ts'
 import { saveRefusalSnapshot } from './refusal-snapshot.ts'
-import { describeError } from '../tools/describe.ts'
 import type { FinishReason, Request } from './types.ts'
 
 export type SendOptions = {
@@ -124,14 +124,19 @@ export async function* sendRequest(
   } finally {
     clock.stop()
     const ms = Date.now() - startedAt
-    const refusalLog = finishReason === 'content-filter'
-      ? await saveRefusalSnapshot({
-          ...(options.folder ? { folder: options.folder } : {}),
-          ...(options.tag ? { tag: options.tag } : {}), model: request.model,
-          protocol: options.protocol.name, provider: options.provider,
-          body: bodyText, startedAt, ...(refusal ? { refusal } : {}),
-        })
-      : {}
+    const refusalLog =
+      finishReason === 'content-filter'
+        ? await saveRefusalSnapshot({
+            ...(options.folder ? { folder: options.folder } : {}),
+            ...(options.tag ? { tag: options.tag } : {}),
+            model: request.model,
+            protocol: options.protocol.name,
+            provider: options.provider,
+            body: bodyText,
+            startedAt,
+            ...(refusal ? { refusal } : {}),
+          })
+        : {}
     // 每次尝试一行（重试 3 次就是 3 行）。中断（用户 abort）不计失败——
     // 那不是模型的问题，kind 记 'aborted' 便于区分
     const incomplete = !failure && !completed
@@ -175,11 +180,34 @@ function tapSSE(source: AsyncIterable<SSEMessage>): StreamTap {
   let count = 0
   let last = ''
   const types: Record<string, number> = {}
+  // 调试开关（narration 排查 2026-11-02）：标记文件存在即 dump 原始 SSE
+  // （每请求一个文件，目录固定）。标记用 bash 可控的文件而不是 env——
+  // 扩展宿主进程的 env 改不动，凭据又只在宿主（CLI 拿不到 key）
+  let dumpFile: string | null | undefined // undefined=未查，null=不 dump
+  const dump = async (msg: SSEMessage): Promise<void> => {
+    if (dumpFile === undefined) {
+      try {
+        const { existsSync, mkdirSync } = await import('node:fs')
+        const { homedir } = await import('node:os')
+        const dir = `${homedir()}/.simple-code/tmp/sse-dump`
+        if (existsSync(`${homedir()}/.simple-code/run/sse-dump`)) {
+          mkdirSync(dir, { recursive: true })
+          dumpFile = `${dir}/sse-${new Date().toISOString().replace(/[:.]/g, '-')}.log`
+        } else dumpFile = null
+      } catch {
+        dumpFile = null
+      }
+    }
+    if (typeof dumpFile !== 'string') return
+    const { appendFileSync } = await import('node:fs')
+    appendFileSync(dumpFile, `${msg.event ? `event: ${msg.event}\n` : ''}data: ${msg.data}\n\n`)
+  }
   return {
     messages: (async function* () {
       for await (const msg of source) {
         count++
         last = msg.data
+        void dump(msg)
         const key = msg.event || sseDataType(msg.data)
         types[key] = (types[key] ?? 0) + 1
         yield msg
@@ -335,7 +363,12 @@ function safeParse(raw: string): unknown {
  * key 打码）——2026-09-30 某渠道连续 429 只剩「HTTP 429」，看不出网关说了什么。
  * 这条 message 同时进界面错误条与 runlog 的 llm/llm_retry 行
  */
-function withRawBody(detail: ProtocolError, status: number, raw: string, key: string): ProtocolError {
+function withRawBody(
+  detail: ProtocolError,
+  status: number,
+  raw: string,
+  key: string,
+): ProtocolError {
   const text = raw.replace(/\s+/g, ' ').trim()
   if (detail.message !== `HTTP ${status}` || text === '') return detail
   const safe = key ? text.split(key).join('***') : text

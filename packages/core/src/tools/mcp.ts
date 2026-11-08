@@ -1,7 +1,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import {
-  StdioClientTransport,
   getDefaultEnvironment,
+  StdioClientTransport,
 } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
@@ -44,7 +44,9 @@ export const isHttpServer = (cfg: McpServerConfig): cfg is McpHttpConfig => 'url
 /** url 型 server 没有代理可走（不在 SC 里 / 宿主已关）。bin 映射成退出码 2 */
 export class McpNoProxyError extends Error {
   constructor() {
-    super('url 型 server 只能经 SC 宿主的凭据代理访问，当前环境没有代理（SIMPLE_CODE_PROXY_PORT 未设置）——请在 SC 里运行（VS Code 面板或终端 sc）')
+    super(
+      'url 型 server 只能经 SC 宿主的凭据代理访问，当前环境没有代理（SIMPLE_CODE_PROXY_PORT 未设置）——请在 SC 里运行（VS Code 面板或终端 sc）',
+    )
   }
 }
 
@@ -99,7 +101,10 @@ export type McpToolInfo = {
 }
 
 /** via：url 型 server 的本机代理端点（endpoint.ts mcpProxyEndpoint），stdio 型忽略 */
-export async function listMcpTools(cfg: McpServerConfig, via?: ProxyEndpoint): Promise<McpToolInfo[]> {
+export async function listMcpTools(
+  cfg: McpServerConfig,
+  via?: ProxyEndpoint,
+): Promise<McpToolInfo[]> {
   return withMcpServer(cfg, via, async (client) => {
     const res = await client.listTools(undefined, { timeout: CALL_TIMEOUT_MS })
     return res.tools.map((t) => ({

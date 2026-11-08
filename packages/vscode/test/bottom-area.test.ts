@@ -41,6 +41,19 @@ function mount() {
   }
 }
 
+describe('空窗口引导（2026-11-04：~ 不能当工作区，folderList 不再兜 HOME）', () => {
+  it('folders 空列表 → 只渲染提示，不出对话主体与输入框', () => {
+    const { send, host } = mount()
+    send({ type: 'folders', folders: [], active: '' })
+    expect(host.querySelector('.empty-folder')?.textContent).toContain('没有打开的文件夹')
+    expect(host.querySelector('.composer')).toBeNull()
+  })
+  it('folders 没到过（还没 attach）→ 不闪提示，照常渲染', () => {
+    const { host } = mount()
+    expect(host.querySelector('.empty-folder')).toBeNull()
+  })
+})
+
 const F = '/w/a'
 const state: ToWebview = {
   type: 'state',
@@ -51,7 +64,7 @@ const state: ToWebview = {
   effort: 'high',
   effortOverridden: false,
   presets: [],
-  approvalOn: true,
+  attendance: 'attended',
   imagesEnabled: false,
   contextWindow: 0,
 }
@@ -99,7 +112,7 @@ describe('任务条', () => {
           effort: null,
           effortOverridden: false,
           contextWindow: 0,
-          approvalOn: true,
+          attendance: 'attended',
           presets: [],
           imagesEnabled: false,
         },

@@ -81,11 +81,16 @@ describe('sendRequest', () => {
   it.each([undefined, 1000])('消费者提前停止时取消底层流（idle=%s）', async (idleTimeoutMs) => {
     let cancelled = false
     const body = new ReadableStream<Uint8Array>({
-      start(c) { c.enqueue(new TextEncoder().encode(ANTHROPIC_SSE)) },
-      cancel() { cancelled = true },
+      start(c) {
+        c.enqueue(new TextEncoder().encode(ANTHROPIC_SSE))
+      },
+      cancel() {
+        cancelled = true
+      },
     })
     const stream = sendRequest(REQ, {
-      protocol: resolveProtocol('anthropic-messages'), provider: PROVIDER,
+      protocol: resolveProtocol('anthropic-messages'),
+      provider: PROVIDER,
       signal: new AbortController().signal,
       fetchImpl: stubFetch(new Response(body)).impl,
       ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs }),
@@ -194,7 +199,9 @@ describe('错误响应', () => {
     const { stream } = send(protocol, new Response(body, { status: 429 }))
     const error = await drain(stream).catch((e: LLMStreamError) => e)
     const msg = (error as LLMStreamError).detail.message
-    expect(msg.startsWith('HTTP 429：<html> <body>Too Many Requests key=***</body></html>x')).toBe(true)
+    expect(msg.startsWith('HTTP 429：<html> <body>Too Many Requests key=***</body></html>x')).toBe(
+      true,
+    )
     expect(msg).not.toContain(KEY)
     expect(msg.length).toBeLessThanOrEqual('HTTP 429：'.length + 201)
     expect((error as LLMStreamError).detail.kind).toBe('rate_limit')
@@ -202,7 +209,10 @@ describe('错误响应', () => {
 
   it('协议取到了 message 就不附原文；空 body 也不附', async () => {
     const protocol = resolveProtocol('anthropic-messages')
-    const ok = send(protocol, new Response(JSON.stringify({ error: { message: 'slow down' } }), { status: 429 }))
+    const ok = send(
+      protocol,
+      new Response(JSON.stringify({ error: { message: 'slow down' } }), { status: 429 }),
+    )
     await expect(drain(ok.stream)).rejects.toMatchObject({ detail: { message: 'slow down' } })
     const empty = send(protocol, new Response('', { status: 503 }))
     await expect(drain(empty.stream)).rejects.toMatchObject({ detail: { message: 'HTTP 503' } })
@@ -430,29 +440,50 @@ describe('运行日志（2026-09-30 补观测）', () => {
   }
 
   it.each([
-    ['max', 200], ['low', 200], ['none', 200],
-    ['max', 400], ['low', 400], ['none', 400],
-  ] as const)('effort=%s、HTTP %s：请求与结果日志均记实际 request.effort', async (effort, status) => {
-    const response = status === 200
-      ? new Response(bodyOf(ANTHROPIC_SSE))
-      : new Response('test error', { status })
-    const fetch = stubFetch(response)
-    const calls = await capture(() => drain(sendRequest({ ...REQ, effort }, {
-      protocol: resolveProtocol('anthropic-messages'), provider: PROVIDER,
-      signal: new AbortController().signal, fetchImpl: fetch.impl,
-    })))
-    expect(fetch.calls).toHaveLength(1)
-    expect(JSON.parse(String(fetch.calls[0]?.init.body)).output_config).toEqual({ effort })
-    expect(calls.filter((c) => c.ev === 'llm_req' || c.ev === 'llm')
-      .map((c) => ({ ev: c.ev, effort: c.effort }))).toEqual([
-        { ev: 'llm_req', effort }, { ev: 'llm', effort },
+    ['max', 200],
+    ['low', 200],
+    ['none', 200],
+    ['max', 400],
+    ['low', 400],
+    ['none', 400],
+  ] as const)(
+    'effort=%s、HTTP %s：请求与结果日志均记实际 request.effort',
+    async (effort, status) => {
+      const response =
+        status === 200
+          ? new Response(bodyOf(ANTHROPIC_SSE))
+          : new Response('test error', { status })
+      const fetch = stubFetch(response)
+      const calls = await capture(() =>
+        drain(
+          sendRequest(
+            { ...REQ, effort },
+            {
+              protocol: resolveProtocol('anthropic-messages'),
+              provider: PROVIDER,
+              signal: new AbortController().signal,
+              fetchImpl: fetch.impl,
+            },
+          ),
+        ),
+      )
+      expect(fetch.calls).toHaveLength(1)
+      expect(JSON.parse(String(fetch.calls[0]?.init.body)).output_config).toEqual({ effort })
+      expect(
+        calls
+          .filter((c) => c.ev === 'llm_req' || c.ev === 'llm')
+          .map((c) => ({ ev: c.ev, effort: c.effort })),
+      ).toEqual([
+        { ev: 'llm_req', effort },
+        { ev: 'llm', effort },
       ])
-    const llm = calls.find((c) => c.ev === 'llm')
-    if (status === 200) {
-      expect(llm?.error).toBeUndefined()
-      expect(llm?.finish).toBe('stop')
-    } else expect(llm?.error).toBeDefined()
-  })
+      const llm = calls.find((c) => c.ev === 'llm')
+      if (status === 200) {
+        expect(llm?.error).toBeUndefined()
+        expect(llm?.finish).toBe('stop')
+      } else expect(llm?.error).toBeDefined()
+    },
+  )
 
   it('流没走完就断：llm 行带上收到的事件计数与最后一条 data', async () => {
     // 9-30 真机形态：没有 event: 行，只有 data.type，且断在结束标记之前
@@ -461,7 +492,9 @@ describe('运行日志（2026-09-30 补观测）', () => {
       'data: {"type":"response.in_progress","response":{}}\n\n' +
       'data: {"type":"response.in_progress","response":{}}\n\n'
     const protocol = resolveProtocol('openai-responses')
-    const calls = await capture(() => drain(send(protocol, new Response(bodyOf(sse), { status: 200 })).stream))
+    const calls = await capture(() =>
+      drain(send(protocol, new Response(bodyOf(sse), { status: 200 })).stream),
+    )
     const llm = calls.find((c) => c.ev === 'llm')
     expect(llm?.error).toBeDefined()
     expect(llm?.finish).toBeUndefined()
@@ -474,7 +507,9 @@ describe('运行日志（2026-09-30 补观测）', () => {
 
   it('对照组：成功的流不记 stream（不落内容）', async () => {
     const protocol = resolveProtocol('anthropic-messages')
-    const calls = await capture(() => drain(send(protocol, new Response(bodyOf(ANTHROPIC_SSE), { status: 200 })).stream))
+    const calls = await capture(() =>
+      drain(send(protocol, new Response(bodyOf(ANTHROPIC_SSE), { status: 200 })).stream),
+    )
     const llm = calls.find((c) => c.ev === 'llm')
     expect(llm).toBeDefined()
     expect(llm?.error).toBeUndefined()
@@ -484,19 +519,32 @@ describe('运行日志（2026-09-30 补观测）', () => {
 
   it('走完但零内容（10-09 空响应形态）：llm 行标 empty 并带 stream，分得清网关真空与解析器丢块', async () => {
     const frame = (event: string, data: string) => `event: ${event}\ndata: ${data}\n\n`
-    const head = frame('message_start', '{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}')
+    const head = frame(
+      'message_start',
+      '{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}',
+    )
     const tail =
-      frame('message_delta', '{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}') +
-      frame('message_stop', '{"type":"message_stop"}')
+      frame(
+        'message_delta',
+        '{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}',
+      ) + frame('message_stop', '{"type":"message_stop"}')
     // 甲：网关真空——只有首尾
     // 乙：网关发了块但解析器不认识（静默丢弃）——统计里多出 content_block_*
     const unknownBlock =
-      frame('content_block_start', '{"type":"content_block_start","index":0,"content_block":{"type":"future_block"}}') +
-      frame('content_block_stop', '{"type":"content_block_stop","index":0}')
+      frame(
+        'content_block_start',
+        '{"type":"content_block_start","index":0,"content_block":{"type":"future_block"}}',
+      ) + frame('content_block_stop', '{"type":"content_block_stop","index":0}')
     const protocol = resolveProtocol('anthropic-messages')
     const run = async (sse: string) => {
-      const calls = await capture(() => drain(send(protocol, new Response(bodyOf(sse), { status: 200 })).stream))
-      return calls.find((c) => c.ev === 'llm') as { empty?: boolean; error?: unknown; stream?: { types: Record<string, number> } }
+      const calls = await capture(() =>
+        drain(send(protocol, new Response(bodyOf(sse), { status: 200 })).stream),
+      )
+      return calls.find((c) => c.ev === 'llm') as {
+        empty?: boolean
+        error?: unknown
+        stream?: { types: Record<string, number> }
+      }
     }
     const blank = await run(head + tail)
     expect(blank.error).toBeUndefined()

@@ -16,8 +16,8 @@
  */
 
 import { createServer, type Server } from 'node:http'
-import { LLM_PROXY_PORT } from '@simple-code/core/src/remote.ts'
 import { expandEnv } from '@simple-code/core/src/config/env.ts'
+import { LLM_PROXY_PORT } from '@simple-code/core/src/remote.ts'
 
 /** 远端扩展拉配置的只读端点（主扩展 remote.ts 的 syncRemoteSettings 对接这里） */
 export const SETTINGS_PATH = '/simplecode/settings'
@@ -82,7 +82,11 @@ export function createProxyServer(deps: ProxyDeps): Server {
     const route = ROUTE.exec(req.url ?? '')
     if (!route) {
       res.writeHead(404, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: `不是 SimpleCode 的转发路径（${SETTINGS_PATH} 或 /sc-p/<provider>/…）` }))
+      res.end(
+        JSON.stringify({
+          error: `不是 SimpleCode 的转发路径（${SETTINGS_PATH} 或 /sc-p/<provider>/…）`,
+        }),
+      )
       return
     }
     const name = decodeURIComponent(route[1] ?? '')
@@ -115,7 +119,11 @@ export function createProxyServer(deps: ProxyDeps): Server {
     }
     if (!key) {
       res.writeHead(502, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: `provider "${name}" 没配 apiKey，转发会带着空 key 吃 401——先在本机 settings.json 里配好` }))
+      res.end(
+        JSON.stringify({
+          error: `provider "${name}" 没配 apiKey，转发会带着空 key 吃 401——先在本机 settings.json 里配好`,
+        }),
+      )
       log({ path: req.url, status: 502, provider: name })
       return
     }
@@ -133,7 +141,10 @@ export function createProxyServer(deps: ProxyDeps): Server {
       // headers 是 IncomingHttpHeaders（值可为数组）——fetch 只收单值，请求头
       // 里数组值本就不存在于 HTTP 语义，收窄成 Record<string, string>
       // req.method 的类型是 string | undefined——HTTP 请求必有方法，兜 GET
-      const init: RequestInit = { method: req.method ?? 'GET', headers: headers as Record<string, string> }
+      const init: RequestInit = {
+        method: req.method ?? 'GET',
+        headers: headers as Record<string, string>,
+      }
       if (body) init.body = body
       const up = await fetchImpl(url, init)
       res.writeHead(up.status, Object.fromEntries(up.headers))

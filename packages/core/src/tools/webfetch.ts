@@ -3,7 +3,7 @@ import TurndownService from 'turndown'
 import type { ToolDefinition } from '../llm/types.ts'
 import { describeError } from './describe.ts'
 import { truncateOutput } from './truncate.ts'
-import type { ImageInput, Tool, ToolContext, ToolOutput } from './types.ts'
+import type { Tool, ToolContext, ToolOutput } from './types.ts'
 
 /**
  * webfetch（web-tools §3）：抓 URL → HTML 转 markdown → 截断 → 落盘原始响应。

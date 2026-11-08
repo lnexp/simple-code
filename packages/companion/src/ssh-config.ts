@@ -15,7 +15,7 @@
 import { appendFileSync, chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { LLM_PROXY_PORT, forwardBlock } from '@simple-code/core/src/remote.ts'
+import { forwardBlock, LLM_PROXY_PORT } from '@simple-code/core/src/remote.ts'
 
 export const sshConfigPath = (home = homedir()): string => join(home, '.ssh', 'config')
 
@@ -46,7 +46,10 @@ function blocks(text: string): Block[] {
 /** ssh 的 Host 模式匹配（* 和 ? 通配）。只做这两个——ssh 也主要就这两个 */
 function patternMatch(pattern: string, host: string): boolean {
   const re = new RegExp(
-    `^${pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`,
+    `^${pattern
+      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+      .replace(/\*/g, '.*')
+      .replace(/\?/g, '.')}$`,
   )
   return re.test(host)
 }

@@ -166,6 +166,10 @@ export const bashConfig = strictObject({
       'SIMPLE_CODE_TASK',
       'SIMPLE_CODE_TASK_PORT',
       'SIMPLE_CODE_TASK_TOKEN',
+      // task_send 互发（loop-interrupt.md 实现项 2）：与上面三个同一个桥
+      'SIMPLE_CODE_TASK_SEND',
+      // 闹钟（loop-interrupt.md 实现项 3）：与上面同一个桥（路径 env 独立）
+      'SIMPLE_CODE_WAKE',
     ]),
 })
 
@@ -174,7 +178,6 @@ const webfetchConfig = strictObject({
   maxTimeoutMs: z.number().int().positive().default(120_000),
   maxOutputChars: z.number().int().positive().default(100_000),
 })
-
 
 /**
  * 视觉转述副模型（vision relay）。主模型无视觉（capabilities.images
@@ -231,13 +234,16 @@ const memoryConfig = strictObject({
   /** 四类共用估算 token 预算；当前目标完整保留，可借用其他类额度。 */
   noteBudgetTokens: z.number().int().positive().default(2100),
   noteRatios: strictObject({
-    general: z.number().min(0).max(1).default(.35),
-    lesson: z.number().min(0).max(1).default(.10),
-    principle: z.number().min(0).max(1).default(.20),
-    goal: z.number().min(0).max(1).default(.35),
-  }).default({ general: .35, lesson: .10, principle: .20, goal: .35 })
-    .refine(r => Math.abs(r.general + r.lesson + r.principle + r.goal - 1) < 1e-8,
-      'noteRatios 四类比例之和必须为 1；零比例仅取消该类通常份额，当前 goal 仍完整保留'),
+    general: z.number().min(0).max(1).default(0.35),
+    lesson: z.number().min(0).max(1).default(0.1),
+    principle: z.number().min(0).max(1).default(0.2),
+    goal: z.number().min(0).max(1).default(0.35),
+  })
+    .default({ general: 0.35, lesson: 0.1, principle: 0.2, goal: 0.35 })
+    .refine(
+      (r) => Math.abs(r.general + r.lesson + r.principle + r.goal - 1) < 1e-8,
+      'noteRatios 四类比例之和必须为 1；零比例仅取消该类通常份额，当前 goal 仍完整保留',
+    ),
   // 没有 unloadThresholdRatio：触发不再是比例，而是
   // `contextWindow - maxTokens - 安全余量`（run.ts 的 inputBudget）。
   // 比例形式的问题是它把「给输出留多少」藏在一个数字里——0.7 碰巧盖住了
@@ -256,7 +262,7 @@ const memoryConfig = strictObject({
    * 基数是预算（`contextWindow - maxTokens - reservedTokens`）不是窗口，
    * 见提案 §10.5。
    */
-  unloadTargetRatio: z.number().gt(0).lte(1).default(0.10),
+  unloadTargetRatio: z.number().gt(0).lte(1).default(0.1),
   /**
    * 保底区：最近这么多 token 的原文一个字不动（提案 §11.5 的 ⑤ 区）。
    *
@@ -287,6 +293,14 @@ const memoryConfig = strictObject({
    * 最多多大」一个意思。默认与 `floorTokens` 同量级。
    */
   stubTokens: z.number().int().positive().default(16_000),
+  /**
+   * 摘要是否进上下文（2026-11-02 拍板，docs/proposals/summary-on-demand.md）。
+   * false = 压缩换召回：上下文只剩「未卸载原文 + 常驻结论段」，索引区
+   * 稳态成员不进发请求的装配。摘要照常生成/合并/落盘（cue 的候选面
+   * 不变，recall 照常撞）；webview 回放不受影响（独立链路）。实验期
+   * 观察（方案 §5 五项）跑一周后定默认值。
+   */
+  summaryInContext: z.boolean().default(true),
   /**
    * 存根区的 **step** 数上界（compaction-v2 §0.4）。与 `stubTokens` 先到先停。
    *

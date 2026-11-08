@@ -35,7 +35,12 @@ describe('renderInline（单行）', () => {
 })
 
 describe('renderTable（整块）', () => {
-  const md = ['| 目录 | 内容 |\n', '| --- | --- |\n', '| 广州资产POC | 尽调 |\n', '| 评测 | 报告 |\n']
+  const md = [
+    '| 目录 | 内容 |\n',
+    '| --- | --- |\n',
+    '| 广州资产POC | 尽调 |\n',
+    '| 评测 | 报告 |\n',
+  ]
   // （非 tty 的零污染由挂载层保证——render.ts 只在 tty.out 时调
   // renderTable/renderInline，见 render.test.ts 的管道用例）
   it('tty：框线重画，表头 bold，列宽按显示宽对齐（中文 2）', () => {

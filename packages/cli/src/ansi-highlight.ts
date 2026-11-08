@@ -15,7 +15,7 @@ const CLASS_PAINT: Record<string, keyof Paint> = {
   // hljs 11 的类名：空格分隔多词（"title function_"）、有下划线后缀——
   // 按词查表取第一个命中
   keyword: 'hlKeyword',
-  'built_in': 'hlKeyword',
+  built_in: 'hlKeyword',
   type: 'hlKeyword',
   literal: 'hlNumber',
   number: 'hlNumber',

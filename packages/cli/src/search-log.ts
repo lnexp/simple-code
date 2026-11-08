@@ -9,11 +9,25 @@ import { appendFileSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { runLogPath } from '@simple-code/core/src/runlog.ts'
 
-export function logSearch(lib: string, folder: string, query: string, hits: number, hidden = 0): void {
+export function logSearch(
+  lib: string,
+  folder: string,
+  query: string,
+  hits: number,
+  hidden = 0,
+): void {
   try {
     const path = runLogPath()
     mkdirSync(dirname(path), { recursive: true })
-    const ev = { at: new Date().toISOString(), pid: process.pid, ev: 'search', lib, folder, query, hits }
+    const ev = {
+      at: new Date().toISOString(),
+      pid: process.pid,
+      ev: 'search',
+      lib,
+      folder,
+      query,
+      hits,
+    }
     appendFileSync(path, JSON.stringify(hidden > 0 ? { ...ev, hidden } : ev) + '\n')
   } catch {
     // 见文件头
@@ -24,6 +38,7 @@ export function logSearch(lib: string, folder: string, query: string, hits: numb
  *  event 的「- name」行；被时间衰减收起的条数取 decayNotice「另有 N 条」 */
 export function logSearchText(lib: string, folder: string, query: string, text: string): void {
   const n = /^(\d+) 条命中：/.exec(text)?.[1]
-  const hits = n !== undefined ? Number(n) : text.split('\n').filter((l) => l.startsWith('- ')).length
+  const hits =
+    n !== undefined ? Number(n) : text.split('\n').filter((l) => l.startsWith('- ')).length
   logSearch(lib, folder, query, hits, Number(/另有 (\d+) 条/.exec(text)?.[1] ?? 0))
 }

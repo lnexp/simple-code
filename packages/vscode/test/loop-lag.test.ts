@@ -20,7 +20,25 @@ describe('watchLoopLag', () => {
     expect(lines).toHaveLength(1) // dispose 后不再记
   })
 
-  it('≥ 600s 记 loop_nap 不记 loop_lag（OS 睡眠/节流与真卡顿分档）', () => {
+  it('≥ 30s 记 loop_nap 不记 loop_lag（2026-11-06 收紧：600s 档漏掉短睡眠残留）', () => {
+    vi.useFakeTimers()
+    const lines: Record<string, unknown>[] = []
+    const w = watchLoopLag((ev) => void lines.push(ev))
+    // 短睡眠残留 414s（11-06 实测冒充过卡顿）与 925s 长睡眠都归 nap
+    vi.setSystemTime(Date.now() + 414_100)
+    vi.advanceTimersByTime(1000)
+    expect(lines).toEqual([{ ev: 'loop_nap', ms: 414_100 }])
+    vi.setSystemTime(Date.now() + 925_000)
+    vi.advanceTimersByTime(1000)
+    // 第二段 925s 也是独立的一次 nap
+    expect(lines).toEqual([
+      { ev: 'loop_nap', ms: 414_100 },
+      { ev: 'loop_nap', ms: 925_000 },
+    ])
+    w.dispose()
+  })
+
+  it('≥ 925s 记 loop_nap 不记 loop_lag（OS 睡眠/节流与真卡顿分档）', () => {
     vi.useFakeTimers()
     const lines: Record<string, unknown>[] = []
     const w = watchLoopLag((ev) => void lines.push(ev))

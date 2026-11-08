@@ -2,7 +2,16 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
-import { LESSONS_INDEX_LIMIT, lessonNamesIndex, listLessons, parseStdinLessonInput, readLesson, searchLessons, slugifyLessonName, writeLesson } from '../src/tools/lesson.ts'
+import {
+  LESSONS_INDEX_LIMIT,
+  lessonNamesIndex,
+  listLessons,
+  parseStdinLessonInput,
+  readLesson,
+  searchLessons,
+  slugifyLessonName,
+  writeLesson,
+} from '../src/tools/lesson.ts'
 
 const root = mkdtempSync(join(tmpdir(), 'sc-lesson-'))
 afterAll(() => rmSync(root, { recursive: true, force: true }))
@@ -39,7 +48,11 @@ describe('writeLesson', () => {
   it('组装完整格式：front matter + 总标题 + 五段', () => {
     expect(writeLesson(root, input)).toContain('已写入')
     const text = readFileSync(join(root, '.simple-code/lessons/webview-asset-cache.md'), 'utf8')
-    expect(text.startsWith('---\nname: webview-asset-cache\ndescription: webview 改了代码、reload 后毫无变化时读——外链资源缓存绕法\n---\n')).toBe(true)
+    expect(
+      text.startsWith(
+        '---\nname: webview-asset-cache\ndescription: webview 改了代码、reload 后毫无变化时读——外链资源缓存绕法\n---\n',
+      ),
+    ).toBe(true)
     expect(text).toContain('# webview 改了代码 reload 后毫无变化：外链资源缓存')
     for (const label of ['## 症状', '## 当时怎么误判的', '## 根因', '## 修法', '## 怎么验证的']) {
       expect(text).toContain(label)
@@ -54,16 +67,27 @@ describe('writeLesson', () => {
   })
 
   it('缺段抛错并列出；同名再写是修订', () => {
-    expect(() => writeLesson(root, { ...input, rootCause: '', verified: ' ' })).toThrow(/rootCause、verified/)
+    expect(() => writeLesson(root, { ...input, rootCause: '', verified: ' ' })).toThrow(
+      /rootCause、verified/,
+    )
     expect(writeLesson(root, { ...input, symptom: '修订后的症状。' })).toContain('已修订')
-    expect(readFileSync(join(root, '.simple-code/lessons/webview-asset-cache.md'), 'utf8')).toContain('修订后的症状')
+    expect(
+      readFileSync(join(root, '.simple-code/lessons/webview-asset-cache.md'), 'utf8'),
+    ).toContain('修订后的症状')
   })
 })
 
 describe('listLessons / readLesson / searchLessons', () => {
   it('list：name + description 一行一条；read 带全文；search 命中带窗口', () => {
-    writeLesson(root, { ...input, name: 'vsce-stale-vsix', title: 't', description: '装机像没更新时读' })
-    expect(listLessons(root)).toContain('webview-asset-cache  —  webview 改了代码、reload 后毫无变化时读')
+    writeLesson(root, {
+      ...input,
+      name: 'vsce-stale-vsix',
+      title: 't',
+      description: '装机像没更新时读',
+    })
+    expect(listLessons(root)).toContain(
+      'webview-asset-cache  —  webview 改了代码、reload 后毫无变化时读',
+    )
     expect(listLessons(root)).toContain('vsce-stale-vsix  —  装机像没更新时读')
     expect(readLesson(root, 'webview-asset-cache')).toContain('## 修法')
     expect(searchLessons(root, '缓存')).toContain('webview-asset-cache')
@@ -90,7 +114,9 @@ describe('lessonNamesIndex（system prompt 注入清单，2026-09-17 方案 A）
       expect(lessonNamesIndex(empty)).toBe(null)
       mkdirSync(join(empty, '.simple-code', 'lessons'), { recursive: true })
       expect(lessonNamesIndex(empty)).toBe(null) // 目录在但无 .md 也算空
-    } finally { rmSync(empty, { recursive: true, force: true }) }
+    } finally {
+      rmSync(empty, { recursive: true, force: true })
+    }
     const idx = lessonNamesIndex(root)
     expect(idx).toContain('- webview-asset-cache')
     expect(idx).not.toContain('description') // 只占位，不带描述——细节 read 全文
@@ -105,11 +131,18 @@ describe('lessonNamesIndex（system prompt 注入清单，2026-09-17 方案 A）
       const idx = lessonNamesIndex(r2)!
       expect(idx.indexOf('new-lesson')).toBeLessThan(idx.indexOf('old-lesson'))
       for (let i = 0; i < LESSONS_INDEX_LIMIT; i++)
-        writeLesson(r2, { ...input, name: `bulk-${String(i).padStart(2, '0')}`, title: 't', description: 'd' })
+        writeLesson(r2, {
+          ...input,
+          name: `bulk-${String(i).padStart(2, '0')}`,
+          title: 't',
+          description: 'd',
+        })
       const lines = lessonNamesIndex(r2)!.split('\n')
       expect(lines).toHaveLength(LESSONS_INDEX_LIMIT)
       expect(lines.some((l) => l.includes('old-lesson'))).toBe(false) // 老的被挤出
-    } finally { rmSync(r2, { recursive: true, force: true }) }
+    } finally {
+      rmSync(r2, { recursive: true, force: true })
+    }
   })
 })
 

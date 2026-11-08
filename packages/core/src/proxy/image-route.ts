@@ -1,5 +1,5 @@
 import { homedir } from 'node:os'
-import { loadConfig, resolveImageModel, type ImageModel } from '../config/load.ts'
+import { type ImageModel, loadConfig, resolveImageModel } from '../config/load.ts'
 import type { RouteResolver } from './credential-proxy.ts'
 
 /** 生图路由路径。bin 侧 imagegen-bin.ts 写死同一字面量（不 import 本文件，免得把 loadConfig 打进 bin） */
@@ -16,7 +16,10 @@ export function imageRoutes(load: () => Promise<ImageModel | null>): RouteResolv
   return async (path, method) => {
     if (path !== IMAGE_ROUTE || method !== 'POST') return undefined
     const image = await load()
-    if (!image) throw new Error('未配置 imageModel——在 ~/.simple-code/settings.json 加 "imageModel": {"provider": "...", "model": "..."}')
+    if (!image)
+      throw new Error(
+        '未配置 imageModel——在 ~/.simple-code/settings.json 加 "imageModel": {"provider": "...", "model": "..."}',
+      )
     return {
       url: `${image.baseUrl.replace(/\/+$/, '')}/v1/images/generations`,
       headers: { authorization: `Bearer ${image.apiKey}` },

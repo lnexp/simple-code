@@ -46,7 +46,7 @@ export type PrefixFingerprint = {
   version?: string
 }
 
-export type PrefixBaselineStore = {
+type PrefixBaselineStore = {
   read(): PrefixFingerprint | null
   write(fp: PrefixFingerprint): void
 }
@@ -58,12 +58,12 @@ export type PrefixBaselineStore = {
  * null，两条请求没法 diff，定位只能靠倒推。所以原文单独落一份每 owner
  * 一个的文件——只在违规落现场时才被读，平时就是静默覆盖写
  */
-export type PrevRequestStore = {
+type PrevRequestStore = {
   read(): Request | null
   write(request: Request): void
 }
 
-export type PrefixBreak = {
+type PrefixBreak = {
   /** 哪一块变了 */
   part: 'system' | 'tools' | 'messages'
   /** messages：第一条不同的下标；前一次比这次长时 = 这次的长度 */
@@ -145,6 +145,8 @@ export function createPrefixGuard(deps: {
         ...(deps.version === undefined ? {} : { version: deps.version }),
       }
       const prev = deps.baseline.read()
+      // 本进程第一次（prevRequest 还空、库里有基线）= 重启/重载后的第一次请求
+      const firstOfProcess = prevRequest === null
       // 先读后写：读到的才是「上一次」，写进去的是这一次
       const prevReq = prevRequest ?? deps.prev?.read() ?? null
       deps.baseline.write(next)
@@ -154,7 +156,14 @@ export function createPrefixGuard(deps: {
       const ticket = deps.ticket?.take() ?? false
       const pass = allowed || ticket
       allowed = false
-      if (prev === null || pass || prev.params !== next.params || prev.version !== next.version) return
+      if (prev === null || pass || prev.params !== next.params || prev.version !== next.version)
+        return
+      // 重载后第一次的 tools/system 差异静默重置（2026-11-06）：version 通道只认
+      // package 版本号，dev 装机版本不变但代码在变——13 次真机「tools/system 变了」
+      // 全是装机+reload 后的第一请求，每装一次用户会话断一次。放行依据：进程内
+      // 还没发过请求（prevRequest 为 null）= 这次的 tools/system 差异只能是宿主
+      // 代码换了。messages 差异不放——重启后的真改写（如叶子覆盖事故）照样要报
+      if (firstOfProcess && (prev.system !== next.system || prev.tools !== next.tools)) return
       const found = findBreak(prev, next)
       if (found === null) return
       if (isLegacyResumeMigration(prev, prevReq, next, configKey)) return

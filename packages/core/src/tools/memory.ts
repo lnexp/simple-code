@@ -137,12 +137,12 @@ function renderStep(step: MemoryLine[], no: number, full: boolean): string[] {
   ]
 }
 
-/** 一行里可检索的文本段。tool_call 检索命令本身——「当时跑了什么」是高频问法 */
+/** 一行里可检索的文本段。tool_call 检索命令本身——「当时跑了什么」是高频问法；
+ *  reasoning 不进检索——模型内心独白与用户问法无关，还会稀释命中（t20911 拍板） */
 export function searchable(line: MemoryLine): { kind: string; text: string }[] {
   const out: { kind: string; text: string }[] = []
   for (const p of line.parts) {
-    if (p.type === 'text' || p.type === 'reasoning')
-      out.push({ kind: String(p.type), text: str(p.text) })
+    if (p.type === 'text') out.push({ kind: 'text', text: str(p.text) })
     else if (p.type === 'tool_call') {
       const input = p.input as Record<string, unknown> | undefined
       out.push({ kind: 'tool_call', text: str(input?.command) })

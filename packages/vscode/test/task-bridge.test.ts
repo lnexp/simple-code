@@ -108,6 +108,98 @@ describe('派任务桥', () => {
     })
     expect((await post(`${b.base}/models`, { root: '/w/a' }, null)).status).toBe(401)
   })
+
+  it('/send-list：列任务交给 lister；不接 handler 的宿主 404（CLI 同款）', async () => {
+    const got: unknown[] = []
+    const server = createTaskBridge({
+      token: 'tok',
+      dispatch: async () => ({ ok: false, error: '不该到这' }),
+      models: async () => ({ ok: false, error: '不该到这' }),
+      sendList: async (req) => {
+        got.push(req)
+        return { ok: true, tasks: [{ name: '调研某库', status: 'idle', lastLine: '查完了' }] }
+      },
+    })
+    servers.push(server)
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()))
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    const res = await post(`${base}/send-list`, { root: '/w/a' })
+    expect(await res.json()).toEqual({
+      ok: true,
+      tasks: [{ name: '调研某库', status: 'idle', lastLine: '查完了' }],
+    })
+    expect(got).toEqual([{ root: '/w/a' }])
+    // 不接 sendList 的宿主（只给 dispatch/models）：明确 404 而不是静默
+    const b = await bridge()
+    expect((await post(`${b.base}/send-list`, { root: '/w/a' })).status).toBe(404)
+  })
+
+  it('/send：发消息交给 sender；空文本/缺任务名 400；不接的宿主 404', async () => {
+    const got: unknown[] = []
+    const server = createTaskBridge({
+      token: 'tok',
+      dispatch: async () => ({ ok: false, error: '不该到这' }),
+      models: async () => ({ ok: false, error: '不该到这' }),
+      send: async (req) => {
+        got.push(req)
+        return req.task === '没有它' ? { ok: false, error: '没有任务「没有它」' } : { ok: true }
+      },
+    })
+    servers.push(server)
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()))
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    // 正常发送
+    const res = await post(`${base}/send`, {
+      root: '/w/a',
+      task: '调研某库',
+      text: '〔task-send〕补充：再查一下',
+    })
+    expect(await res.json()).toEqual({ ok: true })
+    expect(got).toEqual([{ root: '/w/a', task: '调研某库', text: '〔task-send〕补充：再查一下' }])
+    // 参数校验
+    expect((await post(`${base}/send`, { root: '/w/a', task: '', text: 'x' })).status).toBe(400)
+    expect((await post(`${base}/send`, { root: '/w/a', task: 't', text: ' ' })).status).toBe(400)
+    // 拒绝原因透传（任务不存在）
+    const miss = await post(`${base}/send`, { root: '/w/a', task: '没有它', text: 'x' })
+    expect(await miss.json()).toEqual({ ok: false, error: '没有任务「没有它」' })
+    // 不接 send 的宿主
+    const b = await bridge()
+    expect((await post(`${b.base}/send`, { root: '/w/a', task: 't', text: 'x' })).status).toBe(404)
+  })
+
+  it('/wake：注册闹钟交给 wake 中心；非法 owner / 非法毫秒 400；不接的宿主 404', async () => {
+    const got: unknown[] = []
+    const server = createTaskBridge({
+      token: 'tok',
+      dispatch: async () => ({ ok: false, error: '不该到这' }),
+      models: async () => ({ ok: false, error: '不该到这' }),
+      wake: (req) => {
+        got.push(req)
+        return { ok: true, id: 'wake-test' }
+      },
+    })
+    servers.push(server)
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()))
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    const res = await post(`${base}/wake`, {
+      root: '/w/a',
+      owner: 'task-ab12',
+      afterMs: 60_000,
+      note: '看构建',
+    })
+    expect(await res.json()).toEqual({ ok: true, id: 'wake-test' })
+    expect(got).toEqual([{ root: '/w/a', owner: 'task-ab12', afterMs: 60_000, note: '看构建' }])
+    // 非法 owner / 非正毫秒
+    expect(
+      (await post(`${base}/wake`, { root: '/w/a', owner: '../evil', afterMs: 1000 })).status,
+    ).toBe(400)
+    expect((await post(`${base}/wake`, { root: '/w/a', owner: '', afterMs: -5 })).status).toBe(400)
+    // 不接 wake 的宿主
+    const b = await bridge()
+    expect((await post(`${b.base}/wake`, { root: '/w/a', owner: '', afterMs: 1000 })).status).toBe(
+      404,
+    )
+  })
 })
 
 describe('pickTaskModel（规则 14）', () => {

@@ -1,14 +1,24 @@
 import { describe, expect, it } from 'vitest'
-import { createRouter, type RouterDeps } from '../src/router.ts'
 import type { Bridge } from '../src/bridge.ts'
 import type { ToHost, ToWebview } from '../src/protocol.ts'
+import { createRouter, type RouterDeps } from '../src/router.ts'
 
 /** 假 bridge：记录调用，post 全部转给路由注入的（测过滤） */
 function makeFakeBridgeDeps() {
   const sent: ToWebview[] = []
   const calls: Array<{
     folder: string
-    method: 'attach' | 'detach' | 'requestReload' | 'dispose' | 'rehydrateTasks' | 'taskModels' | `dispatch:${string}`
+    method:
+      | 'attach'
+      | 'detach'
+      | 'requestReload'
+      | 'dispose'
+      | 'rehydrateTasks'
+      | 'taskModels'
+      | 'taskSendList'
+      | `wakeFire:${string}`
+      | `taskSend:${string}`
+      | `dispatch:${string}`
   }> = []
   let folders = ['/w/a', '/w/b']
   type Fake = Bridge & {
@@ -57,6 +67,17 @@ function makeFakeBridgeDeps() {
           calls.push({ folder, method: 'taskModels' })
           return { ok: true as const, models: [], defaultModel: 'p/m' }
         },
+        taskSendFromAgent: (task: string) => {
+          calls.push({ folder, method: `taskSend:${task}` })
+          return null
+        },
+        taskSendList: () => {
+          calls.push({ folder, method: 'taskSendList' })
+          return []
+        },
+        wakeFire: (owner: string) => {
+          calls.push({ folder, method: `wakeFire:${owner}` })
+        },
       } as Fake
       made.set(folder, b)
       return b
@@ -85,14 +106,23 @@ describe('多根路由（router）', () => {
     const r = createRouter(deps)
     r.handle({ type: 'ready' }) // spawn /w/a
     r.handle({ type: 'switchFolder', folder: '/w/b' }) // a 转后台
-    expect(await r.dispatchFromAgent({ root: '/w/a', brief: '调研', owner: 'task-x1' })).toEqual({ ok: true, name: '调研' })
-    expect(calls.filter((c) => c.method.startsWith('dispatch'))).toEqual([{ folder: '/w/a', method: 'dispatch:task-x1:调研' }])
+    expect(await r.dispatchFromAgent({ root: '/w/a', brief: '调研', owner: 'task-x1' })).toEqual({
+      ok: true,
+      name: '调研',
+    })
+    expect(calls.filter((c) => c.method.startsWith('dispatch'))).toEqual([
+      { folder: '/w/a', method: 'dispatch:task-x1:调研' },
+    ])
     const miss = await r.dispatchFromAgent({ root: '/w/none', brief: '调研', owner: '' })
     expect(miss.ok).toBe(false)
     // --model 原文透传到那个文件夹的 bridge（规则 14）；--models 同样按 root 找
     await r.dispatchFromAgent({ root: '/w/a', brief: '查', owner: '', model: 'm2' })
     expect(calls.at(-1)).toEqual({ folder: '/w/a', method: 'dispatch::查:m2' })
-    expect(await r.taskModels({ root: '/w/a' })).toEqual({ ok: true, models: [], defaultModel: 'p/m' })
+    expect(await r.taskModels({ root: '/w/a' })).toEqual({
+      ok: true,
+      models: [],
+      defaultModel: 'p/m',
+    })
     expect((await r.taskModels({ root: '/w/none' })).ok).toBe(false)
   })
 
@@ -134,10 +164,31 @@ describe('多根路由（router）', () => {
     r.handle({ type: 'switchFolder', folder: '/w/b' })
     r.handle({ type: 'switchFolder', folder: '/w/a' }) // b 转后台
     const bg = made.get('/w/b')!
-    bg._post({ type: 'state', running: true, folder: '/w/b', current: null, models: [], effort: null, effortOverridden: false,
-      presets: [], approvalOn: true, imagesEnabled: false, contextWindow: 0 })
+    bg._post({
+      type: 'state',
+      running: true,
+      folder: '/w/b',
+      current: null,
+      models: [],
+      effort: null,
+      effortOverridden: false,
+      presets: [],
+      summaryInContext: true,
+      attendance: 'attended',
+      imagesEnabled: false,
+      contextWindow: 0,
+    })
     bg._post({ type: 'agent', event: { type: 'text_delta', text: 'x' } as never, at: 1 })
-    bg._post({ type: 'approval_request', id: 1, expiresAt: 1, command: 'rm /etc/x', toolCallId: 't', category: 'external_dir', detail: '/etc/x', reason: '项目外' })
+    bg._post({
+      type: 'approval_request',
+      id: 1,
+      expiresAt: 1,
+      command: 'rm /etc/x',
+      toolCallId: 't',
+      category: 'external_dir',
+      detail: '/etc/x',
+      reason: '项目外',
+    })
     expect(sent.filter((m) => m.type === 'state').length).toBe(0)
     expect(sent.filter((m) => m.type === 'agent').length).toBe(0)
     const card = sent.find((m) => m.type === 'approval_request')
@@ -151,7 +202,8 @@ describe('多根路由（router）', () => {
     r.handle({ type: 'ready' })
     r.handle({ type: 'switchFolder', folder: '/w/b' })
     // b 的 handle 记录
-    ;(made.get('/w/b')! as unknown as { handle: (m: ToHost) => void }).handle = (m) => handled.push(m)
+    ;(made.get('/w/b')! as unknown as { handle: (m: ToHost) => void }).handle = (m) =>
+      handled.push(m)
     r.handle({ type: 'approval_reply', id: 3, choice: 'deny', folder: '/w/b' })
     expect(handled).toEqual([{ type: 'approval_reply', id: 3, choice: 'deny', folder: '/w/b' }])
   })
@@ -177,7 +229,8 @@ describe('多根路由（router）', () => {
     r.handle({ type: 'ready' })
     r.handle({ type: 'switchFolder', folder: '/w/b' }) // spawn b
     r.handle({ type: 'switchFolder', folder: '/w/a' }) // active 是 a
-    ;(made.get('/w/b')! as unknown as { handle: (m: ToHost) => void }).handle = (m) => handled.push(m)
+    ;(made.get('/w/b')! as unknown as { handle: (m: ToHost) => void }).handle = (m) =>
+      handled.push(m)
     r.handle({ type: 'bg_kill', pgid: 42, folder: '/w/b' })
     expect(handled).toEqual([{ type: 'bg_kill', pgid: 42, folder: '/w/b' }])
   })
@@ -267,7 +320,10 @@ describe('settings 热重载转发', () => {
     r.handle({ type: 'ready' })
     r.handle({ type: 'switchFolder', folder: '/w/b' })
     r.requestReloadAll()
-    const methods = calls.filter((c) => c.method === 'requestReload').map((c) => c.folder).sort()
+    const methods = calls
+      .filter((c) => c.method === 'requestReload')
+      .map((c) => c.folder)
+      .sort()
     expect(methods).toEqual(['/w/a', '/w/b'])
   })
 })
@@ -312,7 +368,9 @@ describe('桌面机器人接口（desktop-robot.md §5.2、§5.5）', () => {
     // 前提：就绪前什么都没发（发了也会被 VS Code 丢掉）
     expect(sent).toEqual([])
     r.handle({ type: 'ready' })
-    expect(calls.filter((c) => c.method === 'attach')).toEqual([{ folder: '/w/b', method: 'attach' }])
+    expect(calls.filter((c) => c.method === 'attach')).toEqual([
+      { folder: '/w/b', method: 'attach' },
+    ])
     expect(sent.at(-1)).toEqual({ type: 'select_task', task: null })
     expect(r.showing().folder).toBe('/w/b')
   })

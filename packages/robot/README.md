@@ -2,7 +2,7 @@
 
 [SimpleCode](https://marketplace.visualstudio.com/items?itemName=lnexp.simplecode-agent) 的桌面机器人，**仅支持 macOS**。
 
-别的应用（飞书、浏览器……）盖住 VS Code 时，机器人浮在屏幕上层提醒你 SimpleCode 的事：
+别的应用（浏览器、聊天软件……）盖住 VS Code 时，机器人浮在屏幕上层提醒你 SimpleCode 的事：
 
 - **审批卡**：直接点「允许」。`git push`、`gh` 这类命令和出网命令只能点「回窗口」，到面板里处理。
 - **任务结束**：显示结论的第一句，以及是完成还是出错。

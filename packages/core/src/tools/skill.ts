@@ -1,8 +1,9 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import { matchTerms, splitSearchTerms } from './search-terms.ts'
+
 /**
  * skill 库的只读检索（$SIMPLE_CODE_SKILL 的内核）。
  *

@@ -1,17 +1,28 @@
-import type { TaskDispatchRequest, TaskDispatchResponse, TaskModelsRequest, TaskModelsResponse } from '@simple-code/core'
-import { forwardBlock, forwardLine, getSession, logRun, scopeOf } from '@simple-code/core'
-import { existsSync, readFileSync, statSync as fsStatSync } from 'node:fs'
+import { existsSync, statSync as fsStatSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
+import type {
+  TaskDispatchRequest,
+  TaskDispatchResponse,
+  TaskModelsRequest,
+  TaskModelsResponse,
+  TaskSendListRequest,
+  TaskSendListResponse,
+  TaskSendRequest,
+  TaskSendResponse,
+  WakeRequest,
+  WakeResponse,
+} from '@simple-code/core'
+import { forwardBlock, forwardLine, getSession, logRun, scopeOf } from '@simple-code/core'
 import * as vscode from 'vscode'
 import { createBridge } from './bridge.ts'
 import { renderHtml } from './html.ts'
 import { bestCandidate } from './openfile-resolve.ts'
-import type { ToHost } from './protocol.ts'
-import { createRouter, type Router } from './router.ts'
+import type { Attendance, ToHost } from './protocol.ts'
+import { type RemoteSyncResult, syncRemoteSettings } from './remote.ts'
 import type { RobotFolderView } from './robot-feed.ts'
-import { remoteSettingsPath, syncRemoteSettings, type RemoteSyncResult } from './remote.ts'
-import { asSavedChoice, EFFORTS } from './saved-choice.ts'
+import { createRouter, type Router } from './router.ts'
+import { asSavedChoice } from './saved-choice.ts'
 
 /**
  * 侧边栏面板。**这个文件只做接线**——把 vscode 的对象接到 bridge.ts 上。
@@ -130,9 +141,19 @@ export class ChatPanel implements vscode.WebviewViewProvider {
           // 分支模型选择的持久化（2026-09-22 拍板）：键 = 任务目录本身，
           // 目录删除（合并/丢弃）后键成残留垃圾——Memento 小对象，不追着清
           choiceStore: {
-            get: (dir) =>
-              asSavedChoice(this.state.get(modelKey(dir)) ?? null),
+            get: (dir) => asSavedChoice(this.state.get(modelKey(dir)) ?? null),
             set: (dir, choice) => void this.state.update(modelKey(dir), choice),
+          },
+          // 任务级历史摘要开关（2026-11-03，各自独立不联动）：键 = owner，
+          // 任务关闭后成残留垃圾——与 choiceStore 同一取舍，Memento 小对象
+          summaryStore: {
+            get: (owner) => this.state.get<boolean>(`summary.${owner}`) ?? null,
+            set: (owner, value) => void this.state.update(`summary.${owner}`, value),
+          },
+          // 任务级审批值守态（2026-11-04）：同 summaryStore 的 owner 键取舍
+          attendanceStore: {
+            get: (owner) => this.state.get<Attendance>(`attendance.${owner}`) ?? null,
+            set: (owner, mode) => void this.state.update(`attendance.${owner}`, mode),
           },
           openExternal: (url) => vscode.env.openExternal(vscode.Uri.parse(url)),
           // vscode.open 而不是 showTextDocument：后者只收文本文件，vscode.open
@@ -142,21 +163,27 @@ export class ChatPanel implements vscode.WebviewViewProvider {
           // basename 收集候选、尾部段连续对齐评分（openfile-resolve.ts）。
           // 相对路径是按「当前激活 folder」拼的（bridge.ts），多根工作区里
           // 文件可能在其他根——同 folder 没中就全工作区再找一次
+          // 两类失败都给 information 轻提示而不是静默（2026-11-05 拍板）：
+          // 模型给错路径时点击无声无息，用户分不清是功能坏了还是路径错了
           openFile: (abs, line) => {
             // path:line 形态的定位（grep -n / 报错栈）：打开后滚到行。
             // vscode.open 的第三参是 TextDocumentShowOptions，selection
             // 让编辑器滚过去；行号 1-based → Position 0-based
             const open = (p: string) =>
-              vscode.commands.executeCommand('vscode.open', vscode.Uri.file(p), {
-                ...(line !== undefined
-                  ? {
-                      selection: new vscode.Range(
-                        new vscode.Position(Math.max(0, line - 1), 0),
-                        new vscode.Position(Math.max(0, line - 1), 0),
-                      ),
-                    }
-                  : {}),
-              })
+              vscode.commands
+                .executeCommand('vscode.open', vscode.Uri.file(p), {
+                  ...(line !== undefined
+                    ? {
+                        selection: new vscode.Range(
+                          new vscode.Position(Math.max(0, line - 1), 0),
+                          new vscode.Position(Math.max(0, line - 1), 0),
+                        ),
+                      }
+                    : {}),
+                })
+                // 文件存在但 vscode.open 拒开（权限/特殊文件）：还是得有个响，
+                // 只是和「路径不存在」分开说
+                .then(undefined, () => vscode.window.showInformationMessage(`打不开：${p}`))
             if (existsSync(abs)) {
               return open(abs)
             }
@@ -176,14 +203,13 @@ export class ChatPanel implements vscode.WebviewViewProvider {
                     segs,
                     paths.filter((p) => p.startsWith(`${folder}/`)),
                   ) ?? bestCandidate(segs, paths)
-                return hit
-                  ? open(hit)
-                  : undefined
+                return hit ? open(hit) : vscode.window.showInformationMessage(`路径不存在：${abs}`)
               })
           },
           folder: f,
           onTurnEnd,
-          savedChoice: () => asSavedChoice(this.state.get(modelKey(f)) ?? this.state.get(MODEL_KEY)),
+          savedChoice: () =>
+            asSavedChoice(this.state.get(modelKey(f)) ?? this.state.get(MODEL_KEY)),
           saveChoice: (choice) => void this.state.update(modelKey(f), choice),
           clearChoice: () => void this.state.update(modelKey(f), undefined),
         }),
@@ -238,12 +264,27 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   /** agent 派任务（task-bridge.ts 转来，task-trunk 规则 11）。面板没开过 =
    *  没有路由也没有会话，派它的 bash 不可能在跑——兜底拒绝 */
   dispatchFromAgent(req: TaskDispatchRequest): Promise<TaskDispatchResponse> {
-    return this.router?.dispatchFromAgent(req) ?? Promise.resolve({ ok: false, error: '面板还没打开' })
+    return (
+      this.router?.dispatchFromAgent(req) ?? Promise.resolve({ ok: false, error: '面板还没打开' })
+    )
   }
 
   /** bin --models（规则 14）：root 所在目录的 taskModels。兜底同 dispatchFromAgent */
   taskModels(req: TaskModelsRequest): Promise<TaskModelsResponse> {
     return this.router?.taskModels(req) ?? Promise.resolve({ ok: false, error: '面板还没打开' })
+  }
+
+  /** task_send（loop-interrupt.md 实现项 2）：agent 发消息 / 列任务。兜底同上 */
+  taskSend(req: TaskSendRequest): TaskSendResponse {
+    return this.router?.taskSend(req) ?? { ok: false, error: '面板还没打开' }
+  }
+  taskSendList(req: TaskSendListRequest): TaskSendListResponse {
+    return this.router?.taskSendList(req) ?? { ok: false, error: '面板还没打开' }
+  }
+
+  /** $SIMPLE_CODE_WAKE 闹钟：注册到 router 的闹钟中心。兜底同上 */
+  wake(req: WakeRequest): WakeResponse {
+    return this.router?.wake(req) ?? { ok: false, error: '面板还没打开' }
   }
 
   // ── 桌面机器人（robot.ts）：面板没打开过 = 没有路由，也就没有任何事可提醒 ──
@@ -336,9 +377,15 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     // 从没触发过——runlog 里 session_close source=reload 为 0，直到 2026-10-12
     // 改 opus cacheTtl 后请求迟迟不带才发现
     const globalDir = vscode.Uri.file(join(homedir(), '.simple-code'))
-    wire(vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(globalDir, globalName)))
+    wire(
+      vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(globalDir, globalName)),
+    )
     for (const f of vscode.workspace.workspaceFolders ?? []) {
-      wire(vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(f, '.simple-code/settings.json')))
+      wire(
+        vscode.workspace.createFileSystemWatcher(
+          new vscode.RelativePattern(f, '.simple-code/settings.json'),
+        ),
+      )
     }
   }
 }
@@ -350,7 +397,6 @@ const MODEL_KEY = 'simpleCode.model'
 const modelKey = (folder: string) => `simpleCode.model:${folder}`
 /** 多根工作区的上次选择（design.md §7）。失效（被移出工作区）时 pickFolder 回落 [0] */
 const FOLDER_KEY = 'simpleCode.folder'
-
 
 /**
  * Memento 里读回来的东西形状对不上就当没有。`as` 强转会把脏数据带进 core。
@@ -365,7 +411,10 @@ const FOLDER_KEY = 'simpleCode.folder'
 function folderList(): string[] {
   const list = vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath.replace(/\/+$/, ''))
   if (list && list.length > 0) return list
-  return [process.env.HOME ?? process.cwd()]
+  // 空窗口不兜 ~（2026-11-04 拍板，v2 §2.2 ~ 工作区禁令）：home 当
+  // 工作区会让「项目内」豁免罩住整个用户目录。router 对空列表天然健壮
+  // （不 spawn、消息静默无操作），webview 显示「打开文件夹」引导
+  return []
 }
 
 /** 上次选的还在列表里就用它，否则 `[0]`（首次打开 / 上次被移出工作区）。

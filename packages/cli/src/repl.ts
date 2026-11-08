@@ -7,9 +7,9 @@ import {
   type SetTimer,
   watchIdle,
 } from '@simple-code/core'
-import type { ApprovalShared } from './run.ts'
 import { bracketPaste, type PasteBox } from './paste.ts'
 import { createRenderer, type Sink } from './render.ts'
+import type { ApprovalShared } from './run.ts'
 
 export type ReplOptions = {
   session: Session
@@ -56,7 +56,11 @@ const EFFORTS = new Set<Effort>(['low', 'medium', 'high', 'xhigh', 'max'])
  * 元信息一律走 err 通道（render.ts
  * 的分工：stdout 是模型的话，stderr 是状态）。解析规则与 sc -m 一致：
  * provider/model 从第一个 / 断——模型名自己可含 /，provider 不会 */
-async function handleSlash(session: Session, sink: Sink, text: string): Promise<boolean | 'reload'> {
+async function handleSlash(
+  session: Session,
+  sink: Sink,
+  text: string,
+): Promise<boolean | 'reload'> {
   const [word, ...rest] = text.split(/\s+/)
   const arg = rest.join(' ')
   if (word === '/reload') {
@@ -75,8 +79,14 @@ async function handleSlash(session: Session, sink: Sink, text: string): Promise<
     const num = (k: string) => Number(tail[k] ?? 0) // 老行缺字段当 0
     const window_ = session.config.model.contextWindow
     const used =
-      num('overhead') + num('cold') + num('warm') + num('hot') + num('stub') + num('floor') +
-      num('live') + num('maxTokens')
+      num('overhead') +
+      num('cold') +
+      num('warm') +
+      num('hot') +
+      num('stub') +
+      num('floor') +
+      num('live') +
+      num('maxTokens')
     const pct = ((used / window_) * 100).toFixed(1)
     sink.err(
       `上下文 ${Math.round(used)}/${window_}（${pct}%）· 记录于 ${String(tail.at ?? '?')}\n` +
@@ -116,7 +126,9 @@ async function handleSlash(session: Session, sink: Sink, text: string): Promise<
   if (word === '/effort') {
     if (arg === '') {
       const { effort, overridden } = session.effortState()
-      sink.err(`推理深度：${effort}${overridden ? '（本轮会话手动设的）' : '（配置默认）'}。/effort ${[...EFFORTS].join('|')}\n`)
+      sink.err(
+        `推理深度：${effort}${overridden ? '（本轮会话手动设的）' : '（配置默认）'}。/effort ${[...EFFORTS].join('|')}\n`,
+      )
       return true
     }
     if (!EFFORTS.has(arg as Effort)) {
@@ -304,5 +316,5 @@ async function runTurn(session: Session, sink: Sink, text: string): Promise<bool
 
 const banner = (root: string): string =>
   `sc · ${root}\n` +
-    `直接输入开始对话。/exit 或 Ctrl-D 退出，Ctrl-C 打断当前这一轮。\n` +
-    `/model 看清单换模型，/effort 换推理深度，/context 看上下文分区。\n\n`
+  `直接输入开始对话。/exit 或 Ctrl-D 退出，Ctrl-C 打断当前这一轮。\n` +
+  `/model 看清单换模型，/effort 换推理深度，/context 看上下文分区。\n\n`

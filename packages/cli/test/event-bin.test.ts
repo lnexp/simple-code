@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -47,8 +47,9 @@ describe('eventMain 订正口（2026-09-20）', () => {
     expect(after).toContain('- 2026-09-01 · 立档，初判 A 原因')
     expect(after).toContain('订正 其实 是 B')
     // 原文除追加行与 updated 时间戳外没别的变化
-    expect(after.replace(/^\s*- .*订正 其实 是 B.*$\n?/m, '').replace(/^updated:.*$/m, ''))
-      .toBe(before.replace(/^updated:.*$/m, ''))
+    expect(after.replace(/^\s*- .*订正 其实 是 B.*$\n?/m, '').replace(/^updated:.*$/m, '')).toBe(
+      before.replace(/^updated:.*$/m, ''),
+    )
   })
 
   it('describe：front matter 与 H1 两处同步，正文不动', async () => {
@@ -65,7 +66,9 @@ describe('eventMain 订正口（2026-09-20）', () => {
   it('不存在的事件：不新建，明说', async () => {
     const dir = await fixture()
     expect(eventMain(['progress', 'no-such', '一句话'], dir)).toBe(0) // 原语返回文案、不炸
-    const after = await readFile(join(dir, '.simple-code/events/no-such.md'), 'utf8').catch(() => null)
+    const after = await readFile(join(dir, '.simple-code/events/no-such.md'), 'utf8').catch(
+      () => null,
+    )
     expect(after).toBeNull() // 关键：没变相新建
   })
 

@@ -5,13 +5,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { type BashConfig, MISSING_DESC, createBashTool } from '../src/tools/bash.ts'
 import { bashConfig } from '../src/config/schema.ts'
+import { type BashConfig, createBashTool, MISSING_DESC } from '../src/tools/bash.ts'
 import { BgRegistry } from '../src/tools/bg.ts'
 
 // schema 默认白名单（envPassthrough 不写时的值）。从 schema 现取而不是
 // 在测试里抄一份——抄的会随默认值漂移，测的还是旧列表
 const defaultPassthrough = (): string[] => bashConfig.shape.envPassthrough.parse(undefined)
+
 import type { ToolContext } from '../src/tools/types.ts'
 
 const config: BashConfig = {
@@ -43,7 +44,9 @@ const ctx = (over: Partial<ToolContext> = {}): ToolContext => ({
  * 测漏 desc 的用例直接调 bash.execute */
 const run = (input: unknown, over: Partial<ToolContext> = {}) =>
   bash.execute(
-    typeof input === 'object' && input !== null && !('desc' in input) ? { desc: '测试', ...input } : input,
+    typeof input === 'object' && input !== null && !('desc' in input)
+      ? { desc: '测试', ...input }
+      : input,
     ctx(over),
   )
 
@@ -129,27 +132,37 @@ describe('bash / 参数校验', () => {
 
   it('desc 在 schema 里必填，执行层不因缺 desc 拒绝，但结果末尾提醒补上（2026-09-29 方案 B）', async () => {
     const bash = createBashTool(config)
-    expect((bash.definition.parameters as { required: string[] }).required).toEqual(['desc', 'command'])
+    expect((bash.definition.parameters as { required: string[] }).required).toEqual([
+      'desc',
+      'command',
+    ])
     const r = await bash.execute({ command: 'echo ok' }, ctx())
     expect(r.isError).toBe(false)
     expect(r.output).toBe(`ok\n${MISSING_DESC}`)
     // 空白 desc 等于没写
-    expect((await bash.execute({ command: 'echo ok', desc: '  ' }, ctx())).output).toContain(MISSING_DESC)
+    expect((await bash.execute({ command: 'echo ok', desc: '  ' }, ctx())).output).toContain(
+      MISSING_DESC,
+    )
     // 带了就不提醒（对照组）
     expect((await bash.execute({ command: 'echo ok', desc: '回显' }, ctx())).output).toBe('ok\n')
   })
 
   it('写成 description（glm 照官方 Bash 工具参数名，真实项目入参）算带了，不提醒', async () => {
     const bash = createBashTool(config)
-    const r = await bash.execute({ command: 'echo ok', description: '定位 writeChunk 所在测试文件', timeout: 15 }, ctx())
+    const r = await bash.execute(
+      { command: 'echo ok', description: '定位 writeChunk 所在测试文件', timeout: 15 },
+      ctx(),
+    )
     expect(r.output).toBe('ok\n')
     // 空白 description 同样等于没写
-    expect((await bash.execute({ command: 'echo ok', description: ' ' }, ctx())).output).toContain(MISSING_DESC)
+    expect((await bash.execute({ command: 'echo ok', description: ' ' }, ctx())).output).toContain(
+      MISSING_DESC,
+    )
   })
 
   it('审批被拒的结果也带提醒——模型下一条照样要写 desc', async () => {
     const r = await bash.execute(
-      { command: 'curl https://example.com' },
+      { command: 'cat /etc/passwd' },
       ctx({ requestApproval: async () => 'deny' }),
     )
     expect(r.isError).toBe(true)
@@ -375,35 +388,40 @@ describe('bash / 环境变量白名单', () => {
   })
 })
 
-  it('工具描述的 LSP 句按注入条件拼：env 有桥才教 LSP（2026-09-17 拍板——描述与实际能力一致）', () => {
-    const withLsp = createBashTool(config, { SIMPLE_CODE_LSP: '/x/lsp.js' })
-    const without = createBashTool(config, {})
-    // 分工（v2 拍板）：分流句+语言无关在 system prompt 工具约定，描述只留命令格式
-    expect(withLsp.definition.description).toContain('refs <file>:<行>:<列>')
-    expect(withLsp.definition.description).toContain('列须落在符号名上')
-    expect(withLsp.definition.description).not.toContain('优先于 grep')
-    expect(withLsp.definition.description).not.toContain('语言无关')
-    // 无桥环境（终端裸跑 sc 的子 agent）：整段不出现，模型不知道 LSP 存在也就不会试
-    expect(without.definition.description).not.toContain('SIMPLE_CODE_LSP')
-    // 默认参数（不传 env）= 空对象 = 不拼，老调用方行为不变
-    expect(bash.definition.description).not.toContain('SIMPLE_CODE_LSP')
-  })
+it('工具描述的 LSP 句按注入条件拼：env 有桥才教 LSP（2026-09-17 拍板——描述与实际能力一致）', () => {
+  const withLsp = createBashTool(config, { SIMPLE_CODE_LSP: '/x/lsp.js' })
+  const without = createBashTool(config, {})
+  // 分工（v2 拍板）：分流句+语言无关在 system prompt 工具约定，描述只留命令格式
+  expect(withLsp.definition.description).toContain('refs <file>:<行>:<列>')
+  expect(withLsp.definition.description).toContain('列须落在符号名上')
+  expect(withLsp.definition.description).not.toContain('优先于 grep')
+  expect(withLsp.definition.description).not.toContain('语言无关')
+  // 无桥环境（终端裸跑 sc 的子 agent）：整段不出现，模型不知道 LSP 存在也就不会试
+  expect(without.definition.description).not.toContain('SIMPLE_CODE_LSP')
+  // 默认参数（不传 env）= 空对象 = 不拼，老调用方行为不变
+  expect(bash.definition.description).not.toContain('SIMPLE_CODE_LSP')
+})
 
-  it('派任务句按注入条件拼：bin 与桥端口都在才写（终端 sc 没有任务条，对照）', () => {
-    const withTask = createBashTool(config, { SIMPLE_CODE_TASK: '/x/task.js', SIMPLE_CODE_TASK_PORT: '1' })
-    expect(withTask.definition.description).toContain('【派任务】"$SIMPLE_CODE_TASK"')
-    expect(withTask.definition.description).toContain('〔任务结果〕')
-    expect(createBashTool(config, { SIMPLE_CODE_TASK: '/x/task.js' }).definition.description).not.toContain('SIMPLE_CODE_TASK')
-    expect(createBashTool(config, {}).definition.description).not.toContain('SIMPLE_CODE_TASK')
+it('派任务句按注入条件拼：bin 与桥端口都在才写（终端 sc 没有任务条，对照）', () => {
+  const withTask = createBashTool(config, {
+    SIMPLE_CODE_TASK: '/x/task.js',
+    SIMPLE_CODE_TASK_PORT: '1',
   })
+  expect(withTask.definition.description).toContain('【派任务】"$SIMPLE_CODE_TASK"')
+  expect(withTask.definition.description).toContain('〔任务结果〕')
+  expect(
+    createBashTool(config, { SIMPLE_CODE_TASK: '/x/task.js' }).definition.description,
+  ).not.toContain('SIMPLE_CODE_TASK')
+  expect(createBashTool(config, {}).definition.description).not.toContain('SIMPLE_CODE_TASK')
+})
 
-  it('note write 的格式原样写进描述：前缀 + --- 分隔（note-bin 正则要的就是这个）', () => {
-    // 原描述「heredoc 四段：name/title/description/正文」没写前缀和 ---，
-    // 9-17~9-30 note write 格式失败 27 次，19 次是不带 name: 的裸行
-    const d = bash.definition.description
-    for (const s of ['name: ', 'title: ', 'description: ', '---']) expect(d).toContain(s)
-    expect(d).not.toContain('heredoc 四段')
-  })
+it('note write 的格式原样写进描述：前缀 + --- 分隔（note-bin 正则要的就是这个）', () => {
+  // 原描述「heredoc 四段：name/title/description/正文」没写前缀和 ---，
+  // 9-17~9-30 note write 格式失败 27 次，19 次是不带 name: 的裸行
+  const d = bash.definition.description
+  for (const s of ['name: ', 'title: ', 'description: ', '---']) expect(d).toContain(s)
+  expect(d).not.toContain('heredoc 四段')
+})
 
 describe('bash / 输出截断', () => {
   it('超过上限时两端保留，中间标注省略量', async () => {
@@ -490,7 +508,10 @@ describe('审批 always 白名单（approval.json）', () => {
     try {
       // 预置白名单：模拟用户此前点过「始终允许」
       mkdirSync(join(root0, '.simple-code'), { recursive: true })
-      writeFileSync(join(root0, '.simple-code', 'approval.json'), JSON.stringify({ leads: ['python3'], paths: [] }))
+      writeFileSync(
+        join(root0, '.simple-code', 'approval.json'),
+        JSON.stringify({ leads: ['python3'], paths: [] }),
+      )
       let asked = 0
       const ra = () => {
         asked++
@@ -507,7 +528,7 @@ describe('审批 always 白名单（approval.json）', () => {
     }
   })
 
-  it('lead 命中免审：批过 python3 后不再弹卡', async () => {
+  it('命令维无豁免层（2026-11-05 拆 leads）：askCommands 命中每次都问，点 always 不落盘', async () => {
     let asked = 0
     let decision: 'allow' | 'always' | 'deny' = 'always'
     const raAlways = (q: Parameters<NonNullable<ToolContext['requestApproval']>>[0]) => {
@@ -515,42 +536,48 @@ describe('审批 always 白名单（approval.json）', () => {
       void q
       return Promise.resolve(decision)
     }
-    await run({ command: 'python3 -c "print(1)"' }, { requestApproval: raAlways })
-    expect(asked).toBe(1) // 只问了第一次
-    // 第二条 python3 命令：白名单已生效，不该再问
+    mkdirSync(join(root, '.simple-code'), { recursive: true })
+    writeFileSync(
+      join(root, '.simple-code', 'approval.json'),
+      JSON.stringify({ askCommands: ['node'] }),
+    )
+    await run({ command: 'node -e "console.log(1)"' }, { requestApproval: raAlways })
+    expect(asked).toBe(1)
+    // 第二条同命令：没有 lead 豁免层了，照问（想放行只能删 askCommands）
     decision = 'deny'
-    const r = await run({ command: 'python3 -c "print(2)"' }, { requestApproval: raAlways })
-    expect(asked).toBe(1) // 免问（若问了会 shift 到空 → deny → 报错）
-    expect(r.isError).toBe(false)
-    expect(r.output).toContain('2')
-    // 卡上带 always 预览（执行器类）——UI 靠它出第三键
-    // 落盘内容可读
+    await run({ command: 'node -e "console.log(2)"' }, { requestApproval: raAlways })
+    expect(asked).toBe(2)
+    // 点 always 也不落盘：手写规则原样
     const data = JSON.parse(readFileSync(join(root, '.simple-code', 'approval.json'), 'utf8'))
-    expect(data.leads).toContain('python3')
+    expect(data.askCommands).toContain('node') // 手写规则没被冲掉
+    expect(data.leads).toBeUndefined() // 不再写 leads 键
     // 清场：别的测试的 root 别被污染（本测试的 root 是同一个 beforeAll 的）
     rmSync(join(root, '.simple-code', 'approval.json'), { force: true })
   })
 
-  it('隐藏路径始终允许：记读不记写，批过的读不再弹（2026-09-29）', async () => {
-    writeFileSync(join(root, '.hp-probe'), 'secret-ish')
+  it('项目外路径始终允许（读写同权，2026-11-04 简化拍板）：批过的读不再弹', async () => {
+    const probeDir = join(root, '..', 'sc-hp-allow')
+    mkdirSync(probeDir, { recursive: true })
+    const probe = join(probeDir, 'probe.txt')
+    writeFileSync(probe, 'secret-ish')
     const cards: Parameters<NonNullable<ToolContext['requestApproval']>>[0][] = []
     const ra = (q: (typeof cards)[number]) => {
       cards.push(q)
       return Promise.resolve<'always' | 'deny'>(cards.length === 1 ? 'always' : 'deny')
     }
-    const r1 = await run({ command: 'cat .hp-probe' }, { requestApproval: ra })
-    expect(cards[0]?.always).toEqual({ kind: 'hidden', path: '.hp-probe', write: false })
+    const r1 = await run({ command: `cat ${probe}` }, { requestApproval: ra })
+    expect(cards[0]?.always).toEqual({ kind: 'paths', dirs: [realpathSync(probeDir)] })
     expect(r1.output).toContain('secret-ish')
-    const r2 = await run({ command: 'cat .hp-probe' }, { requestApproval: ra })
+    const r2 = await run({ command: `cat ${probe}` }, { requestApproval: ra })
     expect(cards.length).toBe(1) // 读已批，免问
     expect(r2.output).toContain('secret-ish')
-    // 写没批：照样弹（第二张卡 deny）
-    const r3 = await run({ command: 'echo y > .hp-probe' }, { requestApproval: ra })
-    expect(cards.length).toBe(2)
-    expect(r3.isError).toBe(true)
+    // 读写同权：批过读，写也放
+    const r3 = await run({ command: `echo y > ${probe}` }, { requestApproval: ra })
+    expect(cards.length).toBe(1) // 不再为写弹卡
+    expect(r3.isError).toBeFalsy()
     const data = JSON.parse(readFileSync(join(root, '.simple-code', 'approval.json'), 'utf8'))
-    expect(data.hiddenRead).toEqual(['.hp-probe'])
-    expect(data.hiddenWrite).toEqual([])
+    expect(data.paths).toContain(realpathSync(probeDir))
+    rmSync(probeDir, { recursive: true, force: true })
     rmSync(join(root, '.simple-code', 'approval.json'), { force: true })
     rmSync(join(root, '.hp-probe'), { force: true })
   })
@@ -558,9 +585,11 @@ describe('审批 always 白名单（approval.json）', () => {
   it('拒绝带反馈：{ deny: 话 } 的输出含用户的话，模型按它调整重试', async () => {
     const ra = (q: Parameters<NonNullable<ToolContext['requestApproval']>>[0]) => {
       void q
-      return Promise.resolve<'allow' | 'always' | 'deny' | { deny: string }>({ deny: '别用 curl，用 webfetch' })
+      return Promise.resolve<'allow' | 'always' | 'deny' | { deny: string }>({
+        deny: '别用 curl，用 webfetch',
+      })
     }
-    const r = await run({ command: 'curl https://example.com' }, { requestApproval: ra })
+    const r = await run({ command: 'cat /etc/passwd' }, { requestApproval: ra })
     expect(r.isError).toBe(true)
     expect(r.output).toContain('审批被拒绝')
     expect(r.output).toContain('用户反馈：别用 curl，用 webfetch')
@@ -568,7 +597,7 @@ describe('审批 always 白名单（approval.json）', () => {
 
   it('裸 deny 不变：无反馈字段、输出与原来一致', async () => {
     const ra = () => Promise.resolve<'allow' | 'always' | 'deny' | { deny: string }>('deny')
-    const r = await run({ command: 'curl https://example.com' }, { requestApproval: ra })
+    const r = await run({ command: 'cat /etc/passwd' }, { requestApproval: ra })
     expect(r.isError).toBe(true)
     expect(r.output).not.toContain('用户反馈')
     expect(r.output).toContain('用户拒绝了这条命令')
@@ -577,7 +606,7 @@ describe('审批 always 白名单（approval.json）', () => {
 
   it('超时拒绝：告诉模型是没人处理，不是用户拒绝（2026-10-31）', async () => {
     const ra = () => Promise.resolve('timeout' as const)
-    const r = await run({ command: 'curl https://example.com' }, { requestApproval: ra })
+    const r = await run({ command: 'cat /etc/passwd' }, { requestApproval: ra })
     expect(r.isError).toBe(true)
     expect(r.output).toContain('审批被拒绝')
     expect(r.output).toContain('无人处理')
@@ -634,7 +663,10 @@ describe('审批 always 白名单（approval.json）', () => {
       expect(data.paths).toContain(real(d1))
       expect(data.paths).toContain(real(d2))
       // 白名单生效：同两条命令不再问
-      const r2 = await run({ command: `ls ${d1}; ls ${d2}` }, { requestApproval: () => Promise.resolve('deny') })
+      const r2 = await run(
+        { command: `ls ${d1}; ls ${d2}` },
+        { requestApproval: () => Promise.resolve('deny') },
+      )
       expect(r2.isError).toBe(false)
     } finally {
       rmSync(join(root, '.simple-code', 'approval.json'), { force: true })
@@ -643,23 +675,26 @@ describe('审批 always 白名单（approval.json）', () => {
     }
   })
 
-  it('.simple-code 写：memory 不给 always，其余子目录按第二级给（2026-10-29）', async () => {
+  it('memory 写是禁令档（不弹卡直接拒）；其余项目内 .simple-code 写放（v2 §2.2，2026-11-04）', async () => {
     const seen: Array<Parameters<NonNullable<ToolContext['requestApproval']>>[0] | undefined> = []
     const ra = (q: Parameters<NonNullable<ToolContext['requestApproval']>>[0]) => {
       seen.push(q)
       return Promise.resolve<'deny'>('deny')
     }
-    await run(
+    const r1 = await run(
       { command: `echo x > ${root}/.simple-code/memory/probe.txt` },
       { requestApproval: ra },
     )
-    expect(seen[0]?.always).toBeUndefined() // 对话记录：每次都弹
-    expect(seen[0]?.reason).toContain('.simple-code')
-    await run(
+    expect(seen).toHaveLength(0) // 不弹卡
+    expect(r1.isError).toBe(true)
+    expect(r1.output).toContain('禁止用 bash 写')
+    mkdirSync(join(root, '.simple-code/scripts'), { recursive: true })
+    const r2 = await run(
       { command: `echo x > ${root}/.simple-code/scripts/probe.txt` },
       { requestApproval: ra },
     )
-    expect(seen[1]?.always).toEqual({ kind: 'hidden', path: '.simple-code/scripts', write: true })
+    expect(seen).toHaveLength(0) // 项目内整树放（除 memory）
+    expect(r2.isError).toBeFalsy()
   })
 
   it('multi 卡批量 always 掺隐藏路径：目录记 paths、隐藏路径记 hiddenRead（2026-10-29）', async () => {
@@ -672,17 +707,13 @@ describe('审批 always 白名单（approval.json）', () => {
         seen.push(q)
         return Promise.resolve<'always'>('always')
       }
+      // 2026-11-04 简化：项目内 .sc-multi-h 不再触发，卡收敛成单目录
       const r = await run({ command: `ls ${d1}; cat .sc-multi-h` }, { requestApproval: ra })
       expect(r.isError).toBe(false)
       const d1r = realpathSync(d1)
-      expect(seen[0]?.always).toEqual({
-        kind: 'paths',
-        dirs: [d1r],
-        hidden: [{ path: '.sc-multi-h', write: false }],
-      })
+      expect(seen[0]?.always).toEqual({ kind: 'paths', dirs: [d1r] })
       const data = JSON.parse(readFileSync(join(root, '.simple-code', 'approval.json'), 'utf8'))
       expect(data.paths).toContain(d1r)
-      expect(data.hiddenRead).toContain('.sc-multi-h')
       const r2 = await run(
         { command: `ls ${d1}; cat .sc-multi-h` },
         { requestApproval: () => Promise.resolve('deny') },

@@ -1,5 +1,5 @@
-import { access, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { constants as fsConstants } from 'node:fs'
+import { access, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -321,7 +321,11 @@ describe('ensureCredentialProxy（终端 sc 自起凭据代理）', () => {
       const port = process.env.SIMPLE_CODE_PROXY_PORT
       expect(port).toMatch(/^\d+$/)
       expect(process.env.SIMPLE_CODE_PROXY_TOKEN).toMatch(/^[0-9a-f]{48}$/)
-      const res = await fetch(`http://127.0.0.1:${port}/websearch`, { method: 'POST', headers: { 'x-sc-token': 'wrong' }, body: '{}' })
+      const res = await fetch(`http://127.0.0.1:${port}/websearch`, {
+        method: 'POST',
+        headers: { 'x-sc-token': 'wrong' },
+        body: '{}',
+      })
       expect(res.status).toBe(401)
       await new Promise((r) => server?.close(r))
     } finally {

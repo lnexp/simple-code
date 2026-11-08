@@ -113,7 +113,14 @@ function indexStep(db: Db, s: { id: number; turn_id: number }): number | null {
  * 游标之上的新 step。full/merged 段主人已切走，游标 step 不会再长，只收
  * 游标之上的（通常没有）。宿主 save 尾部调用。 */
 export function syncSearchIndex(db: Db): void {
-  const segs = db.all<{ id: number; floor: number; ceil: number; state: string; step: number | null; rowid: number | null }>(
+  const segs = db.all<{
+    id: number
+    floor: number
+    ceil: number
+    state: string
+    step: number | null
+    rowid: number | null
+  }>(
     `SELECT id, step_floor AS floor, step_ceil AS ceil, state, indexed_step AS step, indexed_rowid AS rowid FROM segments`,
   )
   for (const g of segs) {
@@ -131,7 +138,12 @@ export function syncSearchIndex(db: Db): void {
     for (const s of steps) {
       const rowid = indexStep(db, s)
       if (rowid === null) continue
-      db.run(`UPDATE segments SET indexed_step = ?, indexed_rowid = ? WHERE id = ?`, s.id, rowid, g.id)
+      db.run(
+        `UPDATE segments SET indexed_step = ?, indexed_rowid = ? WHERE id = ?`,
+        s.id,
+        rowid,
+        g.id,
+      )
     }
   }
 }

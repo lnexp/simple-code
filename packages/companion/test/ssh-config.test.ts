@@ -2,7 +2,12 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { appendForwardBlock, forwardLine, hasForwardForHost, sshConfigPath } from '../src/ssh-config.ts'
+import {
+  appendForwardBlock,
+  forwardLine,
+  hasForwardForHost,
+  sshConfigPath,
+} from '../src/ssh-config.ts'
 
 const homes: string[] = []
 const home = (): string => {
@@ -30,9 +35,7 @@ describe('ssh config 的 RemoteForward 检测与追加', () => {
   })
 
   it('通配 Host 块（my-remote-*）也算数', () => {
-    expect(
-      hasForwardForHost(`Host my-remote-*\n  ${forwardLine()}\n`, 'my-remote-1'),
-    ).toBe(true)
+    expect(hasForwardForHost(`Host my-remote-*\n  ${forwardLine()}\n`, 'my-remote-1')).toBe(true)
     expect(hasForwardForHost(`Host my-remote-*\n  User x\n`, 'my-remote-1')).toBe(false)
   })
 

@@ -81,18 +81,21 @@ function buildRequest(req: Request, ctx: ProviderContext) {
  */
 function toWireMessages(msg: Message): WireMessage[] {
   if (msg.role === 'tool') {
-    return msg.parts.flatMap((part) => {
-      if (part.type !== 'tool_result') return []
+    // 配对块必须连续：assistant(tool_calls) 后面只能跟 tool 消息。图片
+    // 换道的合成 user 若插在两条 tool 中间，严格网关（DeepSeek 官方，
+    // 2026-11-07 远端实证）直接 400「insufficient tool messages following
+    // tool_calls message」——合成 user 挪到本块全部 tool 消息之后
+    const tools: WireMessage[] = []
+    const deferred: WireMessage[] = []
+    for (const part of msg.parts) {
+      if (part.type !== 'tool_result') continue
       // tool role 的 content 协议上只有 string，图带不进去。
-      // 换道：
-      // 图抽出来，拼成紧随其后的合成 user 消息——user 消息的多模态
-      // content 本来就在用（用户贴图同路），图照发，只换消息角色
-      const wire: WireMessage[] = [
-        { role: 'tool', tool_call_id: part.toolCallId, content: part.output },
-      ]
+      // 换道：图抽出来，拼成合成 user 消息（块尾，见上）——user 消息的
+      // 多模态 content 本来就在用（用户贴图同路），图照发，只换消息角色
+      tools.push({ role: 'tool', tool_call_id: part.toolCallId, content: part.output })
       const images = part.images ?? []
       if (images.length > 0) {
-        wire.push({
+        deferred.push({
           role: 'user',
           content: [
             { type: 'text', text: `工具结果附图（${part.output.slice(0, 80)}）：` },
@@ -103,8 +106,8 @@ function toWireMessages(msg: Message): WireMessage[] {
           ],
         })
       }
-      return wire
-    })
+    }
+    return [...tools, ...deferred]
   }
 
   const toolCalls = msg.parts.filter((p) => p.type === 'tool_call')
@@ -349,7 +352,11 @@ function toError(err: Record<string, unknown>, status: number): ProtocolError {
   const kind = errorKind(asString(err.code) || asString(err.type), message, status)
   // unknown 也重试：流内 error 事件归不上类的默认可重试，理由见
   // anthropic-messages.ts 的 toError（2026-09-29 方案 A）
-  return { kind, message, retryable: kind === 'rate_limit' || kind === 'server' || kind === 'unknown' }
+  return {
+    kind,
+    message,
+    retryable: kind === 'rate_limit' || kind === 'server' || kind === 'unknown',
+  }
 }
 
 function errorKind(code: string, message: string, status: number): ProtocolError['kind'] {

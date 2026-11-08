@@ -42,6 +42,10 @@ const fail = (line: number, msg: string): never => {
   throw new Error(`补丁第 ${line} 行：${msg}`)
 }
 
+/** 报错里引用用户实际写的内容：长行截断（60 字符），空行如实说空 */
+const brief = (s: string): string =>
+  s === '' ? '（空行）' : s.length > 60 ? `${s.slice(0, 60)}…` : s
+
 /** lenient 容错：模型可能把 heredoc 壳一起塞进来，剥掉再解析 */
 function stripHeredoc(raw: string): string {
   const m = /^<<'\w+'\n([\s\S]*?)\n\w+\n?$/.exec(raw)
@@ -52,11 +56,14 @@ function stripHeredoc(raw: string): string {
 export function parsePatch(raw: string): PatchHunk[] {
   const lines = stripHeredoc(raw).split('\n')
   if (lines[0]?.trim() !== BEGIN) fail(1, `补丁必须以 ${BEGIN} 开头`)
-  const last = lines[lines.length - 1]?.trim()
-  if (last === '' && lines[lines.length - 2]?.trim() !== END) {
-    fail(lines.length - 1, `补丁必须以 ${END} 结尾`)
+  const last = lines[lines.length - 1]?.trim() ?? ''
+  const penult = lines[lines.length - 2]?.trim() ?? ''
+  if (last === '' && penult !== END) {
+    fail(lines.length - 1, `补丁必须以 ${END} 结尾（实际最后一行是「${brief(penult)}」）`)
   }
-  if (last !== '' && last !== END) fail(lines.length, `补丁必须以 ${END} 结尾`)
+  if (last !== '' && last !== END) {
+    fail(lines.length, `补丁必须以 ${END} 结尾（实际最后一行是「${brief(last)}」）`)
+  }
   const endIdx = last === '' ? lines.length - 2 : lines.length - 1
   if (endIdx === 0) fail(1, '空补丁：Begin 和 End 之间没有任何文件操作')
 
@@ -248,10 +255,14 @@ export async function patchFile(
   const hunks = parsePatch(raw)
   const h = hunks[0]
   if (hunks.length !== 1 || h?.kind !== 'update') {
-    throw new Error('patch 通道只接受单个 Update File（新建走各通道的 write，多文件走 $SIMPLE_CODE_APPLY_PATCH）')
+    throw new Error(
+      'patch 通道只接受单个 Update File（新建走各通道的 write，多文件走 $SIMPLE_CODE_APPLY_PATCH）',
+    )
   }
   if (resolve(root, h.path) !== resolve(absTarget)) {
-    throw new Error(`补丁目标是 ${h.path}，与要改的文件（${absTarget}）不一致——要改别的文件走 $SIMPLE_CODE_APPLY_PATCH`)
+    throw new Error(
+      `补丁目标是 ${h.path}，与要改的文件（${absTarget}）不一致——要改别的文件走 $SIMPLE_CODE_APPLY_PATCH`,
+    )
   }
   const original = readFileSync(absTarget, 'utf8')
   const summary = await applyPatch(root, raw)

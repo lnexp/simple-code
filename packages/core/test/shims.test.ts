@@ -1,5 +1,15 @@
 import { execFile } from 'node:child_process'
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -34,10 +44,10 @@ describe('shims（宿主内置 Node 优先、系统 node 兜底）', () => {
     const script = join(scriptDir, 'space dir', 'echo-bin.js')
     await mkdir(join(scriptDir, 'space dir'))
     await writeFile(script, 'console.log("ok", process.argv.slice(2).join(" "))\n')
-    const shims = await ensureShims(
-      [{ name: 'TEST', bin: 'sc-test', script }],
-      { binDir, nodeBin: process.execPath },
-    )
+    const shims = await ensureShims([{ name: 'TEST', bin: 'sc-test', script }], {
+      binDir,
+      nodeBin: process.execPath,
+    })
     const { stdout } = await run(shims.TEST!, ['a', 'b c'])
     expect(stdout).toBe('ok a b c\n')
   })
@@ -63,7 +73,10 @@ describe('shims（宿主内置 Node 优先、系统 node 兜底）', () => {
     const target = join(targetDir, 'real-sc.js')
     await writeFile(target, '真实脚本内容，被写穿就毁了\n')
     await symlink(target, join(binDir, 'sc'))
-    await ensureShims([{ name: 'SC', bin: 'sc', script: '/x/sc.js' }], { binDir, nodeBin: process.execPath })
+    await ensureShims([{ name: 'SC', bin: 'sc', script: '/x/sc.js' }], {
+      binDir,
+      nodeBin: process.execPath,
+    })
     // 链接被替换成普通文件，目标原封不动
     expect((await lstat(join(binDir, 'sc'))).isSymbolicLink()).toBe(false)
     expect(await readFile(target, 'utf8')).toContain('真实脚本内容')

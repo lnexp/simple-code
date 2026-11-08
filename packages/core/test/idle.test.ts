@@ -20,7 +20,10 @@ const fakeSession = () => {
   let finish: () => void = () => {}
   const session = {
     config: { config: { memory: { idleSummarizeDelayMs: 3000 } } },
-    summarizeIdle: () => new Promise<void>((resolve) => { finish = resolve }),
+    summarizeIdle: () =>
+      new Promise<void>((resolve) => {
+        finish = resolve
+      }),
   } as unknown as Session
   return { session, finish: () => finish() }
 }

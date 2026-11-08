@@ -1,9 +1,9 @@
-import { beforeAll, describe, expect, it } from 'vitest'
-import { DEFAULT_HIDDEN_ALLOW, DEFAULT_NETWORK_ALLOW, classify } from '../src/tools/approval.ts'
-import { warmupShellParser } from '../src/tools/shell-ast.ts'
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { beforeAll, describe, expect, it } from 'vitest'
+import { classify } from '../src/tools/approval.ts'
+import { warmupShellParser } from '../src/tools/shell-ast.ts'
 
 /**
  * AST 路径（tree-sitter）的判定回归。approval.test.ts 不调 warmup、
@@ -16,10 +16,19 @@ beforeAll(async () => {
 
 const ROOT = '/Users/dev/Code/proj'
 // 假 root 下文件都不存在：注入「都存在」，这里测的是第 1 层（按名字判）
-// 与各类别规则；第 2 层（存在检查）在 hidden-path.test.ts 用真目录测
-const cfg = { hiddenAllow: [...DEFAULT_HIDDEN_ALLOW], networkAllow: [...DEFAULT_NETWORK_ALLOW], askCommands: [], pathExists: () => true }
+// 与各类别规则；第 2 层（存在检查）在 approval-path.test.ts 用真目录测
+const cfg = {
+  askCommands: [],
+  denyCommands: [],
+  pathExists: () => true,
+}
 const ask = (cmd: string) => classify(cmd, ROOT, cfg)
 const allow = (cmd: string) => expect(ask(cmd)).toEqual({ kind: 'allow' })
+const denied = (cmd: string, reasonIncludes: string) => {
+  const v = ask(cmd)
+  expect(v.kind).toBe('deny')
+  if (v.kind === 'deny') expect(v.reason).toContain(reasonIncludes)
+}
 const blocked = (cmd: string, reasonIncludes: string) => {
   const v = ask(cmd)
   expect(v.kind).toBe('ask')
@@ -29,30 +38,32 @@ const blocked = (cmd: string, reasonIncludes: string) => {
 describe('AST 路径：与正则路径同规则的抽样回归', () => {
   it('`"((` grammar bug 绕行后按普通规则判：已批的 agent-browser eval 放行，藏着的危险段照弹（2026-09-30）', () => {
     const real = `export AGENT_BROWSER_SESSION="$(agent-browser session id --scope worktree --prefix hide-menu)"; agent-browser click @e4 && sleep 6 && agent-browser eval "(() => JSON.stringify([...document.querySelectorAll('.ant-menu-item')].filter(e=>e.offsetParent).map(e=>e.textContent.trim()).filter(Boolean)))()" 2>&1 | head -2`
-    expect(classify(real, ROOT, { ...cfg, alwaysLeads: ['agent-browser eval'] })).toEqual({ kind: 'allow' })
-    // 没批过：是可「始终允许」的 eval 卡，不再是无键的「$( ) 无法静态判定」
-    const v = ask(real)
-    expect(v).toMatchObject({ kind: 'ask', detail: 'eval', alwaysLead: 'agent-browser eval' })
+    // 2026-11-05 拆 leads：agent-browser eval 的豁免改走 nonPathFrom/批键，
+    // 这里用批过的 eval 路径断言同一条命令不再依赖命令维豁免
+    expect(classify(real, ROOT, cfg)).toMatchObject({ kind: 'allow' })
+    // 没批过也放：eval 不拦（2026-11-04 拍板），$() 子命令枚举承担判定
+    expect(ask(real)).toEqual({ kind: 'allow' })
     blocked('agent-browser eval "(() => 1)()" && rm -rf /etc/zz', '/etc/zz')
   })
 
   it('路径 / 隐藏 / 网络 / 读写分离', () => {
     blocked('cat /etc/passwd', '项目外')
-    blocked('cat .env', '隐藏')
-    blocked('curl https://evil.com', '网络命令')
+    allow('cat .env') // 2026-11-04 拍板：项目内全放（.env 也不例外）
+    allow('curl https://evil.com') // v2 §2.1 类 4：网络不限制
     allow('cat src/index.ts')
     allow('ls .simple-code/memory') // 2026-09-14 拍板：.simple-code 读放行
     allow('cat .simple-code/settings.json') // settings.json 同样读放行
     allow('grep -r 占位符 .simple-code/memory/turns') // 翻对话史不再弹卡
     allow('sort < .simple-code/memory/x') // 输入方向读，同放行
-    blocked('echo x > .simple-code/memory/a', '写入')
-    blocked('rm .simple-code/memory/state.db', '写入')
-    blocked('echo x > .simple-code/settings.json', '写入') // 写仍拦：apiKey 在里面
+    // v2 §2.2（2026-11-04）：memory 写禁（deny），其余项目内 .simple-code 写放
+    denied('echo x > .simple-code/memory/a', '禁止用 bash 写')
+    denied('rm .simple-code/memory/state.db', '禁止用 bash 写')
+    allow('echo x > .simple-code/settings.json') // 项目级配置在恢复域内
   })
-  it('解释器 / eval 仍拦', () => {
-    blocked('bash -c "ls"', '任意代码')
-    blocked('python3 /tmp/x.py', '任意代码')
-    blocked('echo a | bash', '任意代码')
+  it('解释器 / eval 不拦（2026-11-04 拍板）', () => {
+    allow('bash -c "ls"')
+    allow('python3 scripts/x.py')
+    allow('echo a | bash')
   })
   it('透传前缀（nohup/timeout/env/xargs …）后面的真命令照判（2026-10-30 实案）', () => {
     const t = { ...cfg, askCommands: ['git push', 'appctl build run'] }
@@ -71,9 +82,9 @@ describe('AST 路径：与正则路径同规则的抽样回归', () => {
       'nohup timeout 5 git push',
     ])
       expect(classify(c, ROOT, t), c).toMatchObject({ kind: 'ask', detail: 'git push' })
-    blocked('nohup python3 x.py', '任意代码')
+    allow('nohup python3 x.py') // 解释器不拦（2026-11-04）
     // 写动词按内层算：外层 lead 是 nohup 时 rm 的参数曾被当读
-    blocked('nohup rm .simple-code/memory/state.db', '写入')
+    denied('nohup rm .simple-code/memory/state.db', '禁止用 bash 写')
     // 对照：内层无害、查询形态、无命令
     allow('nohup node server.js > .simple-code/tmp/s.log 2>&1 &')
     allow('command -v python3')
@@ -87,10 +98,7 @@ describe('AST 路径：与正则路径同规则的抽样回归', () => {
     blocked("cat <<'E' > /etc/passwd\nhi\nE", '项目外')
     // 批过 python3 也只免命令名那一层，写项目外照弹（真机形态）
     expect(
-      classify(`cd ${ROOT} && python3 - <<'PY' > /tmp/x.patch\nprint(1)\nPY`, ROOT, {
-        ...cfg,
-        alwaysLeads: ['python3'],
-      }),
+      classify(`cd ${ROOT} && python3 - <<'PY' > /tmp/x.patch\nprint(1)\nPY`, ROOT, cfg),
     ).toMatchObject({ kind: 'ask', category: 'external_dir' })
     const t = { ...cfg, askCommands: ['git push'] }
     for (const c of ['> o.log git push', 'nohup > .simple-code/tmp/o.log git push'])
@@ -103,24 +111,28 @@ describe('AST 路径：与正则路径同规则的抽样回归', () => {
 
 describe('AST 路径：正则做不到的结构性判定（本次升级的目的）', () => {
   it('quoted heredoc body 是字面量——反引号/$(/路径都不弹（apply_patch 场景）', () => {
-    allow('cd /Users/dev/Code/proj && "$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n*** Update File: docs/x.md\n+用 `git rm --cached` 和 `$(ls)` 写的段落，路径 ~/.ssh/keys\n*** End Patch\nPATCH')
-    // 不带引号的 heredoc 分隔符：body 里 $() 会被 shell 展开，不能豁免
-    blocked('cat <<EOF\n`evil`\nEOF', '反引号')
+    allow(
+      'cd /Users/dev/Code/proj && "$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n*** Update File: docs/x.md\n+用 `git rm --cached` 和 `$(ls)` 写的段落，路径 ~/.ssh/keys\n*** End Patch\nPATCH',
+    )
+    // 不带引号的 heredoc 分隔符：同权放行（2026-11-04 拍板）
+    allow('cat <<EOF\n`evil`\nEOF')
   })
   it('APPLY_PATCH 段级形态：cd 后接补丁，路径判定照走（judge 透传原始命令）', () => {
     // 段级 bin 规则在 judge 里，heredoc body 不进 items——路径检查靠
     // classify 把原始命令串透传进来（rawCmd），这条用例锁住透传不断
-    blocked(
+    // v2 §2.2（2026-11-04）：项目内 .simple-code 除 memory 全放
+    allow(
       'cd /Users/dev/Code/proj && "$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n*** Begin Patch\n*** Update File: .simple-code/state.db\n@@\n x\n+y\n*** End Patch\nPATCH',
-      '要写入 .simple-code 数据',
     )
     // 项目内路径 + 上下文里长得危险的字符串：照旧放行（回归）
-    allow('cd /Users/dev/Code/proj && "$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n*** Begin Patch\n*** Update File: docs/x.md\n@@\n ctx\n+要改 ~/.ssh/authorized_keys 的文档段落\n*** End Patch\nPATCH')
+    allow(
+      'cd /Users/dev/Code/proj && "$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n*** Begin Patch\n*** Update File: docs/x.md\n@@\n ctx\n+要改 ~/.ssh/authorized_keys 的文档段落\n*** End Patch\nPATCH',
+    )
   })
   it('$() 子命令全量枚举——里面的危险命令照样弹', () => {
     // 项目外点开头报隐藏路径（2026-09-30）；这里要验的是子命令被枚举到
-    blocked('echo $(cat ~/.ssh/id_rsa)', '隐藏路径')
-    blocked('echo file_$(rm ~/.zshrc)', '隐藏路径')
+    blocked('echo $(cat ~/.ssh/id_rsa)', '项目外')
+    blocked('echo file_$(rm ~/.zshrc)', '项目外')
     allow('echo $(ls src)')
   })
   it('tr 的字符集不是路径；读重定向 < 是真文件，不进参数位豁免（2026-10-30）', () => {
@@ -128,7 +140,7 @@ describe('AST 路径：正则做不到的结构性判定（本次升级的目的
     allow(`echo a/b | tr -d '/'`)
     // tr 读 stdin：`< 文件` 等于把文件内容打出来
     blocked('tr a b < /Users/dev/Desktop/y.txt', '项目外')
-    blocked('tr -d x < ~/.ssh/id_rsa', '隐藏路径')
+    blocked('tr -d x < ~/.ssh/id_rsa', '项目外')
     // 同一个洞也在 nonPathFrom 豁免位上（xcli 第 2 位起豁免）
     const v = classify('xcli get f.pptx /body < /Users/dev/Desktop/y.txt', ROOT, {
       ...cfg,
@@ -141,27 +153,33 @@ describe('AST 路径：正则做不到的结构性判定（本次升级的目的
     allow('git commit -m "fix; deploy"')
   })
   it('重定向目标 write 标记（file_redirect 兄弟节点）', () => {
-    blocked('cat src/a.ts >> ~/.zshrc', '隐藏路径')
+    blocked('cat src/a.ts >> ~/.zshrc', '项目外')
     // 段内（单命令多路径）仍是首中即返——multi 合并只在段间（2026-09-15
     // 拍板时的取舍：judge 核心流收集化侵入大，单命令双触发场景边缘）
-    blocked('sort < /etc/passwd > .simple-code/memory/x', '项目外')
-    blocked('sort /etc/passwd > .simple-code/memory/x', '项目外')
-    // 实案：cd 项目外（最无害的段在最前）+ python3 任意代码 + 字符串里读项目外 xlsx
-    const multi = classify('cd /Users/dev && python3 - <<\'EOF\'\nload_workbook(\'/Users/dev/Downloads/a.xlsx\')\nEOF', '/Users/dev/Code/proj', cfg)
+    denied('sort < /etc/passwd > .simple-code/memory/x', '禁止用 bash 写') // 禁令优先于外部源弹卡
+    denied('sort /etc/passwd > .simple-code/memory/x', '禁止用 bash 写')
+    // 实案：cd 项目外 + python3 heredoc（解释器已放，2026-11-04）——
+    // 只剩 cd 段的 external_dir
+    const multi = classify(
+      "cd /Users/dev && python3 - <<'EOF'\nload_workbook('/Users/dev/Downloads/a.xlsx')\nEOF",
+      '/Users/dev/Code/proj',
+      cfg,
+    )
     expect(multi.kind).toBe('ask')
     if (multi.kind === 'ask') {
-      expect(multi.category).toBe('multi')
-      expect(multi.reason).toContain('python3') // 解释器段：「无法静态判定」
+      expect(multi.category).toBe('external_dir')
       expect(multi.reason).toContain('/Users/dev') // cd 段：项目外路径
-      expect(multi.alwaysLead).toBeUndefined() // multi 不给 always
+      // alwaysPaths 不断言：dirHint 走真实 statSync，/Users/dev 不存在时
+      // 收敛到 /Users（给键），平台不同结果不同——原断言写的已删的
+      // alwaysLead 字段（恒 undefined 的假断言）
     }
   })
   it('双引号内的 $() 子命令同样枚举', () => {
-    blocked('echo "x$(cat ~/.ssh/id_rsa)y"', '隐藏路径')
+    blocked('echo "x$(cat ~/.ssh/id_rsa)y"', '项目外')
     allow('echo "file_$(basename src/a.ts).log"')
   })
   it('FOO=1 前缀剥离后按动词判', () => {
-    blocked('FOO=1 curl https://x.com', '网络命令')
+    allow('FOO=1 curl https://x.com') // v2 §2.1 类 4
     allow('FOO=1 ls src')
   })
   it('root 内绝对路径剥前缀后走组件规则——.simple-code 拦截不失配', () => {
@@ -169,7 +187,8 @@ describe('AST 路径：正则做不到的结构性判定（本次升级的目的
     // 是根下第一段（如 Users），失配、掉进通用隐藏扫描。剥前缀后
     // .simple-code 才回到首组件位置。用写验证（读已放行，验不出拦截）
     allow(`cat ${ROOT}/.simple-code/approval.json 2>/dev/null || echo x`)
-    blocked(`cat > ${ROOT}/.simple-code/x.txt`, '要写入 .simple-code')
+    denied(`cat > ${ROOT}/.simple-code/memory/x.txt`, '禁止用 bash 写') // v2：memory 禁令验组件不失配
+    allow(`cat > ${ROOT}/.simple-code/x.txt`) // v2 §2.2：项目内写放
     allow(`cat ${ROOT}/.simple-code/settings.json`) // 读放行（2026-09-14 拍板）
     blocked('cat /etc/passwd', '项目外') // 前缀外照旧
   })
@@ -183,7 +202,7 @@ describe('AST 路径：重定向在 && / 管道 / 复合语句里不再漏扫（
     blocked('true && echo x > /etc/passwd', '项目外')
     blocked(`cd ${ROOT} && echo x >> /etc/passwd`, '项目外')
     blocked(`cd ${ROOT} || echo x > /etc/passwd`, '项目外')
-    blocked(`cd ${ROOT} && echo x > .env`, '隐藏')
+    allow(`cd ${ROOT} && echo x > .env`)
     blocked(`cd ${ROOT} && cat src/a.ts > ../outside.txt`, '项目外')
     blocked('echo x | cat > /etc/passwd', '项目外')
     blocked(`cd ${ROOT} && { echo x; } > /etc/passwd`, '项目外')
@@ -203,25 +222,32 @@ describe('AST 路径：重定向在 && / 管道 / 复合语句里不再漏扫（
     // `a && b > f`：b 的实参照样判——左命令不受牵连
     blocked(`cd ${ROOT} && cat /etc/shadow`, '项目外')
   })
-  it('不带引号的 heredoc 在 && 形状下同样拦（body 会被 shell 展开）', () => {
-    blocked(`cd ${ROOT} && cat <<EOF\n\`evil\`\nEOF`, '反引号')
-    blocked(
+  it('不带引号的 heredoc 不再拦（2026-11-04 拍板）：&& 形状同权，body 展开已接受', () => {
+    allow(`cd ${ROOT} && cat <<EOF\n\`evil\`\nEOF`)
+    allow(
       `cd ${ROOT} && "$SIMPLE_CODE_APPLY_PATCH" <<PATCH\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x\n+\`rm -rf /tmp/x\`\n*** End Patch\nPATCH`,
-      '反引号',
     )
     // 带引号的分隔符：body 是字面量，照旧放行
-    allow(`cd ${ROOT} && "$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x\n+\`ls\` 与 $(ls) 的文档段落\n*** End Patch\nPATCH`)
+    allow(
+      `cd ${ROOT} && "$SIMPLE_CODE_APPLY_PATCH" <<'PATCH'\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x\n+\`ls\` 与 $(ls) 的文档段落\n*** End Patch\nPATCH`,
+    )
   })
   it('不带引号 heredoc 的字符判定：裸括号不再误报，转义反斜杠不再漏', () => {
     // 修前：body 里只有 foo() 也弹「unquoted heredoc」——凡带函数调用的
     // 补丁全中；(` 在无引号 heredoc 里不展开，纯误报）
-    allow(`cd ${ROOT} && "$SIMPLE_CODE_APPLY_PATCH" <<PATCH\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x = foo()\n+y = bar()\n*** End Patch\nPATCH`)
-    // 修前：\\ 会被 shell 吃掉一个（补丁内容静默变形）却放行
-    blocked(`cd ${ROOT} && cat <<EOF\nx = "a\\\\b"\nEOF`, '反斜杠')
+    allow(
+      `cd ${ROOT} && "$SIMPLE_CODE_APPLY_PATCH" <<PATCH\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x = foo()\n+y = bar()\n*** End Patch\nPATCH`,
+    )
+    // \\ 变形风险与展开风险同层（2026-11-04 一并接受）
+    allow(`cd ${ROOT} && cat <<EOF\nx = "a\\\\b"\nEOF`)
   })
-  it('规则 0（裸 apply_patch 开头）也查不带引号的 heredoc', () => {
-    blocked('"$SIMPLE_CODE_APPLY_PATCH" <<PATCH\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x\n+`rm -rf /tmp/x`\n*** End Patch\nPATCH', '反引号')
-    allow('"$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x\n+`ls` 与 $(ls) 的文档段落\n*** End Patch\nPATCH')
+  it('规则 0（裸 apply_patch 开头）：不带引号 heredoc 同样不拦（2026-11-04）', () => {
+    allow(
+      '"$SIMPLE_CODE_APPLY_PATCH" <<PATCH\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x\n+`rm -rf /tmp/x`\n*** End Patch\nPATCH',
+    )
+    allow(
+      '"$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n-x\n+`ls` 与 $(ls) 的文档段落\n*** End Patch\nPATCH',
+    )
   })
 })
 
@@ -230,24 +256,15 @@ describe('AST 路径：自家 bin 的不带引号 heredoc 弹卡（stdin 展开�
   // shell 展开（$( ) 任意命令）。SKILL 的 patch 2026-09-27 退役，但规则
   // 对任意自家 bin 的不带引号 heredoc 通用，保留一个虚构形态测机制。
   // 必须挂 wasm 测——正则回退路径看不见 heredoc 结构
-  it('不带引号的分隔符 + body 含 $/反引号 → 弹卡（unparseable）', () => {
+  it('不带引号的分隔符 + body 含 $/反引号：不拦（2026-11-04 拍板，展开已接受）', () => {
     for (const cmd of [
       `"$SIMPLE_CODE_NOTE" write <<MD\nname: $(rm -rf /)\nMD`,
       `"$SIMPLE_CODE_LESSON" write <<JSON\n{"name":"x $y"}\nJSON`,
       `"$SIMPLE_CODE_SKILL" read <<PATCH\nbody $x\nPATCH`,
       `"$SIMPLE_CODE_APPLY_PATCH" <<PATCH\nbody $x\nPATCH`,
     ]) {
-      const v = ask(cmd)
-      if (v.kind !== 'ask') throw new Error(`应弹卡：${cmd}`)
-      if (v.category !== 'unparseable') throw new Error(`category 应为 unparseable：${cmd}`)
+      expect(ask(cmd), cmd).toEqual({ kind: 'allow' })
     }
-  })
-  it('采集键=bin 本体：批「始终允许」后同形态免审', () => {
-    const v = ask(`"$SIMPLE_CODE_NOTE" write <<MD\n$x\nMD`)
-    if (v.kind === 'ask') expect(v.alwaysLead).toBe('$SIMPLE_CODE_NOTE')
-    else throw new Error('未批白名单时应弹卡')
-    const cfgN = { ...cfg, alwaysLeads: ['$SIMPLE_CODE_NOTE'] }
-    expect(classify(`"$SIMPLE_CODE_NOTE" write <<MD\n$x\nMD`, ROOT, cfgN)).toEqual({ kind: 'allow' })
   })
   it('带引号的分隔符（通道用法样例的形态）照放', () => {
     allow(`"$SIMPLE_CODE_NOTE" write <<'MD'\nname: foo\ntitle: t\ndescription: d\n---\n正文\nMD`)
@@ -289,18 +306,23 @@ describe('multi 同质 external_dir 的批量 always（2026-09-21 方案 1）', 
     }
   })
 
-  it('掺了解释器：维持两键（无 alwaysPaths）', () => {
+  it('掺了解释器（已放行）：只剩 external 段照弹两键（2026-11-04）', () => {
     const v = ask('cd /Users/dev && python3 -c "print(1)"')
     expect(v.kind).toBe('ask')
     if (v.kind === 'ask') {
-      expect(v.category).toBe('multi')
-      expect(v.alwaysPaths).toBeUndefined()
-      expect(v.alwaysLead).toBeUndefined()
+      // python3 段算不出 → 放行后 multi 收敛成单 external（2026-11-04 同拍板）。
+      // 单卡也统一带键（简化拍板：一律可始终允许）——/Users/dev 不存在，
+      // dirHint 收敛到 /Users
+      expect(v.category).toBe('external_dir')
+      expect(v.alwaysPaths).toEqual(['/Users'])
     }
   })
 
   it('multi 带各段类别：桌面机器人据此判「git push 混在 && 里」只能回窗口处理', () => {
-    const v = classify('cd /Users/dev && git push origin main', ROOT, { ...cfg, askCommands: ['git push'] })
+    const v = classify('cd /Users/dev && git push origin main', ROOT, {
+      ...cfg,
+      askCommands: ['git push'],
+    })
     expect(v).toMatchObject({ kind: 'ask', category: 'multi' })
     if (v.kind === 'ask') expect([...(v.parts ?? [])].sort()).toEqual(['ask_rule', 'external_dir'])
     // 单一触发不是 multi，类别本身就是答案，不带 parts
@@ -331,7 +353,12 @@ describe('multi 同质 external_dir 的批量 always（2026-09-21 方案 1）', 
       expect(v.kind).toBe('ask')
       if (v.kind === 'ask') expect(v.alwaysPaths).toBeUndefined()
       // 恰好 5 个：给
-      const v5 = ask(dirs.slice(0, 5).map((d) => `ls ${d}`).join(';'))
+      const v5 = ask(
+        dirs
+          .slice(0, 5)
+          .map((d) => `ls ${d}`)
+          .join(';'),
+      )
       expect(v5.kind).toBe('ask')
       if (v5.kind === 'ask') expect(v5.alwaysPaths).toHaveLength(5)
     } finally {
@@ -339,14 +366,14 @@ describe('multi 同质 external_dir 的批量 always（2026-09-21 方案 1）', 
     }
   })
 
-  it('单触发 external_dir 不带 alwaysPaths（走原有的单目录卡）', () => {
+  it('单触发 external_dir 也带键（2026-11-04 简化：一律可始终允许）', () => {
     const a = mk()
     try {
       const v = ask(`ls ${a}`)
       expect(v.kind).toBe('ask')
       if (v.kind === 'ask') {
         expect(v.category).toBe('external_dir')
-        expect(v.alwaysPaths).toBeUndefined()
+        expect(v.alwaysPaths).toEqual([a])
       }
     } finally {
       rm(a)

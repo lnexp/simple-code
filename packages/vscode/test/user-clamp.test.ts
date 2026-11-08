@@ -4,8 +4,7 @@
  * mock 成 600/300 造「溢出」。曾出的 bug：展开后 effect 重测恒不溢出 →
  * clamped=false → 按钮连同「收起」入口一起消失，展开就收不回去了
  */
-import { act } from 'react'
-import { createElement } from 'react'
+import { act, createElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { UserBubble } from '../webview/App.tsx'

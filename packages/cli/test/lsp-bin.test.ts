@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from 'vitest'
 import { createServer, type Server } from 'node:http'
+import { afterEach, describe, expect, it } from 'vitest'
 import { lspMain, parseLspArgs } from '../src/lsp-bin.ts'
 
 describe('lsp-bin 参数解析', () => {
@@ -9,7 +9,7 @@ describe('lsp-bin 参数解析', () => {
     if (p.ok) {
       expect(p.cmd).toBe('refs')
       expect(p.file).toMatch(/src\/run\.ts$/)
-    expect(p.line).toBe(120)
+      expect(p.line).toBe(120)
       expect(p.col).toBe(5)
       expect(p.colGiven).toBe(true)
     }
@@ -66,7 +66,9 @@ describe('lspMain', () => {
     const run = async (argv: string[]) => {
       out.length = 0
       const orig = process.stdout.write.bind(process.stdout)
-      process.stdout.write = ((s: string) => (out.push(String(s)), true)) as typeof process.stdout.write
+      process.stdout.write = ((s: string) => (
+        out.push(String(s)), true
+      )) as typeof process.stdout.write
       try {
         return await lspMain(argv)
       } finally {

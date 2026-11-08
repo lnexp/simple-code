@@ -52,7 +52,12 @@ const saysWithTool = (text: string): StreamEvent[] => [
     id: 'tc1',
     partial: JSON.stringify({ command: `#侦查${'x'.repeat(400)}` }),
   },
-  { type: 'tool_input_end', id: 'tc1', name: 'bash', input: { command: `#侦查${'x'.repeat(400)}` } },
+  {
+    type: 'tool_input_end',
+    id: 'tc1',
+    name: 'bash',
+    input: { command: `#侦查${'x'.repeat(400)}` },
+  },
   { type: 'finish', reason: 'tool-calls', usage: usage() },
   // loop 补完 isError result 后的第二发：收尾文本
   { type: 'text_start' },
@@ -81,7 +86,7 @@ const CONFIG = {
   // unload.test.ts 里测
   memory: {
     unloadTargetRatio: 0.001,
-        stubSteps: 1,
+    stubSteps: 1,
     keepHeadChars: 40,
     mergeFactor: 2,
     idleSummarizeDelayMs: 0,
@@ -232,7 +237,8 @@ describe('合并端到端', () => {
 
     // 债还清后的空闲 tick：合并（mergeFactor=2）只写库。第四问那一轮也要
     // 先还 L0 债，所以 tick 到出现 L1 为止
-    for (let i = 0; i < 8 && !rowsOf(dir).some((r) => r.level === 1); i++) await session.summarizeIdle()
+    for (let i = 0; i < 8 && !rowsOf(dir).some((r) => r.level === 1); i++)
+      await session.summarizeIdle()
     const rows = rowsOf(dir)
     const l1 = rows.find((r) => r.level === 1)
     expect(l1?.text).toContain('L1【索引】')
@@ -425,7 +431,12 @@ describe('合并端到端', () => {
    * 给 0 = 拿不到 usage，系数一直是建会话时的值。seedRegions = 预先写进
    * regions.jsonl 的行（模拟 reload 前留下的记录）
    */
-  const sixTurnsThen = async (indexRatio: number, inputTokens = 1, seedRegions?: object, emptyMerge = false) => {
+  const sixTurnsThen = async (
+    indexRatio: number,
+    inputTokens = 1,
+    seedRegions?: object,
+    emptyMerge = false,
+  ) => {
     const { dir, globalPath } = await workspace({
       memory: {
         unloadTargetRatio: 0.001,
@@ -442,7 +453,9 @@ describe('合并端到端', () => {
       await mkdir(mem, { recursive: true })
       await writeFile(join(mem, 'regions.jsonl'), `${JSON.stringify(seedRegions)}\n`, 'utf8')
     }
-    const rec = recordingStream(Array.from({ length: 7 }, (_, i) => says(bigReply(String(i)), inputTokens)))
+    const rec = recordingStream(
+      Array.from({ length: 7 }, (_, i) => says(bigReply(String(i)), inputTokens)),
+    )
     const session = await getSession(dir, {
       globalPath,
       env: { TEST_KEY: KEY },
@@ -494,23 +507,40 @@ describe('合并端到端', () => {
     expect(typeof rec?.quota).toBe('number')
     expect(typeof rec?.from).toBe('number')
     // 停止原因必记：配额 0.5 token 永远超，停在「没有可合的组」
-    expect(calls.some((c) => c.ev === 'merge' && c.action === 'stop' && c.reason === 'no_group')).toBe(true)
-    expect(calls.some((c) => c.step === 'apply_merges_done' && typeof c.droppedSteps === 'number')).toBe(true)
+    expect(
+      calls.some((c) => c.ev === 'merge' && c.action === 'stop' && c.reason === 'no_group'),
+    ).toBe(true)
+    expect(
+      calls.some((c) => c.step === 'apply_merges_done' && typeof c.droppedSteps === 'number'),
+    ).toBe(true)
     expect(calls.some((c) => c.step === 'activate' && typeof c.entered === 'number')).toBe(true)
     // 同一次请求的真实 usage × 面板估算记在同一行（底栏与面板对拍用）。
     // 只看主循环行：collectText（summary/merge 的副模型请求）也记
     // llm_usage，但带 tag、没有 estimated（2026-10-14）
     const usage = calls.filter((c) => c.ev === 'llm_usage' && c.tag === undefined)
     expect(usage.length).toBeGreaterThanOrEqual(7)
-    expect(usage.every((c) => typeof c.input === 'number' && typeof c.cacheRead === 'number')).toBe(true)
-    expect(usage.every((c) => typeof c.model === 'string' && (c.model as string).length > 0)).toBe(true)
-    expect(usage.every((c) => typeof c.estimated === 'number' && (c.estimated as number) > 0)).toBe(true)
+    expect(usage.every((c) => typeof c.input === 'number' && typeof c.cacheRead === 'number')).toBe(
+      true,
+    )
+    expect(usage.every((c) => typeof c.model === 'string' && (c.model as string).length > 0)).toBe(
+      true,
+    )
+    expect(usage.every((c) => typeof c.estimated === 'number' && (c.estimated as number) > 0)).toBe(
+      true,
+    )
     // 副模型行：带 tag 与缓存读写字段，缓存命中可从日志直接判。archiver
     // 2026-10-31 起也记（原先直调 sendRequest 漏记）
     const side = calls.filter((c) => c.ev === 'llm_usage' && typeof c.tag === 'string')
     expect(side.length).toBeGreaterThanOrEqual(1)
     expect(side.every((c) => ['summary', 'merge', 'archiver'].includes(c.tag as string))).toBe(true)
-    expect(side.every((c) => typeof c.input === 'number' && typeof c.cacheRead === 'number' && typeof c.cacheWrite === 'number')).toBe(true)
+    expect(
+      side.every(
+        (c) =>
+          typeof c.input === 'number' &&
+          typeof c.cacheRead === 'number' &&
+          typeof c.cacheWrite === 'number',
+      ),
+    ).toBe(true)
   })
 
   it('**停止行去重**：空闲 tick 反复停在同一原因、成员数没变，只记一行', async () => {
@@ -523,7 +553,9 @@ describe('合并端到端', () => {
     } finally {
       spy.mockRestore()
     }
-    const stops = calls.filter((c) => c.ev === 'merge' && c.action === 'stop').map((c) => `${c.reason}|${c.members}`)
+    const stops = calls
+      .filter((c) => c.ev === 'merge' && c.action === 'stop')
+      .map((c) => `${c.reason}|${c.members}`)
     // 前提：确实停过（否则测的是没走到合并判断）
     expect(stops.some((s) => s.startsWith('under_quota|'))).toBe(true)
     expect(new Set(stops).size).toBe(stops.length)
@@ -592,7 +624,20 @@ describe('合并端到端', () => {
   it('**系数跨 reload 恢复**：建会话读 regions.jsonl 本 owner 最后一行；本会话拿不到 usage 时就用它', async () => {
     // usage 报 0 = 这个会话一直拿不到真实值，系数只能来自种子行（真实 = 估算×2）。
     // 对照是「没超配额就不合」那条（同一个 0.5，系数 1 → 不合）
-    const seed = { at: 'x', budget: 500, owner: null, overhead: 50, cold: 0, warm: 0, hot: 0, stub: 0, floor: 25, live: 25, real: 200, ranges: null }
+    const seed = {
+      at: 'x',
+      budget: 500,
+      owner: null,
+      overhead: 50,
+      cold: 0,
+      warm: 0,
+      hot: 0,
+      stub: 0,
+      floor: 25,
+      live: 25,
+      real: 200,
+      ranges: null,
+    }
     const rows = await sixTurnsThen(0.5, 0, seed)
     expect(rows.filter((r) => r.level === 1).length).toBeGreaterThanOrEqual(1)
     // 别人家的行不算：同一份种子挂在任务 owner 名下，主任务读不到 → 不合

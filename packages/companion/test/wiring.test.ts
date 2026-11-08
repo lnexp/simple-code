@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { describe, expect, it } from 'vitest'
 import { LLM_PROXY_PORT } from '@simple-code/core'
+import { describe, expect, it } from 'vitest'
 
 const read = (p: string): string => readFileSync(fileURLToPath(new URL(p, import.meta.url)), 'utf8')
 const pkg = JSON.parse(read('../package.json'))

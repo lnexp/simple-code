@@ -9,9 +9,9 @@ import type { Message, Request, Usage } from '../src/llm/types.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
 import type { LoopDeps } from '../src/loop/run.ts'
 import { listBucketFiles } from '../src/session/buckets.ts'
-import { createTask, scopeOf } from '../src/session/task.ts'
 import { getSession, MODEL_SWITCH_HEAD, modelSwitchNotice } from '../src/session/session.ts'
 import { MEMORY_RELATIVE, openStore } from '../src/session/store.ts'
+import { createTask, scopeOf } from '../src/session/task.ts'
 import type { Tool } from '../src/tools/types.ts'
 
 /**
@@ -471,13 +471,25 @@ describe('换模型剥掉 reasoning 签名', () => {
     const { dir, globalPath } = await workspace()
     const big = { provider: 'alpha', model: 'a-big' }
     const first = scripted([withThinking])
-    const s1 = await getSession(dir, { globalPath, env: ENV, tools: [fakeTool()], stream: first.stream, skipLock: true })
+    const s1 = await getSession(dir, {
+      globalPath,
+      env: ENV,
+      tools: [fakeTool()],
+      stream: first.stream,
+      skipLock: true,
+    })
     s1.setModel(big)
     await drain(s1.send('想一下'))
     await s1.close()
 
     const second = scripted([says('接着')])
-    const s2 = await getSession(dir, { globalPath, env: ENV, tools: [fakeTool()], stream: second.stream, skipLock: true })
+    const s2 = await getSession(dir, {
+      globalPath,
+      env: ENV,
+      tools: [fakeTool()],
+      stream: second.stream,
+      skipLock: true,
+    })
     s2.setModel(big) // 恢复上次选择
     const events: { type: string; message?: string }[] = []
     for await (const ev of s2.send('重启后')) events.push(ev as { type: string; message?: string })
@@ -547,7 +559,13 @@ const openPersisted = async (rounds: StreamEvent[][] = []) => {
 }
 
 const reopen = (dir: string, globalPath: string, rounds: StreamEvent[][]) =>
-  getSession(dir, { globalPath, env: ENV, tools: [fakeTool()], stream: scripted(rounds).stream, skipLock: true })
+  getSession(dir, {
+    globalPath,
+    env: ENV,
+    tools: [fakeTool()],
+    stream: scripted(rounds).stream,
+    skipLock: true,
+  })
 
 const texts = (session: { messages(): readonly Message[] }) =>
   session.messages().flatMap((m) => m.parts.flatMap((p) => (p.type === 'text' ? [p.text] : [])))
@@ -563,7 +581,9 @@ const collect = async (events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]>
 describe('切换事件告知（2026-10-17 甲案）', () => {
   it('换模型 → 下次 send 在用户消息前插告知、流首发 model_switch，只一次', async () => {
     const { session } = await openPersisted([says('答一'), says('答二'), says('答三')])
-    expect((await collect(session.send('第一轮'))).some((e) => e.type === 'model_switch')).toBe(false)
+    expect((await collect(session.send('第一轮'))).some((e) => e.type === 'model_switch')).toBe(
+      false,
+    )
     session.setModel({ provider: 'beta', model: 'b-one' })
     const evs = await collect(session.send('第二轮'))
     // 流首：在任何内容之前，面板据此画分割线
@@ -571,12 +591,16 @@ describe('切换事件告知（2026-10-17 甲案）', () => {
     expect(evs.filter((e) => e.type === 'model_switch')).toHaveLength(1)
     const all = texts(session)
     const at = all.indexOf(modelSwitchNotice('alpha/a-small', 'beta/b-one'))
-    expect(all[at]).toBe('〔系统〕模型已从 alpha/a-small 切换到 beta/b-one。此前的回复由上一个模型生成。')
+    expect(all[at]).toBe(
+      '〔系统〕模型已从 alpha/a-small 切换到 beta/b-one。此前的回复由上一个模型生成。',
+    )
     // 位置：上一轮回复之后、切换后这轮的用户消息之前——agent 看得出从哪条起换的
     expect(all[at - 1]).toBe('答一')
     expect(all[at + 1]).toBe('第二轮')
     // 下一轮上一轮已是 b-one：不再告知
-    expect((await collect(session.send('第三轮'))).some((e) => e.type === 'model_switch')).toBe(false)
+    expect((await collect(session.send('第三轮'))).some((e) => e.type === 'model_switch')).toBe(
+      false,
+    )
     expect(notices(session)).toHaveLength(1)
     await session.close()
   })
@@ -635,7 +659,9 @@ describe('切换事件告知（2026-10-17 甲案）', () => {
   it('会话第一轮没有上一轮，不告知', async () => {
     const { session } = await openPersisted([says('答')])
     session.setModel({ provider: 'beta', model: 'b-one' })
-    expect((await collect(session.send('第一轮'))).some((e) => e.type === 'model_switch')).toBe(false)
+    expect((await collect(session.send('第一轮'))).some((e) => e.type === 'model_switch')).toBe(
+      false,
+    )
     expect(notices(session)).toEqual([])
     await session.close()
   })

@@ -1,9 +1,9 @@
+import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
-import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { afterEach, describe, expect, it } from 'vitest'
 import {
   localSettingsPath,
   PROXY_PORT,
@@ -27,12 +27,15 @@ describe('远端配置同步（settings.remote.json 方案）', () => {
     const payload = {
       provider: 'p',
       model: 'm',
-      providers: { p: { baseUrl: 'http://127.0.0.1:15432', apiKey: 'via-local-proxy', models: {} } },
+      providers: {
+        p: { baseUrl: 'http://127.0.0.1:15432', apiKey: 'via-local-proxy', models: {} },
+      },
       memory: { unloadTargetRatio: 0.25 },
     }
     const r = await syncRemoteSettings({
       home: h,
-      fetchImpl: (async () => new Response(JSON.stringify(payload), { status: 200 })) as typeof fetch,
+      fetchImpl: (async () =>
+        new Response(JSON.stringify(payload), { status: 200 })) as typeof fetch,
     })
     expect(r.ok).toBe(true)
     expect(JSON.parse(await readFile(remoteSettingsPath(h), 'utf8'))).toEqual(payload)
@@ -72,7 +75,8 @@ describe('远端配置同步（settings.remote.json 方案）', () => {
     )
     const r = await syncRemoteSettings({
       home: h,
-      fetchImpl: (async () => new Response(JSON.stringify(payload), { status: 200 })) as typeof fetch,
+      fetchImpl: (async () =>
+        new Response(JSON.stringify(payload), { status: 200 })) as typeof fetch,
     })
     expect(r.ok).toBe(true)
     const out = JSON.parse(await readFile(remoteSettingsPath(h), 'utf8'))
@@ -90,7 +94,8 @@ describe('远端配置同步（settings.remote.json 方案）', () => {
     await writeFile(localSettingsPath(h), '{broken', 'utf8')
     const r = await syncRemoteSettings({
       home: h,
-      fetchImpl: (async () => new Response(JSON.stringify(payload), { status: 200 })) as typeof fetch,
+      fetchImpl: (async () =>
+        new Response(JSON.stringify(payload), { status: 200 })) as typeof fetch,
     })
     expect(r.ok).toBe(true)
     if (r.ok) expect(r.localError).toContain('没并进来')
@@ -100,7 +105,8 @@ describe('远端配置同步（settings.remote.json 方案）', () => {
   it('本地 settings.json 缺失或为空 → 静默跳过（纯隧道用户零变化）', async () => {
     const h = await home()
     const payload = { provider: 'p' }
-    const fetchImpl = (async () => new Response(JSON.stringify(payload), { status: 200 })) as typeof fetch
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify(payload), { status: 200 })) as typeof fetch
     // 缺失
     const r1 = await syncRemoteSettings({ home: h, fetchImpl })
     expect(r1).toMatchObject({ ok: true })
@@ -130,12 +136,9 @@ describe('远端配置同步（settings.remote.json 方案）', () => {
     // 从远端直连——「以为走隧道、实际远端直连」的静默错位。任务工厂漏接
     // 的话任务会话读默认路径，同样直连
     const source = readFileSync(fileURLToPath(new URL('../src/panel.ts', import.meta.url)), 'utf8')
-    const factories = source.match(
-      /getSession\(f, \{[^}]*(requestApproval)[^}]*\}\)/gs,
-    )
+    const factories = source.match(/getSession\(f, \{[^}]*(requestApproval)[^}]*\}\)/gs)
     expect(factories?.length).toBeGreaterThanOrEqual(2)
-    for (const f of factories ?? [])
-      expect(f).toContain('remoteGlobalPath')
+    for (const f of factories ?? []) expect(f).toContain('remoteGlobalPath')
     // local 会话（remoteName undefined）不传 globalPath——remote.ts 返回空对象
     expect(source).toContain('remoteName === undefined) return {}')
     // 卡片主机名的空窗口兜底：SSH_CONNECTION 第三段（sshd 注入的远端地址）
@@ -147,7 +150,9 @@ describe('远端配置同步（settings.remote.json 方案）', () => {
     // 本地；运行时同一启发式又判成 workspace 类在远端窗口禁用本地那份——
     // 「装不进远端 + 本地装了也被禁」两头堵死。agent 要读远端文件、起远端
     // 进程，语义就是 workspace；显式声明后 VSIX 在远端窗口装的就是远端
-    const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+    const pkg = JSON.parse(
+      readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
+    )
     expect(pkg.extensionKind).toEqual(['workspace'])
   })
 })

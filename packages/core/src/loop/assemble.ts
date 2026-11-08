@@ -158,15 +158,22 @@ export function assembleContext(
     const block = (entry.live ?? []).map(({ message, turnId }) => {
       const lines = cues.get(turnId)
       // 一个 turn 只贴一次（插话轮可能有第二条 user 行）；不复制消息对象
-      if (message.role !== 'user' || !lines || lines.length === 0 || cuedTurns.has(turnId)) return message
+      if (message.role !== 'user' || !lines || lines.length === 0 || cuedTurns.has(turnId))
+        return message
       cuedTurns.add(turnId)
-      return { ...message, parts: [...message.parts, { type: 'text', text: lines.join('\n') }] } satisfies Message
+      return {
+        ...message,
+        parts: [...message.parts, { type: 'text', text: lines.join('\n') }],
+      } satisfies Message
     })
     // live 块恰是一个 step（planContext 按 step 分组）。块短于锚点 = 锚定的
     // 消息不在了（不该发生：step 只追加、卸载整步走），不渲染
     const asyncCue = asyncCues.get(entry.live?.[0]?.stepId ?? -1)
     if (!asyncCue || asyncCue.lines.length === 0 || block.length < asyncCue.after) return block
-    const injected: Message = { role: 'user', parts: [{ type: 'text', text: asyncCue.lines.join('\n') }] }
+    const injected: Message = {
+      role: 'user',
+      parts: [{ type: 'text', text: asyncCue.lines.join('\n') }],
+    }
     return [...block.slice(0, asyncCue.after), injected, ...block.slice(asyncCue.after)]
   })
 }

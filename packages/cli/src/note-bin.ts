@@ -91,7 +91,13 @@ try {
       console.error(usage)
       process.exit(2)
     }
-    const m = text.match(/^\s*name:\s*(.+)\ntitle:\s*(.+)\ndescription:\s*(.+)\n---\n?([\s\S]*)$/)
+    // --- 可省（2026-11-06）：模型按 markdown 头部块习惯写，三个字段行
+    // 后直接接正文（当天两个 agent 实例各撞一次，报错回了头也不容易看出
+    // 差在哪一行）。字段只认开头三行，正文从其后全收，无歧义；开头
+    // 的整空行剥掉
+    const m =
+      text.match(/^\s*name:\s*(.+)\ntitle:\s*(.+)\ndescription:\s*(.+)\n---\n?([\s\S]*)$/) ??
+      text.match(/^\s*name:\s*(.+)\ntitle:\s*(.+)\ndescription:\s*(.+)\n?([\s\S]*)$/)
     if (!m) {
       console.error(
         'stdin 要逐行写 name:/title:/description:（单行），再一行 ---，其后是正文（见 usage），开头几行是：\n' +
@@ -106,7 +112,7 @@ try {
           name: m[1]!.trim(),
           title: m[2]!.trim(),
           description: m[3]!.trim(),
-          body: m[4] ?? '',
+          body: (m[4] ?? '').replace(/^(?:[ \t]*\r?\n)+/, ''),
         },
         options.type,
       ),

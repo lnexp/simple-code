@@ -1,9 +1,14 @@
-import { describe, expect, it, vi } from 'vitest'
-import type { ToolContext } from '../src/tools/types.ts'
 import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createWebsearchTool, parseSseData, readWebsearchConfig, websearchEndpoint } from '../src/tools/websearch.ts'
+import { describe, expect, it, vi } from 'vitest'
+import type { ToolContext } from '../src/tools/types.ts'
+import {
+  createWebsearchTool,
+  parseSseData,
+  readWebsearchConfig,
+  websearchEndpoint,
+} from '../src/tools/websearch.ts'
 
 const ctx: ToolContext = { root: '/tmp', signal: new AbortController().signal }
 
@@ -170,11 +175,16 @@ describe('经凭据代理（2026-10-23 websearch 迁代理）', () => {
       'fetch',
       vi.fn(async (_url: unknown, init?: RequestInit) => {
         seen.push(init?.headers as Record<string, string>)
-        return new Response('凭据代理：配置引用了环境变量 EXA_API_KEY，但它没有设置', { status: 500 })
+        return new Response('凭据代理：配置引用了环境变量 EXA_API_KEY，但它没有设置', {
+          status: 500,
+        })
       }),
     )
     try {
-      const out = await createWebsearchTool({ url: 'http://127.0.0.1:1/websearch', headers: { 'x-sc-token': 't' } }).execute({ query: 'q' }, ctx)
+      const out = await createWebsearchTool({
+        url: 'http://127.0.0.1:1/websearch',
+        headers: { 'x-sc-token': 't' },
+      }).execute({ query: 'q' }, ctx)
       expect(seen[0]?.['x-sc-token']).toBe('t')
       expect(seen[0]?.authorization).toBeUndefined()
       expect(out.output).toContain('HTTP 500')
@@ -186,8 +196,14 @@ describe('经凭据代理（2026-10-23 websearch 迁代理）', () => {
 
   it('websearchEndpoint：匿名 / key 进 URL / 自定义 url 走 Bearer', () => {
     expect(websearchEndpoint({})).toEqual({ url: 'https://mcp.exa.ai/mcp', headers: {} })
-    expect(websearchEndpoint({ exaApiKey: 'k&y' })).toEqual({ url: 'https://mcp.exa.ai/mcp?exaApiKey=k%26y', headers: {} })
-    expect(websearchEndpoint({ url: 'https://gw/x', exaApiKey: 'g' })).toEqual({ url: 'https://gw/x', headers: { authorization: 'Bearer g' } })
+    expect(websearchEndpoint({ exaApiKey: 'k&y' })).toEqual({
+      url: 'https://mcp.exa.ai/mcp?exaApiKey=k%26y',
+      headers: {},
+    })
+    expect(websearchEndpoint({ url: 'https://gw/x', exaApiKey: 'g' })).toEqual({
+      url: 'https://gw/x',
+      headers: { authorization: 'Bearer g' },
+    })
   })
 
   it('readWebsearchConfig：缺文件 = 匿名；${VAR} 展开；缺变量抛；坏 JSON 抛', async () => {

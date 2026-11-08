@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { Message, Request } from '../src/llm/types.ts'
 import { stripImagesWhenUnsupported } from '../src/llm/resizer.ts'
+import type { Message, Request } from '../src/llm/types.ts'
 import { regionSizes, regionsEstimate, usageRatio } from '../src/loop/regions.ts'
 
 /**
@@ -141,9 +141,7 @@ describe('四个区的记账', () => {
     expect(hot.hot).toBeGreaterThan(0)
     expect(hot.warm).toBe(0)
 
-    const warm = regionSizes(
-      request([text('<历史摘要 turn=1-10>\n摘要：改了鉴权\n</历史摘要>')]),
-    )
+    const warm = regionSizes(request([text('<历史摘要 turn=1-10>\n摘要：改了鉴权\n</历史摘要>')]))
     expect(warm.warm).toBeGreaterThan(0)
     expect(warm.hot).toBe(0)
     expect(warm.cold).toBe(0)
@@ -191,7 +189,9 @@ describe('四个区的记账', () => {
 
 describe('范围列已删（2026-09-30 拍板）', () => {
   it('regionSizes 只给各区大小，不再给 ranges', () => {
-    const r = regionSizes(request([text('<历史摘要 turn=1-2>\n开头：x\n</历史摘要>'), text('普通消息')]))
+    const r = regionSizes(
+      request([text('<历史摘要 turn=1-2>\n开头：x\n</历史摘要>'), text('普通消息')]),
+    )
     expect(r).not.toHaveProperty('ranges')
     expect(r.warm).toBeGreaterThan(0)
   })
@@ -212,7 +212,19 @@ describe('估算 → 真实系数（usageRatio，2026-09-29 额度按 usage 校�
     expect(usageRatio(0, 50_000)).toBeNull()
   })
   it('regionsEstimate = 七个区之和，不含 budget/real/ranges 这些行里的其它字段', () => {
-    const line = { at: 'x', budget: 290_000, overhead: 1, cold: 2, warm: 3, hot: 4, stub: 5, floor: 6, live: 7, real: 99, ranges: null }
+    const line = {
+      at: 'x',
+      budget: 290_000,
+      overhead: 1,
+      cold: 2,
+      warm: 3,
+      hot: 4,
+      stub: 5,
+      floor: 6,
+      live: 7,
+      real: 99,
+      ranges: null,
+    }
     expect(regionsEstimate(line)).toBe(28)
   })
 })

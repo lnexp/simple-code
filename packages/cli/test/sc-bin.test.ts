@@ -1,18 +1,19 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { Readable } from 'node:stream'
+import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { readFile } from 'node:fs/promises'
-import { assertRootAllowed, parseScArgs, scMain, SC_USAGE } from '../src/sc-bin.ts'
+import { assertRootAllowed, parseScArgs, SC_USAGE, scMain } from '../src/sc-bin.ts'
 
 // scMain 校验 fallback 到 process.env.SIMPLE_CODE_ROOTS——而「被 agent
 // 跑的 vitest」本身就是这个变量的真实携带者（bash.ts 注入，实测全量
 // 跑时把 /tmp 的 fixture 拦下退 2）。测试环境摘掉宿主痕迹，校验用例
 // 自己显式喂 io.env
 const savedRoots = process.env.SIMPLE_CODE_ROOTS
-beforeEach(() => { delete process.env.SIMPLE_CODE_ROOTS })
+beforeEach(() => {
+  delete process.env.SIMPLE_CODE_ROOTS
+})
 const dirs: string[] = []
 afterEach(async () => {
   if (savedRoots !== undefined) process.env.SIMPLE_CODE_ROOTS = savedRoots
@@ -38,18 +39,35 @@ const CONFIG = {
   },
 }
 
-const DONE = ['event: message_start',
+const DONE = [
+  'event: message_start',
   'data: {"type":"message_start","message":{"usage":{"input_tokens":466,"output_tokens":0}}}',
-  '', 'event: content_block_start',
+  '',
+  'event: content_block_start',
   'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
-  '', 'event: content_block_delta',
+  '',
+  'event: content_block_delta',
   'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"结论一行"}}',
-  '', 'event: content_block_stop', 'data: {"type":"content_block_stop","index":0}', '', 'event: message_delta',
+  '',
+  'event: content_block_stop',
+  'data: {"type":"content_block_stop","index":0}',
+  '',
+  'event: message_delta',
   'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6}}',
-  '', 'event: message_stop', 'data: {"type":"message_stop"}', '', ''].join('\n')
+  '',
+  'event: message_stop',
+  'data: {"type":"message_stop"}',
+  '',
+  '',
+].join('\n')
 
 const bodyOf = (bytes: Uint8Array) =>
-  new ReadableStream<Uint8Array>({ start(c) { c.enqueue(bytes); c.close() } })
+  new ReadableStream<Uint8Array>({
+    start(c) {
+      c.enqueue(bytes)
+      c.close()
+    },
+  })
 
 function io(over: {
   argv?: string[]
@@ -93,7 +111,13 @@ describe('parseScArgs', () => {
     const r = parseScArgs(['-q', '-t', '600', '调研', '一下'])
     expect(r).toEqual({
       ok: true,
-      value: { quiet: true, timeoutSec: 600, prompt: '调研 一下', listModelsFlag: false, help: false },
+      value: {
+        quiet: true,
+        timeoutSec: 600,
+        prompt: '调研 一下',
+        listModelsFlag: false,
+        help: false,
+      },
     })
   })
   it('-m 从第一个 / 断——模型名可含 /（网关命名）', () => {
@@ -222,8 +246,11 @@ describe('scMain', () => {
     const globalPath = join(dir, 'settings.json')
     await writeFile(globalPath, JSON.stringify(CONFIG), 'utf8')
     const h = io({
-      argv: [], globalPath, cwd: dir,
-      fetchImpl: (async () => new Response(bodyOf(new TextEncoder().encode(DONE)), { status: 200 })) as typeof fetch,
+      argv: [],
+      globalPath,
+      cwd: dir,
+      fetchImpl: (async () =>
+        new Response(bodyOf(new TextEncoder().encode(DONE)), { status: 200 })) as typeof fetch,
     })
     // tty 假流：REPL 接管 stdin，喂一行问题再 /exit
     ;(h.io.stdin as unknown as { isTTY: boolean }).isTTY = true
@@ -240,8 +267,12 @@ describe('scMain', () => {
     const { runOnce } = await import('../src/run.ts')
     const realRunOnce = runOnce
     const h = io({
-      argv: ['-q'], stdin: 'heredoc 任务书', globalPath, cwd: dir,
-      fetchImpl: (async () => new Response(bodyOf(new TextEncoder().encode(DONE)), { status: 200 })) as typeof fetch,
+      argv: ['-q'],
+      stdin: 'heredoc 任务书',
+      globalPath,
+      cwd: dir,
+      fetchImpl: (async () =>
+        new Response(bodyOf(new TextEncoder().encode(DONE)), { status: 200 })) as typeof fetch,
     })
     h.feed('heredoc 任务书')
     expect(await scMain(h.argv, h.io)).toBe(0)

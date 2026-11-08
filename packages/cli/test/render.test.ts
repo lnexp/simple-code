@@ -7,8 +7,12 @@ const collector = (): Sink & { out_(): string; err_(): string } => {
   let o = ''
   let e = ''
   return {
-    out: (s) => { o += s },
-    err: (s) => { e += s },
+    out: (s) => {
+      o += s
+    },
+    err: (s) => {
+      e += s
+    },
     out_: () => o,
     err_: () => e,
   }
@@ -84,9 +88,9 @@ describe('renderer 感知层（着色 + 代码块缓冲）', () => {
     const c = collector()
     const r = createRenderer(c, { out: true, err: true })
     r.on(ev({ type: 'text_start' }))
-    r.on(ev({ type: 'text_delta', text: '``' }))   // 围栏被劈
+    r.on(ev({ type: 'text_delta', text: '``' })) // 围栏被劈
     r.on(ev({ type: 'text_delta', text: '`ts\n' }))
-    r.on(ev({ type: 'text_end' }))                  // ← 中途被 part 边界劈开
+    r.on(ev({ type: 'text_end' })) // ← 中途被 part 边界劈开
     r.on(ev({ type: 'text_start' }))
     r.on(ev({ type: 'text_delta', text: 'const x = 1\n' }))
     r.on(ev({ type: 'text_delta', text: '```\n' }))
@@ -103,14 +107,16 @@ describe('renderer 感知层（着色 + 代码块缓冲）', () => {
     const c = collector()
     const r = createRenderer(c, { out: true, err: true })
     r.on(ev({ type: 'text_start' }))
-    r.on(ev({ type: 'text_delta', text: '```typescript' }))      // 无换行
-    r.on(ev({ type: 'text_delta', text: '\nfunction add(a' }))    // 换行在下一个 delta 开头
+    r.on(ev({ type: 'text_delta', text: '```typescript' })) // 无换行
+    r.on(ev({ type: 'text_delta', text: '\nfunction add(a' })) // 换行在下一个 delta 开头
     r.on(ev({ type: 'text_delta', text: ': number): number {\n  return 1;\n}\n```' })) // 闭合无尾换行
     r.on(ev({ type: 'text_end' }))
     r.on(finish())
     r.done()
     expect(c.out_()).toContain('\x1b[35mfunction\x1b[0m')
-    expect(c.out_().replace(/\x1b\[[0-9;]*m/g, '')).toBe('```typescript\nfunction add(a: number): number {\n  return 1;\n}\n```\n\n')
+    expect(c.out_().replace(/\x1b\[[0-9;]*m/g, '')).toBe(
+      '```typescript\nfunction add(a: number): number {\n  return 1;\n}\n```\n\n',
+    )
   })
 
   it('围栏被劈在两个 delta（`` + \\n）：不当代码块，内容照样完整直出', () => {
@@ -145,13 +151,20 @@ describe('renderer 感知层（着色 + 代码块缓冲）', () => {
   it('高亮输出无残留 span 标签（嵌套与 title function_ 类名都转成 ANSI）', () => {
     const c = collector()
     const r = createRenderer(c, { out: true, err: true })
-    r.on(ev({ type: 'text_delta', text: '```ts\nconst s: string = "x"\nfunction add(a: number): number { return a }\n```\n' }))
+    r.on(
+      ev({
+        type: 'text_delta',
+        text: '```ts\nconst s: string = "x"\nfunction add(a: number): number { return a }\n```\n',
+      }),
+    )
     r.on(ev({ type: 'text_end' }))
     const raw = c.out_()
     expect(raw).not.toContain('<span')
     expect(raw).not.toContain('hljs-')
     // 剥色后内容逐字完整
-    expect(raw.replace(/\x1b\[[0-9;]*m/g, '')).toContain('function add(a: number): number { return a }')
+    expect(raw.replace(/\x1b\[[0-9;]*m/g, '')).toContain(
+      'function add(a: number): number { return a }',
+    )
   })
 
   it('Markdown 行内渲染：标题 bold、加粗、行内 code、bullet（仅 tty）', () => {
@@ -221,7 +234,13 @@ describe('bash 入参 desc 前置（2026-09-28）', () => {
   it('带 desc：青色短语 + 暗色 · + 命令；缺省维持现状', () => {
     const c = collector()
     const r = createRenderer(c, { out: true, err: true })
-    r.on(ev({ type: 'tool_call', name: 'bash', input: { command: 'npx vitest run', desc: '跑全量测试' } }))
+    r.on(
+      ev({
+        type: 'tool_call',
+        name: 'bash',
+        input: { command: 'npx vitest run', desc: '跑全量测试' },
+      }),
+    )
     r.on(ev({ type: 'tool_call', name: 'bash', input: { command: 'ls' } }))
     expect(c.out_()).toContain('跑全量测试\x1b[0m \x1b[90m·\x1b[0m npx vitest run')
     expect(c.out_()).toContain('$\x1b[0m ls\n')
@@ -230,7 +249,13 @@ describe('bash 入参 desc 前置（2026-09-28）', () => {
   it('写成 description（glm 照官方 Bash 工具参数名）同样前置', () => {
     const c = collector()
     const r = createRenderer(c, { out: true, err: true })
-    r.on(ev({ type: 'tool_call', name: 'bash', input: { command: 'ls', description: '列目录', timeout: 15 } }))
+    r.on(
+      ev({
+        type: 'tool_call',
+        name: 'bash',
+        input: { command: 'ls', description: '列目录', timeout: 15 },
+      }),
+    )
     expect(c.out_()).toContain('列目录\x1b[0m \x1b[90m·\x1b[0m ls')
   })
 })

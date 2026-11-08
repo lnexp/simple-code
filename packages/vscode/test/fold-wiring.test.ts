@@ -54,7 +54,7 @@ const state = (running: boolean): ToWebview => ({
   models: [{ provider: 'p', model: 'm' }],
   effort: 'high',
   effortOverridden: false,
-      presets: [],
+  presets: [],
   approvalOn: true,
   imagesEnabled: false,
   contextWindow: 0,
@@ -196,7 +196,10 @@ describe('跑着时插话', () => {
     app.send(state(true))
     app.send({
       type: 'hydrate',
-      items: [{ kind: 'user', text: '你来实现吧' }, { kind: 'assistant', text: '我先跑一下' }],
+      items: [
+        { kind: 'user', text: '你来实现吧' },
+        { kind: 'assistant', text: '我先跑一下' },
+      ],
       queued: [{ kind: 'user', text: '顺便看下日志', interject: true }],
     })
     expect(app.html()).toContain('顺便看下日志')
@@ -219,9 +222,9 @@ describe('跑着时插话', () => {
       id: 1,
       toolCallId: 't1',
       command: 'cat .env',
-      category: 'hidden_path',
+      category: 'external_dir',
       detail: '.env',
-      reason: '要触碰隐藏路径：.env',
+      reason: '要读项目外路径：/tmp/x/.env',
     })
     expect(document.querySelectorAll('.approval-card').length).toBe(1)
     enter('先别读')
@@ -259,19 +262,55 @@ describe('跑着时插话', () => {
       if (!tab) throw new Error(`没有任务 tab：${name}`)
       tab.click()
     })
-    app.send({ type: 'task_hydrate', folder: '/tmp/x', name, items: [{ kind: 'user', text: '分支任务书' }], contextTokens: 0 })
+    app.send({
+      type: 'task_hydrate',
+      folder: '/tmp/x',
+      name,
+      items: [{ kind: 'user', text: '分支任务书' }],
+      contextTokens: 0,
+    })
     app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'text_start' }, at: 1 })
-    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'text_delta', text: '分支先跑一下' }, at: 1 })
+    app.send({
+      type: 'task_agent',
+      folder: '/tmp/x',
+      name,
+      event: { type: 'text_delta', text: '分支先跑一下' },
+      at: 1,
+    })
     app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'text_end' }, at: 1 })
-    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'tool_input_start', id: 't1', name: 'bash' }, at: 1 })
+    app.send({
+      type: 'task_agent',
+      folder: '/tmp/x',
+      name,
+      event: { type: 'tool_input_start', id: 't1', name: 'bash' },
+      at: 1,
+    })
     enter('插一句')
     // 投递前到的回答排在插话前面（插话在 queued，画在最下面）
     app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'text_start' }, at: 1 })
-    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'text_delta', text: '分支答完' }, at: 1 })
+    app.send({
+      type: 'task_agent',
+      folder: '/tmp/x',
+      name,
+      event: { type: 'text_delta', text: '分支答完' },
+      at: 1,
+    })
     app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'text_end' }, at: 1 })
-    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'tool_input_start', id: 't2', name: 'bash' }, at: 1 })
+    app.send({
+      type: 'task_agent',
+      folder: '/tmp/x',
+      name,
+      event: { type: 'tool_input_start', id: 't2', name: 'bash' },
+      at: 1,
+    })
     expect(app.html().indexOf('分支答完')).toBeLessThan(app.html().indexOf('插一句'))
-    app.send({ type: 'task_agent', folder: '/tmp/x', name, event: { type: 'input_delivered' }, at: 1 })
+    app.send({
+      type: 'task_agent',
+      folder: '/tmp/x',
+      name,
+      event: { type: 'input_delivered' },
+      at: 1,
+    })
 
     // 先确认看的是分支（选中失败的话插话落进主任务，下面的断言会空过）
     expect(app.html()).toContain('分支任务书')

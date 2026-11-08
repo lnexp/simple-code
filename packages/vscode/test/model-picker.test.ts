@@ -49,7 +49,7 @@ const MODELS = [
 ]
 
 const state = (over: Partial<Extract<ToWebview, { type: 'state' }>> = {}): ToWebview => ({
-  approvalOn: true,
+  attendance: 'attended',
   type: 'state',
   running: false,
   folder: '/tmp/x',
@@ -57,7 +57,7 @@ const state = (over: Partial<Extract<ToWebview, { type: 'state' }>> = {}): ToWeb
   models: MODELS,
   effort: 'high',
   effortOverridden: false,
-      presets: [],
+  presets: [],
   imagesEnabled: false,
   contextWindow: 0,
   ...over,
@@ -136,7 +136,12 @@ describe('底栏布局', () => {
     const app = mount()
     app.send(state())
     // 审批开关排最前（安全语义，approval.md §4.2），其次两个选择器
-    expect(rightOrder(app.host)).toEqual(['button:开', 'effort-picker', 'model-picker', 'button:发送'])
+    expect(rightOrder(app.host)).toEqual([
+      'button:审批',
+      'effort-picker',
+      'model-picker',
+      'button:发送',
+    ])
   })
 
   it('用量在右侧组外面（也就是左边）', () => {
@@ -320,9 +325,9 @@ describe('预设选择器', () => {
     ui.send(state({ presets: ['备用线路', '长输出'], preset: '备用线路' }))
     const on = ui.host.querySelector<HTMLButtonElement>('button.preset-picker')
     expect(on?.textContent).toContain('备用线路')
-    expect(
-      ui.host.querySelector('.preset-picker')?.closest('.picker')?.getAttribute('title'),
-    ).toBe('预设：备用线路')
+    expect(ui.host.querySelector('.preset-picker')?.closest('.picker')?.getAttribute('title')).toBe(
+      '预设：备用线路',
+    )
   })
 
   it('选一项发 setModel 带 preset；选「默认」发的 choice 不带 preset 键', () => {
@@ -367,7 +372,7 @@ describe('预设选择器', () => {
           presets: ['line-a', 'line-b'],
           imagesEnabled: false,
           contextWindow: 0,
-          approvalOn: true,
+          attendance: 'attended',
         },
       ],
     })
@@ -376,11 +381,9 @@ describe('预设选择器', () => {
     expect(btn).not.toBeNull()
     // 任务没选预设 = 默认，不回退成主任务的
     expect(btn?.textContent).toContain('默认')
-    expect(ui.open('preset-picker').map((i) => i.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
-      '默认模型本体参数',
-      'line-a',
-      'line-b',
-    ])
+    expect(ui.open('preset-picker').map((i) => i.textContent?.replace(/\s+/g, ' ').trim())).toEqual(
+      ['默认模型本体参数', 'line-a', 'line-b'],
+    )
   })
 
   it('任务标签的贴图门控用任务模型自己的 imagesEnabled（主干能收图、分支不能 → 分支里贴图要提示）', () => {
@@ -400,7 +403,7 @@ describe('预设选择器', () => {
           presets: [],
           imagesEnabled: false,
           contextWindow: 0,
-          approvalOn: true,
+          attendance: 'attended',
         },
       ],
     })

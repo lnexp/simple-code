@@ -219,7 +219,14 @@ describe('请求与解析', () => {
       call('view_image', '"$SIMPLE_CODE_SKILL" read deploy'),
     ])
     expect(got).toEqual(
-      new Set(['note:recall-llm-selector-pending', 'lesson:env-pair', 'event:cue-zero', 'principle:same', 'goal:same', 'lesson:new-lesson']),
+      new Set([
+        'note:recall-llm-selector-pending',
+        'lesson:env-pair',
+        'event:cue-zero',
+        'principle:same',
+        'goal:same',
+        'lesson:new-lesson',
+      ]),
     )
   })
 })
@@ -348,7 +355,9 @@ describe('session e2e：异步注入', () => {
     await writeLesson(dir, 'lesson-alpha', '改 alpha 前必读')
     await writeLesson(dir, 'lesson-ctl', '跑 alphactl 前必读')
     const rawSse = new TextDecoder().decode(await readFixture('anthropic-messages.tool-call.sse'))
-    const toolSse = opts.tail ? rawSse.replace('"partial_json":"s\\"}"', `"partial_json":"s${opts.tail}\\"}"`) : rawSse
+    const toolSse = opts.tail
+      ? rawSse.replace('"partial_json":"s\\"}"', `"partial_json":"s${opts.tail}\\"}"`)
+      : rawSse
     const main: Body[] = []
     let selectorCalls = 0
     const impl = (async (_url: unknown, init?: RequestInit) => {
@@ -447,7 +456,8 @@ describe('session e2e：异步注入', () => {
     const { open, main } = await setup({ tail: '; alphactl' })
     const session = await open()
     const events: { type: string; message?: string }[] = []
-    for await (const ev of session.send('改一下 alpha')) events.push(ev as { type: string; message?: string })
+    for await (const ev of session.send('改一下 alpha'))
+      events.push(ev as { type: string; message?: string })
     await session.close()
     expect(main).toHaveLength(3)
     expect(recallIndex(main[0]!)).toBe(-1)

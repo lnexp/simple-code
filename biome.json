@@ -18,10 +18,51 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "preset": "recommended"
+      "preset": "recommended",
+      "style": {
+        "noNonNullAssertion": "off",
+        "useTemplate": "off"
+      },
+      "suspicious": {
+        "noTemplateCurlyInString": "off",
+        "noExplicitAny": "off"
+      },
+      "complexity": {
+        "noCommaOperator": "off"
+      }
     }
   },
   "overrides": [
+    {
+      "includes": ["**/test/**", "**/test.ts"],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noUnsafeOptionalChaining": "off",
+            "useYield": "off",
+            "noUnusedImports": "off",
+            "noUnusedVariables": "off",
+            "noUnusedFunctionParameters": "off",
+            "noChildrenProp": "off"
+          },
+          "suspicious": {
+            "noAssignInExpressions": "off",
+            "noControlCharactersInRegex": "off",
+            "useIterableCallbackReturn": "off",
+            "noArrayIndexKey": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["packages/vscode/webview/**", "packages/robot/skins/**"],
+      "linter": {
+        "rules": {
+          "a11y": "off",
+          "suspicious": { "noArrayIndexKey": "off" }
+        }
+      }
+    },
     {
       "includes": ["**/config/**", "**/config.test.ts"],
       "linter": {

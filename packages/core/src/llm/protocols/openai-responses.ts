@@ -280,7 +280,10 @@ function onCompleted(state: State, ev: Record<string, unknown>): [State, LLMEven
   const response = asObject(ev.response)
   const usage = toUsage(response.usage)
   const reason = toFinishReason(response)
-  return [{ ...state, usage, finishReason: reason, finished: true }, [{ type: 'finish', reason, usage }]]
+  return [
+    { ...state, usage, finishReason: reason, finished: true },
+    [{ type: 'finish', reason, usage }],
+  ]
 }
 
 // ---------------------------------------------------------------- usage / 错误
@@ -332,7 +335,11 @@ function toError(err: Record<string, unknown>, status: number): ProtocolError {
   const kind = errorKind(asString(err.code) || asString(err.type), message, status)
   // unknown 也重试：流内 error 事件归不上类的默认可重试，理由见
   // anthropic-messages.ts 的 toError（2026-09-29 方案 A）
-  return { kind, message, retryable: kind === 'rate_limit' || kind === 'server' || kind === 'unknown' }
+  return {
+    kind,
+    message,
+    retryable: kind === 'rate_limit' || kind === 'server' || kind === 'unknown',
+  }
 }
 
 function errorKind(code: string, message: string, status: number): ProtocolError['kind'] {

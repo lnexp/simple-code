@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { readFile, readdir } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
 import { createHash } from 'node:crypto'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import {
   GLOBAL_CONFIG_PATH,
   type LoadedConfig,
@@ -14,27 +14,25 @@ import type { ModelSpec } from '../config/schema.ts'
 import type { AgentEvent } from '../events.ts'
 import { sendRequest } from '../llm/client.ts'
 import type { LLMEvent } from '../llm/events.ts'
-import { logRun } from '../runlog.ts'
-import { probeSync } from '../sync-probe.ts'
-import { thumbnailDataUrl } from '../llm/resizer.ts'
 import type { ProviderContext } from '../llm/protocol.ts'
+import { thumbnailDataUrl } from '../llm/resizer.ts'
 import type { Effort, ImageInput, Message, Part, Request } from '../llm/types.ts'
+import { type ArchiveSummary, runEventArchive } from '../loop/archiver.ts'
 import { hotSummaryIds, indexTokens, type Summary } from '../loop/assemble.ts'
-import { regionSizes, regionsEstimate, usageRatio } from '../loop/regions.ts'
+import { fitIndexLine, oversizedNodes } from '../loop/index-cap.ts'
+import { createPrefixGuard, type PrefixFingerprint } from '../loop/prefix-guard.ts'
+import { regionsEstimate, usageRatio } from '../loop/regions.ts'
 import { requestWithRetry, type StreamEvent } from '../loop/retry.ts'
-import { canAppendUser, compactIdle, headOf, type LoopContext, type LoopDeps, run, type Task, userParts } from '../loop/run.ts'
-import { loadCueCandidates, matchSummaries } from './cue.ts'
-import { loadTouchContext, matchTouch, renderTouch, stepCommands } from './touch-cue.ts'
 import {
-  buildSelectorRequest,
-  loadSelectorCandidates,
-  parseKeywords,
-  parseSelection,
-  previousReply,
-  readInContext,
-  renderSelection,
-  type SelectorCandidate,
-} from './selector.ts'
+  canAppendUser,
+  compactIdle,
+  headOf,
+  type LoopContext,
+  type LoopDeps,
+  run,
+  type Task,
+  userParts,
+} from '../loop/run.ts'
 import {
   buildMergeRequest,
   buildSummaryRequest,
@@ -46,16 +44,30 @@ import {
   renderTurn,
   type SummaryOutput,
 } from '../loop/summarize.ts'
-import { fitIndexLine, oversizedNodes } from '../loop/index-cap.ts'
 import { estimateMessageTokens, estimateTextTokens, inputBudget } from '../loop/tokens.ts'
-import { runEventArchive, type ArchiveSummary } from '../loop/archiver.ts'
-import { readEventsIndex } from '../tools/events.ts'
-import { buildNoteBudget, type NoteBudgetConfig } from './note-budget.ts'
+import { logRun } from '../runlog.ts'
+import { probeSync } from '../sync-probe.ts'
 import { createBashTool } from '../tools/bash.ts'
-import { BgRegistry, type BgProcessInfo } from '../tools/bg.ts'
+import { type BgProcessInfo, BgRegistry } from '../tools/bg.ts'
+import { readEventsIndex } from '../tools/events.ts'
 import type { Tool, ToolContext } from '../tools/types.ts'
 import { createViewImageTool } from '../tools/viewimage.ts'
+import { SC_VERSION } from '../version.ts'
+import { loadCueCandidates, matchSummaries } from './cue.ts'
 import { acquireLock } from './lock.ts'
+import { modelFetch } from './model-fetch.ts'
+import { buildNoteBudget, type NoteBudgetConfig } from './note-budget.ts'
+import { TRUNK } from './segments.ts'
+import {
+  buildSelectorRequest,
+  loadSelectorCandidates,
+  parseKeywords,
+  parseSelection,
+  previousReply,
+  readInContext,
+  renderSelection,
+  type SelectorCandidate,
+} from './selector.ts'
 import {
   type HistoryRow,
   lastRegionLine,
@@ -64,10 +76,7 @@ import {
   type Segment,
   type Store,
 } from './store.ts'
-import { TRUNK } from './segments.ts'
-import { createPrefixGuard, type PrefixFingerprint } from '../loop/prefix-guard.ts'
-import { SC_VERSION } from '../version.ts'
-import { modelFetch } from './model-fetch.ts'
+import { loadTouchContext, matchTouch, renderTouch, stepCommands } from './touch-cue.ts'
 
 /**
  * hydrate 出口的行（historyPage 的返回）。tool_result.images 从原图
@@ -102,9 +111,7 @@ export async function toHydrateRows<T extends { parts: readonly Part[] }>(
           const { images: _originals, ...rest } = part
           if (!part.images || part.images.length === 0) return rest
           const thumbs = (
-            await Promise.all(
-              part.images.map((img) => thumbnailDataUrl(img).then((u) => u ?? '')),
-            )
+            await Promise.all(part.images.map((img) => thumbnailDataUrl(img).then((u) => u ?? '')))
           ).filter((u) => u !== '')
           // 缩略图全失败 → 不带 images 字段（live 路径同样 filter 掉空）
           return thumbs.length > 0 ? { ...rest, images: thumbs } : rest
@@ -113,6 +120,7 @@ export async function toHydrateRows<T extends { parts: readonly Part[] }>(
     })),
   )
 }
+
 import { warmupShellParser } from '../tools/shell-ast.ts'
 
 export type Session = {
@@ -143,12 +151,27 @@ export type Session = {
     elapsedMs: number | null
     finishedAt: number | null
   })[]
+  /** fold 的窗口版（2026-11-06 拍板）：只恢复最近 N 个不同 step 的原文，
+   * 窗口外的行带 stubbed: true（webview 聚合成一条「已摘要」占位）。
+   * 不传参 = 全量恢复（冷启动基线用） */
+  historyRowsWindowed(recentSteps: number): readonly (Message & {
+    turnId: number
+    meta: { model: string; effort: string | null } | null
+    elapsedMs: number | null
+    finishedAt: number | null
+    stubbed: boolean
+  })[]
   /**
    * 历史分页（UI 往上拉加载用）。store 分页是纯读，但 Session 层不再直通：
    * tool_result 的原图要换成缩略图（HydrateRow），这个变换是异步的
    * （wasm resizer），所以 async
    */
-  historyPage(cursor: number | null, limit: number): Promise<{ rows: HydrateRow[]; next: number | null }>
+  /** 最后一轮的错误摘要（store.lastTurnError 的透传）。reload 后 UI 提示用 */
+  lastTurnError(): { message: string; endState: string } | null
+  historyPage(
+    cursor: number | null,
+    limit: number,
+  ): Promise<{ rows: HydrateRow[]; next: number | null }>
   /**
    * 发一条消息并消费事件流。
    *
@@ -363,8 +386,14 @@ export async function getSession(
       readAgentsFile(projectAgentsPath),
       readUserAgents(),
     ])
-    agents = agentsText === null ? null : clampAgents(agentsText, 'AGENTS.md', config.config.memory.agentsMaxTokens)
-    userAgents = userText === null ? null : clampAgents(userText, '~/.simple-code/AGENTS.md', config.config.memory.agentsMaxTokens)
+    agents =
+      agentsText === null
+        ? null
+        : clampAgents(agentsText, 'AGENTS.md', config.config.memory.agentsMaxTokens)
+    userAgents =
+      userText === null
+        ? null
+        : clampAgents(userText, '~/.simple-code/AGENTS.md', config.config.memory.agentsMaxTokens)
     notes = await readNotesIndex(folderPath, config.config.memory)
     events = readEventsIndex(folderPath)
     lessons = null // 新快照的四类型均在 notes；旧 lessons 字段仅供热恢复旧快照。
@@ -431,7 +460,12 @@ export async function getSession(
               try {
                 return JSON.parse(
                   readFileSync(
-                    join(store.root, MEMORY_RELATIVE, 'last-requests', `${options.task?.owner ?? 'main'}.json`),
+                    join(
+                      store.root,
+                      MEMORY_RELATIVE,
+                      'last-requests',
+                      `${options.task?.owner ?? 'main'}.json`,
+                    ),
                     'utf8',
                   ),
                 ) as Request
@@ -443,7 +477,10 @@ export async function getSession(
               try {
                 const dir = join(store.root, MEMORY_RELATIVE, 'last-requests')
                 mkdirSync(dir, { recursive: true })
-                writeFileSync(join(dir, `${options.task?.owner ?? 'main'}.json`), JSON.stringify(request))
+                writeFileSync(
+                  join(dir, `${options.task?.owner ?? 'main'}.json`),
+                  JSON.stringify(request),
+                )
               } catch {
                 // 落不了就不落：指纹基线还在，现场里 prev 退回 null
               }
@@ -460,7 +497,9 @@ export async function getSession(
               mkdirSync(dir, { recursive: true })
               const file = join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}.json`)
               const around = (req: Request | null) =>
-                req === null ? null : req.messages.slice(Math.max(0, found.index - 1), found.index + 2)
+                req === null
+                  ? null
+                  : req.messages.slice(Math.max(0, found.index - 1), found.index + 2)
               writeFileSync(
                 file,
                 JSON.stringify(
@@ -499,141 +538,154 @@ export async function getSession(
     // 没配 visionModel → undefined）
     const visionRelay = makeVisionRelay(config, folderPath)
     const deps: LoopDeps = {
-    stream: options.stream ?? httpStream(config, modelFetch(config, fetchScope), folderPath),
-    tools: new Map(tools.map((t) => [t.name, t])),
-    root: folderPath,
-    memoryRoot: options.memoryRoot ?? folderPath,
-    owner: options.task?.owner ?? '',
-    ...(store ? { takeTaskResults: () => store.takeTaskResults() } : {}),
-    // 配置键 = 当前模型配置（system prompt 里写着模型名与窗口，settings 改了
-    // 它就变——那是用户的选择，不是违规）。每次 check 现读，跟得上 setModel
-    ...(prefixGuard
-      ? {
-          prefixGuard: {
-            allowRewrite: () => prefixGuard.allowRewrite(),
-            check: (r: Request) => prefixGuard.check(r, JSON.stringify(config.model)),
-          },
-        }
-      : {}),
-    caps: config.model.capabilities,
-    now: () => Date.now(),
-    // 发请求前落盘（LoopDeps.checkpoint）。与内存历史末尾同一条 = 上次存
-    // 后没新消息（首个请求：send 刚存过用户消息），跳过——save 是全量替换
-    ...(store
-      ? {
-          checkpoint: (current: Message[]) => {
-            if (current.length === messages.length && current.at(-1) === messages.at(-1)) return
-            messages.splice(0, messages.length, ...current)
-            store.save(messages)
-          },
-        }
-      : {}),
-    requestApproval: options.requestApproval,
-    request: {
-      ...config.request,
-      // 覆盖压在 config 算出来的值上面。展开在后面，顺序不能反
-      ...(effortOverride === null ? {} : { effort: effortOverride }),
-      model: config.config.model,
-      // 稳定客户端标识：同项目跨重启不变（路径哈希）。必须是官方客户端的
-      // 三件套形状 {device_id, account_uuid, session_id}——2026-09-28
-      // 探针实锤（cache-probe9/10，Q/R/T 臂）：网关只对带 device_id 的
-      // user_id 走按内容匹配的前缀缓存（挪标记位置、3 秒间隔、流式
-      // 全命中）；单键 session_id 落进只认断点精确位置的模式（0/8），
-      // 标记每轮前移就永远 miss。folderPath 为空的临时会话不发
-      ...(folderPath
+      stream: options.stream ?? httpStream(config, modelFetch(config, fetchScope), folderPath),
+      tools: new Map(tools.map((t) => [t.name, t])),
+      root: folderPath,
+      memoryRoot: options.memoryRoot ?? folderPath,
+      owner: options.task?.owner ?? '',
+      ...(store ? { takeTaskResults: () => store.takeTaskResults() } : {}),
+      // 配置键 = 当前模型配置（system prompt 里写着模型名与窗口，settings 改了
+      // 它就变——那是用户的选择，不是违规）。每次 check 现读，跟得上 setModel。
+      // 精简开关同性质（2026-11-03）：切换那轮装配从「存根在场」变「过滤
+      // +提示行」，前缀必变——拼进 configKey 走 params 通道跳过比对，
+      // reload 后 baseline 持久化也带 params，同样认
+      ...(prefixGuard
         ? {
-            userId: JSON.stringify({
-              device_id: createHash('sha256').update(folderPath).digest('hex'),
-              account_uuid: '',
-              session_id: uuidFromHash(folderPath),
-            }),
-            // OpenAI Responses 用；和 session_id 同值，同项目跨重启不变
-            cacheKey: uuidFromHash(folderPath),
+            prefixGuard: {
+              allowRewrite: () => prefixGuard.allowRewrite(),
+              check: (r: Request) =>
+                prefixGuard.check(
+                  r,
+                  JSON.stringify(config.model) +
+                    (config.config.memory?.summaryInContext === false ? '|lean' : ''),
+                ),
+            },
           }
         : {}),
-      // 状态行跟着 deps 每轮现算：setModel 之后下一轮 system 自动带上新
-      // 模型的能力（方案 A——模型切换是静默操作，agent 得能低头看到现状）
-      system: systemPrompt(
-        folderPath,
-        agentsMutable,
-        userAgentsMutable,
-        notes,
-        events,
-        lessons,
-        options.env ?? process.env,
-        {
-          provider: config.config.provider,
-          name: config.config.model,
-          contextWindow: config.model.contextWindow,
-          images: config.model.capabilities.images,
-        },
-        visionRelay !== undefined,
-        new Date().toLocaleDateString('sv-SE'),
-      ),
-      tools: tools.map((t) => t.definition),
-    },
-    maxIterations: config.config.loop.maxIterations,
-    bg,
-    ...(visionRelay ? { visionRelay } : {}),
-    ...(store
-      ? {
-          rawSink: (id: string) => store.rawSink(id),
-          // 没有 store 就没有 memory：卸载的前提是原文能留在磁盘上，
-          // 否则「卸载」就成了单纯的丢数据（design.md §9.3）
-          memory: {
+      caps: config.model.capabilities,
+      now: () => Date.now(),
+      // 发请求前落盘（LoopDeps.checkpoint）。与内存历史末尾同一条 = 上次存
+      // 后没新消息（首个请求：send 刚存过用户消息），跳过——save 是全量替换
+      ...(store
+        ? {
+            checkpoint: (current: Message[]) => {
+              if (current.length === messages.length && current.at(-1) === messages.at(-1)) return
+              messages.splice(0, messages.length, ...current)
+              store.save(messages)
+            },
+          }
+        : {}),
+      requestApproval: options.requestApproval,
+      request: {
+        ...config.request,
+        // 覆盖压在 config 算出来的值上面。展开在后面，顺序不能反
+        ...(effortOverride === null ? {} : { effort: effortOverride }),
+        model: config.config.model,
+        // 稳定客户端标识：同项目跨重启不变（路径哈希）。必须是官方客户端的
+        // 三件套形状 {device_id, account_uuid, session_id}——2026-09-28
+        // 探针实锤（cache-probe9/10，Q/R/T 臂）：网关只对带 device_id 的
+        // user_id 走按内容匹配的前缀缓存（挪标记位置、3 秒间隔、流式
+        // 全命中）；单键 session_id 落进只认断点精确位置的模式（0/8），
+        // 标记每轮前移就永远 miss。folderPath 为空的临时会话不发
+        ...(folderPath
+          ? {
+              userId: JSON.stringify({
+                device_id: createHash('sha256').update(folderPath).digest('hex'),
+                account_uuid: '',
+                session_id: uuidFromHash(folderPath),
+              }),
+              // OpenAI Responses 用；和 session_id 同值，同项目跨重启不变
+              cacheKey: uuidFromHash(folderPath),
+            }
+          : {}),
+        // 状态行跟着 deps 每轮现算：setModel 之后下一轮 system 自动带上新
+        // 模型的能力（方案 A——模型切换是静默操作，agent 得能低头看到现状）
+        system: systemPrompt(
+          folderPath,
+          agentsMutable,
+          userAgentsMutable,
+          notes,
+          events,
+          lessons,
+          options.env ?? process.env,
+          {
+            provider: config.config.provider,
+            name: config.config.model,
             contextWindow: config.model.contextWindow,
-            targetRatio: config.config.memory.unloadTargetRatio,
-            cacheTtlMs: config.model.cacheTtlMs,
-            now: () => Date.now(),
-            lastResponseAt: () => lastResponseAt,
-            markResponded: () => {
-              lastResponseAt = Date.now()
-            },
-            floorTokens: config.config.memory.floorTokens,
-            stubTokens: config.config.memory.stubTokens,
-            stubSteps: config.config.memory.stubSteps,
-            tokenRatio: () => tokenRatio,
-            safetyMargin: config.config.memory.reservedTokens,
-            // 命令留头用 clipCommandChars，不用 keepHeadChars——后者还管本地
-            // L0 的描述截断（headOf），两边默认值已分家（2026-09-28 方案 C）
-            keepHeadChars: config.config.memory.clipCommandChars,
-            outputHeadChars: config.config.memory.clipOutputHeadChars,
-            outputTailChars: config.config.memory.clipOutputTailChars,
-            clipThresholdChars: config.config.memory.clipThresholdChars,
-            remap: (origin) => store.remapMessages(origin),
-            unload: (indices: number[]) => store.unload(indices),
-            markCold: (stepIds: number[]) => store.markCold(stepIds),
-            markStubs: (stubs: Message[]) => store.markStubs(stubs),
-            activateSummary: (stepId) => store.activateSummary(stepId),
-            summaries: () => store.summaries(),
-            leafBodies: (rows) => store.leafBodies(rows),
-            hotLeaves: config.config.memory.hotLeaves,
-            demoteBatch: config.config.memory.demoteBatch,
-            consumeMergePending: () => store.consumeMergePending(),
-            pullPending: () => store.pullPending(),
-            pullSegments: () => store.pullSegments(),
-            withTurns: (msgs: Message[]) => store.withTurns(msgs),
-            // shadow 模式：算+落库（观察日志）但不渲染——上线与否就看这行
-            cues: () => (config.config.recall.mode === 'on' ? store.cues() : new Map()),
-            asyncCues: () => (config.config.recall.mode === 'on' ? store.asyncCues() : new Map()),
-            offerAsyncCue: (anchor) => {
-              // 已在场的不再注入：锚点还在场的上次注入、在场 bash 已 read 过的
-              // ——正文/提醒行就在上下文里，再来一次是重复（selector 只看得到
-              // 最新交互，不知道上下文里有什么）。skipped 留给一周评估算重复率
-              const floor = store.liveStepFloor()
-              const seen = new Set([...(floor === null ? [] : store.asyncCuedNamesSince(floor)), ...readInContext(messages)])
-              for (const n of offerSelection(store, anchor, seen)) seen.add(n)
-              offerTouch(store, anchor, seen)
-            },
-            recordRegions: (sizes, budget, real) => {
-              store.recordRegions(sizes, budget, real)
-              tokenRatio = usageRatio(regionsEstimate(sizes), real) ?? tokenRatio
-            },
-            pruneMessages: (indices) => store.pruneMessages(indices),
-            applyMerges: () => store.applyMerges(),
+            images: config.model.capabilities.images,
           },
-        }
-      : {}),
+          visionRelay !== undefined,
+          new Date().toLocaleDateString('sv-SE'),
+        ),
+        tools: tools.map((t) => t.definition),
+      },
+      maxIterations: config.config.loop.maxIterations,
+      bg,
+      ...(visionRelay ? { visionRelay } : {}),
+      ...(store
+        ? {
+            rawSink: (id: string) => store.rawSink(id),
+            // 没有 store 就没有 memory：卸载的前提是原文能留在磁盘上，
+            // 否则「卸载」就成了单纯的丢数据（design.md §9.3）
+            memory: {
+              contextWindow: config.model.contextWindow,
+              targetRatio: config.config.memory.unloadTargetRatio,
+              cacheTtlMs: config.model.cacheTtlMs,
+              now: () => Date.now(),
+              lastResponseAt: () => lastResponseAt,
+              markResponded: () => {
+                lastResponseAt = Date.now()
+              },
+              floorTokens: config.config.memory.floorTokens,
+              stubTokens: config.config.memory.stubTokens,
+              stubSteps: config.config.memory.stubSteps,
+              tokenRatio: () => tokenRatio,
+              safetyMargin: config.config.memory.reservedTokens,
+              // 命令留头用 clipCommandChars，不用 keepHeadChars——后者还管本地
+              // L0 的描述截断（headOf），两边默认值已分家（2026-09-28 方案 C）
+              keepHeadChars: config.config.memory.clipCommandChars,
+              outputHeadChars: config.config.memory.clipOutputHeadChars,
+              outputTailChars: config.config.memory.clipOutputTailChars,
+              clipThresholdChars: config.config.memory.clipThresholdChars,
+              remap: (origin) => store.remapMessages(origin),
+              unload: (indices: number[]) => store.unload(indices),
+              markCold: (stepIds: number[]) => store.markCold(stepIds),
+              markStubs: (stubs: Message[]) => store.markStubs(stubs),
+              activateSummary: (stepId) => store.activateSummary(stepId),
+              summaries: () => store.summaries(),
+              leafBodies: (rows) => store.leafBodies(rows),
+              hotLeaves: config.config.memory.hotLeaves,
+              demoteBatch: config.config.memory.demoteBatch,
+              summaryInContext: () => config.config.memory.summaryInContext,
+              unloadedSteps: () => store.unloadedSteps(),
+              consumeMergePending: () => store.consumeMergePending(),
+              pullPending: () => store.pullPending(),
+              pullSegments: () => store.pullSegments(),
+              withTurns: (msgs: Message[]) => store.withTurns(msgs),
+              // shadow 模式：算+落库（观察日志）但不渲染——上线与否就看这行
+              cues: () => (config.config.recall.mode === 'on' ? store.cues() : new Map()),
+              asyncCues: () => (config.config.recall.mode === 'on' ? store.asyncCues() : new Map()),
+              offerAsyncCue: (anchor) => {
+                // 已在场的不再注入：锚点还在场的上次注入、在场 bash 已 read 过的
+                // ——正文/提醒行就在上下文里，再来一次是重复（selector 只看得到
+                // 最新交互，不知道上下文里有什么）。skipped 留给一周评估算重复率
+                const floor = store.liveStepFloor()
+                const seen = new Set([
+                  ...(floor === null ? [] : store.asyncCuedNamesSince(floor)),
+                  ...readInContext(messages),
+                ])
+                for (const n of offerSelection(store, anchor, seen)) seen.add(n)
+                offerTouch(store, anchor, seen)
+              },
+              recordRegions: (sizes, budget, real) => {
+                store.recordRegions(sizes, budget, real)
+                tokenRatio = usageRatio(regionsEstimate(sizes), real) ?? tokenRatio
+              },
+              pruneMessages: (indices) => store.pruneMessages(indices),
+              applyMerges: () => store.applyMerges(),
+            },
+          }
+        : {}),
     }
     // **只会在卸载触发点被调用**（run.ts unloadIfNeeded 的注释写了契约）。
     // 这里改动的是 deps.request.system——deps 整体仍是「setModel 才重建」，
@@ -642,8 +694,11 @@ export async function getSession(
     deps.reloadSystem = async () => {
       let noteError: string | undefined
       let freshNotes = notes
-      try { freshNotes = await readNotesIndex(folderPath, config.config.memory) }
-      catch (error) { noteError = `${error instanceof Error ? error.message : error} 本次 note 刷新保留旧快照。` }
+      try {
+        freshNotes = await readNotesIndex(folderPath, config.config.memory)
+      } catch (error) {
+        noteError = `${error instanceof Error ? error.message : error} 本次 note 刷新保留旧快照。`
+      }
       const [freshAgents, freshUser] = await Promise.all([
         readAgentsFile(projectAgentsPath),
         readUserAgents(),
@@ -657,8 +712,12 @@ export async function getSession(
         ...(over(freshUser) ? [userAgentsPath] : []),
         ...(over(freshAgents) ? ['AGENTS.md'] : []),
       ]
-      if (!over(freshAgents)) agentsMutable = freshAgents === null ? null : clampAgents(freshAgents, 'AGENTS.md', maxTokens)
-      if (!over(freshUser)) userAgentsMutable = freshUser === null ? null : clampAgents(freshUser, '~/.simple-code/AGENTS.md', maxTokens)
+      if (!over(freshAgents))
+        agentsMutable =
+          freshAgents === null ? null : clampAgents(freshAgents, 'AGENTS.md', maxTokens)
+      if (!over(freshUser))
+        userAgentsMutable =
+          freshUser === null ? null : clampAgents(freshUser, '~/.simple-code/AGENTS.md', maxTokens)
       notes = freshNotes
       // events 索引同款：压缩点换新（proposals/events.md §6——新归档的事件
       // 这时才进索引；此前原文还热着，本来不需要档案）
@@ -666,7 +725,13 @@ export async function getSession(
       if (!noteError) lessons = null
       // 快照回写：让「缓存还热的重建」沿用到的正是此刻生效的这四段。
       // agentsMutable 而非 freshAgents——超限保旧版时生效的是旧版
-      store?.writePromptSnapshot({ agents: agentsMutable, userAgents: userAgentsMutable, notes, events, lessons })
+      store?.writePromptSnapshot({
+        agents: agentsMutable,
+        userAgents: userAgentsMutable,
+        notes,
+        events,
+        lessons,
+      })
       deps.request.system = systemPrompt(
         folderPath,
         agentsMutable,
@@ -684,7 +749,10 @@ export async function getSession(
         visionRelay !== undefined,
         new Date().toLocaleDateString('sv-SE'),
       )
-      return { ...(overLimit.length ? { agentsOverLimit: { files: overLimit, maxTokens } } : {}), ...(noteError ? { noteError } : {}) }
+      return {
+        ...(overLimit.length ? { agentsOverLimit: { files: overLimit, maxTokens } } : {}),
+        ...(noteError ? { noteError } : {}),
+      }
     }
     // 存根段水位检查的「催摘要」：summarizeIdle 自带并发闸（同时最多一个、
     // 正在跑的不打断），这里只管点火不管等——水位检查是同步路径，不能挂
@@ -819,7 +887,8 @@ export async function getSession(
   const startSelector = (text: string): void => {
     selection = null
     const recall = config.config.recall
-    if (recall.mode !== 'on' || store === null || activeTurn === null || options.task !== undefined) return
+    if (recall.mode !== 'on' || store === null || activeTurn === null || options.task !== undefined)
+      return
     const pending = {
       turn: activeTurn,
       picked: null as SelectorCandidate[] | null,
@@ -839,7 +908,12 @@ export async function getSession(
         { user: text, previous },
         { ...config.summary.request, model: config.summary.name },
       )
-      const raw = await collectText(request, { config, fetchImpl: options.fetchImpl, folder: folderPath, tag: 'recall' })
+      const raw = await collectText(request, {
+        config,
+        fetchImpl: options.fetchImpl,
+        folder: folderPath,
+        tag: 'recall',
+      })
       // 关键词行剥出来再给名字解析：关键词可能恰好等于某索引名，不剥会
       // 被当成选择
       const { body, keywords } = parseKeywords(raw)
@@ -876,21 +950,44 @@ export async function getSession(
   /** 选择器结果的轮内注入（startSelector 产出）。返回注入了的名字，给动作联想去重 */
   function offerSelection(store: Store, anchor: CueAnchor, seen: ReadonlySet<string>): string[] {
     const pending = selection
-    if (!pending || pending.offered || pending.turn !== anchor.turnId || pending.picked === null || pending.summaries === null) return []
+    if (
+      !pending ||
+      pending.offered ||
+      pending.turn !== anchor.turnId ||
+      pending.picked === null ||
+      pending.summaries === null
+    )
+      return []
     // 结果到了就只问这一次：选了 0 条也算用掉，不再等后面的 step
     pending.offered = true
     const fresh = pending.picked.filter((c) => !seen.has(`${c.kind}:${c.name}`))
-    const skipped = pending.picked.filter((c) => seen.has(`${c.kind}:${c.name}`)).map((c) => `${c.kind}:${c.name}`)
+    const skipped = pending.picked
+      .filter((c) => seen.has(`${c.kind}:${c.name}`))
+      .map((c) => `${c.kind}:${c.name}`)
     // 摘要行同判：入场与 matchSummaries 的排除之间可能已注入过
     const sumNames = pending.summaries.names.filter((n) => !seen.has(`summary:${n}`))
-    const sumLines = pending.summaries.lines.filter((_, i) => !seen.has(`summary:${pending.summaries!.names[i]}`))
-    const sumSkipped = pending.summaries.names.filter((n) => seen.has(`summary:${n}`)).map((n) => `summary:${n}`)
-    const names = [...fresh.map((c) => `${c.kind}:${c.name}`), ...sumNames.map((n) => `summary:${n}`)]
+    const sumLines = pending.summaries.lines.filter(
+      (_, i) => !seen.has(`summary:${pending.summaries!.names[i]}`),
+    )
+    const sumSkipped = pending.summaries.names
+      .filter((n) => seen.has(`summary:${n}`))
+      .map((n) => `summary:${n}`)
+    const names = [
+      ...fresh.map((c) => `${c.kind}:${c.name}`),
+      ...sumNames.map((n) => `summary:${n}`),
+    ]
     const allSkipped = [...skipped, ...sumSkipped]
     // 轮内被改成非 on（settings 热重载）：照样不注入
     if (config.config.recall.mode !== 'on') return []
     if (names.length === 0) {
-      logRun({ ev: 'recall_inject', folder: folderPath, turn: anchor.turnId, step: anchor.stepId, names, skipped: allSkipped })
+      logRun({
+        ev: 'recall_inject',
+        folder: folderPath,
+        turn: anchor.turnId,
+        step: anchor.stepId,
+        names,
+        skipped: allSkipped,
+      })
       return []
     }
     store.saveAsyncCue(anchor.turnId, {
@@ -920,12 +1017,57 @@ export async function getSession(
     if (config.config.recall.mode !== 'on' || options.task !== undefined) return
     const commands = stepCommands(messages)
     if (commands.length === 0) return
-    if (touchContext?.turn !== anchor.turnId) touchContext = { turn: anchor.turnId, ctx: loadTouchContext(folderPath) }
+    if (touchContext?.turn !== anchor.turnId)
+      touchContext = { turn: anchor.turnId, ctx: loadTouchContext(folderPath) }
     const hits = matchTouch(commands, touchContext.ctx.entries, touchContext.ctx.repo, seen)
     if (hits.length === 0) return
     const names = hits.map((h) => `${h.c.kind}:${h.c.name}`)
-    store.saveTouchCue({ stepId: anchor.stepId, after: anchor.after, lines: renderTouch(hits), names })
-    logRun({ ev: 'recall_touch', folder: folderPath, turn: anchor.turnId, step: anchor.stepId, names, via: hits.map((h) => h.via) })
+    store.saveTouchCue({
+      stepId: anchor.stepId,
+      after: anchor.after,
+      lines: renderTouch(hits),
+      names,
+    })
+    logRun({
+      ev: 'recall_touch',
+      folder: folderPath,
+      turn: anchor.turnId,
+      step: anchor.stepId,
+      names,
+      via: hits.map((h) => h.via),
+    })
+  }
+
+  // fold（每轮）走窗口版省冷读；冷启动基线走全量。两版共用一个实现。
+  // stubbed 按 stepId 窗口集判定（不能按「是否被恢复」判：窗口内最新
+  // 消息本来就没有 unloaded 原文，不恢复也是全文）
+  const historyRowsImpl = (recentSteps: number | undefined) => {
+    if (!store)
+      return messages.map((m) => ({
+        ...m,
+        turnId: 0,
+        meta: null,
+        elapsedMs: null,
+        finishedAt: null,
+        stubbed: false,
+      }))
+    const live = store.withTurns(messages)
+    const allSteps = [...new Set(live.map((l) => l.stepId))]
+    const windowSet = recentSteps === undefined ? null : new Set(allSteps.slice(-recentSteps))
+    const restored = store.historyOriginals(live, recentSteps)
+    historyRestoredIds = restored.restoredIds
+    const infos = store.turnsInfo(restored.rows.map((l) => l.turnId))
+    return restored.rows.map(({ message, turnId }, i) => {
+      const info = infos.get(turnId)
+      return {
+        ...message,
+        turnId,
+        meta: info?.meta ?? null,
+        elapsedMs: info?.elapsedMs ?? null,
+        finishedAt: info?.finishedAt ?? null,
+        stubbed: windowSet !== null && !windowSet.has(live[i]!.stepId),
+      }
+    })
   }
 
   return {
@@ -939,24 +1081,10 @@ export async function getSession(
     },
     defaultModel,
     messages: () => messages,
-    historyRows: () => {
-      if (!store)
-        return messages.map((m) => ({ ...m, turnId: 0, meta: null, elapsedMs: null, finishedAt: null }))
-      const restored = store.historyOriginals(store.withTurns(messages))
-      historyRestoredIds = restored.restoredIds
-      const live = restored.rows
-      const infos = store.turnsInfo(live.map((l) => l.turnId))
-      return live.map(({ message, turnId }) => {
-        const info = infos.get(turnId)
-        return {
-          ...message,
-          turnId,
-          meta: info?.meta ?? null,
-          elapsedMs: info?.elapsedMs ?? null,
-          finishedAt: info?.finishedAt ?? null,
-        }
-      })
-    },
+    lastTurnError: () => store?.lastTurnError() ?? null,
+
+    historyRows: () => historyRowsImpl(undefined),
+    historyRowsWindowed: (recentSteps: number) => historyRowsImpl(recentSteps),
     historyPage: async (cursor, limit) => {
       if (!store) return { rows: [], next: null } // ephemeral 会话没有历史
       const page = store.historyPage(cursor, limit, historyRestoredIds)
@@ -982,7 +1110,12 @@ export async function getSession(
       // 已 abort 的不再记：abort 同步、running 置空要等 loop 收尾，
       // dispose 紧跟 close 会记两行
       if (!running || running.signal.aborted) return
-      logRun({ ev: 'interrupt', folder: folderPath, owner: options.task?.owner ?? null, source: source ?? 'unknown' })
+      logRun({
+        ev: 'interrupt',
+        folder: folderPath,
+        owner: options.task?.owner ?? null,
+        source: source ?? 'unknown',
+      })
       running.abort()
     },
     terminateBg: (pgid) => bg.terminate(pgid),
@@ -1049,7 +1182,13 @@ export async function getSession(
       if (compacting) return { ok: false, message: '已经在压缩了' }
       if (!store) return { ok: false, message: '这个会话不落盘，没有可压缩的内容' }
       compacting = true
-      const ctx: LoopContext = { messages, tasks, deps, signal: new AbortController().signal, relayCache }
+      const ctx: LoopContext = {
+        messages,
+        tasks,
+        deps,
+        signal: new AbortController().signal,
+        relayCache,
+      }
       let unloaded = 0
       let estimated: number | null = null
       const errors: string[] = []
@@ -1081,9 +1220,20 @@ export async function getSession(
     close: async (source?: string) => {
       // 谁、何时关的库（2026-09-30 补观测）：exthost 里 `database is not open`
       // 查到最后卡在 runlog 没有关闭记录；summarizing = 关的那刻摘要还在跑
-      logRun({ ev: 'session_close', folder: folderPath, owner: options.task?.owner ?? null, summarizing: summarizing !== null, source })
+      logRun({
+        ev: 'session_close',
+        folder: folderPath,
+        owner: options.task?.owner ?? null,
+        summarizing: summarizing !== null,
+        source,
+      })
       if (running && !running.signal.aborted) {
-        logRun({ ev: 'interrupt', folder: folderPath, owner: options.task?.owner ?? null, source: 'close' })
+        logRun({
+          ev: 'interrupt',
+          folder: folderPath,
+          owner: options.task?.owner ?? null,
+          source: 'close',
+        })
         running.abort()
       }
       // **不等摘要跑完。** 等的话用户按了 /exit 还得干等几秒。中途丢下的
@@ -1137,7 +1287,7 @@ export async function getSession(
       const stripped = dropForeignSignatures(messages, models, current)
       if (stripped.length > 0) {
         // 剥完的消息指纹已变——不登记的话 save 会把无签名版当新消息再归档
-      // 一遍（2026-10-07 某项目 turn 54/60 实锤：同轮两份，带签名在前、
+        // 一遍（2026-10-07 某项目 turn 54/60 实锤：同轮两份，带签名在前、
         // 剥完在后）。markStubs 的语义本来就是「已归档原文的等价内容，不追加」
         store?.markStubs(stripped)
         store?.save(messages)
@@ -1153,6 +1303,13 @@ export async function getSession(
       // 条件），不用特判
       const prevModel = store?.lastTurnModel() ?? null
       const switchFrom = prevModel !== null && prevModel !== current ? prevModel : null
+      // 日期变更告知（2026-11-02 拍板，同 model_switch 模式）：上一轮落库
+      // 那天 ≠ 今天 → 在用户消息前插一条〔系统〕日期变更。与时间戳互补：
+      // 时间戳给连续工作的时间感，这里给跨天事件的显式信号。判据同样
+      // 必须在 beginTurn 之前读
+      const prevDay = store?.lastTurnDay() ?? null
+      const today = dayNow()
+      const dayFrom = prevDay !== null && prevDay !== today ? prevDay : null
       // turn 续接（docs/proposals/turn-resume.md，2026-09-29 拍板）：上一轮被
       // 中断或报错结束的，这条消息续进那一轮，不开新轮——与排队插话同形。
       // SC 的摘要/归档/检索/cue 都按 turn，「继续」另起一轮会把一件事拆成
@@ -1187,6 +1344,8 @@ export async function getSession(
           role: 'user',
           parts: userParts(modelSwitchNotice(switchFrom, current)),
         })
+      if (dayFrom !== null)
+        messages.push({ role: 'user', parts: userParts(daySwitchNotice(dayFrom, today)) })
       if (!repeat) messages.push(userMessage)
       // 先落盘再发请求。反过来的话，请求发出去了但用户这条消息没记下来，
       // 崩溃重启后模型的回答在历史里成了没有来由的一段话
@@ -1232,7 +1391,10 @@ export async function getSession(
 
       // 切换事件排在流首：面板拿它在这轮用户气泡后画分割线（气泡是 App
       // 本地 append 的，事件到时已在上屏——reduce 把线插到末条 user 前面）
-      const stream = switchFrom === null ? run(ctx) : prepend({ type: 'model_switch', from: switchFrom, to: current }, run(ctx))
+      const stream =
+        switchFrom === null
+          ? run(ctx)
+          : prepend({ type: 'model_switch', from: switchFrom, to: current }, run(ctx))
       // step_persist：store_save（store.ts）之外的两段——下游消费 step_finish
       // 与 kickSummary 的同步前缀（store.summaries() 等查库）。观测版，同
       // store_save 的注释。kickCpuMs/kickGcMs/kickGcN 把 kickMs 再拆开（sync-probe.ts）
@@ -1255,7 +1417,8 @@ export async function getSession(
         // 快照——之后换模型不会改写这一轮的任何记录
         // 结束状态决定下一次 send 续不续（turn-resume.md）
         const endState = controller.signal.aborted ? 'aborted' : ctx.failed ? 'error' : 'done'
-        if (activeTurn !== null) store?.finishTurn(activeTurn, Date.now() - turnStartedAt, endState)
+        if (activeTurn !== null)
+          store?.finishTurn(activeTurn, Date.now() - turnStartedAt, endState, ctx.lastErrorMessage)
         running = null
         // **清在 persist 之后**：那一脚 kickSummary 还属于「turn 正在跑」，
         // 早清的话它会摘到刚结束但还没落定的这一轮。清完之后空闲摘要才够得着
@@ -1535,8 +1698,15 @@ const pendingArchive = new Map<
   Array<{ s: ArchiveSummary; cfg: LoadedConfig; fetchImpl?: typeof fetch; tries: number }>
 >()
 
-export function queueEventArchive(root: string, s: ArchiveSummary, cfg: LoadedConfig, fetchImpl?: typeof fetch): void {
-  const q = (pendingArchive.get(root) ?? []).concat([{ s, cfg, ...(fetchImpl ? { fetchImpl } : {}), tries: 0 }])
+export function queueEventArchive(
+  root: string,
+  s: ArchiveSummary,
+  cfg: LoadedConfig,
+  fetchImpl?: typeof fetch,
+): void {
+  const q = (pendingArchive.get(root) ?? []).concat([
+    { s, cfg, ...(fetchImpl ? { fetchImpl } : {}), tries: 0 },
+  ])
   pendingArchive.set(root, q)
   if (archivingRoots.has(root)) return // 在跑：留在队列，跑完续
   archivingRoots.add(root)
@@ -1547,11 +1717,23 @@ export function queueEventArchive(root: string, s: ArchiveSummary, cfg: LoadedCo
       archivingRoots.delete(root)
       return
     }
-    void runEventArchive({ root, summary: next.s, config: next.cfg, ...(next.fetchImpl ? { fetchImpl: next.fetchImpl } : {}) })
+    void runEventArchive({
+      root,
+      summary: next.s,
+      config: next.cfg,
+      ...(next.fetchImpl ? { fetchImpl: next.fetchImpl } : {}),
+    })
       .catch((e) => {
         const retry = next.tries === 0
         const message = e instanceof Error ? e.message : String(e)
-        logRun({ ev: 'archive', folder: root, action: 'failed', retry, steps: `${next.s.coversFrom}–${next.s.coversTo}`, message })
+        logRun({
+          ev: 'archive',
+          folder: root,
+          action: 'failed',
+          retry,
+          steps: `${next.s.coversFrom}–${next.s.coversTo}`,
+          message,
+        })
         if (retry) pendingArchive.get(root)?.push({ ...next, tries: 1 })
         else console.error('[archiver] 归类失败（已重试一次，本批跳过）:', e)
       })
@@ -1617,7 +1799,15 @@ async function mergeWhileDue(
       const state = `${reason}|${index.length}`
       if (lastMergeStop.get(key) === state) return
       lastMergeStop.set(key, state)
-      logRun({ ev: 'merge', ...log, action: 'stop', reason, index: Math.round(size), members: index.length, quota: Math.round(quota) })
+      logRun({
+        ev: 'merge',
+        ...log,
+        action: 'stop',
+        reason,
+        index: Math.round(size),
+        members: index.length,
+        quota: Math.round(quota),
+      })
     }
     if (size <= quota) return stop('under_quota')
 
@@ -1694,7 +1884,16 @@ async function rewriteOversized(
       { ...node, name: '', text, status: 'ready', inContext: false, supersededBy: null },
       [node.id],
     )
-    logRun({ ev: 'merge', ...log, action: 'rewrite', id, of: node.id, level: node.level, before: node.text.length, chars: text.length })
+    logRun({
+      ev: 'merge',
+      ...log,
+      action: 'rewrite',
+      id,
+      of: node.id,
+      level: node.level,
+      before: node.text.length,
+      chars: text.length,
+    })
   }
 }
 
@@ -1705,7 +1904,12 @@ async function rewriteOversized(
  */
 async function collectText(
   request: Request,
-  opts: { config: LoadedConfig; fetchImpl: typeof fetch | undefined; folder: string | undefined; tag: string },
+  opts: {
+    config: LoadedConfig
+    fetchImpl: typeof fetch | undefined
+    folder: string | undefined
+    tag: string
+  },
 ): Promise<string> {
   const { config, fetchImpl, folder, tag } = opts
   let text = ''
@@ -1789,7 +1993,10 @@ async function requestSummary(
   // 描述就是索引行，同样受 400 字上限（index-cap.ts）。重写只要描述那一行，
   // 正文沿用第一次的——热区正文另有 1200 字的上限，不归这里管
   const description = await fitIndexLine(out.description, async (feedback) => {
-    const again = await collectText(followUp(request, raw, `${feedback}（只重写「描述」这一行的内容）`), opts)
+    const again = await collectText(
+      followUp(request, raw, `${feedback}（只重写「描述」这一行的内容）`),
+      opts,
+    )
     return cleanSummaryText(again).replace(/^\s*\*{0,2}描述\*{0,2}\s*[:：]\s*/, '')
   })
   return { ...out, description }
@@ -2077,7 +2284,6 @@ const systemPrompt = (
     : `${withNotes}\n\n## 历史事件档案（按事归档、跨摘要窗口完整；检索："$SIMPLE_CODE_EVENT" search <关键词> / read <name>）：\n\n${events}`
 }
 
-
 /**
  * 产品级工具约定，**条件拼**：宿主注入了对应 bin 才写那行（CLI/测试环境
  * 没注入，写了只会误导）。为什么放 system prompt 不放 AGENTS.md：这是
@@ -2093,7 +2299,9 @@ const toolRules = (env: NodeJS.ProcessEnv): string => {
         'python3/sed 只在补丁表达不了时用（按行号定位、跨文件计算）。',
     )
   if (env.SIMPLE_CODE_MEMORY !== undefined)
-    lines.push('- 下钻历史会话用 "$SIMPLE_CODE_MEMORY" search/show（one session 全量落盘，细节随时可捞）。')
+    lines.push(
+      '- 下钻历史会话用 "$SIMPLE_CODE_MEMORY" search/show（one session 全量落盘，细节随时可捞）。',
+    )
   if (env.SIMPLE_CODE_EVENT !== undefined)
     lines.push(
       '- 历史事件档案（按事归档、跨摘要窗口完整）：查「之前那件事怎么做的」优先用 "$SIMPLE_CODE_EVENT" search <关键词> / read <name>，别拼摘要碎片。档案结论错了可点状订正：progress <name> "<一句话>"（追加进展）、describe（改描述）、rename（改名）、merge <new> <oldA> <oldB>（同战役碎片合并，正文全保留）——不重写正文。',
@@ -2106,7 +2314,7 @@ const toolRules = (env: NodeJS.ProcessEnv): string => {
         '语言无关，TS/Java/Python 只要宿主有语言服务就通；命令格式在 bash 工具描述里）。',
     )
   // LESSON/NOTE 行（2026-09-17 v2 拍板）：read 入口从经验沉淀节挪来——分工
- // 变为「沉淀讲什么时候记，约定讲什么时候用哪个」
+  // 变为「沉淀讲什么时候记，约定讲什么时候用哪个」
   if (env.SIMPLE_CODE_NOTE !== undefined)
     lines.push(
       '- note 统一记录/教训/原则/目标："$SIMPLE_CODE_NOTE" read <name> [--type general|lesson|principle|goal]；list/search 默认跨类型，--all 含历史。教训用 --type lesson。',
@@ -2114,7 +2322,7 @@ const toolRules = (env: NodeJS.ProcessEnv): string => {
   if (env.SIMPLE_CODE_MCP !== undefined)
     lines.push(
       '- 外部工具经 MCP："$SIMPLE_CODE_MCP" list 看已配置的 server，"$SIMPLE_CODE_MCP" tools <server> 看工具清单（含参数 schema），' +
-        "调用 \"$SIMPLE_CODE_MCP\" <server> <tool> '{\\\"key\\\":\\\"value\\\"}'；不重造轮子前先看有没有现成的 MCP 工具。",
+        '调用 "$SIMPLE_CODE_MCP" <server> <tool> \'{\\"key\\":\\"value\\"}\'；不重造轮子前先看有没有现成的 MCP 工具。',
     )
   return lines.length === 0 ? '' : `\n\n## 工具约定\n${lines.join('\n')}`
 }
@@ -2166,6 +2374,12 @@ const contextRules = (env: NodeJS.ProcessEnv): string => {
     // 词表只是本仓的病历，产品段只写对所有项目成立的形状：动手前拿方案
     // 自己的名词检索，撞的是用户自己项目的经验库，代价一次检索
     '有方案要动手前，先拿方案里的名词（工具名、文件名、机制词）搜一遍教训与 note——这类误判恰恰发生在自信时，与确信与否无关。' +
+    // 三条执行纪律（2026-11-05 拍板，对照 CC 的 read-before-modify /
+    // verify-before-claim；第三条补「失败 ≥2 次记教训」的读侧对偶——
+    // 只写不读，记了也白记。只写对所有项目成立的形状，不列领域词表）
+    '报完成前先验证：能跑的（测试、脚本、构建）跑过了再说完成；验证不了的明说未验证与原因，不用「应该可以」包装——已完成与已验证是两件事，没跑过就只说改了什么。' +
+    '改文件前先读过它的现状——grep 定位得到行号，看不到行与行的关系；动手前把要改的那段读全，再决定怎么改。' +
+    '同一处第二次失败，先查教训与 note 再修——能撞第二次的坑，多半教训里已经记着；失败 ≥2 次记教训的另一半，是失败第二次先读教训。' +
     // 常驻清单（t885 用户提出）：模型只有读了本仓源码才知道「AGENTS.md 每轮
     // 全价」——换个目录就不知道自己在花钱，会往 AGENTS.md 猛写、把该记 note
     // 的塞进常驻区。只写「谁常驻/谁不常驻」的相对关系，不写 2048/30 条这类
@@ -2195,7 +2409,9 @@ const growthRules = (lessons: string | null, env: NodeJS.ProcessEnv): string =>
   // 零注入时期实测只写不读（write 60 / read 9），清单把复用链路接回来。
   // 压缩点换新（与 notes/events 索引同点）：新教训在原文还热时不进清单
   '①教训（name 即症状，调试受挫先对着清单看一眼，查法见工具约定）：' +
-  (lessons === null ? '见下方 note 教训分组；未列出不等于不存在，NOTE search 可查。' : `\n${lessons}\n`) +
+  (lessons === null
+    ? '见下方 note 教训分组；未列出不等于不存在，NOTE search 可查。'
+    : `\n${lessons}\n`) +
   '一件事失败 ≥2 次后终于做成，用 NOTE write --type lesson 记一条（五段内容，front matter 和标题' +
   '自动组装——description 写清治什么症状、什么时候读）。\n' +
   '②技能：用户点名，或不确定该怎么做时查用（求证链的第一步）——项目 `.simple-code/skills/<name>/SKILL.md` 与' +
@@ -2220,7 +2436,7 @@ const growthRules = (lessons: string | null, env: NodeJS.ProcessEnv): string =>
   // 自动跑的，模型只读——补齐全家福（教训/技能/note/事件四层沉淀各自怎么进出）
   (env.SIMPLE_CODE_EVENT !== undefined
     ? '④事件归档：压缩点由 archiver 自动按事归档，跨摘要窗口完整——查「之前那件事怎么做的」优先 `"$SIMPLE_CODE_EVENT" search`（详见工具约定）。完成某 event 挂账的下一步时，当场 progress 闭环一行。'
- : '')
+    : '')
 
 /**
  * 模型身份的操作事实（产品内置）。模型不知道「用户可以随时换掉自己」时，
@@ -2240,7 +2456,10 @@ const modelRules = (env: NodeJS.ProcessEnv): string =>
 async function* empty(): AsyncIterable<AgentEvent> {}
 
 /** 流首补一个事件（模型切换告知），其余原样透传 */
-async function* prepend(first: AgentEvent, rest: AsyncIterable<AgentEvent>): AsyncIterable<AgentEvent> {
+async function* prepend(
+  first: AgentEvent,
+  rest: AsyncIterable<AgentEvent>,
+): AsyncIterable<AgentEvent> {
   yield first
   yield* rest
 }
@@ -2252,6 +2471,18 @@ async function* prepend(first: AgentEvent, rest: AsyncIterable<AgentEvent>): Asy
 export const MODEL_SWITCH_HEAD = '〔系统〕模型已从 '
 export const modelSwitchNotice = (from: string, to: string): string =>
   `${MODEL_SWITCH_HEAD}${from} 切换到 ${to}。此前的回复由上一个模型生成。`
+
+/** 日期变更告知（dayNow 与 store.lastTurnDay 同格式）：跨天回来接续
+ *  会话时给 agent 显式的「昨天→今天」信号，时间戳只到时:分 */
+export const DAY_SWITCH_HEAD = '〔系统〕日期变更'
+export const daySwitchNotice = (from: string, to: string): string =>
+  `${DAY_SWITCH_HEAD}：上次活动 ${from}，现在是 ${to}，已跨天。`
+const weekdayOf = (d: Date): string => '日一二三四五六'[d.getDay()] ?? ''
+/** 完整日期锚点：2026-11-3 周一。带年（跨年不歧义）与周几（t210019 拍板） */
+export const dayNow = (): string => {
+  const d = new Date()
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()} 周${weekdayOf(d)}`
+}
 
 /** 单事件流：分支跑超拒绝（session.send 入口闸）——发一个 error 事件收口 */
 async function* errorOnce(message: string): AsyncIterable<AgentEvent> {
@@ -2272,4 +2503,3 @@ function sameAsLastUser(messages: readonly Message[], message: Message): boolean
   const last = messages.at(-1)
   return last?.role === 'user' && JSON.stringify(last.parts) === JSON.stringify(message.parts)
 }
-

@@ -169,7 +169,13 @@ describe('装机前的超长节点：空闲时单条重写（L9 6984 字那种�
     ])
     const { fetchImpl, bodies } = scriptedFetch(['重写：跨半个月的主题 · 关键词'])
     // 配额很大：不会走普通合并，只有重写这一趟会调模型
-    const session = await getSession(dir, { globalPath, env: { TEST_KEY: 'k' }, tools: [], fetchImpl, skipLock: true })
+    const session = await getSession(dir, {
+      globalPath,
+      env: { TEST_KEY: 'k' },
+      tools: [],
+      fetchImpl,
+      skipLock: true,
+    })
     await session.summarizeIdle()
     await session.close()
 
@@ -186,7 +192,13 @@ describe('装机前的超长节点：空闲时单条重写（L9 6984 字那种�
     const { dir, globalPath } = await seeded([{ level: 2, text: huge }])
     const stillLong = `又抄：${'词 · '.repeat(150)}` // 比第一次短、仍超上限
     const { fetchImpl, bodies } = scriptedFetch([huge, stillLong])
-    const session = await getSession(dir, { globalPath, env: { TEST_KEY: 'k' }, tools: [], fetchImpl, skipLock: true })
+    const session = await getSession(dir, {
+      globalPath,
+      env: { TEST_KEY: 'k' },
+      tools: [],
+      fetchImpl,
+      skipLock: true,
+    })
     await session.summarizeIdle()
     await session.close()
 
@@ -204,7 +216,10 @@ describe('L0 的描述同样受上限', () => {
     const store = openStore(dir)
     const t = store.beginTurn({ model: 'p/m', effort: null })
     store.save([
-      { role: 'user', parts: [{ type: 'text', text: `问题${'。要足够长才会去调摘要模型'.repeat(30)}` }] },
+      {
+        role: 'user',
+        parts: [{ type: 'text', text: `问题${'。要足够长才会去调摘要模型'.repeat(30)}` }],
+      },
       { role: 'assistant', parts: [{ type: 'text', text: `回答${'。回答也要够长'.repeat(30)}` }] },
     ])
     store.finishTurn(t, 1, 'done')
@@ -212,7 +227,13 @@ describe('L0 的描述同样受上限', () => {
 
     const longDesc = `名称: 长描述\n描述: ${'做了很多事，'.repeat(120)}\n\n## 实际完成\n第一次的正文`
     const { fetchImpl, bodies } = scriptedFetch([longDesc, '描述: 改了 a.ts，测试 3 条过'])
-    const session = await getSession(dir, { globalPath, env: { TEST_KEY: 'k' }, tools: [], fetchImpl, skipLock: true })
+    const session = await getSession(dir, {
+      globalPath,
+      env: { TEST_KEY: 'k' },
+      tools: [],
+      fetchImpl,
+      skipLock: true,
+    })
     for (let i = 0; i < 3; i++) await session.summarizeIdle()
     await session.close()
 

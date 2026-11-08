@@ -1,10 +1,17 @@
-import { mkdtemp, readFile, readdir } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, test, vi } from 'vitest'
-import { checkOutPath, imagegenMain, outputFormat, parseImagegenArgs, placeImage, sniffFormat } from '../src/imagegen-bin.ts'
+import {
+  checkOutPath,
+  imagegenMain,
+  outputFormat,
+  parseImagegenArgs,
+  placeImage,
+  sniffFormat,
+} from '../src/imagegen-bin.ts'
 
 const servers: Server[] = []
 afterEach(async () => {
@@ -14,8 +21,13 @@ afterEach(async () => {
 
 describe('parseImagegenArgs', () => {
   test('指令+路径，flag 可在任意位置，n 默认 1', () => {
-    expect(parseImagegenArgs(['猫', 'a.png'])).toEqual({ ok: true, args: { prompt: '猫', out: 'a.png', n: 1 } })
-    expect(parseImagegenArgs(['--size', '1024x1024', '猫', 'a.png', '--quality', 'high', '--n', '2'])).toEqual({
+    expect(parseImagegenArgs(['猫', 'a.png'])).toEqual({
+      ok: true,
+      args: { prompt: '猫', out: 'a.png', n: 1 },
+    })
+    expect(
+      parseImagegenArgs(['--size', '1024x1024', '猫', 'a.png', '--quality', 'high', '--n', '2']),
+    ).toEqual({
       ok: true,
       args: { prompt: '猫', out: 'a.png', n: 2, size: '1024x1024', quality: 'high' },
     })
@@ -41,7 +53,10 @@ test('outputFormat：按扩展名，大小写不敏感', () => {
 test('checkOutPath：只许项目内、非隐藏目录，.simple-code/tmp 例外', () => {
   const root = '/proj'
   expect(checkOutPath(root, 'docs/a.png')).toEqual({ ok: true, abs: '/proj/docs/a.png' })
-  expect(checkOutPath(root, '.simple-code/tmp/a.png')).toEqual({ ok: true, abs: '/proj/.simple-code/tmp/a.png' })
+  expect(checkOutPath(root, '.simple-code/tmp/a.png')).toEqual({
+    ok: true,
+    abs: '/proj/.simple-code/tmp/a.png',
+  })
   expect(checkOutPath(root, '../x/a.png').ok).toBe(false)
   expect(checkOutPath(root, '/etc/a.png').ok).toBe(false)
   expect(checkOutPath(root, '.git/a.png').ok).toBe(false)
@@ -66,7 +81,10 @@ describe('placeImage', () => {
 })
 
 /** 假代理：记下请求，按 handler 回 */
-async function fakeProxy(handler: (body: Record<string, unknown>) => [number, string]): Promise<{ env: NodeJS.ProcessEnv; seen: Array<{ token: unknown; body: Record<string, unknown> }> }> {
+async function fakeProxy(handler: (body: Record<string, unknown>) => [number, string]): Promise<{
+  env: NodeJS.ProcessEnv
+  seen: Array<{ token: unknown; body: Record<string, unknown> }>
+}> {
   const seen: Array<{ token: unknown; body: Record<string, unknown> }> = []
   const server = createServer((req, res) => {
     let raw = ''
@@ -87,17 +105,30 @@ async function fakeProxy(handler: (body: Record<string, unknown>) => [number, st
 function capture(): { out: () => string; err: () => string } {
   const out = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
   const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
-  return { out: () => out.mock.calls.map((c) => String(c[0])).join(''), err: () => err.mock.calls.map((c) => String(c[0])).join('') }
+  return {
+    out: () => out.mock.calls.map((c) => String(c[0])).join(''),
+    err: () => err.mock.calls.map((c) => String(c[0])).join(''),
+  }
 }
 
 describe('imagegenMain', () => {
   test('请求体与落盘：不带 model（代理钉），output_format 由扩展名定，stdout 一行', async () => {
     const root = await mkdtemp(join(tmpdir(), 'imagegen-'))
     const png = Buffer.from('fake-png')
-    const { env, seen } = await fakeProxy(() => [200, JSON.stringify({ data: [{ b64_json: png.toString('base64') }], size: '1024x1024', output_format: 'png' })])
+    const { env, seen } = await fakeProxy(() => [
+      200,
+      JSON.stringify({
+        data: [{ b64_json: png.toString('base64') }],
+        size: '1024x1024',
+        output_format: 'png',
+      }),
+    ])
     const io = capture()
     expect(await imagegenMain(['橘猫', 'img/cat.png', '--size', '1024x1024'], env, root)).toBe(0)
-    expect(seen[0]).toEqual({ token: 'tok', body: { prompt: '橘猫', n: 1, output_format: 'png', size: '1024x1024' } })
+    expect(seen[0]).toEqual({
+      token: 'tok',
+      body: { prompt: '橘猫', n: 1, output_format: 'png', size: '1024x1024' },
+    })
     expect(await readFile(join(root, 'img/cat.png'))).toEqual(png)
     expect(io.out()).toMatch(/^已生成 img\/cat\.png（1024x1024，png，1KB，用时 \d+s）\n$/)
     expect(io.out()).not.toContain(png.toString('base64'))
@@ -106,18 +137,31 @@ describe('imagegenMain', () => {
   test('网关回的格式与扩展名不符：按实际格式改扩展名再存，输出写明', async () => {
     const root = await mkdtemp(join(tmpdir(), 'imagegen-'))
     const png = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('rest')])
-    const { env, seen } = await fakeProxy(() => [200, JSON.stringify({ data: [{ b64_json: png.toString('base64') }], output_format: 'png' })])
+    const { env, seen } = await fakeProxy(() => [
+      200,
+      JSON.stringify({ data: [{ b64_json: png.toString('base64') }], output_format: 'png' }),
+    ])
     const io = capture()
     expect(await imagegenMain(['图标', 'img/logo.jpg'], env, root)).toBe(0)
     expect(seen[0]?.body.output_format).toBe('jpeg')
     expect(await readdir(join(root, 'img'))).toEqual(['logo.png'])
-    expect(io.out()).toMatch(/^请求 jpeg，网关返回 png，改存 img\/logo\.png；已生成 img\/logo\.png（/)
+    expect(io.out()).toMatch(
+      /^请求 jpeg，网关返回 png，改存 img\/logo\.png；已生成 img\/logo\.png（/,
+    )
   })
 
   test('sniffFormat：按文件头认 png/jpeg/webp，认不出返回 undefined', () => {
     expect(sniffFormat(Buffer.from('89504e470d0a1a0a00', 'hex'))).toBe('png')
     expect(sniffFormat(Buffer.from('ffd8ffe000', 'hex'))).toBe('jpeg')
-    expect(sniffFormat(Buffer.concat([Buffer.from('RIFF'), Buffer.from('00000000', 'hex'), Buffer.from('WEBPVP8 ')]))).toBe('webp')
+    expect(
+      sniffFormat(
+        Buffer.concat([
+          Buffer.from('RIFF'),
+          Buffer.from('00000000', 'hex'),
+          Buffer.from('WEBPVP8 '),
+        ]),
+      ),
+    ).toBe('webp')
     expect(sniffFormat(Buffer.from('fake-png'))).toBeUndefined()
   })
 
@@ -143,7 +187,9 @@ describe('imagegenMain', () => {
 
   test('上游报错 → 1，错误原文回 stderr；响应无图 → 1', async () => {
     const root = await mkdtemp(join(tmpdir(), 'imagegen-'))
-    const { env } = await fakeProxy((b) => (b.size === 'bad' ? [400, '{"error":{"message":"invalid size"}}'] : [200, '{"data":[]}']))
+    const { env } = await fakeProxy((b) =>
+      b.size === 'bad' ? [400, '{"error":{"message":"invalid size"}}'] : [200, '{"data":[]}'],
+    )
     const io = capture()
     expect(await imagegenMain(['猫', 'a.png', '--size', 'bad'], env, root)).toBe(1)
     expect(io.err()).toContain('HTTP 400')

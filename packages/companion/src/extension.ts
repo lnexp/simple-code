@@ -13,9 +13,9 @@
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import * as vscode from 'vscode'
 import { LLM_PROXY_PORT } from '@simple-code/core/src/remote.ts'
-import { SETTINGS_PATH, createProxyServer } from './proxy.ts'
+import * as vscode from 'vscode'
+import { createProxyServer, SETTINGS_PATH } from './proxy.ts'
 import { appendForwardBlock, forwardLine, hasForwardForHost, sshConfigPath } from './ssh-config.ts'
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -27,7 +27,10 @@ export function activate(context: vscode.ExtensionContext): void {
     try {
       const dir = join(homedir(), '.simple-code', 'logs')
       mkdirSync(dir, { recursive: true })
-      appendFileSync(join(dir, 'llm-proxy.jsonl'), JSON.stringify({ t: new Date().toISOString(), ...obj }) + '\n')
+      appendFileSync(
+        join(dir, 'llm-proxy.jsonl'),
+        JSON.stringify({ t: new Date().toISOString(), ...obj }) + '\n',
+      )
     } catch {
       /* 日志失败不拦请求 */
     }
@@ -45,12 +48,11 @@ export function activate(context: vscode.ExtensionContext): void {
     else output.appendLine(`代理出错: ${e.message}`)
   })
   server.listen(LLM_PROXY_PORT, '127.0.0.1', () => {
-    output.appendLine(`伴生代理 listening 127.0.0.1:${LLM_PROXY_PORT}（${SETTINGS_PATH} + /sc-p/<provider>/… 转发）`)
+    output.appendLine(
+      `伴生代理 listening 127.0.0.1:${LLM_PROXY_PORT}（${SETTINGS_PATH} + /sc-p/<provider>/… 转发）`,
+    )
   })
-  context.subscriptions.push(
-    { dispose: () => server.close() },
-    output,
-  )
+  context.subscriptions.push({ dispose: () => server.close() }, output)
   void offerForward(context, output)
 }
 
@@ -67,7 +69,10 @@ export function activate(context: vscode.ExtensionContext): void {
  * 的代价：没装 SC 的远端也会弹一次——每台主机一次、可「不再提示这台」
  * 关掉，装伴生的本就是 SC 用户，可接受（方案 A，2026-09-26 拍板）。
  */
-async function offerForward(context: vscode.ExtensionContext, output: vscode.OutputChannel): Promise<void> {
+async function offerForward(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
+): Promise<void> {
   if (vscode.env.remoteName !== 'ssh-remote') {
     output.appendLine(`[ssh] 非远端窗口（remoteName=${vscode.env.remoteName ?? '本机'}），不弹`)
     return
@@ -86,7 +91,11 @@ async function offerForward(context: vscode.ExtensionContext, output: vscode.Out
 }
 
 /** 条件齐了，查 ssh config 决定弹不弹 */
-async function offer(context: vscode.ExtensionContext, output: vscode.OutputChannel, host: string): Promise<void> {
+async function offer(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
+  host: string,
+): Promise<void> {
   let text = ''
   try {
     text = readFileSync(sshConfigPath(), 'utf8')

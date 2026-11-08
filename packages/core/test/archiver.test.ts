@@ -1,10 +1,10 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
-import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { loadConfig } from '../src/config/load.ts'
 import { runEventArchive } from '../src/loop/archiver.ts'
 import { queueEventArchive } from '../src/session/session.ts'
-import { loadConfig } from '../src/config/load.ts'
 import { appendProgress, createEvent } from '../src/tools/events.ts'
 
 let root: string
@@ -75,7 +75,12 @@ function fakeFetch(reply: string): typeof fetch {
 
 describe('runEventArchive（单次归类 + 原子落盘）', () => {
   it('match 已有事件 → 追加一行进展，正文不动', async () => {
-    createEvent(root, { name: 'events-mechanism', description: '事件机制', firstProgress: '落地', stepRange: '1–2' })
+    createEvent(root, {
+      name: 'events-mechanism',
+      description: '事件机制',
+      firstProgress: '落地',
+      stepRange: '1–2',
+    })
     const before = readFileSync(join(root, '.simple-code/events/events-mechanism.md'), 'utf8')
     const out = await runEventArchive({
       root,
@@ -99,7 +104,9 @@ describe('runEventArchive（单次归类 + 原子落盘）', () => {
       root,
       summary: SUMMARY,
       config: await loaded(),
-      fetchImpl: fakeFetch('{"match": "events-mechanism", "progress": "战役演进", "description": "事件机制 v3"}'),
+      fetchImpl: fakeFetch(
+        '{"match": "events-mechanism", "progress": "战役演进", "description": "事件机制 v3"}',
+      ),
     })
     const text = readFileSync(join(root, '.simple-code/events/events-mechanism.md'), 'utf8')
     expect(text).toContain('description: 事件机制 v3')
@@ -108,12 +115,18 @@ describe('runEventArchive（单次归类 + 原子落盘）', () => {
   })
 
   it('match 带 rename → 先改名再追加：进展落在新名档案（2026-09-17 拍板）', async () => {
-    createEvent(root, { name: 'classifier-keywords-lock', description: 'keywords 锁定', firstProgress: '发现锁定问题' })
+    createEvent(root, {
+      name: 'classifier-keywords-lock',
+      description: 'keywords 锁定',
+      firstProgress: '发现锁定问题',
+    })
     const out = await runEventArchive({
       root,
       summary: SUMMARY,
       config: await loaded(),
-      fetchImpl: fakeFetch('{"match": "classifier-keywords-lock", "progress": "keywords 全部删除", "rename": "keywords-removed"}'),
+      fetchImpl: fakeFetch(
+        '{"match": "classifier-keywords-lock", "progress": "keywords 全部删除", "rename": "keywords-removed"}',
+      ),
     })
     expect(out.action).toBe('append')
     expect(existsSync(join(root, '.simple-code/events/classifier-keywords-lock.md'))).toBe(false)
@@ -135,7 +148,9 @@ describe('runEventArchive（单次归类 + 原子落盘）', () => {
     expect(out.action).toBe('append')
     const text = readFileSync(join(root, '.simple-code/events/a-campaign.md'), 'utf8')
     expect(text).toContain('推进')
-    expect(readFileSync(join(root, '.simple-code/events/b-campaign.md'), 'utf8')).not.toContain('推进')
+    expect(readFileSync(join(root, '.simple-code/events/b-campaign.md'), 'utf8')).not.toContain(
+      '推进',
+    )
   })
 
   it('match=null 且给全 name/description → 新建档案（首行带 step）', async () => {
@@ -143,7 +158,9 @@ describe('runEventArchive（单次归类 + 原子落盘）', () => {
       root,
       summary: SUMMARY,
       config: await loaded(),
-      fetchImpl: fakeFetch('{"match": null, "progress": "CLI 形态定案", "name": "sc-cli-form", "description": "sc 命令形态战役"}'),
+      fetchImpl: fakeFetch(
+        '{"match": null, "progress": "CLI 形态定案", "name": "sc-cli-form", "description": "sc 命令形态战役"}',
+      ),
     })
     expect(out.action).toBe('create')
     const text = readFileSync(join(root, '.simple-code/events/sc-cli-form.md'), 'utf8')
@@ -214,7 +231,9 @@ describe('runEventArchive（单次归类 + 原子落盘）', () => {
       root,
       summary: SUMMARY,
       config: await loaded(),
-      fetchImpl: fakeFetch('{"match": null, "progress": "再来一条", "name": "dup-event", "description": "d"}'),
+      fetchImpl: fakeFetch(
+        '{"match": null, "progress": "再来一条", "name": "dup-event", "description": "d"}',
+      ),
     })
     expect(out.action).toBe('append-existing')
     const text = readFileSync(join(root, '.simple-code/events/dup-event.md'), 'utf8')
@@ -247,7 +266,12 @@ describe('queueEventArchive（失败重排一次）', () => {
   }
 
   it('第一次调用失败 → 排回队尾重试，第二次成功照常落盘', async () => {
-    createEvent(root, { name: 'events-mechanism', description: '事件机制', firstProgress: '落地', stepRange: '1–2' })
+    createEvent(root, {
+      name: 'events-mechanism',
+      description: '事件机制',
+      firstProgress: '落地',
+      stepRange: '1–2',
+    })
     let calls = 0
     const ok = fakeFetch('{"match": "events-mechanism", "progress": "重试后归上"}')
     const flaky = (async (...args: Parameters<typeof fetch>) => {
@@ -293,7 +317,14 @@ describe('archiver 的副模型观测', () => {
       spy.mockRestore()
     }
     expect(calls.filter((c) => c.ev === 'llm_usage')).toMatchObject([
-      { tag: 'archiver', folder: root, input: 5, output: 4, cacheRead: expect.any(Number), cacheWrite: expect.any(Number) },
+      {
+        tag: 'archiver',
+        folder: root,
+        input: 5,
+        output: 4,
+        cacheRead: expect.any(Number),
+        cacheWrite: expect.any(Number),
+      },
     ])
     expect(calls.find((c) => c.ev === 'llm_req')).toMatchObject({ tag: 'archiver', folder: root })
   })

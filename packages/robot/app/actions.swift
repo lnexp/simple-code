@@ -1,5 +1,9 @@
 // 卡片内容、按钮动作、右键/菜单栏菜单（desktop-robot.md §5.2–§5.5）
 import Cocoa
+import ApplicationServices
+
+/// 辅助功能授权提示只弹一次
+private var axPrompted = false
 
 final class FocusTarget: NSObject {
   let fd: Int32, folder: String?, task: String?
@@ -76,26 +80,76 @@ extension AppDelegate {
     return nil
   }
 
-  /// 跳转（§5.5）：先用该窗口自己的应用打开它自己的身份路径（VS Code 找到已开的窗口就聚焦它，
-  /// 不新开），再沿同一条连接让 SC 展开面板、切目录、选任务
+  /// 跳转（§5.5）：先让窗口到前台，再沿同一条连接让 SC 展开面板、切目录、选任务。
+  /// VS Code：open 它自己的身份路径，VS Code 找到已开的窗口就聚焦它，不新开。
+  /// 其他宿主（Cursor 等）：3.27 起 open 文件夹会被发给一个新的 agent window
+  /// （2026-11-02 官方论坛确认 known behavior），改用 AX 按窗口标题提窗，
+  /// 完全不经过 open；提不了（无授权/找不到窗口）就只到激活应用为止
   func focus(_ c: Conn, _ folder: String?, _ task: String?) {
     let ws = NSWorkspace.shared
     let app = c.appPath.map { URL(fileURLWithPath: $0) } ?? ws.urlForApplication(withBundleIdentifier: vscodeID)
     if let app {
       let oc = NSWorkspace.OpenConfiguration()
       oc.activates = true
-      if let p = c.windowPath {
-        ws.open([URL(fileURLWithPath: p)], withApplicationAt: app, configuration: oc) { _, err in
-          if let err { log("open \(p) failed: \(err.localizedDescription)") }
+      if (Bundle(url: app)?.bundleIdentifier ?? vscodeID).hasPrefix("com.microsoft.VSCode") {
+        if let p = c.windowPath {
+          ws.open([URL(fileURLWithPath: p)], withApplicationAt: app, configuration: oc) { _, err in
+            if let err { log("open \(p) failed: \(err.localizedDescription)") }
+          }
+        } else {
+          ws.openApplication(at: app, configuration: oc) { _, err in
+            if let err { log("activate app failed: \(err.localizedDescription)") }
+          }
         }
       } else {
-        ws.openApplication(at: app, configuration: oc) { _, err in
-          if let err { log("activate app failed: \(err.localizedDescription)") }
-        }
+        raiseWindow(app, oc, c.windowName)
       }
     }
     c.send(["type": "focus", "folder": folder ?? NSNull(), "task": task ?? NSNull()])
     log("focus pid=\(c.pid) folder=\(baseName(folder)) task=\(task ?? "主任务")")
+  }
+
+  /// AX 提窗：激活应用后按标题找出连接对应的编辑器窗口（形如「文件 — 目录」「目录 — App」），
+  /// 还原最小化、AXRaise、设为 main。只激活不 open 路径——那会被 Cursor 开成 agent window
+  private func raiseWindow(_ app: URL, _ oc: NSWorkspace.OpenConfiguration, _ windowName: String) {
+    guard let bundleId = Bundle(url: app)?.bundleIdentifier,
+          let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first else {
+      log("raise: \(app.lastPathComponent) 没在跑")
+      return
+    }
+    if !AXIsProcessTrusted() && !axPrompted {
+      axPrompted = true   // 只提示一次，别每次点击都弹系统设置
+      let o = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+      _ = AXIsProcessTrustedWithOptions(o)
+    }
+    NSWorkspace.shared.openApplication(at: app, configuration: oc) { _, err in
+      if let err { log("raise: activate failed \(err.localizedDescription)") }
+      Thread.sleep(forTimeInterval: 0.15)   // 等应用到前台，避免提窗和激活竞争
+      let axApp = AXUIElementCreateApplication(running.processIdentifier)
+      var winsRef: CFTypeRef?
+      guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &winsRef) == .success,
+            let wins = winsRef as? [AXUIElement] else { return log("raise: 拿不到窗口（缺辅助功能授权？）") }
+      var hit: AXUIElement?
+      for w in wins {
+        var sub: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(w, kAXSubroleAttribute as CFString, &sub) == .success,
+              (sub as? String) == "AXStandardWindow" else { continue }
+        var t: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(w, kAXTitleAttribute as CFString, &t) == .success,
+              let title = t as? String, !title.isEmpty else { continue }
+        if title == windowName { hit = w; break }
+        if hit == nil && title.contains(windowName) { hit = w }
+      }
+      guard let win = hit else { return log("raise: 没有标题含「\(windowName)」的窗口") }
+      var mini: CFTypeRef?
+      if AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute as CFString, &mini) == .success,
+         (mini as? Bool) == true {
+        AXUIElementSetAttributeValue(win, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+      }
+      AXUIElementPerformAction(win, "AXRaise" as CFString)
+      AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
+      log("raise: 「\(windowName)」已提到前台")
+    }
   }
 
   func robotClicked() {

@@ -12,16 +12,28 @@
  * 文件不存在 = 匿名层；不整份 loadConfig（那会挡住没配置过的环境）。
  */
 import { WEBSEARCH_CONFIG_PATH } from '@simple-code/core/src/config/load.ts'
-import { PROXY_PORT_ENV, PROXY_TOKEN_ENV, PROXY_TOKEN_HEADER } from '@simple-code/core/src/proxy/endpoint.ts'
+import {
+  PROXY_PORT_ENV,
+  PROXY_TOKEN_ENV,
+  PROXY_TOKEN_HEADER,
+} from '@simple-code/core/src/proxy/endpoint.ts'
 import { WEBSEARCH_ROUTE } from '@simple-code/core/src/proxy/websearch-route.ts'
-import { createWebsearchTool, readWebsearchConfig, type WebsearchConfig } from '@simple-code/core/src/tools/websearch.ts'
+import {
+  createWebsearchTool,
+  readWebsearchConfig,
+  type WebsearchConfig,
+} from '@simple-code/core/src/tools/websearch.ts'
 
 /** 配置错（坏 JSON、`${VAR}` 没设）返回一行文案而不是抛——顶层 await 抛出去
  * node 会打整段堆栈，用户在终端直接敲时看到的是源码行和 \u 转义 */
 async function websearchConfig(): Promise<WebsearchConfig | string> {
   const port = process.env[PROXY_PORT_ENV]
   const token = process.env[PROXY_TOKEN_ENV]
-  if (port && token) return { url: `http://127.0.0.1:${port}${WEBSEARCH_ROUTE}`, headers: { [PROXY_TOKEN_HEADER]: token } }
+  if (port && token)
+    return {
+      url: `http://127.0.0.1:${port}${WEBSEARCH_ROUTE}`,
+      headers: { [PROXY_TOKEN_HEADER]: token },
+    }
   try {
     return await readWebsearchConfig(WEBSEARCH_CONFIG_PATH)
   } catch (e) {

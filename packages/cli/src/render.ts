@@ -1,6 +1,6 @@
-import { type AgentEvent } from '@simple-code/core'
-import { makePaint, type Paint } from './colors.ts'
+import type { AgentEvent } from '@simple-code/core'
 import { highlightAnsi } from './ansi-highlight.ts'
+import { makePaint, type Paint } from './colors.ts'
 import { isTableRow, renderInline, renderTable } from './markdown.ts'
 
 /**
@@ -173,7 +173,9 @@ export function createRenderer(
         return sink.err('\n')
 
       case 'tool_call':
-        return sink.out(`\n${outPaint.cyan('$')} ${describe(agentEv.name, agentEv.input, outPaint)}\n`)
+        return sink.out(
+          `\n${outPaint.cyan('$')} ${describe(agentEv.name, agentEv.input, outPaint)}\n`,
+        )
       case 'tool_result':
         return sink.out(outPaint.dim(resultText(agentEv.output, agentEv.exitCode)))
       case 'tool_error':
@@ -184,7 +186,9 @@ export function createRenderer(
       case 'truncated':
         // 跟 restart 相反：上面已经打出去的内容是有效的，后面接着往下写。
         // 不提示的话用户看到的是一段莫名其妙断开又续上的文字
-        return sink.err(`\n${errPaint.yellow(`（输出被长度上限截断，正在续写 ${agentEv.attempt}/${agentEv.limit}）`)}\n`)
+        return sink.err(
+          `\n${errPaint.yellow(`（输出被长度上限截断，正在续写 ${agentEv.attempt}/${agentEv.limit}）`)}\n`,
+        )
       case 'unloaded': {
         // 必须告诉用户。不说的话他翻上去看到自己的消息变成了半截，
         // 像是数据被弄坏了——而实际上原文还在，只是不占上下文了。
@@ -273,7 +277,8 @@ function describe(name: string, input: unknown, paint: Paint): string {
   // description：glm 照官方 Bash 工具的参数名写，同 bash.ts hasDesc
   const { desc: d, description, command } = (input ?? {}) as Record<string, unknown>
   const desc = typeof d === 'string' && d !== '' ? d : description
-  const label = typeof desc === 'string' && desc !== '' ? `${paint.cyan(desc)} ${paint.dim('·')} ` : ''
+  const label =
+    typeof desc === 'string' && desc !== '' ? `${paint.cyan(desc)} ${paint.dim('·')} ` : ''
   return `${label}${typeof command === 'string' ? command : `${name} ${JSON.stringify(input)}`}`
 }
 
@@ -289,7 +294,8 @@ function resultText(output: string, exitCode: number): string {
 
 /** token/耗时 → 人话。与插件页脚（webview/events.ts fmtMs/fmtTok）同格式：
  * 850 / 1k / 45.2k；0ms / 1.2s */
-const fmtMs = (ms: number): string => (ms < 1000 ? `${ms}ms` : `${parseFloat((ms / 1000).toFixed(1))}s`)
+const fmtMs = (ms: number): string =>
+  ms < 1000 ? `${ms}ms` : `${parseFloat((ms / 1000).toFixed(1))}s`
 const fmtTok = (n: number): string => (n < 1000 ? `${n}` : `${parseFloat((n / 1000).toFixed(1))}k`)
 
 function assertNever(value: never): never {

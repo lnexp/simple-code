@@ -54,5 +54,14 @@ it('NOTE 真进程统一四类型 list/search，新写入分类目录且撞名�
     'status: candidate',
   )
   expect(run(root, ['write', '--type', 'principle'], input).status).toBe(1)
+  // --- 可省（2026-11-06）：markdown 头部块习惯，字段行后直接正文
+  const noSep =
+    'name: nosep\ntitle: 无分隔\ndescription: 单行描述\n\n## 症状\n正文从空行后开始\n## 当时怎么误判的\n想当然\n## 根因\n习惯\n## 修法\n改了\n## 怎么验证的\n测了\n'
+  const r = run(root, ['write', '--type', 'lesson'], noSep)
+  expect(r.status, r.stderr).toBe(0)
+  const written = readFileSync(join(root, '.simple-code/notes/lesson/nosep.md'), 'utf8')
+  expect(written).toContain('## 症状')
+  expect(written).not.toMatch(/^\n/) // 开头空行剥掉
+  expect(run(root, ['list', '--type', 'lesson']).stdout).toContain('nosep')
   expect(run(root, ['list', '--type', 'principle']).stdout).not.toContain('[lesson]')
 })

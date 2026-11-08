@@ -13,16 +13,34 @@
 import { createHash } from 'node:crypto'
 import { access, mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { PROXY_PORT_ENV, PROXY_TOKEN_ENV, PROXY_TOKEN_HEADER } from '@simple-code/core/src/proxy/endpoint.ts'
+import {
+  PROXY_PORT_ENV,
+  PROXY_TOKEN_ENV,
+  PROXY_TOKEN_HEADER,
+} from '@simple-code/core/src/proxy/endpoint.ts'
 
-const USAGE = '用法：imagegen "<指令>" <输出路径(.png/.jpg/.jpeg/.webp)> [--size WxH] [--quality <档位>] [--n 张数，默认 1]'
+const USAGE =
+  '用法：imagegen "<指令>" <输出路径(.png/.jpg/.jpeg/.webp)> [--size WxH] [--quality <档位>] [--n 张数，默认 1]'
 /** 生成常需 30–120 秒，高档位更久 */
 const TIMEOUT_MS = 300_000
-const FORMATS: Record<string, string> = { '.png': 'png', '.jpg': 'jpeg', '.jpeg': 'jpeg', '.webp': 'webp' }
+const FORMATS: Record<string, string> = {
+  '.png': 'png',
+  '.jpg': 'jpeg',
+  '.jpeg': 'jpeg',
+  '.webp': 'webp',
+}
 
-export type ImagegenArgs = { prompt: string; out: string; size?: string; quality?: string; n: number }
+export type ImagegenArgs = {
+  prompt: string
+  out: string
+  size?: string
+  quality?: string
+  n: number
+}
 
-export function parseImagegenArgs(argv: string[]): { ok: true; args: ImagegenArgs } | { ok: false; error: string } {
+export function parseImagegenArgs(
+  argv: string[],
+): { ok: true; args: ImagegenArgs } | { ok: false; error: string } {
   const positional: string[] = []
   const flags: Record<string, string> = {}
   for (let i = 0; i < argv.length; i++) {
@@ -41,7 +59,13 @@ export function parseImagegenArgs(argv: string[]): { ok: true; args: ImagegenArg
   if (!Number.isInteger(n) || n < 1) return { ok: false, error: `--n 须为正整数：${flags.n}` }
   return {
     ok: true,
-    args: { prompt, out, n, ...(flags.size ? { size: flags.size } : {}), ...(flags.quality ? { quality: flags.quality } : {}) },
+    args: {
+      prompt,
+      out,
+      n,
+      ...(flags.size ? { size: flags.size } : {}),
+      ...(flags.quality ? { quality: flags.quality } : {}),
+    },
   }
 }
 
@@ -54,7 +78,11 @@ export function outputFormat(path: string): string | undefined {
 export function sniffFormat(bytes: Buffer): string | undefined {
   if (bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) return 'png'
   if (bytes.subarray(0, 3).equals(Buffer.from('ffd8ff', 'hex'))) return 'jpeg'
-  if (bytes.subarray(0, 4).toString('latin1') === 'RIFF' && bytes.subarray(8, 12).toString('latin1') === 'WEBP') return 'webp'
+  if (
+    bytes.subarray(0, 4).toString('latin1') === 'RIFF' &&
+    bytes.subarray(8, 12).toString('latin1') === 'WEBP'
+  )
+    return 'webp'
   return undefined
 }
 
@@ -65,10 +93,14 @@ const EXT_OF: Record<string, string> = { png: '.png', jpeg: '.jpg', webp: '.webp
  * `.simple-code/tmp` 例外（用户定）。审批只看命令文本、认不出 bin 参数是
  * 写路径，所以 bin 自己守。返回绝对路径或错误
  */
-export function checkOutPath(root: string, out: string): { ok: true; abs: string } | { ok: false; error: string } {
+export function checkOutPath(
+  root: string,
+  out: string,
+): { ok: true; abs: string } | { ok: false; error: string } {
   const abs = resolve(root, out)
   const rel = relative(root, abs)
-  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return { ok: false, error: `输出路径须在项目目录内：${out}` }
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel))
+    return { ok: false, error: `输出路径须在项目目录内：${out}` }
   const parts = rel.split(sep)
   const inScTmp = parts[0] === '.simple-code' && parts[1] === 'tmp'
   if (!inScTmp && parts.some((p) => p.startsWith('.'))) {
@@ -77,7 +109,11 @@ export function checkOutPath(root: string, out: string): { ok: true; abs: string
   return { ok: true, abs }
 }
 
-const exists = (p: string): Promise<boolean> => access(p).then(() => true, () => false)
+const exists = (p: string): Promise<boolean> =>
+  access(p).then(
+    () => true,
+    () => false,
+  )
 
 export type Placed = { path: string; taken: boolean; same: boolean }
 
@@ -100,7 +136,9 @@ export async function placeImage(abs: string, bytes: Buffer): Promise<Placed> {
 }
 
 function humanSize(bytes: number): string {
-  return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)}MB` : `${Math.max(1, Math.round(bytes / 1024))}KB`
+  return bytes >= 1024 * 1024
+    ? `${(bytes / 1024 / 1024).toFixed(1)}MB`
+    : `${Math.max(1, Math.round(bytes / 1024))}KB`
 }
 
 /** 一张图一行。路径按相对当前目录显示 */
@@ -113,10 +151,17 @@ export function describePlaced(p: Placed, wanted: string, meta: string, root: st
 
 type ImagesResponse = { data?: Array<{ b64_json?: string }>; size?: string; output_format?: string }
 
-async function requestImages(args: ImagegenArgs, format: string, env: NodeJS.ProcessEnv): Promise<Response> {
+async function requestImages(
+  args: ImagegenArgs,
+  format: string,
+  env: NodeJS.ProcessEnv,
+): Promise<Response> {
   return fetch(`http://127.0.0.1:${env[PROXY_PORT_ENV]}/image/generations`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', [PROXY_TOKEN_HEADER]: env[PROXY_TOKEN_ENV] ?? '' },
+    headers: {
+      'content-type': 'application/json',
+      [PROXY_TOKEN_HEADER]: env[PROXY_TOKEN_ENV] ?? '',
+    },
     body: JSON.stringify({
       prompt: args.prompt,
       n: args.n,
@@ -133,18 +178,34 @@ function summarize(text: string): string {
   return text.replace(/"b64_json"\s*:\s*"[^"]*"/g, '"b64_json":"…"').slice(0, 800)
 }
 
-async function saveAll(body: ImagesResponse, args: ImagegenArgs, abs: string, ctx: { root: string; started: number }): Promise<string[]> {
-  const images = (body.data ?? []).map((d) => d.b64_json).filter((b): b is string => typeof b === 'string' && b !== '')
+async function saveAll(
+  body: ImagesResponse,
+  args: ImagegenArgs,
+  abs: string,
+  ctx: { root: string; started: number },
+): Promise<string[]> {
+  const images = (body.data ?? [])
+    .map((d) => d.b64_json)
+    .filter((b): b is string => typeof b === 'string' && b !== '')
   const lines: string[] = []
   for (const b64 of images) {
     const bytes = Buffer.from(b64, 'base64')
     // 实际格式与扩展名不符 → 换成实际格式的扩展名再存（用户定），行首写明；认不出照原路径
     const actual = sniffFormat(bytes)
     const wantedFormat = outputFormat(abs)
-    const target = actual && actual !== wantedFormat ? abs.slice(0, -extname(abs).length) + EXT_OF[actual] : abs
-    const note = target === abs ? '' : `请求 ${wantedFormat}，网关返回 ${actual}，改存 ${relative(ctx.root, target)}；`
+    const target =
+      actual && actual !== wantedFormat ? abs.slice(0, -extname(abs).length) + EXT_OF[actual] : abs
+    const note =
+      target === abs
+        ? ''
+        : `请求 ${wantedFormat}，网关返回 ${actual}，改存 ${relative(ctx.root, target)}；`
     const placed = await placeImage(target, bytes)
-    const meta = [body.size ?? args.size, body.output_format, humanSize(bytes.length), `用时 ${Math.round((Date.now() - ctx.started) / 1000)}s`]
+    const meta = [
+      body.size ?? args.size,
+      body.output_format,
+      humanSize(bytes.length),
+      `用时 ${Math.round((Date.now() - ctx.started) / 1000)}s`,
+    ]
       .filter(Boolean)
       .join('，')
     lines.push(note + describePlaced(placed, relative(ctx.root, target), meta, ctx.root))
@@ -152,7 +213,11 @@ async function saveAll(body: ImagesResponse, args: ImagegenArgs, abs: string, ct
   return lines
 }
 
-export async function imagegenMain(argv: string[], env: NodeJS.ProcessEnv = process.env, root = process.cwd()): Promise<number> {
+export async function imagegenMain(
+  argv: string[],
+  env: NodeJS.ProcessEnv = process.env,
+  root = process.cwd(),
+): Promise<number> {
   const parsed = parseImagegenArgs(argv)
   if (!parsed.ok) return fail(parsed.error, 3)
   const { args } = parsed
@@ -161,7 +226,10 @@ export async function imagegenMain(argv: string[], env: NodeJS.ProcessEnv = proc
   const target = checkOutPath(root, args.out)
   if (!target.ok) return fail(target.error, 3)
   if (!env[PROXY_PORT_ENV] || !env[PROXY_TOKEN_ENV]) {
-    return fail('无凭据代理：生图须在 SC 里用（VS Code 面板或终端 sc；SIMPLE_CODE_PROXY_PORT 未设置）', 2)
+    return fail(
+      '无凭据代理：生图须在 SC 里用（VS Code 面板或终端 sc；SIMPLE_CODE_PROXY_PORT 未设置）',
+      2,
+    )
   }
   const started = Date.now()
   let res: Response
@@ -169,8 +237,12 @@ export async function imagegenMain(argv: string[], env: NodeJS.ProcessEnv = proc
     res = await requestImages(args, format, env)
   } catch (e) {
     // 超时是上游慢（生成中），不是代理不在——分开报，退出码也分开
-    if (e instanceof Error && e.name === 'TimeoutError') return fail(`生图超时（${TIMEOUT_MS / 1000}s 未返回）`, 1)
-    return fail(`凭据代理不可达：${e instanceof Error ? e.message : String(e)}（宿主关闭或端口失效）`, 2)
+    if (e instanceof Error && e.name === 'TimeoutError')
+      return fail(`生图超时（${TIMEOUT_MS / 1000}s 未返回）`, 1)
+    return fail(
+      `凭据代理不可达：${e instanceof Error ? e.message : String(e)}（宿主关闭或端口失效）`,
+      2,
+    )
   }
   const text = await res.text()
   if (!res.ok) return fail(`生图失败（HTTP ${res.status}）：${summarize(text)}`, 1)
@@ -181,7 +253,8 @@ export async function imagegenMain(argv: string[], env: NodeJS.ProcessEnv = proc
     return fail(`响应不是 JSON：${summarize(text)}`, 1)
   }
   const lines = await saveAll(body, args, target.abs, { root, started })
-  if (lines.length === 0) return fail(`响应里没有图片（data[].b64_json 为空）：${summarize(text)}`, 1)
+  if (lines.length === 0)
+    return fail(`响应里没有图片（data[].b64_json 为空）：${summarize(text)}`, 1)
   process.stdout.write(`${lines.join('\n')}\n`)
   return 0
 }

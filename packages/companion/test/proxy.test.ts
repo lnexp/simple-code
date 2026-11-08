@@ -1,7 +1,12 @@
 import { once } from 'node:events'
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createProxyServer, remoteSettingsPayload, SETTINGS_PATH, type LocalSettings } from '../src/proxy.ts'
+import {
+  createProxyServer,
+  type LocalSettings,
+  remoteSettingsPayload,
+  SETTINGS_PATH,
+} from '../src/proxy.ts'
 
 const servers: import('node:http').Server[] = []
 afterEach(() => {
@@ -55,7 +60,12 @@ describe('本机代理（伴生扩展）', () => {
     const res = await fetch(`${base}${SETTINGS_PATH}`)
     expect(res.status).toBe(200)
     const payload = (await res.json()) as Record<string, any>
-    expect(Object.keys(payload).sort()).toEqual(['memory', 'model', 'provider', 'providers', 'request', 'visionModel'].sort().filter(k => k in payload || ['providers'].includes(k)).filter(k => k in payload))
+    expect(Object.keys(payload).sort()).toEqual(
+      ['memory', 'model', 'provider', 'providers', 'request', 'visionModel']
+        .sort()
+        .filter((k) => k in payload || ['providers'].includes(k))
+        .filter((k) => k in payload),
+    )
     expect(payload.mcp).toBeUndefined()
     expect(payload.bash).toBeUndefined()
     // baseUrl 指向实际监听口（localPort），apiKey 换假值
@@ -110,7 +120,10 @@ describe('本机代理（伴生扩展）', () => {
   })
 
   it('payload 纯函数：port 决定 baseUrl', () => {
-    const p = remoteSettingsPayload({ providers: { a: { baseUrl: 'https://real', apiKey: 'k' } } }, 15432)
+    const p = remoteSettingsPayload(
+      { providers: { a: { baseUrl: 'https://real', apiKey: 'k' } } },
+      15432,
+    )
     expect((p.providers as Record<string, any>).a.baseUrl).toBe('http://127.0.0.1:15432/sc-p/a')
   })
 })

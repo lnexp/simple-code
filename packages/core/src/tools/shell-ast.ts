@@ -29,11 +29,14 @@ type SyntaxNode = import('web-tree-sitter').Node
 
 /** 一个 token：text 是词面（引号留给 judge 的 unquote），write 标记
  * 重定向目标方向（> >> 2> 是写；< 是读）。redirect：重定向目标——
- * 不是命令参数，参数位豁免（echo/tr/nonPathFrom）罩不到它 */
-export type AstItem = { text: string; write: boolean; redirect?: true }
+ * 不是命令参数，参数位豁免（echo/tr/nonPathFrom）罩不到它。
+ * subst：text 是剥掉了 $( )/>( ) 替换后拼出的字面残片——真实落点要执行
+ * 才知道，judge 对它归「算不出」，不能把残片当绝对路径判
+ * （2026-11-05 真机：git rev-parse 的残片 /common/… 被当项目外弹卡） */
+export type AstItem = { text: string; write: boolean; redirect?: true; subst?: true }
 /** nested：命令在所处作用域里不只处在顺序结构中（还有管道、if/for 等）。
  * 顺序结构里的 cd 改变之后各段的当前目录，nested 的 cd 效果不确定
- * （hidden-path.ts 第 2 层据此判「算不出」）。
+ * （real-path.ts 据此判「算不出」）。
  * scopes：命令所在的作用域节点 id，外层在前——子 shell、$( )、<( )、后面
  * 跟 `&` 的语句各带一份当前目录，里面的 cd 出来就作废（classify 据此恢复）。
  * assigns：上一段之后、本段之前按源码顺序出现的独立赋值（`W=x`、
@@ -41,7 +44,6 @@ export type AstItem = { text: string; write: boolean; redirect?: true }
 export type AstSegment = {
   lead: string
   items: AstItem[]
-  unparseable?: string
   nested?: true
   scopes?: number[]
   assigns?: AstAssign[]
@@ -49,7 +51,7 @@ export type AstSegment = {
 /** definite：这个变量的每一处赋值都在最外层作用域的顺序结构里——执行到
  * 这里就一定赋了这个值。有一处在循环/分支/子 shell/函数体里，所有处都不算
  * （循环会回头、函数调用时才赋值，排在前面的赋值也可能被它覆盖）。
- * value：赋值的原文（引号、$VAR 留给 hidden-path 展开）；含 $( ) 等要
+ * value：赋值的原文（引号、$VAR 留给 real-path 展开）；含 $( ) 等要
  * 执行才知道的、或 `+=` 追加 → null */
 export type AstAssign = { name: string; value: string | null; definite: boolean }
 
@@ -192,7 +194,7 @@ function parseClean(cmd: string): ReturnType<Parser['parse']> | null {
  * 「$( ) 无法静态判定」卡里本项目两条都是它。首解析失败才把该行唯一一个
  * 带引号的起始符挪到行尾：带引号的 body 是字面量、commandToSegment 不给它
  * 出 token，挪动只改 stdin 挂在谁身上，命令与 token 集合不变。不带引号的
- * 不挪——body 展开标记（unparseable）挂在宿主命令上，挪了 alwaysLead 记错命令 */
+ * 不挪——body 属于哪条命令不定，挪了 token 会记错宿主 */
 const QUOTED_HEREDOC = /<<-?\s*(['"])\w+\1/g
 function hoistQuotedHeredocs(cmd: string): string {
   return cmd
@@ -360,7 +362,6 @@ function commandToSegment(node: SyntaxNode): AstSegment | null {
   // 重定向目标单独收、最后接在参数后面：`> f echo x` 里 f 排在 command_name
   // 前面，混进 items 就被当成 lead（命令名规则全部失效）
   const redirs: AstItem[] = []
-  let unparseable: string | undefined
   let argEnd = -1 // 上一个参数 token 的结束位置（拼词用）
   for (const c of children) {
     const before = items.length
@@ -371,17 +372,9 @@ function commandToSegment(node: SyntaxNode): AstSegment | null {
         break
       case 'heredoc_redirect': {
         // 分隔符带引号（'X' / "X"）→ body 是字面量，shell 不解释，跳过。
-        // 不带引号 → body 会被展开：$() 子命令虽已被全量枚举（descendants
-        // ofType 不分位置），但 tree-sitter 不解析 body 内的反引号替换
-        // （纯文本节点），判不全——标记 unparseable 交给 judge 弹
-        //
-        // 展开字符只认 $、反引号、转义反斜杠（\\ 会吃掉一个、\ 换行续行）。
-        // 裸 ( 不展开：原来字符类写成 [$(]，凡 body 里有函数调用的补丁
-        // （几乎全部）都误报 unquoted heredoc（2026-09-21 修）
-        const start = c.namedChild(0)?.text ?? ''
-        if (!/^['"]/.test(start) && /(\$|`|\\\n|\\[\\$`])/.test(c.text)) {
-          unparseable = '不带引号的 heredoc body 含 $/反引号/转义反斜杠，会被 shell 展开'
-        }
+        // 不带引号 → body 会被 shell 展开（$、反引号、转义反斜杠）。
+        // 展开风险 2026-11-04 拍板不再弹卡（解释器与 $( ) 同层放行），
+        // 不再产出 unparseable 标记（消费端已拆，标记成了空挂）
         break
       }
       case 'file_redirect': {
@@ -399,11 +392,17 @@ function commandToSegment(node: SyntaxNode): AstSegment | null {
       case 'concatenation': {
         // "a$(x)b" 混合体：拼字面子节点，跳过替换（内部命令已独立枚举）
         let text = ''
+        let subst = false
         for (let i = 0; i < c.childCount; i++) {
           const p = c.child(i)
-          if (p && p.type !== 'command_substitution' && p.type !== 'process_substitution') text += p.text
+          if (p?.type === 'command_substitution' || p?.type === 'process_substitution') {
+            subst = true
+            continue
+          }
+          text += p?.text ?? ''
         }
-        if (text !== '') items.push({ text, write: false })
+        if (text !== '')
+          items.push(subst ? { text, write: false, subst: true } : { text, write: false })
         break
       }
       default:
@@ -414,11 +413,17 @@ function commandToSegment(node: SyntaxNode): AstSegment | null {
         if (!c.isNamed) break
         if (c.type === 'string') {
           let text = ''
+          let subst = false
           for (let i = 0; i < c.namedChildCount; i++) {
             const p = c.namedChild(i)
-            if (p && p.type !== 'command_substitution' && p.type !== 'process_substitution') text += p.text
+            if (p?.type === 'command_substitution' || p?.type === 'process_substitution') {
+              subst = true
+              continue
+            }
+            text += p?.text ?? ''
           }
-          if (text !== '') items.push({ text, write: false })
+          if (text !== '')
+            items.push(subst ? { text, write: false, subst: true } : { text, write: false })
         } else {
           items.push({ text: c.text, write: false })
         }
@@ -439,7 +444,7 @@ function commandToSegment(node: SyntaxNode): AstSegment | null {
   const lead = items[0]?.text ?? ''
   if (lead === '') return null
   const rest = [...items.slice(1), ...redirs]
-  return unparseable === undefined ? { lead, items: rest } : { lead, items: rest, unparseable }
+  return { lead, items: rest }
 }
 
 /** file_redirect 的目标与多出来的参数。0.25 grammar 的 destination 是

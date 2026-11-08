@@ -469,7 +469,10 @@ describe('开任务（规则 7）', () => {
     expect(readTaskManifest(dir, b.owner).parent).toBeUndefined()
     // 只输名称开的空任务带标记（规则 13）；不传就没有（对照）
     const c = createTask(dir, '空的', { parent: '', awaitingFirstMessage: true })
-    expect(readTaskManifest(dir, c.owner)).toMatchObject({ awaitingFirstMessage: true, callback: 'pending' })
+    expect(readTaskManifest(dir, c.owner)).toMatchObject({
+      awaitingFirstMessage: true,
+      callback: 'pending',
+    })
     expect(readTaskManifest(dir, a.owner).awaitingFirstMessage).toBeUndefined()
     expect(
       listTaskManifests(dir)
@@ -619,7 +622,13 @@ describe('真 session：前缀与主干（规则 5、10）', () => {
     summarizeAll(as, stepsOf(dir, a.owner), 'A经历')
     as.close()
     finalizeTask(dir, a.owner)
-    const t = await getSession(dir, { task: scopeOf(b), skipLock: true, globalPath, env: {}, stream } as never)
+    const t = await getSession(dir, {
+      task: scopeOf(b),
+      skipLock: true,
+      globalPath,
+      env: {},
+      stream,
+    } as never)
     for await (const ev of t.send('B 第一句')) void ev
     await t.close()
     const segA = segs(dir).find((s) => s.owner === a.owner)
@@ -628,7 +637,14 @@ describe('真 session：前缀与主干（规则 5、10）', () => {
     // 第一轮才开段，落在 A 之上；A 在它之下、合回了，第一个请求就拉（firstPull）
     expect(segB?.floor).toBeGreaterThanOrEqual(segA?.ceil ?? Number.POSITIVE_INFINITY)
     expect(seen.at(-1) ?? '').toContain('A经历摘要')
-    expect(query(dir, `SELECT 1 FROM segment_pulls WHERE owner = ? AND segment_id = ?`, b.owner, segA?.id ?? 0)).toHaveLength(1)
+    expect(
+      query(
+        dir,
+        `SELECT 1 FROM segment_pulls WHERE owner = ? AND segment_id = ?`,
+        b.owner,
+        segA?.id ?? 0,
+      ),
+    ).toHaveLength(1)
   })
 
   it('主干：合回的段拷进来，超配额就合并且立即生效；新任务拿到合并后的那条', async () => {

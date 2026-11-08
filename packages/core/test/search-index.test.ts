@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
@@ -45,8 +45,18 @@ describe('syncSearchIndex + ftsSearch（真库）', () => {
   // 游标在段上（task-trunk）：主任务一段 (0, 50000]，下面的 step 都在里面
   openSegment(db, '', dir)
 
-  const insert = (turn: number, step: number, role: string, text: string, owner: string | null = null) => {
-    db.run(`INSERT INTO turns(id, started_at, owner) VALUES(?, '2026-01-01', ?) ON CONFLICT(id) DO NOTHING`, turn, owner)
+  const insert = (
+    turn: number,
+    step: number,
+    role: string,
+    text: string,
+    owner: string | null = null,
+  ) => {
+    db.run(
+      `INSERT INTO turns(id, started_at, owner) VALUES(?, '2026-01-01', ?) ON CONFLICT(id) DO NOTHING`,
+      turn,
+      owner,
+    )
     db.run(`INSERT INTO steps(id, turn_id, started_at) VALUES(?, ?, '2026-01-01')`, step, turn)
     db.run(
       `INSERT INTO messages(turn_id, role, content_json, state, step_id, owner) VALUES(?, ?, ?, 'live', ?, ?)`,
@@ -181,7 +191,10 @@ describe('runSearch：FTS 优先、0 命中回退老扫描（端到端）', () =
     join(turnsDir, 'turn-000001.jsonl'),
     [
       JSON.stringify({ role: 'user', parts: [{ type: 'text', text: '卸载机制的讨论' }] }),
-      JSON.stringify({ role: 'assistant', parts: [{ type: 'text', text: 'pickOldestSteps 落在 run.ts' }] }),
+      JSON.stringify({
+        role: 'assistant',
+        parts: [{ type: 'text', text: 'pickOldestSteps 落在 run.ts' }],
+      }),
     ].join('\n'),
   )
   // db 与文件 step 对齐：step1=user 行，step2=assistant 行
@@ -197,7 +210,10 @@ describe('runSearch：FTS 优先、0 命中回退老扫描（端到端）', () =
   db.run(`INSERT INTO steps(id, turn_id, started_at) VALUES(2, 1, '2026-01-01')`)
   db.run(
     `INSERT INTO messages(turn_id, role, content_json, state, step_id) VALUES(1, 'assistant', ?, 'live', 2)`,
-    JSON.stringify({ role: 'assistant', parts: [{ type: 'text', text: 'pickOldestSteps 落在 run.ts' }] }),
+    JSON.stringify({
+      role: 'assistant',
+      parts: [{ type: 'text', text: 'pickOldestSteps 落在 run.ts' }],
+    }),
   )
   syncSearchIndex(db)
   db.close()

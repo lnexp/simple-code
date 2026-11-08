@@ -169,7 +169,13 @@ describe('unloaded', () => {
   })
 
   it('**stale 触发不说「接近上限」**——预算没超，喊上限是误导（实测 raw 14% 也喊过）', () => {
-    const view = feed({ type: 'unloaded', count: 13, estimated: 32674, reason: 'stale', sinceMs: 11 * 60_000 })
+    const view = feed({
+      type: 'unloaded',
+      count: 13,
+      estimated: 32674,
+      reason: 'stale',
+      sinceMs: 11 * 60_000,
+    })
     const notice = view.items.find((i) => i.kind === 'notice')
     expect(notice?.kind === 'notice' && notice.text.includes('缓存已过期')).toBe(true)
     expect(notice?.kind === 'notice' && notice.text.includes('接近上限')).toBe(false)
@@ -217,7 +223,12 @@ describe('用量', () => {
       { type: 'step_finish', usage: usage(150), contextTokens: 9000 },
     )
     expect(view.contextTokens).toBe(9000) // 最后一步报的数，不是累加、也不是 usage
-    expect(view.lastTiming).toEqual({ ttftMs: 800, totalMs: 4200, inputTokens: 150, outputTokens: 10 })
+    expect(view.lastTiming).toEqual({
+      ttftMs: 800,
+      totalMs: 4200,
+      inputTokens: 150,
+      outputTokens: 10,
+    })
   })
 
   it('乱序宽容：step_finish 先到（比如测试或回放缺 timing）也建得起骨架', () => {
@@ -522,10 +533,11 @@ describe('历史回放（hydrateItems）', () => {
         ],
       }),
     )
-    expect(items.filter((i) => i.kind === 'reasoning').map((i) => (i.kind === 'reasoning' ? i.text : ''))).toEqual([
-      "I'm noticing\n\n继续核对几项",
-      '看完了',
-    ])
+    expect(
+      items
+        .filter((i) => i.kind === 'reasoning')
+        .map((i) => (i.kind === 'reasoning' ? i.text : '')),
+    ).toEqual(["I'm noticing\n\n继续核对几项", '看完了'])
   })
 
   it('user/assistant/text 各成一个气泡，图片随 user 气泡', () => {
@@ -573,7 +585,9 @@ describe('历史回放（hydrateItems）', () => {
   })
 
   it('〔系统〕开头但不是切换告知的（用户自己打的），照常是用户气泡', () => {
-    const items = hydrateItems(msgs({ role: 'user', parts: [{ type: 'text', text: '〔系统〕这几个字是我打的' }] }))
+    const items = hydrateItems(
+      msgs({ role: 'user', parts: [{ type: 'text', text: '〔系统〕这几个字是我打的' }] }),
+    )
     expect(items).toEqual([{ kind: 'user', text: '〔系统〕这几个字是我打的' }])
   })
 
@@ -581,7 +595,12 @@ describe('历史回放（hydrateItems）', () => {
     const items = hydrateItems(
       msgs({
         role: 'user',
-        parts: [{ type: 'text', text: '〔系统〕模型已从 a/org/m-1 切换到 b/org/m-2。此前的回复由上一个模型生成。' }],
+        parts: [
+          {
+            type: 'text',
+            text: '〔系统〕模型已从 a/org/m-1 切换到 b/org/m-2。此前的回复由上一个模型生成。',
+          },
+        ],
       }),
     )
     expect(items).toEqual([{ kind: 'divider', text: '模型已从 a/org/m-1 切换到 b/org/m-2' }])
@@ -601,7 +620,15 @@ describe('历史回放（hydrateItems）', () => {
       ),
     )
     expect(items).toEqual([
-      { kind: 'tool', id: 't1', name: 'bash', desc: '', command: 'ls', output: 'a\nb', failed: false },
+      {
+        kind: 'tool',
+        id: 't1',
+        name: 'bash',
+        desc: '',
+        command: 'ls',
+        output: 'a\nb',
+        failed: false,
+      },
     ])
   })
 
@@ -740,7 +767,10 @@ describe('历史回放（hydrateItems）', () => {
         ],
       },
     ] as const
-    const items = hydrateItems(rows as never) as Extract<import('../webview/events.ts').ChatItem, { kind: 'tool' }>[]
+    const items = hydrateItems(rows as never) as Extract<
+      import('../webview/events.ts').ChatItem,
+      { kind: 'tool' }
+    >[]
     const t1 = items.find((i) => i.id === 't1')
     expect(t1?.images).toEqual([THUMB])
     const t2 = items.find((i) => i.id === 't2')
@@ -811,11 +841,33 @@ describe('第三层折叠（splitTurns）', () => {
       ],
     })
     // 跑着：只折上一轮；这一轮从 query 起全部展开（插话不算新一轮的起点）
-    expect(shape(items(true), false)).toEqual(['user', 'process(1)', 'assistant', 'user', 'assistant', 'activity(1)', 'user'])
+    expect(shape(items(true), false)).toEqual([
+      'user',
+      'process(1)',
+      'assistant',
+      'user',
+      'assistant',
+      'activity(1)',
+      'user',
+    ])
     // 跑完：和改前一样，插话照旧是折叠的分界
-    expect(shape(items(true), true)).toEqual(['user', 'process(1)', 'assistant', 'user', 'process(1)', 'user'])
+    expect(shape(items(true), true)).toEqual([
+      'user',
+      'process(1)',
+      'assistant',
+      'user',
+      'process(1)',
+      'user',
+    ])
     // 对照：不带标记的 user（历史回放、新一轮）照旧是分界，跑着时前面那段折起
-    expect(shape(items(false), false)).toEqual(['user', 'process(1)', 'assistant', 'user', 'process(1)', 'user'])
+    expect(shape(items(false), false)).toEqual([
+      'user',
+      'process(1)',
+      'assistant',
+      'user',
+      'process(1)',
+      'user',
+    ])
   })
 
   it('报错 notice 带 kind 与 resumable——UI 据此标色、停稳后给「继续」按钮（不论可否重试：自动重试已在 core 做完）', () => {
@@ -913,7 +965,12 @@ describe('中断要留下痕迹', () => {
 describe('bash 入参 desc → 工具条标题位（2026-09-28）', () => {
   it('tool_call 带 desc 时存进视图态，缺省留空不猜', () => {
     const view = feed(
-      { type: 'tool_call', id: 't1', name: 'bash', input: { command: 'npx vitest run', desc: '跑全量测试' } },
+      {
+        type: 'tool_call',
+        id: 't1',
+        name: 'bash',
+        input: { command: 'npx vitest run', desc: '跑全量测试' },
+      },
       { type: 'tool_call', id: 't2', name: 'bash', input: { command: 'ls' } },
       { type: 'tool_call', id: 't3', name: 'bash', input: { command: 'ls', desc: 42 } },
     )
@@ -927,25 +984,43 @@ describe('bash 入参 desc → 工具条标题位（2026-09-28）', () => {
     view.items.find((i) => i.kind === 'tool' && i.id === id) as Tool
 
   // glm 照官方 Bash 工具的参数名写 description（真实项目入参）
-  const glmInput = { command: 'grep -rn "writeChunk" knowledge-server/src/test/ | head -4', description: '定位 writeChunk 所在测试文件', timeout: 15 }
+  const glmInput = {
+    command: 'grep -rn "writeChunk" knowledge-server/src/test/ | head -4',
+    description: '定位 writeChunk 所在测试文件',
+    timeout: 15,
+  }
 
   it('description 当 desc 用：tool_call、流式、历史回放三条路都认；desc 优先', () => {
     const call = feed({ type: 'tool_call', id: 't1', name: 'bash', input: glmInput })
     expect(toolOf(call).desc).toBe('定位 writeChunk 所在测试文件')
-    const both = feed({ type: 'tool_call', id: 't1', name: 'bash', input: { ...glmInput, desc: '短的' } })
+    const both = feed({
+      type: 'tool_call',
+      id: 't1',
+      name: 'bash',
+      input: { ...glmInput, desc: '短的' },
+    })
     expect(toolOf(both).desc).toBe('短的')
 
     const streamed = feed(
       { type: 'tool_input_start', id: 't1', name: 'bash' },
-      { type: 'tool_input_delta', id: 't1', partial: '{"command": "grep -rn \\"writeChunk\\" x", "description": "定位 writeChunk' },
+      {
+        type: 'tool_input_delta',
+        id: 't1',
+        partial: '{"command": "grep -rn \\"writeChunk\\" x", "description": "定位 writeChunk',
+      },
       { type: 'tool_input_delta', id: 't1', partial: ' 所在测试文件", "timeout' },
     )
     expect(toolOf(streamed).desc).toBe('定位 writeChunk 所在测试文件')
 
     const items = hydrateItems([
-      { role: 'assistant', parts: [{ type: 'tool_call', id: 't1', name: 'bash', input: glmInput }] },
+      {
+        role: 'assistant',
+        parts: [{ type: 'tool_call', id: 't1', name: 'bash', input: glmInput }],
+      },
     ])
-    expect(items.find((i) => i.kind === 'tool')).toMatchObject({ desc: '定位 writeChunk 所在测试文件' })
+    expect(items.find((i) => i.kind === 'tool')).toMatchObject({
+      desc: '定位 writeChunk 所在测试文件',
+    })
   })
 
   it('流式：desc 字符串闭合即显示，不等 tool_call；命令仍留空', () => {
@@ -953,7 +1028,12 @@ describe('bash 入参 desc → 工具条标题位（2026-09-28）', () => {
     const d = (partial: string) => ({ type: 'tool_input_delta', id: 't1', partial }) as const
     const half = feed(start, d('{"desc": "跑全'))
     expect(toolOf(half).desc).toBe('')
-    const done = feed(start, d('{"desc": "跑全'), d('量测试", "comm'), d('and": "npx vitest run --reporter'))
+    const done = feed(
+      start,
+      d('{"desc": "跑全'),
+      d('量测试", "comm'),
+      d('and": "npx vitest run --reporter'),
+    )
     expect(toolOf(done).desc).toBe('跑全量测试')
     expect(toolOf(done).command).toBe('')
     // 抠到就丢中间态，后面的长命令片段不再攒
@@ -963,7 +1043,11 @@ describe('bash 入参 desc → 工具条标题位（2026-09-28）', () => {
   it('流式：转义字符按 JSON 解码；tool_call 用完整入参覆盖', () => {
     const view = feed(
       { type: 'tool_input_start', id: 't1', name: 'bash' },
-      { type: 'tool_input_delta', id: 't1', partial: '{"desc":"看 \\"a\\" 文件","command":"cat a"}' },
+      {
+        type: 'tool_input_delta',
+        id: 't1',
+        partial: '{"desc":"看 \\"a\\" 文件","command":"cat a"}',
+      },
     )
     expect(toolOf(view).desc).toBe('看 "a" 文件')
     const final = feed(
@@ -999,7 +1083,11 @@ describe('任务完成回调（task-trunk 规则 12）', () => {
   })
 
   it('实时：task_result 事件追加同一个条目（与回放一致）', () => {
-    const view = reduce(emptyView(), { type: 'task_result', text: '〔任务结果〕调研 · 被停止\n半截' }, Date.now())
+    const view = reduce(
+      emptyView(),
+      { type: 'task_result', text: '〔任务结果〕调研 · 被停止\n半截' },
+      Date.now(),
+    )
     expect(view.items).toEqual([{ kind: 'task_result', head: '调研 · 被停止', body: '半截' }])
   })
 })
@@ -1015,11 +1103,24 @@ describe('模型切换分割线（实时，model_switch 事件）', () => {
         { kind: 'user', text: '第二轮' },
       ],
     }
-    view = reduce(view, { type: 'model_switch', from: 'alpha/a-small', to: 'beta/b-one' }, Date.now())
+    view = reduce(
+      view,
+      { type: 'model_switch', from: 'alpha/a-small', to: 'beta/b-one' },
+      Date.now(),
+    )
     view = reduce(view, { type: 'text_start' }, Date.now())
     view = reduce(view, { type: 'text_delta', text: '新模型的回答' }, Date.now())
-    expect(view.items.map((i) => i.kind)).toEqual(['user', 'assistant', 'divider', 'user', 'assistant'])
-    expect(view.items[2]).toEqual({ kind: 'divider', text: '模型已从 alpha/a-small 切换到 beta/b-one' })
+    expect(view.items.map((i) => i.kind)).toEqual([
+      'user',
+      'assistant',
+      'divider',
+      'user',
+      'assistant',
+    ])
+    expect(view.items[2]).toEqual({
+      kind: 'divider',
+      text: '模型已从 alpha/a-small 切换到 beta/b-one',
+    })
   })
 
   it('上一轮的过程被折叠时，分割线留在外面不被折进去', () => {
@@ -1031,10 +1132,45 @@ describe('模型切换分割线（实时，model_switch 事件）', () => {
     view = reduce(view, { type: 'text_start' }, Date.now())
     view = reduce(view, { type: 'text_delta', text: '结论' }, Date.now())
     view = { ...view, items: [...view.items, { kind: 'user', text: '第二轮' }] }
-    view = reduce(view, { type: 'model_switch', from: 'alpha/a-small', to: 'beta/b-one' }, Date.now())
+    view = reduce(
+      view,
+      { type: 'model_switch', from: 'alpha/a-small', to: 'beta/b-one' },
+      Date.now(),
+    )
     const shape = splitTurns(groupItems(view.items), true).map((s) =>
-      s.kind === 'process' ? 'process' : s.block.kind === 'activity' ? 'activity' : s.block.item.kind,
+      s.kind === 'process'
+        ? 'process'
+        : s.block.kind === 'activity'
+          ? 'activity'
+          : s.block.item.kind,
     )
     expect(shape).toEqual(['user', 'process', 'assistant', 'divider', 'user'])
+  })
+})
+
+describe('fold 窗口外的存根行聚合成占位（2026-11-06）', () => {
+  const row = (text: string, stubbed = false) => ({
+    role: 'user' as const,
+    parts: [{ type: 'text' as const, text }],
+    turnId: 1,
+    stubbed,
+  })
+  it('连续 stubbed 行聚成一条 notice，窗口内正常渲染', () => {
+    const items = hydrateItems([
+      row('老1', true),
+      row('老2', true),
+      row('老3', true),
+      row('新1'),
+      row('新2'),
+    ])
+    expect(items.map((i) => i.kind)).toEqual(['notice', 'user', 'user'])
+    expect(items[0]).toMatchObject({
+      kind: 'notice',
+      text: '上方 3 行已摘要折叠——重开面板可查看完整历史',
+    })
+  })
+  it('无 stubbed 行时零占位（冷启动全量基线形态不变）', () => {
+    const items = hydrateItems([row('新1'), row('新2')])
+    expect(items.map((i) => i.kind)).toEqual(['user', 'user'])
   })
 })

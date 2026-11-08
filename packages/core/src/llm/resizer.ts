@@ -147,25 +147,31 @@ export function stripImagesWhenUnsupported(
     // 全量 `{...msg}` 新建会把消息引用全部换掉，regions 记账的保底区
     // （floor 集合按对象引用圈人）整区 miss，面板上 floor 恒 0、全部
     // 堆进「未卸载」——2026-09-12 实测就是这么错的
-    if (!msg.parts.some((part) => part.type === 'image' || (part.type === 'tool_result' && part.images && part.images.length > 0))) {
+    if (
+      !msg.parts.some(
+        (part) =>
+          part.type === 'image' ||
+          (part.type === 'tool_result' && part.images && part.images.length > 0),
+      )
+    ) {
       return msg
     }
     return {
       ...msg,
       parts: msg.parts.map((part) => {
-      if (part.type === 'image') {
-        const caption = captions?.get(part.data)
-        return { type: 'text', text: caption || PLACEHOLDER } as Part
-      }
-      // tool_result 的图（webfetch/view_image）是字段不是 part，没有「占位
-      // part」的形状——占位文本 append 到 output 尾部，每张一行（洞①，
-      // 2026-09-08：不处理的话图原样进请求，非视觉模型 400 且每轮都 400）
-      if (part.type === 'tool_result' && part.images && part.images.length > 0) {
-        const { images: _removed, ...rest } = part
-        const notes = part.images.map(() => PLACEHOLDER).join('\n')
-        return { ...rest, output: `${part.output}\n${notes}` } as Part
-      }
-      return part
+        if (part.type === 'image') {
+          const caption = captions?.get(part.data)
+          return { type: 'text', text: caption || PLACEHOLDER } as Part
+        }
+        // tool_result 的图（webfetch/view_image）是字段不是 part，没有「占位
+        // part」的形状——占位文本 append 到 output 尾部，每张一行（洞①，
+        // 2026-09-08：不处理的话图原样进请求，非视觉模型 400 且每轮都 400）
+        if (part.type === 'tool_result' && part.images && part.images.length > 0) {
+          const { images: _removed, ...rest } = part
+          const notes = part.images.map(() => PLACEHOLDER).join('\n')
+          return { ...rest, output: `${part.output}\n${notes}` } as Part
+        }
+        return part
       }),
     }
   })

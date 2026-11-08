@@ -1,8 +1,10 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
-import { loadConfig, selectModel } from '../src/config/load.ts'
 import { stripDenied } from '../src/config/denylist.ts'
+import { expandTilde } from '../src/config/env.ts'
+import { loadConfig, selectModel } from '../src/config/load.ts'
 
 const dirs: string[] = []
 afterEach(async () => {
@@ -61,6 +63,17 @@ it('启用但缺路径时报错', async () => {
   const { claudeAgentSdkPath: _, ...value } = config()
   await expect(load(value)).rejects.toThrow('claudeAgentSdkPath')
 })
+it('~ 路径展开为 home 下的绝对路径，普通路径原样', async () => {
+  const value = config()
+  value.claudeAgentSdkPath = '~/.simple-code/claude-agent-sdk'
+  const { config: c1 } = await load(value)
+  expect(c1.claudeAgentSdkPath).toBe(join(homedir(), '.simple-code/claude-agent-sdk'))
+  const { config: c2 } = await load(config())
+  expect(c2.claudeAgentSdkPath).toBe('/external/sdk')
+  // ~user 形式不展开（Node 无对应 API），原样交给 loadSdk 的绝对路径校验
+  expect(expandTilde('~other/lib', '/home/me')).toBe('~other/lib')
+  expect(expandTilde('~', '/home/me')).toBe('/home/me')
+})
 it('SDK主模型不能兼任默认摘要模型', async () => {
   const { memory: _, ...value } = config()
   await expect(load(value)).rejects.toThrow('memory.summaryModel')
@@ -86,9 +99,7 @@ it.skipIf(process.platform !== 'darwin')(
     const fetchImpl = (() => {
       throw Error('not called')
     }) as unknown as typeof fetch
-    expect(modelFetch(http, { folder: dirs[0]!, fetchImpl, remote: true })).toBe(
-      fetchImpl,
-    )
+    expect(modelFetch(http, { folder: dirs[0]!, fetchImpl, remote: true })).toBe(fetchImpl)
     expect(typeof modelFetch(loaded, { folder: dirs[0]! })).toBe('function')
   },
 )

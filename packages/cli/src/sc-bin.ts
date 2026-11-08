@@ -9,9 +9,8 @@
 // 恒拒绝是唯一安全默认；人在终端不带参数，自然进对话
 import { isAbsolute, resolve } from 'node:path'
 import { Writable } from 'node:stream'
-import { type Effort, type ModelRef, loadConfig } from '@simple-code/core'
-import { runInteractive } from './run.ts'
-import { runOnce } from './run.ts'
+import { type Effort, loadConfig, type ModelRef } from '@simple-code/core'
+import { runInteractive, runOnce } from './run.ts'
 
 export const SC_USAGE = `用法：sc            交互式对话（连续多轮，/exit 退出，审批到终端问答）
       sc [选项] [任务文本]   跑一轮就退出——审批恒拒绝（无人放卡），适合脚本/管道
@@ -47,7 +46,9 @@ export type ScParsed = {
 }
 
 /** 纯解析，不碰 IO。export 给测试 */
-export function parseScArgs(argv: string[]): { ok: true; value: ScParsed } | { ok: false; message: string } {
+export function parseScArgs(
+  argv: string[],
+): { ok: true; value: ScParsed } | { ok: false; message: string } {
   const p: ScParsed = { quiet: false, listModelsFlag: false, help: false }
   const positional: string[] = []
   for (let i = 0; i < argv.length; i++) {
@@ -129,7 +130,9 @@ function readAll(stdin: ScIo['stdin']): Promise<string> {
   return new Promise((res) => {
     let buf = ''
     stdin.setEncoding('utf8')
-    stdin.on('data', (c: string) => { buf += c })
+    stdin.on('data', (c: string) => {
+      buf += c
+    })
     stdin.on('end', () => res(buf))
     stdin.on('error', () => res(buf))
   })
@@ -204,7 +207,10 @@ export async function scMain(argv: string[], io: ScIo): Promise<number> {
   // 权限上限校验（在 help/models 之后：那两个不干活，不用拦）。两处
   // 分支共用的 root 在这里一次算清
   const rootAbs = p.root ? (isAbsolute(p.root) ? p.root : resolve(io.cwd, p.root)) : io.cwd
-  const denied = assertRootAllowed(rootAbs, io.env?.SIMPLE_CODE_ROOTS ?? process.env.SIMPLE_CODE_ROOTS)
+  const denied = assertRootAllowed(
+    rootAbs,
+    io.env?.SIMPLE_CODE_ROOTS ?? process.env.SIMPLE_CODE_ROOTS,
+  )
   if (denied) {
     io.stderr(`${denied}\n`)
     return 2
@@ -212,9 +218,12 @@ export async function scMain(argv: string[], io: ScIo): Promise<number> {
   // 审批全放行（测评容器，2026-10-24 用户批准）。父 agent 调起时（ROOTS
   // 在）拒绝：否则 agent 一条 `SIMPLE_CODE_APPROVE_ALL=1 sc "..."` 就绕过
   // 自己的审批，违背「逐级只减不增」
-  const approveAll = (io.env?.SIMPLE_CODE_APPROVE_ALL ?? process.env.SIMPLE_CODE_APPROVE_ALL) === '1'
+  const approveAll =
+    (io.env?.SIMPLE_CODE_APPROVE_ALL ?? process.env.SIMPLE_CODE_APPROVE_ALL) === '1'
   if (approveAll && (io.env?.SIMPLE_CODE_ROOTS ?? process.env.SIMPLE_CODE_ROOTS)) {
-    io.stderr('SIMPLE_CODE_APPROVE_ALL 不能在 agent 调起的 sc 里用（子 agent 权限只减不增），拒绝启动\n')
+    io.stderr(
+      'SIMPLE_CODE_APPROVE_ALL 不能在 agent 调起的 sc 里用（子 agent 权限只减不增），拒绝启动\n',
+    )
     return 2
   }
 
@@ -226,7 +235,12 @@ export async function scMain(argv: string[], io: ScIo): Promise<number> {
       sink: { out: io.stdout, err: io.stderr },
       input: io.stdin,
       // readline 要 Writable；ScIo 的 stdout 是函数（进程版包了 process.stdout.write）
-      output: new Writable({ write(ch, _enc, cb) { io.stdout(String(ch)); cb() } }),
+      output: new Writable({
+        write(ch, _enc, cb) {
+          io.stdout(String(ch))
+          cb()
+        },
+      }),
       ...(io.globalPath ? { globalPath: io.globalPath } : {}),
       ...(io.env ? { env: io.env } : {}),
       ...(io.fetchImpl ? { fetchImpl: io.fetchImpl } : {}),
@@ -246,7 +260,11 @@ export async function scMain(argv: string[], io: ScIo): Promise<number> {
 
   // -q：out 全缓冲，跑完一次性给——管道那头拿到的是纯最终文本
   let buf = ''
-  const out = p.quiet ? (s: string) => { buf += s } : io.stdout
+  const out = p.quiet
+    ? (s: string) => {
+        buf += s
+      }
+    : io.stdout
   const sink = { out, err: io.stderr }
 
   const code = await runOnce({

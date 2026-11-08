@@ -7,16 +7,15 @@
  * 多轮对话 + 空闲摘要 + 卸载 + 合并全程，守卫一次都不许响；后台偷改前缀
  * 必须当场响。
  */
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { AgentEvent } from '../src/events.ts'
 import type { Request, Usage } from '../src/llm/types.ts'
-import type { StreamEvent } from '../src/loop/retry.ts'
-import type { LoopDeps } from '../src/loop/run.ts'
 import {
   createPrefixGuard,
   findBreak,
@@ -24,6 +23,8 @@ import {
   PrefixBrokenError,
   type PrefixFingerprint,
 } from '../src/loop/prefix-guard.ts'
+import type { StreamEvent } from '../src/loop/retry.ts'
+import type { LoopDeps } from '../src/loop/run.ts'
 import { getSession } from '../src/session/session.ts'
 import { MEMORY_RELATIVE } from '../src/session/store.ts'
 
@@ -49,7 +50,9 @@ const req = (messages: string[], over: Partial<Request> = {}): Request => ({
 
 describe('findBreak', () => {
   it('末尾追加 = 完好', () => {
-    expect(findBreak(fingerprint(req(['a', 'b'])), fingerprint(req(['a', 'b', 'c', 'd'])))).toBeNull()
+    expect(
+      findBreak(fingerprint(req(['a', 'b'])), fingerprint(req(['a', 'b', 'c', 'd']))),
+    ).toBeNull()
   })
   it('中段改一条 → 报出第一处下标', () => {
     const b = findBreak(fingerprint(req(['a', 'b', 'c'])), fingerprint(req(['a', 'X', 'c', 'd'])))
@@ -60,13 +63,76 @@ describe('findBreak', () => {
     expect(b).toMatchObject({ part: 'messages', index: 2 })
   })
   it('system / tools 变了', () => {
-    expect(findBreak(fingerprint(req(['a'])), fingerprint(req(['a'], { system: 'S2' })))?.part).toBe('system')
+    expect(
+      findBreak(fingerprint(req(['a'])), fingerprint(req(['a'], { system: 'S2' })))?.part,
+    ).toBe('system')
     expect(
       findBreak(
         fingerprint(req(['a'])),
-        fingerprint(req(['a'], { tools: [{ name: 't', description: '', inputSchema: {} }] as never })),
+        fingerprint(
+          req(['a'], { tools: [{ name: 't', description: '', inputSchema: {} }] as never }),
+        ),
       )?.part,
     ).toBe('tools')
+  })
+})
+
+describe('重载后第一次的 tools/system 差异（2026-11-06：dev 装机版本不变但代码在变）', () => {
+  const harness = () => {
+    let saved: PrefixFingerprint | null = null
+    const dumps: unknown[] = []
+    const guard = createPrefixGuard({
+      baseline: { read: () => saved, write: (fp) => (saved = fp) },
+      dump: (info) => {
+        dumps.push(info)
+        return '/tmp/x.json'
+      },
+    })
+    return { guard, dumps, baseline: () => saved }
+  }
+
+  it('重载后第一次 tools 变了 = 静默重置（装机场景），不抛不落现场', () => {
+    // 模拟：旧进程写了基线（tools 空），重载后新守卫第一次遇到的 tools 变了
+    let saved: PrefixFingerprint | null = null
+    const guardA = createPrefixGuard({
+      baseline: { read: () => saved, write: (fp) => (saved = fp) },
+      dump: () => '/tmp/x.json',
+    })
+    guardA.check(req(['a', 'b'])) // 旧进程最后请求：tools = []
+    const guardB = createPrefixGuard({
+      // 新守卫实例 = 重载后；baseline 从库里读回（saved）
+      baseline: { read: () => saved, write: (fp) => (saved = fp) },
+      dump: () => {
+        throw new Error('不该落现场')
+      },
+    })
+    expect(() =>
+      guardB.check(
+        req(['a', 'b', 'c'], { tools: [{ name: 't', description: '', inputSchema: {} }] as never }),
+      ),
+    ).not.toThrow()
+  })
+
+  it('同进程第二次 tools 变了照抛——特判只给重载后的第一请求', () => {
+    const { guard } = harness()
+    guard.check(req(['a', 'b']))
+    expect(() => guard.check(req(['a', 'b'], { system: '运行中被偷改' }))).toThrow(
+      PrefixBrokenError,
+    )
+  })
+
+  it('重载后第一次 messages 变了照抛——叶子覆盖那种真改写不因重载豁免', () => {
+    let saved: PrefixFingerprint | null = null
+    const guardA = createPrefixGuard({
+      baseline: { read: () => saved, write: (fp) => (saved = fp) },
+      dump: () => '/tmp/x.json',
+    })
+    guardA.check(req(['a', 'b', 'c']))
+    const guardB = createPrefixGuard({
+      baseline: { read: () => saved, write: (fp) => (saved = fp) },
+      dump: () => '/tmp/x.json',
+    })
+    expect(() => guardB.check(req(['a', 'X', 'c']))).toThrow(PrefixBrokenError)
   })
 })
 
@@ -103,12 +169,16 @@ describe('守卫状态机', () => {
   it('配置键变了（只改 settings 的窗口，system 随之变）= 用户的选择，不报', () => {
     const { guard } = harness()
     guard.check(req(['a', 'b']), 'win=3000')
-    expect(() => guard.check(req(['a', 'b'], { system: '窗口 200000' }), 'win=200000')).not.toThrow()
+    expect(() =>
+      guard.check(req(['a', 'b'], { system: '窗口 200000' }), 'win=200000'),
+    ).not.toThrow()
     // 配置键不变时同样的 system 变化照报
-    expect(() => guard.check(req(['a', 'b'], { system: '偷改' }), 'win=200000')).toThrow(PrefixBrokenError)
+    expect(() => guard.check(req(['a', 'b'], { system: '偷改' }), 'win=200000')).toThrow(
+      PrefixBrokenError,
+    )
   })
 
-  it('版本号变了（用户升级扩展，工具描述随之变）= 静默换基线；同版本照报', () => {
+  it('版本号变了（用户升级扩展，工具描述随之变）= 静默换基线；同进程后续偷改照报', () => {
     let saved: PrefixFingerprint | null = null
     const mk = (version: string) =>
       createPrefixGuard({
@@ -118,8 +188,12 @@ describe('守卫状态机', () => {
       })
     mk('0.1.3').check(req(['a', 'b']))
     const tools = [{ name: 't', description: '新描述', inputSchema: {} }] as never
-    expect(() => mk('0.1.4').check(req(['a', 'b'], { tools }))).not.toThrow()
-    expect(() => mk('0.1.4').check(req(['a', 'b'], { tools, system: '偷改' }))).toThrow(PrefixBrokenError)
+    const g = mk('0.1.4')
+    expect(() => g.check(req(['a', 'b'], { tools }))).not.toThrow()
+    // 同一进程的后续请求：基线已是 tools 版，原样再发不炸
+    expect(() => g.check(req(['a', 'b'], { tools }))).not.toThrow()
+    // 偷改 system：重载特判只给第一次，这里要报
+    expect(() => g.check(req(['a', 'b'], { tools, system: '偷改' }))).toThrow(PrefixBrokenError)
   })
 
   it('旧版落的基线没有版本字段（0.1.3 升上来）= 视为版本变了，不报', () => {
@@ -164,7 +238,10 @@ describe('守卫状态机', () => {
     mk().check(req(['a', 'b']))
     // 会话重建：新实例，内存里的 prev 没了——现场只能靠落盘原文
     expect(() => mk().check(req(['a', 'X', 'c']))).toThrow(PrefixBrokenError)
-    expect(dumps[0]?.prev?.messages.map((m) => (m.parts[0] as { text: string }).text)).toEqual(['a', 'b'])
+    expect(dumps[0]?.prev?.messages.map((m) => (m.parts[0] as { text: string }).text)).toEqual([
+      'a',
+      'b',
+    ])
   })
 
   it('请求参数变了（换模型/档位）= 用户的选择，基线静默重置', () => {
@@ -332,7 +409,9 @@ describe('前缀不变式（真 session 端到端）', () => {
     }[]
     db.close()
     expect(all.some((e) => e.type === 'unloaded')).toBe(true)
-    expect(sums.some((r) => r.level === 0 && r.in_context === 1) || sums.some((r) => r.level >= 1)).toBe(true)
+    expect(
+      sums.some((r) => r.level === 0 && r.in_context === 1) || sums.some((r) => r.level >= 1),
+    ).toBe(true)
     expect(sums.some((r) => r.level >= 1)).toBe(true)
     // 上一请求原文落盘（违规现场里 prev 的来源，2026-09-23 起每请求覆盖写）
     expect(existsSync(join(dir, MEMORY_RELATIVE, 'last-requests', 'main.json'))).toBe(true)
@@ -375,16 +454,20 @@ describe('前缀不变式（真 session 端到端）', () => {
         fetchImpl: summaryFetch,
         skipLock: true,
       })
-    // 对照：同版本（开发装机）改了工具描述，照报
+    // 对照：同版本（开发装机）改了工具描述——2026-11-06 推翻原判（原断言照报）：
+    // 真机 13 次「tools 变了」全是装机+reload 后第一请求，每装一次用户会话断
+    // 一次——重载后第一次放行（prefix-guard 的 firstOfProcess 特判），不打扰
     const same = await withTool()
-    expect(prefixErrors(await collect(same.send('同版本')))).toHaveLength(1)
+    expect(prefixErrors(await collect(same.send('同版本')))).toHaveLength(0)
     await same.close()
 
     const s3 = await open(dir, globalPath)
     await collect(s3.send('回到无工具'))
     await s3.close()
     const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'))
-    const row = db.prepare('SELECT owner, fingerprint FROM prefix_baseline').get() as { fingerprint: string }
+    const row = db.prepare('SELECT owner, fingerprint FROM prefix_baseline').get() as {
+      fingerprint: string
+    }
     const { version: _drop, ...legacy } = JSON.parse(row.fingerprint) as PrefixFingerprint
     db.prepare('UPDATE prefix_baseline SET fingerprint = ?').run(JSON.stringify(legacy))
     db.close()
@@ -409,7 +492,9 @@ describe('前缀不变式（真 session 端到端）', () => {
     const s = await open(dir, globalPath)
     const inCtx = () => {
       const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'), { readOnly: true })
-      const r = db.prepare('SELECT COUNT(*) AS n FROM summaries WHERE in_context = 1').get() as { n: number }
+      const r = db.prepare('SELECT COUNT(*) AS n FROM summaries WHERE in_context = 1').get() as {
+        n: number
+      }
       const all = db.prepare('SELECT COUNT(*) AS n FROM summaries').get() as { n: number }
       db.close()
       return { inCtx: r.n, all: all.n }
@@ -491,7 +576,9 @@ describe('发出去的必须先在库里（checkpoint）', () => {
       if (call === 2) {
         const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'), { readOnly: true })
         toolRowsAtSecondRequest = (
-          db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE role = 'tool' AND state = 'live'`).get() as { n: number }
+          db
+            .prepare(`SELECT COUNT(*) AS n FROM messages WHERE role = 'tool' AND state = 'live'`)
+            .get() as { n: number }
         ).n
         db.close()
       }
@@ -550,7 +637,11 @@ describe('手动压缩（compactNow，2026-10-17）', () => {
         {
           name: 'echo',
           definition: { name: 'echo', description: 'd', parameters: { type: 'object' } },
-          execute: async () => ({ output: '工具的大段输出。'.repeat(200), exitCode: 0, isError: false }),
+          execute: async () => ({
+            output: '工具的大段输出。'.repeat(200),
+            exitCode: 0,
+            isError: false,
+          }),
         } as never,
       ],
       stream: (() => {
@@ -575,7 +666,9 @@ describe('手动压缩（compactNow，2026-10-17）', () => {
   }
   const unloadedRows = (dir: string): number => {
     const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'), { readOnly: true })
-    const r = db.prepare("SELECT COUNT(*) AS n FROM messages WHERE state = 'unloaded'").get() as { n: number }
+    const r = db.prepare("SELECT COUNT(*) AS n FROM messages WHERE state = 'unloaded'").get() as {
+      n: number
+    }
     db.close()
     return r.n
   }
@@ -626,11 +719,13 @@ describe('手动压缩（compactNow，2026-10-17）', () => {
     const refused = await collect(s.send('压缩途中插进来的'))
     expect((await pending).ok).toBe(true)
     await s.close()
-    expect(refused.filter((e) => e.type === 'error').map((e) => (e as { message: string }).message)).toEqual([
-      '正在压缩上下文，稍等一两秒再发',
-    ])
+    expect(
+      refused.filter((e) => e.type === 'error').map((e) => (e as { message: string }).message),
+    ).toEqual(['正在压缩上下文，稍等一两秒再发'])
     const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'), { readOnly: true })
-    const hits = db.prepare("SELECT COUNT(*) AS n FROM messages WHERE content_json LIKE '%压缩途中插进来的%'").get() as {
+    const hits = db
+      .prepare("SELECT COUNT(*) AS n FROM messages WHERE content_json LIKE '%压缩途中插进来的%'")
+      .get() as {
       n: number
     }
     db.close()

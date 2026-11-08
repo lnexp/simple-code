@@ -15,16 +15,16 @@
  * unix 语义同 webfetch-bin：正文 stdout、错误 stderr、isError → 非零 exit。
  */
 import { readFile } from 'node:fs/promises'
-import {
-  listMcpTools,
-  callMcpTool,
-  isHttpServer,
-  McpNoProxyError,
-  type McpServers,
-} from '@simple-code/core/src/tools/mcp.ts'
 import { MCP_CONFIG_PATH } from '@simple-code/core/src/config/load.ts'
 import { mcpProxyEndpoint } from '@simple-code/core/src/proxy/endpoint.ts'
 import { describeError } from '@simple-code/core/src/tools/describe.ts'
+import {
+  callMcpTool,
+  isHttpServer,
+  listMcpTools,
+  McpNoProxyError,
+  type McpServers,
+} from '@simple-code/core/src/tools/mcp.ts'
 
 /** 读 mcp.json 的 servers 段，读不到 = 没配置，正常情况（同 websearch-bin） */
 async function mcpServers(): Promise<McpServers> {

@@ -118,11 +118,20 @@ describe('context 拼装', () => {
   })
 
   it('首行标 turn 范围，不标 step（2026-09-30：step 对模型无法定位，turn 能直接 memory show）', () => {
-    const s = summary({ id: 1, coversFrom: 766214, coversTo: 766304, turnFrom: 16533, turnTo: 16536 })
+    const s = summary({
+      id: 1,
+      coversFrom: 766214,
+      coversTo: 766304,
+      turnFrom: 16533,
+      turnTo: 16536,
+    })
     const [msg] = assembleContext([at(766400, 'user', '现在')], [s])
     expect(texts([msg as Message])[0]?.split('\n')[0]).toBe('<历史摘要 turn=16533-16536>')
     // 缺 turn（只有测试夹具会这样，生产由 loadSummaries 从 steps 表带出）显式标问号
-    const [bare] = assembleContext([at(2, 'user', '现在')], [summary({ id: 2, coversFrom: 1, coversTo: 1 })])
+    const [bare] = assembleContext(
+      [at(2, 'user', '现在')],
+      [summary({ id: 2, coversFrom: 1, coversTo: 1 })],
+    )
     expect(texts([bare as Message])[0]?.split('\n')[0]).toBe('<历史摘要 turn=?>')
   })
 
@@ -209,13 +218,17 @@ describe('分辨率梯度：热区展开正文，其余只给键', () => {
     // 消息一条没变（241→241），旧口径的在场数却从 12 跨到 11、越过
     // demoteBatch 的降级线——热区边界跳一整批，第 23 条摘要从键变正文
     const rows = (shadowedInContext: boolean): Summary[] => [
-      ...Array.from({ length: 11 }, (_, i) => summary({ id: i + 1, coversFrom: i + 1, coversTo: i + 1 })),
+      ...Array.from({ length: 11 }, (_, i) =>
+        summary({ id: i + 1, coversFrom: i + 1, coversTo: i + 1 }),
+      ),
       // 与 5 号同段、排在它后面：findCovering 永远选 5 号，这条在场但不渲染
       summary({ id: 12, coversFrom: 5, coversTo: 5, inContext: shadowedInContext }),
     ]
 
     it('被遮住的在场行不进 emittedSummaries', () => {
-      expect(emittedSummaries([], rows(true)).map((s) => s.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+      expect(emittedSummaries([], rows(true)).map((s) => s.id)).toEqual([
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+      ])
     })
 
     it('被遮住的行翻转 in_context，热区窗口不动', () => {

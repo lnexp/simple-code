@@ -47,6 +47,15 @@ function mount() {
         if (!btn) throw new Error('「上下文 X」按钮没渲染出来')
         btn.click()
       }),
+    clickTab: (name: string) =>
+      act(() => {
+        // 用自己的 host 圈定（document 全局查会撞上别的 mount 残留的树）
+        const btn = Array.from(
+          host.querySelectorAll<HTMLButtonElement>('.branch-strip button'),
+        ).find((x) => (x.textContent ?? '').trim() === name)
+        if (!btn) throw new Error(`没有「${name}」tab`)
+        btn.click()
+      }),
     esc: () =>
       act(() => {
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
@@ -63,7 +72,8 @@ const state: ToWebview = {
   models: [{ provider: 'p', model: 'm' }],
   effort: 'high',
   effortOverridden: false,
-      presets: [],
+  presets: [],
+  summaryInContext: true,
   approvalOn: true,
   imagesEnabled: false,
   contextWindow: 0,
@@ -104,9 +114,11 @@ describe('上下文分析面板接线', () => {
   it('step_finish 出数 → 按钮出现；点击发 get_regions；regions 回来渲染；Esc 关', () => {
     const app = mount()
     app.send(state)
-    // 没数据不渲染（记忆按钮常驻且共用 .usage-ctx 类，锚 title 才是
-    // 「上下文按钮」自己的标识）
-    expect(app.html()).not.toContain('title="上下文分区分析"')
+    // 无条件渲染（2026-11-03：冷启动也要能进面板切「精简上下文」）——
+    // 但没数据时只有按钮壳，数字还没来（记忆按钮共用 .usage-ctx 类，
+    // 锚 title 才是「上下文按钮」自己的标识）
+    expect(app.html()).toContain('title="上下文分区分析"')
+    expect(app.html()).not.toContain('67.3k')
 
     app.send(finish)
     app.clickCtx()
@@ -197,5 +209,42 @@ describe('上下文面板 V2 版式', () => {
     raw.send({ type: 'regions', info })
     expect(raw.html()).toContain('width: 17.19') // 没 real：原样估算
     expect(raw.html()).toContain('（估算）')
+  })
+
+  it('精简上下文开关分支独立（显示层）：任务切回主任务，开关恢复主任务的档位', () => {
+    const app = mount()
+    // 主任务 state：开（mainSummaryRef 记下）
+    app.send(state)
+    // 任务条上出现任务 → 点它的 tab（该任务在快照里是关）
+    app.send({
+      type: 'tasks',
+      folder: '/tmp/x',
+      tasks: [
+        {
+          name: '调研',
+          status: 'idle',
+          lastText: '',
+          current: null,
+          effort: null,
+          effortOverridden: false,
+          presets: [],
+          imagesEnabled: false,
+          contextWindow: 0,
+          approvalOn: true,
+          summaryInContext: false,
+        } satisfies never,
+      ],
+    })
+    app.clickTab('调研')
+    app.send({ type: 'task_hydrate', folder: '/tmp/x', name: '调研', items: [] })
+    // 任务面板：显示「精简上下文：开」（任务精简中）
+    app.clickCtx()
+    const html = app.html()
+    // 后台主任务推 state（主任务自己的标准装配）：任务面板不被冲掉
+    app.send(state)
+    expect(app.html()).toContain('精简上下文：开')
+    // 切回主任务：恢复主任务的档位（标准装配 → 显示「关」）
+    app.clickTab('主任务')
+    expect(app.html()).toContain('精简上下文：关')
   })
 })

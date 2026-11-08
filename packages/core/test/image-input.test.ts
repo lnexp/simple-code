@@ -137,9 +137,9 @@ describe('图片输入', () => {
     expect(blind?.parts[1]).toMatchObject({ type: 'text' })
     expect((blind?.parts[1] as { text?: string }).text).toContain('不支持图片')
     // 库侧：历史里的 ImagePart 还在——「历史可以降分辨率不能丢」
-    const stored = session.messages().find(
-      (m) => m.parts.some((p) => p.type === 'text' && p.text === '看这张'),
-    )
+    const stored = session
+      .messages()
+      .find((m) => m.parts.some((p) => p.type === 'text' && p.text === '看这张'))
     expect(stored?.parts[1]).toMatchObject({ type: 'image', data: IMG.data })
 
     // 切回支持的模型，下一轮请求里图回来了（降级不是一次性的烧毁）
@@ -191,14 +191,16 @@ describe('图片输入', () => {
     await drain(session.send('抓这张图'))
     // 前提：tool_result 确实带了图（真实进过库）
     expect(
-      session.messages().some((m) => m.parts.some((p) => p.type === 'tool_result' && p.images?.length)),
+      session
+        .messages()
+        .some((m) => m.parts.some((p) => p.type === 'tool_result' && p.images?.length)),
     ).toBe(true)
 
     session.setModel({ provider: 'alpha', model: 'a-blind' })
     await drain(session.send('换个模型再看'))
-    const sent = seen[2]?.messages.flatMap((m) => m.parts).find(
-      (p) => p.type === 'tool_result',
-    ) as { images?: unknown } | undefined
+    const sent = seen[2]?.messages.flatMap((m) => m.parts).find((p) => p.type === 'tool_result') as
+      | { images?: unknown }
+      | undefined
     expect(sent?.images).toBeUndefined()
     expect((sent as { output: string } | undefined)?.output).toContain('图片已省略')
     // 库里原图还在
@@ -316,7 +318,9 @@ describe('图片输入', () => {
       // 下一条消息：session 级缓存生效，不再重复转述，历史里的转述还在
       await drain(session.send('再说一遍'))
       expect(relayBodies).toHaveLength(1)
-      const again = seen[1]?.messages.find((m) => m.role === 'user' && m.parts.some((p) => p.type === 'text' && p.text === '看这张'))
+      const again = seen[1]?.messages.find(
+        (m) => m.role === 'user' && m.parts.some((p) => p.type === 'text' && p.text === '看这张'),
+      )
       expect((again?.parts[1] as { text?: string }).text).toContain('红方块')
       await session.close()
     } finally {

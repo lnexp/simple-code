@@ -39,7 +39,7 @@ export function clampIndexLine(text: string, max = INDEX_LINE_MAX_CHARS): string
 }
 
 /** 重写请求里追加的那句话：给出实际字数，模型才知道要砍多少 */
-export function capFeedback(length: number, max = INDEX_LINE_MAX_CHARS): string {
+function capFeedback(length: number, max = INDEX_LINE_MAX_CHARS): string {
   return (
     `你写了 ${length} 字，超过 ${max} 字的上限。重写一遍，总长不超过 ${max} 字：` +
     '主题相近的并成一行，次要的关键词删掉，不要逐条照抄输入。只输出结果。'

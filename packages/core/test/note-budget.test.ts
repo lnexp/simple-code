@@ -1,8 +1,8 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
-import { buildNoteBudget } from '../src/session/note-budget.ts'
 import { estimateTextTokens } from '../src/loop/tokens.ts'
+import { buildNoteBudget } from '../src/session/note-budget.ts'
 import { loadSelectorCandidates, parseSelection } from '../src/session/selector.ts'
 import { loadTouchContext } from '../src/session/touch-cue.ts'
 
@@ -54,16 +54,32 @@ it('goal 超份额借额度，完整且总量不增加，优先使用空余再�
   expect(estimateTextTokens(result.text!)).toBeLessThanOrEqual(400)
 })
 
-it('超总量及多个当前目标明确报错，不静默丢失；缺节原则报告但不作规则', () => {
+it('超总量截断、多个当前目标降级取首个——都不阻塞；缺节原则报告但不作规则', () => {
   const root = fixture()
   put(root, 'notes/goal/a.md', 'status: active\ncurrent: true', goal('中'.repeat(5000)))
-  expect(() => buildNoteBudget(root)).toThrow('超过 note 总预算')
+  const over = buildNoteBudget(root)
+  expect(over.text).toContain('#### 目标')
+  expect(over.text).toContain('已截断')
+  expect(estimateTextTokens(over.text!)).toBeLessThanOrEqual(2100)
+  expect(over.warnings.join()).toContain('a 渲染超预算')
   put(root, 'notes/goal/b.md', 'status: active\ncurrent: true', goal('另一个'))
-  expect(() => buildNoteBudget(root)).toThrow('多个当前 goal')
+  const multi = buildNoteBudget(root)
+  expect(multi.text).toContain('### a')
+  expect(multi.text).not.toContain('### b')
+  expect(multi.warnings.join()).toContain('多个 current goal')
   const other = fixture()
   put(other, 'principles/bad.md', 'status: active', '## 判断\n不完整')
   expect(buildNoteBudget(other).warnings.join()).toContain('bad')
   expect(buildNoteBudget(other).selected).toHaveLength(0)
+})
+
+it('不可读 current goal 跳过不阻塞（2026-11-03 降级修复：goal 是 agent 自管的，炸 session 由用户买单）', () => {
+  const root = fixture()
+  put(root, 'notes/goal/bad.md', 'status: active\ncurrent: true', '## 缺节的正文')
+  const result = buildNoteBudget(root)
+  expect(result.text ?? '').not.toContain('### bad')
+  expect(result.warnings.join()).toContain('bad')
+  expect(result.selected).toHaveLength(0)
 })
 
 it('同名冲突不注入，LRU 选择，正文边界整条保留', () => {

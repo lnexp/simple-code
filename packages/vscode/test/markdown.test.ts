@@ -31,7 +31,9 @@ describe('渲染形状', () => {
     // 高亮后 class 是 "hljs language-ts"（2026-09-12 语法高亮）
     expect(html).toContain('<code class="hljs language-ts">')
     // 2026-09-12 高亮后纯文本被 span 打断，断言 token 形态
-    expect(html).toContain('<span class="hljs-keyword">const</span> a = <span class="hljs-number">1</span>')
+    expect(html).toContain(
+      '<span class="hljs-keyword">const</span> a = <span class="hljs-number">1</span>',
+    )
   })
 
   it('GFM 表格', () => {
@@ -136,7 +138,7 @@ describe('路径链接化（pathlink 接进管线）', () => {
   it('code 块不链接化（原文语义），行内 code 链接化（agent 引用路径的标准写法）', () => {
     const html = renderMarkdown('`a/b.ts` 段落里\n\n```\ncat d/e.log\n```')
     expect(html).toContain('<code><a data-open-path="a/b.ts">a/b.ts</a></code>')
-    expect(html).not.toContain('d/e.log\"')
+    expect(html).not.toContain('d/e.log"')
   })
 
   it('消毒优先：注入尝试不会被链接化路径复活', () => {

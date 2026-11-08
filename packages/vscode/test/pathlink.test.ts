@@ -10,7 +10,9 @@ const tokens = (s: string) =>
 describe('findPathTokens 识别口径', () => {
   it('中文文件名链接化（2026-09-11 实案：other-project 的讨论稿点不开）', () => {
     expect(
-      hits('详见 /Users/dev/Documents/workspace/other-project/限制型query修复方案_讨论稿.md（约 253 行）'),
+      hits(
+        '详见 /Users/dev/Documents/workspace/other-project/限制型query修复方案_讨论稿.md（约 253 行）',
+      ),
     ).toEqual(['/Users/dev/Documents/workspace/other-project/限制型query修复方案_讨论稿.md'])
     expect(hits('见 docs/设计文档/初稿.md 一段')).toEqual(['docs/设计文档/初稿.md'])
   })
@@ -113,11 +115,14 @@ describe('linkifyDom（markdown 管线用）', () => {
 
   it('pre 里的绝对路径粘着 CJK 前缀也命中（复制按钮文案粘进路径的实案）', () => {
     const root = document.createElement('div')
-    root.innerHTML = '<pre>复制/Users/dev/Code/demo-project/scripts/agent_eval/eval_system_prompt_v2.zh.md</pre>'
+    root.innerHTML =
+      '<pre>复制/Users/dev/Code/demo-project/scripts/agent_eval/eval_system_prompt_v2.zh.md</pre>'
     linkifyDom(root)
     const a = root.querySelector('pre a[data-open-path]')
     // 「制」是 CJK 边界，回溯从 / 起匹配；「复制」留在块文本里
-    expect(a?.getAttribute('data-open-path')).toBe('/Users/dev/Code/demo-project/scripts/agent_eval/eval_system_prompt_v2.zh.md')
+    expect(a?.getAttribute('data-open-path')).toBe(
+      '/Users/dev/Code/demo-project/scripts/agent_eval/eval_system_prompt_v2.zh.md',
+    )
     expect(a?.previousSibling?.textContent).toBe('复制')
   })
 

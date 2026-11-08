@@ -1,8 +1,8 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { readFile, mkdir } from 'node:fs/promises'
+import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
+import { mkdir, readFile } from 'node:fs/promises'
+import type { IncomingMessage } from 'node:http'
 import { isAbsolute, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import type { IncomingMessage } from 'node:http'
 import { LLMStreamError } from './protocol.ts'
 
 export const SDK_VERSION = '0.3.308'
@@ -116,14 +116,20 @@ export function sdkProcess(options: Parameters<SdkOptions['spawnClaudeCodeProces
   return child
 }
 
-export function sdkUpstream(req: IncomingMessage, target: string, ownHeaders: RequestInit['headers']) {
+export function sdkUpstream(
+  req: IncomingMessage,
+  target: string,
+  ownHeaders: RequestInit['headers'],
+) {
   const headers = new Headers()
   for (const [key, value] of Object.entries(req.headers)) {
     if (value !== undefined) headers.set(key, Array.isArray(value) ? value.join(', ') : value)
   }
   for (const key of ['host', 'content-length', 'authorization', 'x-api-key', 'connection'])
     headers.delete(key)
-  new Headers(ownHeaders).forEach((value, key) => headers.set(key, value))
+  new Headers(ownHeaders).forEach((value, key) => {
+    headers.set(key, value)
+  })
   headers.set('connection', 'close')
   const url = new URL(target)
   new URL(req.url!, 'http://localhost').searchParams.forEach((v, k) => {

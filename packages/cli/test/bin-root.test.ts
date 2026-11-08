@@ -19,16 +19,25 @@ beforeAll(() => {
   const sc = join(root, '.simple-code')
   mkdirSync(join(sc, 'memory'), { recursive: true })
   mkdirSync(join(sc, 'notes'))
-  writeFileSync(join(sc, 'notes', 'n1.md'), '---\nname: n1\ntitle: 标题\ndescription: 描述 n1\n---\n正文 n1\n')
+  writeFileSync(
+    join(sc, 'notes', 'n1.md'),
+    '---\nname: n1\ntitle: 标题\ndescription: 描述 n1\n---\n正文 n1\n',
+  )
   mkdirSync(join(sc, 'lessons'))
   writeFileSync(
     join(sc, 'lessons', 'l1.md'),
     '---\nname: l1\ndescription: 描述 l1\n---\n# 教训 l1\n\n## 症状\n症状 l1\n',
   )
   mkdirSync(join(sc, 'events'))
-  writeFileSync(join(sc, 'events', 'e1.md'), '---\nname: e1\ndescription: 描述 e1\n---\n# e1 — 描述 e1\n')
+  writeFileSync(
+    join(sc, 'events', 'e1.md'),
+    '---\nname: e1\ndescription: 描述 e1\n---\n# e1 — 描述 e1\n',
+  )
   mkdirSync(join(sc, 'skills', 's1'), { recursive: true })
-  writeFileSync(join(sc, 'skills', 's1', 'SKILL.md'), '---\nname: s1\ndescription: 描述 s1\n---\n正文 s1\n')
+  writeFileSync(
+    join(sc, 'skills', 's1', 'SKILL.md'),
+    '---\nname: s1\ndescription: 描述 s1\n---\n正文 s1\n',
+  )
   mkdirSync(join(root, 'pkg', 'src'), { recursive: true })
   writeFileSync(join(root, 'pkg', 'src', 'a.txt'), 'old\n')
   sub = join(root, 'pkg')
@@ -52,7 +61,11 @@ describe('bin 在子目录下认工作区根', () => {
   }, 60_000)
 
   it('apply-patch 的相对路径按工作区根解析', () => {
-    const r = run('apply-patch', [], '*** Begin Patch\n*** Update File: pkg/src/a.txt\n@@\n-old\n+new\n*** End Patch\n')
+    const r = run(
+      'apply-patch',
+      [],
+      '*** Begin Patch\n*** Update File: pkg/src/a.txt\n@@\n-old\n+new\n*** End Patch\n',
+    )
     expect(r.stderr).toBe('')
     expect(readFileSync(join(root, 'pkg', 'src', 'a.txt'), 'utf8')).toBe('new\n')
   }, 30_000)

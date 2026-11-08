@@ -35,7 +35,8 @@ function mount() {
       act(() => {
         window.dispatchEvent(new MessageEvent('message', { data: msg }))
       }),
-    buttons: (label: string) => [...host.querySelectorAll('button')].filter((b) => b.textContent?.trim() === label),
+    buttons: (label: string) =>
+      [...host.querySelectorAll('button')].filter((b) => b.textContent?.trim() === label),
     click: (b: Element) =>
       act(() => {
         b.dispatchEvent(new MouseEvent('click', { bubbles: true }))
@@ -69,7 +70,11 @@ describe('「继续」按钮', () => {
     const app = mount()
     app.send(state(false))
     app.send(state(true))
-    app.send({ type: 'agent', event: { type: 'error', message: '上游服务错误[502]', retryable: true, kind: 'unknown' }, at: 1 })
+    app.send({
+      type: 'agent',
+      event: { type: 'error', message: '上游服务错误[502]', retryable: true, kind: 'unknown' },
+      at: 1,
+    })
     // 还在跑：不给按钮（core 可能还在收尾）
     expect(app.buttons('继续')).toHaveLength(0)
     app.send(state(false))
@@ -86,7 +91,11 @@ describe('「继续」按钮', () => {
     const app = mount()
     app.send(state(false))
     app.send(state(true))
-    app.send({ type: 'agent', event: { type: 'error', message: '渠道未启用', retryable: false }, at: 1 })
+    app.send({
+      type: 'agent',
+      event: { type: 'error', message: '渠道未启用', retryable: false },
+      at: 1,
+    })
     app.send(state(false))
     expect(app.buttons('继续')).toHaveLength(1)
   })

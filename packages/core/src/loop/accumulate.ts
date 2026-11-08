@@ -89,7 +89,12 @@ export function accumulate(state: Accumulator, ev: StreamEvent): [Accumulator, A
 
     case 'finish':
       return [
-        { ...state, usage: ev.usage, finish: ev.reason, ...(ev.refusal ? { refusal: ev.refusal } : {}) },
+        {
+          ...state,
+          usage: ev.usage,
+          finish: ev.reason,
+          ...(ev.refusal ? { refusal: ev.refusal } : {}),
+        },
         [],
       ]
   }

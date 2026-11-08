@@ -14,7 +14,7 @@
 
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -24,9 +24,13 @@ const pkgDir = fileURLToPath(new URL(`../packages/${pkgName}`, import.meta.url))
 const manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'))
 // 扩展目录名规则：publisher.name-version（name 转小写）
 const extDirName = `${manifest.publisher}.${manifest.name.toLowerCase()}-${manifest.version}`
-const extRoot = join(process.env.SIMPLE_CODE_EXTENSIONS_DIR ?? join(homedir(), '.vscode/extensions'), extDirName)
+const extRoot = join(
+  process.env.SIMPLE_CODE_EXTENSIONS_DIR ?? join(homedir(), '.vscode/extensions'),
+  extDirName,
+)
 
-const run = (cmd, args, opts = {}) => execFileSync(cmd, args, { cwd: pkgDir, stdio: 'inherit', ...opts })
+const run = (cmd, args, opts = {}) =>
+  execFileSync(cmd, args, { cwd: pkgDir, stdio: 'inherit', ...opts })
 const fsStatMtime = (p) => statSync(p).mtimeMs
 
 // 1. 构建 + 打包（package script 已含 build.mjs——教训 vsce-without-build-stale-vsix）
@@ -54,21 +58,30 @@ run('rsync', ['-a', '--delete', `${layer}/`, `${extRoot}/`])
 // 5. md5 核对关键产物——装机验证以产物为准（教训 verify-install-via-jsonl-not-self-read）
 const md5 = (p) => createHash('md5').update(readFileSync(p)).digest('hex')
 // webview 是主扩展独有的（伴生扩展没有 UI），核对清单按包给
-const checks = pkgName === 'vscode' ? ['dist/extension.cjs', 'dist/webview.current'] : ['dist/extension.cjs']
+const checks =
+  pkgName === 'vscode' ? ['dist/extension.cjs', 'dist/webview.current'] : ['dist/extension.cjs']
 let ok = true
 for (const rel of checks) {
   const local = join(pkgDir, rel)
   const remote = join(extRoot, rel)
-  if (!existsSync(remote)) { console.error(`[deploy] ✗ 装机缺文件 ${rel}`); ok = false; continue }
+  if (!existsSync(remote)) {
+    console.error(`[deploy] ✗ 装机缺文件 ${rel}`)
+    ok = false
+    continue
+  }
   // webview.current 是指针文件（内容是 webview.<hash>.js 文件名），核对它指向的文件本体
   if (rel.endsWith('webview.current')) {
     const web = readFileSync(remote, 'utf8').trim()
     for (const side of [join(pkgDir, 'dist', web), join(extRoot, 'dist', web)]) {
-      if (!existsSync(side)) { console.error(`[deploy] ✗ webview 指针指向不存在的 ${web}（${side}）`); ok = false }
+      if (!existsSync(side)) {
+        console.error(`[deploy] ✗ webview 指针指向不存在的 ${web}（${side}）`)
+        ok = false
+      }
     }
     if (!ok) break
     if (md5(join(pkgDir, 'dist', web)) !== md5(join(extRoot, 'dist', web))) {
-      console.error(`[deploy] ✗ ${web} 两边不一致`); ok = false
+      console.error(`[deploy] ✗ ${web} 两边不一致`)
+      ok = false
     } else {
       console.log(`[deploy] ✓ ${web} md5 一致`)
     }
@@ -91,9 +104,20 @@ rmSync(stage, { recursive: true, force: true })
   try {
     const registry = JSON.parse(readFileSync(registryFile, 'utf8'))
     const wantId = `${manifest.publisher}.${manifest.name}`.toLowerCase()
-    if (!registry.some((e) => e?.identifier?.id === wantId && e?.version === manifest.version && e?.location?.path === extRoot)) {
-      console.error(`[deploy] ✗ extensions.json 没有指向本目录的注册条目（${extRoot}）——reload 不会加载它`)
-      console.error('[deploy]   修法见教训 extension-folder-exists-but-not-loaded：补注册条目或清 .obsolete')
+    if (
+      !registry.some(
+        (e) =>
+          e?.identifier?.id === wantId &&
+          e?.version === manifest.version &&
+          e?.location?.path === extRoot,
+      )
+    ) {
+      console.error(
+        `[deploy] ✗ extensions.json 没有指向本目录的注册条目（${extRoot}）——reload 不会加载它`,
+      )
+      console.error(
+        '[deploy]   修法见教训 extension-folder-exists-but-not-loaded：补注册条目或清 .obsolete',
+      )
       ok = false
     } else {
       console.log('[deploy] ✓ extensions.json 注册条目在位')
@@ -108,13 +132,20 @@ rmSync(stage, { recursive: true, force: true })
       }
     }
   } catch (e) {
-    console.error(`[deploy] ⚠ 注册核对失败（${e instanceof Error ? e.message : String(e)}）——md5 已一致，继续`)
+    console.error(
+      `[deploy] ⚠ 注册核对失败（${e instanceof Error ? e.message : String(e)}）——md5 已一致，继续`,
+    )
   }
 }
 
 // ~/.simple-code/bin/ 的 sc 不再由 deploy 建软链——扩展激活时的 shim
 // 接管（core src/shims.ts：宿主内置 Node 优先、系统 node 兜底，激活
 // 每次重写，路径永远新鲜）。deploy 建的软链会和 shim 互相覆盖打架
-if (!ok) { console.error('[deploy] 核对失败——上面的差异要处理，别 reload'); process.exit(1) }
+if (!ok) {
+  console.error('[deploy] 核对失败——上面的差异要处理，别 reload')
+  process.exit(1)
+}
 console.log(`[deploy] 完成。Cmd+Shift+P → Reload Window 生效`)
-console.log(`[deploy] reload 后跑 node scripts/verify-install.mjs 仲裁新版在跑（ext_activate 版本事件）`)
+console.log(
+  `[deploy] reload 后跑 node scripts/verify-install.mjs 仲裁新版在跑（ext_activate 版本事件）`,
+)

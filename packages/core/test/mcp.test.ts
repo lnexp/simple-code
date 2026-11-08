@@ -41,8 +41,6 @@ describe('mcp：callMcpTool', () => {
     await expect(callMcpTool(cfg, 'echo', '{oops}')).rejects.toThrow('参数不是合法 JSON')
   })
   test('起不来的 command → 连接报错', async () => {
-    await expect(
-      listMcpTools({ command: '/nonexistent-bin-xyz', args: [] }),
-    ).rejects.toThrow()
+    await expect(listMcpTools({ command: '/nonexistent-bin-xyz', args: [] })).rejects.toThrow()
   })
 })

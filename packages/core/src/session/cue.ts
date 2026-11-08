@@ -17,7 +17,7 @@ import type { Summary } from '../loop/assemble.ts'
 
 /** 候选头部一行：kind 标来源，name 是去重键（read/search 的入口名）。
  *  turnTo = 覆盖到的最后一轮（时间混合的信号，见 matchSummaries） */
-export type CueCandidate = { kind: string; name: string; text: string; turnTo?: number }
+type CueCandidate = { kind: string; name: string; text: string; turnTo?: number }
 
 /**
  * 关键词匹配：子串包含（大小写不敏感）。命中数多的排前，平手**新→旧**，
@@ -48,10 +48,18 @@ export function matchSummaries(
       return { c, text, hits }
     })
     .filter((x) => x.hits.length > 0)
-    .sort((a, b) => b.hits.length - a.hits.length || (b.c.turnTo ?? 0) - (a.c.turnTo ?? 0) || a.c.name.localeCompare(b.c.name))
+    .sort(
+      (a, b) =>
+        b.hits.length - a.hits.length ||
+        (b.c.turnTo ?? 0) - (a.c.turnTo ?? 0) ||
+        a.c.name.localeCompare(b.c.name),
+    )
     .slice(0, opts.topK)
   return {
-    lines: ranked.map((x) => `〔recall·async〕${x.c.kind} ${clip(x.c.name, 40)} — ${clip(x.text, 70)}（命中: ${x.hits.join(', ')}）`),
+    lines: ranked.map(
+      (x) =>
+        `〔recall·async〕${x.c.kind} ${clip(x.c.name, 40)} — ${clip(x.text, 70)}（命中: ${x.hits.join(', ')}）`,
+    ),
     names: ranked.map((x) => x.c.name),
   }
 }
@@ -76,8 +84,14 @@ export function loadCueCandidates(summaries: Summary[], liveFloor: number | null
   // 用词最像、专抢名额（2026-10-12 t16867/t16868 实例）
   for (const s of summaries)
     if (!s.inContext && s.level === 0 && (liveFloor === null || s.coversTo < liveFloor)) {
-      const t = s.turnFrom === s.turnTo ? `${s.turnFrom ?? '?'}` : `${s.turnFrom ?? '?'}-${s.turnTo ?? '?'}`
-      out.push({ kind: 'summary', name: `t${t}`, text: `${s.name} ${s.head ?? ''}`, turnTo: s.turnTo ?? 0 })
+      const t =
+        s.turnFrom === s.turnTo ? `${s.turnFrom ?? '?'}` : `${s.turnFrom ?? '?'}-${s.turnTo ?? '?'}`
+      out.push({
+        kind: 'summary',
+        name: `t${t}`,
+        text: `${s.name} ${s.head ?? ''}`,
+        turnTo: s.turnTo ?? 0,
+      })
     }
   return out
 }

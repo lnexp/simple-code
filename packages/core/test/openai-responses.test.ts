@@ -73,9 +73,9 @@ describe('openai-responses / parseStream', () => {
 
   it('流 EOF 但没收到 response.completed：当断流抛错，不当成功', async () => {
     // 同 anthropic 侧：干净 EOF 不是模型说完了，是链路把流掐了
-    await expect(
-      feed([['response.output_text.delta', { delta: '半截' }]]),
-    ).rejects.toMatchObject({ detail: { kind: 'server', retryable: true } })
+    await expect(feed([['response.output_text.delta', { delta: '半截' }]])).rejects.toMatchObject({
+      detail: { kind: 'server', retryable: true },
+    })
   })
 
   it('从录制的 fixture 解出完整事件序列', async () => {
@@ -99,7 +99,10 @@ describe('openai-responses / parseStream', () => {
     // `data: {"type":"response.…"}`，一条 event: 行都没有。只认 event: 行的
     // 话全部落进 default 被丢，EOF 时报「未收到结束标记」，界面一个字没有。
     // fixture = 真机抓包，删掉回显的上游 instructions/tools、身份字段换占位
-    const events = await eventsFromFixture(openaiResponses.parseStream, 'openai-responses.data-only.sse')
+    const events = await eventsFromFixture(
+      openaiResponses.parseStream,
+      'openai-responses.data-only.sse',
+    )
     expect(shape(events)).toEqual(['text_start', 'text_delta', 'text_end', 'finish'])
     expect(events.find((e) => e.type === 'text_delta')).toMatchObject({ text: '好' })
     expect(events.at(-1)).toMatchObject({ type: 'finish', reason: 'stop' })
@@ -357,9 +360,15 @@ describe('openai-responses / parseError', () => {
 
   it('流内错误（status 0）归不上类 → 可重试；认得出的照旧不重试', () => {
     // 流里 error / response.failed 走同一个 toError、status 传 0
-    expect(err(0, '', 'passthrough stream idle timeout after 120s')).toMatchObject({ kind: 'unknown', retryable: true })
+    expect(err(0, '', 'passthrough stream idle timeout after 120s')).toMatchObject({
+      kind: 'unknown',
+      retryable: true,
+    })
     expect(err(0, 'rate_limit_exceeded')).toMatchObject({ kind: 'rate_limit', retryable: true })
     expect(err(0, 'invalid_api_key')).toMatchObject({ kind: 'auth', retryable: false })
-    expect(err(0, 'context_length_exceeded')).toMatchObject({ kind: 'context_overflow', retryable: false })
+    expect(err(0, 'context_length_exceeded')).toMatchObject({
+      kind: 'context_overflow',
+      retryable: false,
+    })
   })
 })

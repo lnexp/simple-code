@@ -17,7 +17,11 @@ export type ParsedArgs =
 export function parseLspArgs(argv: string[]): ParsedArgs {
   const [cmd, fileArg] = argv
   if (!cmd || !fileArg) {
-    return { ok: false, error: '用法：<definition|refs|symbols|hover|calls-in|calls-out> <file>[:行[:列]]，如 refs src/run.ts:120:5' }
+    return {
+      ok: false,
+      error:
+        '用法：<definition|refs|symbols|hover|calls-in|calls-out> <file>[:行[:列]]，如 refs src/run.ts:120:5',
+    }
   }
   const parts = fileArg.split(':')
   // 上面判过 fileArg 非空，split 必有首段
@@ -26,7 +30,13 @@ export function parseLspArgs(argv: string[]): ParsedArgs {
   const line = parts[1] ? Number(parts[1]) : cmd === 'symbols' ? 1 : NaN
   const col = parts[2] ? Number(parts[2]) : 1
   if (!Number.isFinite(line) || line < 1) {
-    return { ok: false, error: cmd === 'symbols' ? `行号不合法：${String(parts[1] ?? '')}` : `${cmd} 需要位置：${fileArg}（file:行[:列]）` }
+    return {
+      ok: false,
+      error:
+        cmd === 'symbols'
+          ? `行号不合法：${String(parts[1] ?? '')}`
+          : `${cmd} 需要位置：${fileArg}（file:行[:列]）`,
+    }
   }
   return { ok: true, cmd, file, line, col, colGiven: parts[2] !== undefined && parts[2] !== '' }
 }
@@ -46,7 +56,9 @@ export async function lspMain(argv: string[]): Promise<number> {
     const res = await fetch(`http://127.0.0.1:${port}/`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(parsed.ok ? { cmd: parsed.cmd, file: parsed.file, line: parsed.line, col: parsed.col } : {}),
+      body: JSON.stringify(
+        parsed.ok ? { cmd: parsed.cmd, file: parsed.file, line: parsed.line, col: parsed.col } : {},
+      ),
       signal: AbortSignal.timeout(8000),
     })
     const body = (await res.json()) as { ok: boolean; text?: string; error?: string }
@@ -63,7 +75,9 @@ export async function lspMain(argv: string[]): Promise<number> {
     process.stdout.write(`${body.text}${colHint}\n`)
     return 0
   } catch (error) {
-    process.stderr.write(`LSP 桥不可达：${error instanceof Error ? error.message : String(error)}（宿主关闭或端口失效）。回落 grep 吧。\n`)
+    process.stderr.write(
+      `LSP 桥不可达：${error instanceof Error ? error.message : String(error)}（宿主关闭或端口失效）。回落 grep 吧。\n`,
+    )
     return 2
   }
 }

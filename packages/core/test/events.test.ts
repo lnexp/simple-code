@@ -208,8 +208,16 @@ describe('merge 原语（memory-time-decay ③，2026-10-21 拍板）', () => {
   })
   it('appendProgress 落进最新一节（新→旧排）+ 重复旧名拒绝', () => {
     mkdirSync(eventsDir(root), { recursive: true })
-    writeFileSync(join(eventsDir(root), 'older-camp.md'), '---\nname: older-camp\ndescription: 旧段\ncreated: 2026-08-01 10:00:00\nupdated: 2026-08-05 10:00:00\n---\n\n# older-camp — 旧段\n\n## 进展\n\n- 2026-08-01 · 旧的进展\n', 'utf8')
-    writeFileSync(join(eventsDir(root), 'newer-camp.md'), '---\nname: newer-camp\ndescription: 新段\ncreated: 2026-09-01 10:00:00\nupdated: 2026-09-05 10:00:00\n---\n\n# newer-camp — 新段\n\n## 进展\n\n- 2026-09-01 · 新的进展\n', 'utf8')
+    writeFileSync(
+      join(eventsDir(root), 'older-camp.md'),
+      '---\nname: older-camp\ndescription: 旧段\ncreated: 2026-08-01 10:00:00\nupdated: 2026-08-05 10:00:00\n---\n\n# older-camp — 旧段\n\n## 进展\n\n- 2026-08-01 · 旧的进展\n',
+      'utf8',
+    )
+    writeFileSync(
+      join(eventsDir(root), 'newer-camp.md'),
+      '---\nname: newer-camp\ndescription: 新段\ncreated: 2026-09-01 10:00:00\nupdated: 2026-09-05 10:00:00\n---\n\n# newer-camp — 新段\n\n## 进展\n\n- 2026-09-01 · 新的进展\n',
+      'utf8',
+    )
     // 重复旧名（slug 相同）拒绝，不落任何文件
     expect(mergeEvents(root, 'm2', ['older-camp', 'OLDER_CAMP'])).toContain('旧事件重复')
     expect(existsSync(join(eventsDir(root), 'm2.md'))).toBe(false)

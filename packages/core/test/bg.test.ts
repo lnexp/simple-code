@@ -2,8 +2,8 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { BgRegistry } from '../src/tools/bg.ts'
 import { type BashConfig, createBashTool } from '../src/tools/bash.ts'
+import { BgRegistry } from '../src/tools/bg.ts'
 import type { ToolContext } from '../src/tools/types.ts'
 
 const config: BashConfig = {
@@ -31,10 +31,7 @@ describe('bash → BgRegistry 集成', () => {
       signal: new AbortController().signal,
       bg,
     }
-    const out = await bash.execute(
-      { command: '(sleep 30 >/dev/null 2>&1 &); echo started' },
-      ctx,
-    )
+    const out = await bash.execute({ command: '(sleep 30 >/dev/null 2>&1 &); echo started' }, ctx)
     expect(out.output).toContain('started')
     // collect 在 close 后异步收尾，execute resolve 时已登记
     const items = bg.snapshot()
@@ -49,11 +46,14 @@ describe('bash → BgRegistry 集成', () => {
 
   it('terminate 后快照为空、drain 再报一次', async () => {
     const bg = new BgRegistry()
-    await bash.execute({ command: '(sleep 30 >/dev/null 2>&1 &); echo ok' }, {
-      root,
-      signal: new AbortController().signal,
-      bg,
-    })
+    await bash.execute(
+      { command: '(sleep 30 >/dev/null 2>&1 &); echo ok' },
+      {
+        root,
+        signal: new AbortController().signal,
+        bg,
+      },
+    )
     bg.drain() // 清 dirty
     const items = bg.snapshot()
     expect(items.length).toBeGreaterThanOrEqual(1)
@@ -64,11 +64,14 @@ describe('bash → BgRegistry 集成', () => {
 
   it('进程自然退出后 snapshot 自动清掉', async () => {
     const bg = new BgRegistry()
-    await bash.execute({ command: '(sleep 1 >/dev/null 2>&1 &); echo ok' }, {
-      root,
-      signal: new AbortController().signal,
-      bg,
-    })
+    await bash.execute(
+      { command: '(sleep 1 >/dev/null 2>&1 &); echo ok' },
+      {
+        root,
+        signal: new AbortController().signal,
+        bg,
+      },
+    )
     expect(bg.snapshot().length).toBeGreaterThanOrEqual(1)
     await new Promise((r) => setTimeout(r, 1500))
     expect(bg.snapshot()).toEqual([])
@@ -77,11 +80,14 @@ describe('bash → BgRegistry 集成', () => {
   it('命令不含 & 时不查 ps（纯前台命令零开销）', async () => {
     const bg = new BgRegistry()
     // 不含 &：即使进程组里理论上没有残留，也不该报事件
-    await bash.execute({ command: 'echo plain' }, {
-      root,
-      signal: new AbortController().signal,
-      bg,
-    })
+    await bash.execute(
+      { command: 'echo plain' },
+      {
+        root,
+        signal: new AbortController().signal,
+        bg,
+      },
+    )
     expect(bg.drain()).toBeNull()
   })
 })

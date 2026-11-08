@@ -14,10 +14,7 @@ import { configSchema } from '../src/config/schema.ts'
  */
 describe('示例配置', () => {
   it('能通过 schema 校验', async () => {
-    const raw = await readFile(
-      new URL('../../../settings.example.json', import.meta.url),
-      'utf8',
-    )
+    const raw = await readFile(new URL('../../../settings.example.json', import.meta.url), 'utf8')
     const parsed = configSchema.safeParse(JSON.parse(raw))
 
     // 直接比 issues 而不是 success：红的时候要能一眼看到是哪个字段错了
@@ -25,19 +22,13 @@ describe('示例配置', () => {
   })
 
   it('cli 包的示例也能通过 schema 校验', async () => {
-    const raw = await readFile(
-      new URL('../../cli/settings.example.json', import.meta.url),
-      'utf8',
-    )
+    const raw = await readFile(new URL('../../cli/settings.example.json', import.meta.url), 'utf8')
     expect(configSchema.safeParse(JSON.parse(raw)).error?.issues ?? 'ok').toBe('ok')
   })
 
   it('对照：多一个不认识的字段会被 schema 拒绝', async () => {
     // 证明上一条不是空过的——schema 如果不 strict，示例里写什么都能过
-    const raw = await readFile(
-      new URL('../../../settings.example.json', import.meta.url),
-      'utf8',
-    )
+    const raw = await readFile(new URL('../../../settings.example.json', import.meta.url), 'utf8')
     const withTypo = { ...(JSON.parse(raw) as object), memroy: {} }
 
     expect(configSchema.safeParse(withTypo).success).toBe(false)

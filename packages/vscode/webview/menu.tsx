@@ -165,7 +165,13 @@ export function Menu<T>({
         <i className={`codicon codicon-chevron-${open ? 'up' : 'down'}`} aria-hidden />
       </button>
       {open && (
-        <div ref={listRef} className={`menu ${cls} ${drop === 'down' ? 'drop-down' : ''}`} role="menu" aria-label={ariaLabel} tabIndex={-1}>
+        <div
+          ref={listRef}
+          className={`menu ${cls} ${drop === 'down' ? 'drop-down' : ''}`}
+          role="menu"
+          aria-label={ariaLabel}
+          tabIndex={-1}
+        >
           {rowsOf(options).map((row) =>
             'head' in row ? (
               <div key={`h${row.head}`} className="menu-head">
@@ -184,9 +190,7 @@ export function Menu<T>({
               >
                 <div className="menu-text">
                   <span className="menu-label">{row.opt.label}</span>
-                  {row.opt.sub !== undefined && (
-                    <span className="menu-sub">{row.opt.sub}</span>
-                  )}
+                  {row.opt.sub !== undefined && <span className="menu-sub">{row.opt.sub}</span>}
                 </div>
                 <i className="codicon codicon-check" aria-hidden />
               </div>

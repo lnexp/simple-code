@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -14,7 +14,8 @@ import {
 } from '../src/tools/note.ts'
 
 const dir = () => mkdtempSync(join(tmpdir(), 'sc-note-'))
-const readFileSyncText = (root: string, name: string) => readFileSync(join(root, '.simple-code', 'notes', `${name}.md`), 'utf8')
+const readFileSyncText = (root: string, name: string) =>
+  readFileSync(join(root, '.simple-code', 'notes', `${name}.md`), 'utf8')
 
 describe('note 库', () => {
   it('write 落盘带 name/description/created 的 front matter + # 标题', () => {
@@ -50,7 +51,8 @@ describe('note 库', () => {
   it('已有 lastRead 的再读一次也刷新（2026-09-30 修：正则没带 m，$ 只认串尾，旧值永远换不掉）', () => {
     const root = dir()
     mkdirSync(join(root, '.simple-code', 'notes'), { recursive: true })
-    const head = '---\nname: a\ndescription: d\ncreated: 2026-01-01 00:00:00\nlastRead: 2026-01-02 00:00:00\n---\n\n# t\n'
+    const head =
+      '---\nname: a\ndescription: d\ncreated: 2026-01-01 00:00:00\nlastRead: 2026-01-02 00:00:00\n---\n\n# t\n'
     writeFileSync(join(root, '.simple-code', 'notes', 'a.md'), head, 'utf8')
     const meta = parseNoteMeta(readNote(root, 'a'))
     expect(meta.lastRead).not.toBe('2026-01-02 00:00:00')
@@ -61,10 +63,17 @@ describe('note 库', () => {
     const root = dir()
     mkdirSync(join(root, '.simple-code', 'notes'), { recursive: true })
     const w = (n: string, extra: string) =>
-      writeFileSync(join(root, '.simple-code', 'notes', `${n}.md`), `---\nname: ${n}\ndescription: 关于压缩${n}\n${extra}---\n\n# ${n}\n`, 'utf8')
+      writeFileSync(
+        join(root, '.simple-code', 'notes', `${n}.md`),
+        `---\nname: ${n}\ndescription: 关于压缩${n}\n${extra}---\n\n# ${n}\n`,
+        'utf8',
+      )
     w('new', '')
     w('old', 'status: superseded\nby: new\n')
-    expect(parseNoteMeta(readFileSyncText(root, 'old'))).toMatchObject({ status: 'superseded', by: 'new' })
+    expect(parseNoteMeta(readFileSyncText(root, 'old'))).toMatchObject({
+      status: 'superseded',
+      by: 'new',
+    })
     expect(activeNoteCards(root).map((c) => c.name)).toEqual(['new'])
     expect(listNoteCards(root)).toHaveLength(2) // 全量照旧，不删
     expect(listNotes(root)).toMatch(/- old — .*（已作废，现行见 new）/)
@@ -104,14 +113,19 @@ describe('note 库', () => {
   it('write 撞同名报错——改内容走 APPLY_PATCH 或显式删（静默覆盖会丢旧结论）', () => {
     const root = dir()
     writeNote(root, { name: 'dup', title: 'T', description: 'd', body: 'b' })
-    expect(() => writeNote(root, { name: 'dup', title: 'T2', description: 'd2', body: 'b2' })).toThrow(
-      '已存在',
-    )
+    expect(() =>
+      writeNote(root, { name: 'dup', title: 'T2', description: 'd2', body: 'b2' }),
+    ).toThrow('已存在')
   })
 
   it('search：全文命中（含暗区），格式对齐 lesson search', () => {
     const root = dir()
-    writeNote(root, { name: 'panel-fix', title: '面板', description: '面板串台修法', body: '正文里写了 regions 过滤' })
+    writeNote(root, {
+      name: 'panel-fix',
+      title: '面板',
+      description: '面板串台修法',
+      body: '正文里写了 regions 过滤',
+    })
     writeNote(root, { name: 'other', title: '无关', description: '别的', body: '别的正文' })
     // 命中描述行
     expect(searchNotes(root, '串台')).toContain('panel-fix')
@@ -124,12 +138,27 @@ describe('note 库', () => {
 
   it('search：OR 候选组与多词排序——照 memory search 用法带 OR 不再静默 0 命中', () => {
     const root = dir()
-    writeNote(root, { name: 'cache-ttl', title: '缓存', description: '缓存时长', body: '正文 cache_control 断点' })
-    writeNote(root, { name: 'unrelated', title: '无关', description: '别的', body: 'only for or-ing English words' })
+    writeNote(root, {
+      name: 'cache-ttl',
+      title: '缓存',
+      description: '缓存时长',
+      body: '正文 cache_control 断点',
+    })
+    writeNote(root, {
+      name: 'unrelated',
+      title: '无关',
+      description: '别的',
+      body: 'only for or-ing English words',
+    })
     // OR 组：任一候选词命中即候选（此前整串 indexOf 必 0 命中——2026-10-19 真实日志 23 次全落空）
     expect(searchNotes(root, 'ttl OR 1h OR cache_control')).toContain('cache-ttl')
     // 命中词多的排前：两个候选都命中的排在只中一词的前面
-    writeNote(root, { name: 'both-hit', title: '双中', description: 'ttl 与 cache_control 都有', body: 'ttl cache_control' })
+    writeNote(root, {
+      name: 'both-hit',
+      title: '双中',
+      description: 'ttl 与 cache_control 都有',
+      body: 'ttl cache_control',
+    })
     const out = searchNotes(root, 'ttl OR cache_control')
     expect(out.indexOf('both-hit')).toBeLessThan(out.indexOf('cache-ttl'))
     // 反向：OR 分隔符不参与匹配，纯 OR 查不出东西

@@ -12,9 +12,9 @@
 //   - 尾部空洞：step 已卸、摘要 ready 排队，等下一个压缩点进场（compaction-v2）
 //   - 存根：step.unloaded=1 的 live 行是存根，不是原文
 
-import { DatabaseSync } from 'node:sqlite'
 import { existsSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 
 const CHECKS = [
   {
@@ -78,18 +78,34 @@ for (const d of dirs) {
     const ms = (performance.now() - t0).toFixed(0)
     const mark = rows.length === 0 ? 'ok ' : 'BAD'
     if (rows.length > 0) bad++
-    const sample = rows.slice(0, 8).map((r) => r.s).join(', ')
-    console.log(`  ${mark} ${c.id} ${c.what}：${rows.length}${sample ? `  [${sample}]` : ''}  (${ms}ms)`)
+    const sample = rows
+      .slice(0, 8)
+      .map((r) => r.s)
+      .join(', ')
+    console.log(
+      `  ${mark} ${c.id} ${c.what}：${rows.length}${sample ? `  [${sample}]` : ''}  (${ms}ms)`,
+    )
   }
   // I6 任务残留：库里有 owner 行但 .simple-code/tasks/<owner>.json 不在 = 关闭中断
   const tasksDir = join(root, '.simple-code', 'tasks')
-  const manifests = new Set(existsSync(tasksDir) ? readdirSync(tasksDir).filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5)) : [])
-  const owners = db.prepare(`SELECT DISTINCT owner AS o FROM turns WHERE owner IS NOT NULL
+  const manifests = new Set(
+    existsSync(tasksDir)
+      ? readdirSync(tasksDir)
+          .filter((f) => f.endsWith('.json'))
+          .map((f) => f.slice(0, -5))
+      : [],
+  )
+  const owners = db
+    .prepare(`SELECT DISTINCT owner AS o FROM turns WHERE owner IS NOT NULL
                              UNION SELECT DISTINCT owner FROM messages WHERE owner IS NOT NULL
-                             UNION SELECT DISTINCT owner FROM summaries WHERE owner IS NOT NULL`).all().map((r) => r.o)
+                             UNION SELECT DISTINCT owner FROM summaries WHERE owner IS NOT NULL`)
+    .all()
+    .map((r) => r.o)
   const orphan = owners.filter((o) => !manifests.has(o))
   if (orphan.length > 0) bad++
-  console.log(`  ${orphan.length === 0 ? 'ok ' : 'BAD'} I6 库里有 owner 行但没有 manifest（任务关闭中断）：${orphan.length}${orphan.length ? `  [${orphan.join(', ')}]` : ''}`)
+  console.log(
+    `  ${orphan.length === 0 ? 'ok ' : 'BAD'} I6 库里有 owner 行但没有 manifest（任务关闭中断）：${orphan.length}${orphan.length ? `  [${orphan.join(', ')}]` : ''}`,
+  )
   db.close()
 }
 process.exit(bad > 0 ? 1 : 0)

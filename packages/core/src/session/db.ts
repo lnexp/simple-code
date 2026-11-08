@@ -82,7 +82,8 @@ export function openDbReadOnly(path: string): Db {
     run: () => {
       throw new Error('只读连接不许写')
     },
-    all: <T>(sql: string, ...params: SqlValue[]) => db.prepare(sql).all(...params) as unknown as T[],
+    all: <T>(sql: string, ...params: SqlValue[]) =>
+      db.prepare(sql).all(...params) as unknown as T[],
     transaction: () => {
       throw new Error('只读连接不许写')
     },

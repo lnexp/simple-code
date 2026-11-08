@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { handleQuery, type Exec } from '../src/lsp-query.ts'
+import { type Exec, handleQuery } from '../src/lsp-query.ts'
 
 /** 位置构造器：与 vscode.Uri/Position 的 JSON 形态对齐（query 只读这几个字段） */
 const uri = (p: string) => ({ fsPath: p, scheme: 'file' })

@@ -1,8 +1,8 @@
-import { access } from 'node:fs/promises'
-import type { Interface } from 'node:readline'
 import { constants as fsConstants } from 'node:fs'
+import { access } from 'node:fs/promises'
 import type { Server } from 'node:http'
 import { dirname, join } from 'node:path'
+import type { Interface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import type { Effort, ModelRef, SessionOptions } from '@simple-code/core'
 import {
@@ -10,8 +10,8 @@ import {
   ensureShims,
   getSession,
   logRun,
-  startCredentialProxy,
   type ShimEntry,
+  startCredentialProxy,
 } from '@simple-code/core'
 import { createRenderer, type Sink } from './render.ts'
 import { type ReplOptions, runRepl } from './repl.ts'
@@ -38,7 +38,18 @@ export async function injectLocalTools(
     delete process.env[key]
   const entries: ShimEntry[] = []
   // IMAGEGEN 依赖凭据代理（ensureCredentialProxy）；LSP 依赖 VS Code 桥，终端没有，不注入
-  for (const name of ['WEBFETCH', 'WEBSEARCH', 'MCP', 'APPLY_PATCH', 'MEMORY', 'NOTE', 'EVENT', 'SKILL', 'SC', 'IMAGEGEN']) {
+  for (const name of [
+    'WEBFETCH',
+    'WEBSEARCH',
+    'MCP',
+    'APPLY_PATCH',
+    'MEMORY',
+    'NOTE',
+    'EVENT',
+    'SKILL',
+    'SC',
+    'IMAGEGEN',
+  ]) {
     const key = `SIMPLE_CODE_${name}`
     if (process.env[key]) continue
     const script = join(dir, `${name === 'SC' ? 'sc' : kebab(name)}.js`)
@@ -52,7 +63,12 @@ export async function injectLocalTools(
   }
   if (entries.length > 0) {
     try {
-      const shims = await ensureShims(entries, binDir === undefined ? { nodeBin: process.execPath } : { nodeBin: process.execPath, binDir })
+      const shims = await ensureShims(
+        entries,
+        binDir === undefined
+          ? { nodeBin: process.execPath }
+          : { nodeBin: process.execPath, binDir },
+      )
       for (const { name } of entries) process.env[`SIMPLE_CODE_${name}`] = shims[name]
     } catch {
       // shim 写不进——回落直指脚本（shebang 找系统 node）
@@ -90,7 +106,9 @@ export async function ensureCredentialProxy(): Promise<Server | undefined> {
     server.unref()
     return server
   } catch (e) {
-    process.stderr.write(`凭据代理启动失败（远端 MCP / websearch / 生图不可用）：${e instanceof Error ? e.message : String(e)}\n`)
+    process.stderr.write(
+      `凭据代理启动失败（远端 MCP / websearch / 生图不可用）：${e instanceof Error ? e.message : String(e)}\n`,
+    )
     return undefined
   }
 }
@@ -153,17 +171,11 @@ export const createApproval = (sink: Sink): ApprovalShared => {
       new Promise((resolve) => {
         if (!rl) return resolve('deny') // 没接上就拒绝：宁可拦住
         const alwaysHint = q.always
-          ? q.always.kind === 'lead'
-            ? `[a]始终允许（${q.always.lead} * 今后免审）`
-            : q.always.kind === 'hidden'
-              ? `[a]始终允许（${q.always.write ? '写' : '读'} ${q.always.path} 今后免审）`
-              : q.always.kind === 'nonpath'
-                ? `[a]始终允许（${q.always.lead} 的第 ${q.always.from} 位参数起不是路径，今后免审）`
-                : q.always.kind === 'paths'
-                  ? q.always.hidden?.length
-                    ? `[a]始终允许（这 ${q.always.dirs.length + q.always.hidden.length} 项今后免审）`
-                    : `[a]始终允许（这 ${q.always.dirs.length} 个目录今后免审）`
-                  : `[a]始终允许（${q.always.dir}/ 今后免审）`
+          ? q.always.kind === 'nonpath'
+            ? `[a]始终允许（${q.always.lead} 的第 ${q.always.from} 位参数起不是路径，今后免审）`
+            : q.always.kind === 'paths'
+              ? `[a]始终允许（这 ${q.always.dirs.length} 个目录今后免审）`
+              : `[a]始终允许（${q.always.dir}/ 今后免审）`
           : ''
         sink.err(
           `\n[需要审批·${APPROVAL_LABEL[q.category] ?? q.category}] ${q.reason}\n  ${q.command}\n` +
@@ -274,14 +286,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   try {
     for (;;) {
       const r = await runRepl({
-      session,
-      sink: options.sink,
-      approvalShared: approval,
-      input: options.input ?? process.stdin,
-      output: options.output ?? process.stdout,
-      ...(options.now ? { now: options.now } : {}),
-      ...(options.onReady ? { onReady: options.onReady } : {}),
-      ...(options.setTimer ? { setTimer: options.setTimer } : {}),
+        session,
+        sink: options.sink,
+        approvalShared: approval,
+        input: options.input ?? process.stdin,
+        output: options.output ?? process.stdout,
+        ...(options.now ? { now: options.now } : {}),
+        ...(options.onReady ? { onReady: options.onReady } : {}),
+        ...(options.setTimer ? { setTimer: options.setTimer } : {}),
       })
       if (r !== 'reload') return r
       // /reload：close 释放锁，重建重读 settings。循环内建的闭包
@@ -290,7 +302,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       const next = await start(options, approval.requestApproval)
       if (typeof next === 'number') return next // 配置被改坏：解释已打过，退出
       session = next
-      options.sink.err(`（配置已重载，当前模型：${session.config.config.provider}/${session.config.config.model}）\n`)
+      options.sink.err(
+        `（配置已重载，当前模型：${session.config.config.provider}/${session.config.config.model}）\n`,
+      )
     }
   } finally {
     // 跟 runOnce 一样收在 finally。REPL 崩了没释放锁的话，下次打开同一目录

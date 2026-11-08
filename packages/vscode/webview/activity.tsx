@@ -114,7 +114,12 @@ export function ToolRow({
 
   return (
     <>
-      <div className="tool-row" data-failed={tool.failed} data-running={running} data-open={expanded}>
+      <div
+        className="tool-row"
+        data-failed={tool.failed}
+        data-running={running}
+        data-open={expanded}
+      >
         <button type="button" className="tool-head" onClick={() => setExpanded((v) => !v)}>
           <span className="tool-icon" aria-hidden>
             {running ? <span className="spinner" /> : <i className={`codicon codicon-${icon}`} />}
@@ -171,9 +176,7 @@ export function ToolRow({
           {/* 分身任务弹的卡：标注任务名，不然用户以为当前对话要跑这条
               （fork-merge.md §3）。目录不标：App 只收当前目录的卡（隔离），
               「来自：目录」永远是当前目录，10-29 去掉 */}
-          {approval.task && (
-            <div className="approval-folder">来自分身任务「{approval.task}」</div>
-          )}
+          {approval.task && <div className="approval-folder">来自分身任务「{approval.task}」</div>}
           <code className="approval-cmd">{approval.command}</code>
           {approval.detail && !inReason(approval.detail, approval.reason) && (
             <div className="approval-detail">触碰：{approval.detail}</div>
@@ -182,20 +185,16 @@ export function ToolRow({
             <div className="approval-detail">
               始终允许将记：
               <code>
-                {approval.always.kind === 'lead'
-                  ? `${approval.always.lead} *`
-                  : approval.always.kind === 'hidden'
-                    ? `${approval.always.write ? '写' : '读'} ${approval.always.path}`
-                    : approval.always.kind === 'nonpath'
-                      ? `${approval.always.lead} 的第 ${approval.always.from} 位参数起不是路径`
-                      : approval.always.kind === 'paths'
-                        ? [
-                            ...approval.always.dirs.map((d) => `${d}/*`),
-                            ...(approval.always.hidden ?? []).map(
-                              (h) => `${h.write ? '写' : '读'} ${h.path}`,
-                            ),
-                          ].join('、')
-                        : `${approval.always.dir}/*`}
+                {approval.always.kind === 'nonpath'
+                  ? `${approval.always.lead} 的第 ${approval.always.from} 位参数起不是路径`
+                  : approval.always.kind === 'paths'
+                    ? [
+                        ...approval.always.dirs.map((d) => `${d}/*`),
+                        ...(approval.always.hidden ?? []).map(
+                          (h) => `${h.write ? '写' : '读'} ${h.path}`,
+                        ),
+                      ].join('、')
+                    : `${approval.always.dir}/*`}
               </code>
             </div>
           )}
@@ -252,9 +251,8 @@ export function ToolRow({
 /** 审批类别标签（approval.md §4.2）。webview 自持一份，不依赖 core 运行时 */
 const APPROVAL_TAG: Record<string, string> = {
   external_dir: '项目外路径',
-  hidden_path: '隐藏路径',
-  network_cmd: '网络命令',
-  unparseable: '无法静态判定',
+  ask_rule: '自定义规则',
+  multi: '多重触发',
 }
 
 /** 「触碰：detail」是否和第一行重复：core 的 reason 多半已带着 detail
@@ -418,10 +416,8 @@ export function ProcessGroup({
         {stats.tools > 0 && (
           <span className="process-strip" aria-hidden>
             {stats.strip.map((step, i) => (
-              // biome-ignore lint/suspicious/noArrayIndexKey: 纯展示格子，只追加
               <span key={i} className="strip-step">
                 {step.map((failed, j) => (
-                  // biome-ignore lint/suspicious/noArrayIndexKey: 同上
                   <i key={j} data-failed={failed} />
                 ))}
               </span>

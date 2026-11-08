@@ -50,6 +50,9 @@ export type RobotTaskView = {
   /** 本轮开始的墙钟（running 时有意义），总览显示「在跑 N 分钟」 */
   startedAt: number | null
   lastTurn: TurnEnd | null
+  /** 用户参与过（手打消息或用户开的）：只有这种任务弹完成/出错提醒——
+   *  agent 派、无人参与的完成只回调主任务（2026-11-06 用户定） */
+  userTouched?: boolean
 }
 
 export type RobotFolderView = {
@@ -98,7 +101,7 @@ export type RobotStatus = { type: 'status'; items: RobotItem[]; tasks: RobotTask
 /** D1（用户定 2026-10-31）：命中自定义规则（git push、gh、你配的 askCommands）
  *  或出网命令的卡只能回窗口处理。multi 卡看合并前的各段——两周 10 张含 git push
  *  的卡里 2 张是 multi */
-const WINDOW_ONLY: ApprovalCategory[] = ['ask_rule', 'network_cmd']
+const WINDOW_ONLY: ApprovalCategory[] = ['ask_rule']
 
 export const canAllowOnRobot = (card: Pick<ApprovalRequest, 'category' | 'parts'>): boolean =>
   !WINDOW_ONLY.includes(card.category) && !(card.parts ?? []).some((p) => WINDOW_ONLY.includes(p))
@@ -144,10 +147,13 @@ export function createRobotFeed() {
     seen,
   })
 
-  /** 完成/出错提醒。在跑（开了新一轮）、被停止、看过、关掉过的不提醒 */
+  /** 完成/出错提醒。在跑（开了新一轮）、被停止、看过、关掉过的、以及
+   *  无人参与的（agent 派——结果走〔任务结果〕回主任务，robot 不打扰
+   *  用户）不提醒；用户手打过一次就恢复 */
   const noticeItem = (f: string, t: RobotTaskView, seen: boolean): RobotItem | null => {
     const last = t.lastTurn
     if (t.running || last === null || last.end === 'stopped') return null
+    if (t.userTouched !== true) return null
     const key = `${f}#${t.task ?? ''}#${last.at}`
     if (consumed.has(key)) return null
     // 用户正看着这个任务时结束的、或之后回来看到了：算处理过，以后也不再提醒

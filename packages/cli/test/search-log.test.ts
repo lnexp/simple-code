@@ -1,5 +1,13 @@
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterAll, expect, it } from 'vitest'
@@ -17,7 +25,8 @@ afterAll(() => rmSync(tmp, { recursive: true, force: true }))
 
 const md = (name: string) =>
   `---\nname: ${name}\ndescription: 金丝雀发布的结论\ncreated: 2026-10-23 10:00:00\n---\n\n金丝雀发布正文\n`
-for (const d of ['notes', 'lessons', 'events', 'skills/demo', 'memory/turns']) mkdirSync(join(ws, '.simple-code', d), { recursive: true })
+for (const d of ['notes', 'lessons', 'events', 'skills/demo', 'memory/turns'])
+  mkdirSync(join(ws, '.simple-code', d), { recursive: true })
 mkdirSync(home)
 writeFileSync(join(ws, '.simple-code/notes/a.md'), md('a'))
 // 超半年未用：search 默认收起，记进 hidden 而不是 hits
@@ -33,7 +42,12 @@ writeFileSync(
 const search = (lib: string, query: string) =>
   spawnSync(
     process.execPath,
-    ['--disable-warning=ExperimentalWarning', join(repo, `packages/cli/src/${lib}-bin.ts`), 'search', query],
+    [
+      '--disable-warning=ExperimentalWarning',
+      join(repo, `packages/cli/src/${lib}-bin.ts`),
+      'search',
+      query,
+    ],
     { cwd: ws, encoding: 'utf8', env: { ...process.env, HOME: home } },
   )
 
@@ -50,7 +64,9 @@ it('五个库的 search 每次记一行 runlog：库、查询词、命中数（�
     .filter((e) => e.ev === 'search')
   const got = rows.map((e) => `${e.lib}|${e.query}|${e.hits}`).sort()
   // NOTE 默认跨类型：普通记录 a 和历史 lesson a 是两个独立条目。
-  const want = libs.flatMap((lib) => [`${lib}|金丝雀|${lib === 'note' ? 2 : 1}`, `${lib}|不存在的词|0`]).sort()
+  const want = libs
+    .flatMap((lib) => [`${lib}|金丝雀|${lib === 'note' ? 2 : 1}`, `${lib}|不存在的词|0`])
+    .sort()
   expect(got).toEqual(want)
   expect(rows.find((e) => e.lib === 'note' && e.query === '金丝雀')?.hidden).toBe(1)
   expect(new Set(rows.map((e) => e.folder))).toEqual(new Set([realpathSync(ws)]))

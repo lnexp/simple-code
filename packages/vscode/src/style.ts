@@ -939,6 +939,28 @@ ${WRAP_INDENT}
   padding: 6px 8px; margin: 8px;
 }
 
+/* 空窗口引导（App 的 early return）：没有打开的文件夹——中性提示，
+   不是错误（区别于 .fatal 的红色边框） */
+.empty-folder {
+  margin: auto; /* .app 是 flex 列，auto 居中 */
+  max-width: 460px;
+  padding: 20px 24px;
+  /* panel-border 在 IDEA New UI Dark 里与底色同色（theme-lines 约定），
+     用前景色混出可见边 */
+  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 18%, transparent);
+  border-radius: ${RADIUS.md};
+  color: var(--vscode-descriptionForeground);
+   font-size: 12px;
+   line-height: 1.7;
+   text-align: center;
+}
+.empty-folder-title {
+   color: var(--vscode-foreground);
+   font-size: 13px;
+   font-weight: 600;
+   margin-bottom: 8px;
+}
+
 /* 路径链接（pathlink）：无 href 的 a。与标题同色系（都源自 textLink
    token，见上方标题规则注释），靠「点线 + hover 背景」形状区分——
    标题没有下划线，链接有，颜色相同也认得出。 */
@@ -1066,7 +1088,6 @@ code a[data-open-path]:hover {
   color: var(--vscode-foreground);
 }
 .bar button.approval-toggle .codicon { font-size: 13px; }
-.bar button.approval-toggle.is-off { color: var(--vscode-charts-red, #f85149); }
 
 /* 后台残留进程条（输入框上方）。一条命令一行（2026-10-28 拍板 A2）：
    desc 标签（前景色）+ 进程数/启动时刻；× 是唯一动作。原命令只在整行

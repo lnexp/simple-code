@@ -82,9 +82,7 @@ describe('pass 2：删除孤儿 tool_result', () => {
   })
 
   it('只删孤儿那一个，同消息里配对的留着', () => {
-    const out = normalizeHistory(
-      [assistant(call('a')), tool(result('a'), result('ghost'))],
-    )
+    const out = normalizeHistory([assistant(call('a')), tool(result('a'), result('ghost'))])
 
     expect(out[1]?.parts.map((p) => (p as { toolCallId: string }).toolCallId)).toEqual(['a'])
   })

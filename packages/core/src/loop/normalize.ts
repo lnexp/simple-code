@@ -41,9 +41,10 @@ export function normalizeHistory(messages: Message[]): Message[] {
  * 构造消息的 pass，归属就会静默出错（CLAUDE.md §6.4 那一类）。显式带着走
  * 的话，新 pass 不处理 origin 是编译错误。
  */
-export function normalizeWithOrigin(
-  messages: Message[],
-): { messages: Message[]; origin: (number | null)[] } {
+export function normalizeWithOrigin(messages: Message[]): {
+  messages: Message[]
+  origin: (number | null)[]
+} {
   const tagged = removeOrphanOutputs(
     ensureCallOutputsPresent(messages.map((msg, origin) => ({ msg, origin }))),
   )

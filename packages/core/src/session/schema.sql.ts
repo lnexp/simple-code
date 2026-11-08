@@ -273,4 +273,14 @@ export const MIGRATIONS = [
   // 算不出结束时刻
   `ALTER TABLE turns ADD COLUMN end_state TEXT`,
   `ALTER TABLE turns ADD COLUMN ended_at TEXT`,
+  // 错误轮的最后一句话（2026-11-06）：reload 后「上一轮因错误中断」的提示
+  // 从这读——error notice 只在 webview 内存里，reload 即丢，用户无从得知
+  // loop 为什么停（fork 覆盖事故真机）
+  `ALTER TABLE turns ADD COLUMN error_message TEXT`,
+  // fold 的原文恢复查询索引（2026-11-06）：restoreHistoryOriginals 的
+  // WHERE state='unloaded' AND owner IS ? AND step_id IN (...)——原计划走
+  // messages_owner（owner IS NULL 命中 42587/43517 行，全表级回表过滤），
+  // 379MB 真库实测 1.4s/次，fold 每轮 turn 结束都跑。建复合索引后 SQLite
+  // 改走 messages_live + 索引定位，实测 0.005s（276 倍）
+  `CREATE INDEX IF NOT EXISTS messages_restore ON messages(owner, state, step_id)`,
 ]

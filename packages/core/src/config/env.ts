@@ -1,3 +1,6 @@
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
 const ENV_PATTERN = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/
 
 /**
@@ -34,4 +37,17 @@ const ENV_TEMPLATE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g
  */
 export function expandEnvTemplate(value: string, env: NodeJS.ProcessEnv = process.env): string {
   return value.replace(ENV_TEMPLATE, (_, name: string) => expandEnv(`\${${name}}`, env))
+}
+
+/**
+ * 展开 `~`（home 目录）。只给用户级路径字段用（claudeAgentSdkPath）——
+ * 让同一份 settings 在多台机器复用时不必各自写全路径。
+ *
+ * 只认 `~` 本身或 `~/` 开头；`~user` 形式不碰（Node 没有查其他用户
+ * home 的 API，保持原样交给下游的绝对路径校验报错）。
+ */
+export function expandTilde(value: string, home: string = homedir()): string {
+  if (value === '~') return home
+  if (value.startsWith('~/')) return join(home, value.slice(2))
+  return value
 }

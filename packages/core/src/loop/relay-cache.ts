@@ -20,7 +20,7 @@ import { MEMORY_RELATIVE } from '../session/store.ts'
  */
 const file = (root: string) => join(root, MEMORY_RELATIVE, 'relay-cache.json')
 
-export function relayKey(imageData: string): string {
+function relayKey(imageData: string): string {
   return createHash('sha256').update(imageData).digest('hex')
 }
 
@@ -32,7 +32,9 @@ function diskLayer(root: string): Map<string, string> {
   if (m === undefined) {
     try {
       const raw = JSON.parse(readFileSync(file(root), 'utf8'))
-      m = new Map(Object.entries(raw).filter((e): e is [string, string] => typeof e[1] === 'string'))
+      m = new Map(
+        Object.entries(raw).filter((e): e is [string, string] => typeof e[1] === 'string'),
+      )
     } catch {
       m = new Map() // 没建过/损坏都当空——可选文件缺失是正常情况，静默跳过
     }

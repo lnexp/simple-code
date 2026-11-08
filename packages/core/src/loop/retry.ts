@@ -62,9 +62,9 @@ export async function* requestWithRetry(
       const detail = classify(error)
       if (!detail.retryable || tries + 1 >= config.maxAttempts) {
         logRun({
-        ev: 'llm_retry_giveup',
-        ...(meta?.model ? { model: meta.model } : {}),
-        ...(meta?.folder ? { folder: meta.folder } : {}),
+          ev: 'llm_retry_giveup',
+          ...(meta?.model ? { model: meta.model } : {}),
+          ...(meta?.folder ? { folder: meta.folder } : {}),
           attempt: tries + 1,
           error: { kind: detail.kind, message: detail.message },
         })

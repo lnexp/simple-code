@@ -13,7 +13,7 @@
 import { readFile, stat } from 'node:fs/promises'
 import { isAbsolute, resolve } from 'node:path'
 import type { ToolDefinition } from '../llm/types.ts'
-import type { ImageInput, Tool, ToolContext, ToolOutput } from './types.ts'
+import type { Tool, ToolContext, ToolOutput } from './types.ts'
 
 /**
  * 读入上限。发送侧 resizer 会把出场的图压进 5MB，这条只挡 OOM 级怪文件
@@ -62,7 +62,8 @@ export function createViewImageTool(): Tool {
     name: 'view_image',
     definition,
     async execute(input: unknown, ctx: ToolContext): Promise<ToolOutput> {
-      if (typeof input !== 'object' || input === null) return fail('参数必须是对象：{ path: string }')
+      if (typeof input !== 'object' || input === null)
+        return fail('参数必须是对象：{ path: string }')
       const { path, focus } = input as Record<string, unknown>
       if (typeof path !== 'string' || path === '') return fail('path 必填（string）')
       const focusText = typeof focus === 'string' ? focus.trim() : ''

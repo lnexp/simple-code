@@ -1,25 +1,17 @@
 import { spawn } from 'node:child_process'
-import { createWriteStream } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { appendFileSync, createWriteStream } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ToolDefinition } from '../llm/types.ts'
-import type { ApprovalConfig } from './approval.ts'
-import type { BgMeta } from './bg.ts'
+import { classify } from './approval.ts'
 import {
-  classify,
-  DEFAULT_ASK_COMMANDS,
-  DEFAULT_HIDDEN_ALLOW,
-  DEFAULT_NETWORK_ALLOW,
-} from './approval.ts'
-import {
-  appendHidden,
-  appendLead,
   appendNonPathFrom,
   appendPath,
   dirHint,
   loadAlways,
   loadUserApproval,
 } from './approval-always.ts'
+import type { BgMeta } from './bg.ts'
 import { LOG_DEFAULT_LINES } from './memory.ts'
 import { truncateOutput } from './truncate.ts'
 import type { Tool, ToolContext, ToolOutput } from './types.ts'
@@ -52,7 +44,7 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
     '【临时文件】一律写 `.simple-code/tmp/`（项目内、随项目走、重启不丢），先 `mkdir -p`；' +
     '不写 /tmp——macOS 的 /tmp 重启即清。\n' +
     '【审批】路径出工作区（读放行仅限 .simple-code 子树，其余读也拦）、进隐藏目录（.env、.ssh 类）、' +
-    '网络命令（curl 等）、发布类命令（git push、gh）、approval.json 里 askCommands 配的自定义命令（用户级 ~/.simple-code/ 与项目级 .simple-code/，含私有 CLI，如 appctl workloads apply）、含 $()/解释器的命令——执行前会请用户放行；被拒时如实转告用户、说明需要什么，不要换写法绕。\n' +
+    '发布类命令（git push、gh，内置默认）与 approval.json askCommands 配置的命令（用户级 ~/.simple-code/ 与项目级 .simple-code/，含私有 CLI，如 appctl workloads apply）——执行前会请用户放行；被拒时如实转告用户、说明需要什么，不要换写法绕。网络命令与 $()/解释器不单独拦（2026-11-05 拆层拍板：默认全放、要拦自己配）：出网写、发布仍须按 AGENTS.md 先获批准，不要因「会弹卡」放松。\n' +
     '【网络】"$SIMPLE_CODE_WEBFETCH" <url>（HTML 转 markdown，可接管道）；"$SIMPLE_CODE_WEBSEARCH" <query>。\n' +
     '【自查】查 SC 自身运作（上下文分区/记忆/审批/排障）：grep "<关键词>" "$SIMPLE_CODE_DOC"。\n' +
     // LSP 命令格式按注入条件拼（2026-09-17 两次拍板）：env 里有桥才写这段——
@@ -76,7 +68,13 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
         '立即返回任务名，不等跑完，可一次派多个。它看不到你当前的对话，任务书要自带背景、目标、交付物；' +
         '派出那一轮结束时结果以〔任务结果〕消息回到你这里，不用轮询；它的经历之后合回历史。' +
         // 规则 14：固定一句，列表不进描述——用户改 taskModels 不动 tools[0]
-        '可加 --model <名> 指定模型（"$SIMPLE_CODE_TASK" --models 列出可选的及用途；不写 = 配置默认）。\n'
+        '可加 --model <名> 指定模型（"$SIMPLE_CODE_TASK" --models 列出可选的及用途；不写 = 配置默认）。\n' +
+        // 续派/闹钟（loop-interrupt 实现项 2/3）：同样只在宿主桥在时写；此前漏了这段，
+        // 工具能调但模型不知道它们存在（2026-11-05 用户实测炸出）
+        '【续派】"$SIMPLE_CODE_TASK_SEND"（无参列出任务：名字、状态、最近一句；带任务名和文本 = 往该任务发消息，' +
+        'running 时入队插话、停着时点起新 turn）——追加指令、补背景都走它。\n' +
+        '【闹钟】"$SIMPLE_CODE_WAKE" --after 30m / --at 08:00 / --until-ok "命令"（到点或条件满足时唤醒设闹钟的这个会话：' +
+        '跑着=插话、停着=开新 turn；--note 留给自己的备忘；不持久化，重启即丢，周期靠醒来自己设下一个）\n'
       : '') +
     '【补丁】改既有文件用 "$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n' +
     '*** Begin Patch\n*** Update File: 路径（相对工作区根）\n@@\n 照抄文件里已有的行（上下文）\n-要删的行\n+要加的行\n@@\n 另一处改动的上下文行\n-旧行\n+新行\n*** End Patch\nPATCH' +
@@ -91,7 +89,7 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
     `log [-n ${LOG_DEFAULT_LINES}]（每 turn 一行总览，先扫再下钻）。\n` +
     '【note】"$SIMPLE_CODE_NOTE" list [--all]（清单，默认收起超半年未用，--all 全量含被挤出索引的）| ' +
     'read <name>（全文+喂 LRU 心跳）| search <关键词> [--all] | ' +
-    'write <<\'MD\'（heredoc 逐行写 name: <名>、title: <标题>、description: <单行描述>，' +
+    "write <<'MD'（heredoc 逐行写 name: <名>、title: <标题>、description: <单行描述>，" +
     '再一行 ---，其后是正文；新结论当场记一条）。' +
     '改内容用 "$SIMPLE_CODE_APPLY_PATCH"（.simple-code/notes/，免审批；write 撞同名拒绝，不覆盖）；' +
     '结论被推翻时不删，头里加 status: superseded 与 by: <接替的 note 名>，从此不进索引。\n' +
@@ -185,55 +183,64 @@ async function checkApproval(
   // 审批配置的三源组装（2026-09-27 拍板：settings 里不再出现 approval，
   // 只住用户级 ~/.simple-code/approval.json + 项目级 .simple-code/
   // approval.json 两个文件）：内置默认 ← 用户级（手写）← 项目级（手写
-  // + 卡上采集）。例外面（hiddenAllow/networkAllow/askCommands）取并集
-  // ——加是日常，减是拍板级变更，删行或卡上不点即是；nonPathFrom 同键
-  // 项目级覆盖——卡上后拍的板是新决定，新决定盖旧的
+  // + 卡上采集）。例外面（askCommands）取并集
+  // ——加是日常，减是拍板级变更，删行或卡上不点即是（命令维不给
+  // always 键，2026-11-05 拍板）；nonPathFrom 同键项目级覆盖——卡上后
+  // 拍的板是新决定，新决定盖旧的
   const user = loadUserApproval()
   const verdict = classify(args.command, ctx.root, {
-    hiddenAllow: [
-      ...new Set([...DEFAULT_HIDDEN_ALLOW, ...user.hiddenAllow, ...(always.hiddenAllow ?? [])]),
-    ],
-    networkAllow: [
-      ...new Set([...DEFAULT_NETWORK_ALLOW, ...user.networkAllow, ...(always.networkAllow ?? [])]),
-    ],
-    // askCommands 三源：内置默认（发布闸 git push/gh）∪ 两级文件。想撤
-    // 兜底条目，卡上对该命令点「始终允许」（进 leads）
-    askCommands: [
-      ...new Set([...DEFAULT_ASK_COMMANDS, ...user.askCommands, ...(always.askCommands ?? [])]),
-    ],
+    // askCommands 两级文件并集（内置默认已清空，2026-11-04 拍板）：
+    // 需要拦什么用户自己配
+    askCommands: [...new Set([...user.askCommands, ...(always.askCommands ?? [])])],
+    // denyCommands（2026-11-04）：两级文件并集，命中直接拒（不弹卡）
+    denyCommands: [...new Set([...user.denyCommands, ...(always.denyCommands ?? [])])],
     nonPathFrom: { ...user.nonPathFrom, ...always.nonPathFrom },
-    alwaysLeads: always.leads,
     alwaysPaths: always.paths,
-    hiddenRead: always.hiddenRead,
-    hiddenWrite: always.hiddenWrite,
     // 第 2 层算真实路径：$VAR 按 spawn 的同一份环境替换，相对路径从 root 起算
     env: spawnEnv(config, ctx),
+    // 算不出的路径放行记日志（2026-11-04 拍板：不弹卡——冷启动窗口的
+    // 代入失效、运行时值都落这里；带 folder 供回放分析）
+    onUnparsed: (token, reason) => {
+      try {
+        appendFileSync(
+          join(homedir(), '.simple-code/logs/approval-unparsed.jsonl'),
+          `${JSON.stringify({ ts: new Date().toISOString(), folder: ctx.root, token, reason })}\n`,
+        )
+      } catch {
+        /* 日志写不进去不拦放行 */
+      }
+    },
   })
   if (verdict.kind === 'allow') return null
 
-  // always 预览：解释器/网络命令记命令名（verdict 直接带）；项目外
+  // 禁令档（v2 §2.2，2026-11-04）：memory 写、sudo——不弹卡直接拒绝。
+  // 与「用户拒绝了这条命令」同形态的工具错误，模型读 reason 后自行调整
+  if (verdict.kind === 'deny') {
+    return {
+      output: `命令被禁用：${verdict.reason}。如果任务确实需要这个操作，向用户说明需要做什么；不要换写法绕过禁令。`,
+      exitCode: -1,
+      isError: true,
+    }
+  }
+
+  // always 预览：项目外
   // 路径记目录（dirHint 算：目录记本身、文件记父目录，过宽不给）；
   // multi 同质 external_dir 记一组目录（方案 1，approval.ts 算好带来）
   const alwaysHint =
     verdict.kind === 'ask'
-      ? verdict.alwaysLead !== undefined
-        ? { kind: 'lead' as const, lead: verdict.alwaysLead }
-        : verdict.alwaysHidden !== undefined
-          ? { kind: 'hidden' as const, ...verdict.alwaysHidden }
-          : verdict.nonPathFrom !== undefined
-            ? { kind: 'nonpath' as const, ...verdict.nonPathFrom }
-            : verdict.alwaysPaths !== undefined || verdict.alwaysHiddens !== undefined
-              ? {
-                  kind: 'paths' as const,
-                  dirs: verdict.alwaysPaths ?? [],
-                  ...(verdict.alwaysHiddens ? { hidden: verdict.alwaysHiddens } : {}),
-                }
-              : verdict.category === 'external_dir'
-                ? (() => {
-                    const dir = dirHint(verdict.detail)
-                    return dir === null ? undefined : { kind: 'path' as const, dir }
-                  })()
-                : undefined
+      ? verdict.nonPathFrom !== undefined
+        ? { kind: 'nonpath' as const, ...verdict.nonPathFrom }
+        : verdict.alwaysPaths !== undefined
+          ? {
+              kind: 'paths' as const,
+              dirs: verdict.alwaysPaths ?? [],
+            }
+          : verdict.category === 'external_dir'
+            ? (() => {
+                const dir = dirHint(verdict.detail)
+                return dir === null ? undefined : { kind: 'path' as const, dir }
+              })()
+            : undefined
       : undefined
 
   // 中断兜底：宿主收到 abort 应自行 resolve 'deny'，但没做的话这里
@@ -257,14 +264,10 @@ async function checkApproval(
   // 白名单只是减烦机制，不该反过来阻塞干活
   if (decision === 'always' && alwaysHint) {
     try {
-      if (alwaysHint.kind === 'lead') appendLead(ctx.root, alwaysHint.lead)
-      else if (alwaysHint.kind === 'hidden') appendHidden(ctx.root, alwaysHint.path, alwaysHint.write)
-      else if (alwaysHint.kind === 'nonpath') appendNonPathFrom(ctx.root, alwaysHint.lead, alwaysHint.from)
+      if (alwaysHint.kind === 'nonpath')
+        appendNonPathFrom(ctx.root, alwaysHint.lead, alwaysHint.from)
       else if ('dir' in alwaysHint) appendPath(ctx.root, alwaysHint.dir)
-      else {
-        for (const d of alwaysHint.dirs) appendPath(ctx.root, d)
-        for (const h of alwaysHint.hidden ?? []) appendHidden(ctx.root, h.path, h.write)
-      }
+      else for (const d of alwaysHint.dirs) appendPath(ctx.root, d)
     } catch (err) {
       process.stderr.write(
         `approval.json 写入失败（本次仍放行）：${err instanceof Error ? err.message : String(err)}\n`,
@@ -277,7 +280,7 @@ async function checkApproval(
   const note = ctx.signal.aborted
     ? '等待审批时被用户中断'
     : decision === 'timeout'
-      ? '审批等待超时、无人处理，已按拒绝处理（不是用户拒绝）'
+      ? '当前无人处理审批，不是用户拒绝'
       : '用户拒绝了这条命令'
   return {
     output:
@@ -348,14 +351,32 @@ function run(args: Args, config: BashConfig, ctx: ToolContext): Promise<ToolOutp
       startedAt: Date.now(),
       ...(args.desc === undefined ? {} : { desc: args.desc }),
     }
-    const child = spawn('bash', ['-c', `exec 2>&1\n${args.command}`], {
-      cwd: ctx.root,
-      // 独立进程组。少了它 kill 只能杀掉 bash 自己，它派生的子进程会变成孤儿
-      // 继续跑
-      detached: true,
-      env: spawnEnv(config, ctx),
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
+    const spawnBash = () =>
+      spawn('bash', ['-c', `exec 2>&1\n${args.command}`], {
+        cwd: ctx.root,
+        // 独立进程组。少了它 kill 只能杀掉 bash 自己，它派生的子进程会变成孤儿
+        // 继续跑
+        detached: true,
+        env: spawnEnv(config, ctx),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    let child: ReturnType<typeof spawnBash>
+    try {
+      child = spawnBash()
+    } catch (err) {
+      // spawn 同步 throw（macOS 下偶发的 fd 失效，南夷非 7 天日志 70 次
+      // spawn EBADF）：child.on('error') 接不到同步 throw，契约上「工具
+      // 永不抛」（run.ts 工具调用只有 finally 没有 catch）——不接住就炸穿
+      // 整轮 turn。瞬态故障，返回工具错误让模型自己重试（实测 51 秒后
+      // 同进程同命令即成功），与下方 child.on('error') 的文案同一口径
+      resolveOutput({
+        output: `[命令无法启动：${err instanceof Error ? err.message : String(err)}]
+这是瞬态故障，通常重试同一命令即可恢复。`,
+        exitCode: -1,
+        isError: true,
+      })
+      return
+    }
 
     let output = ''
     const collect = (chunk: Buffer) => {
@@ -521,7 +542,7 @@ function buildEnv(passthrough: string[]): Record<string, string> {
   return env
 }
 
-/** bash 子进程的环境。审批判定用同一份替换 $VAR（hidden-path.ts），
+/** bash 子进程的环境。审批判定用同一份替换 $VAR（real-path.ts），
  * 两边必须一致——判定时替换出的路径就是执行时的路径 */
 function spawnEnv(config: BashConfig, ctx: ToolContext): Record<string, string> {
   return {

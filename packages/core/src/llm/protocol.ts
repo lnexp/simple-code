@@ -60,6 +60,8 @@ export type ErrorKind =
   | 'invalid_request'
   | 'server'
   | 'unknown'
+  /** loop 层不变式破坏（非协议错）：前缀守卫拦下的改写。UI 按它上红色样式 */
+  | 'prefix_broken'
 
 export type ProtocolError = {
   kind: ErrorKind

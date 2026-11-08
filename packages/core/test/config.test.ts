@@ -5,7 +5,12 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { deepMerge, stripDenied } from '../src/config/denylist.ts'
 import { expandEnv } from '../src/config/env.ts'
-import { loadConfig, resolveImageModel, selectModel } from '../src/config/load.ts'
+import {
+  loadConfig,
+  resolveImageModel,
+  selectModel,
+  writeWorkspaceSummaryInContext,
+} from '../src/config/load.ts'
 import { configSchema } from '../src/config/schema.ts'
 
 let root = ''
@@ -52,10 +57,22 @@ describe('config / 基本加载', () => {
   })
   it('note 四类型共享预算默认值、比例校验与旧配置兼容', () => {
     expect(configSchema.parse(MINIMAL).memory.noteBudgetTokens).toBe(2100)
-    expect(configSchema.parse(MINIMAL).memory.noteRatios).toEqual({ general: .35, lesson: .1, principle: .2, goal: .35 })
-    expect(() => configSchema.parse({ ...MINIMAL, memory: { noteRatios: { goal: .8 } } })).toThrow('比例之和')
+    expect(configSchema.parse(MINIMAL).memory.noteRatios).toEqual({
+      general: 0.35,
+      lesson: 0.1,
+      principle: 0.2,
+      goal: 0.35,
+    })
+    expect(() => configSchema.parse({ ...MINIMAL, memory: { noteRatios: { goal: 0.8 } } })).toThrow(
+      '比例之和',
+    )
     expect(() => configSchema.parse({ ...MINIMAL, memory: { noteBudgetTokens: 0 } })).toThrow()
-    expect(configSchema.parse({ ...MINIMAL, memory: { noteRatios: { general: 1, lesson: 0, principle: 0, goal: 0 } } }).memory.noteRatios.goal).toBe(0)
+    expect(
+      configSchema.parse({
+        ...MINIMAL,
+        memory: { noteRatios: { general: 1, lesson: 0, principle: 0, goal: 0 } },
+      }).memory.noteRatios.goal,
+    ).toBe(0)
   })
   it('最小配置能解析出协议、baseUrl、模型规格', async () => {
     await writeGlobal(MINIMAL)
@@ -252,9 +269,13 @@ describe('config / 必填项与引用', () => {
 
   it('ref 形态：provider 不存在 / 模型不存在各自报错并列出已配置的', async () => {
     await writeGlobal({ ...MINIMAL, memory: { summaryModel: { provider: 'nope', model: 'x' } } })
-    await expect(load()).rejects.toThrow(/summaryModel 的 provider "nope" 不在 providers 里.*已配置的：p/)
+    await expect(load()).rejects.toThrow(
+      /summaryModel 的 provider "nope" 不在 providers 里.*已配置的：p/,
+    )
     await writeGlobal({ ...MINIMAL, memory: { summaryModel: { provider: 'p', model: 'typo' } } })
-    await expect(load()).rejects.toThrow(/memory\.summaryModel "typo" 不在 provider "p" 的 models 里/)
+    await expect(load()).rejects.toThrow(
+      /memory\.summaryModel "typo" 不在 provider "p" 的 models 里/,
+    )
   })
 
   it('对照组：summaryModel 为 null 时 summary 就是主模型那一份', async () => {
@@ -492,7 +513,11 @@ describe('config / 模型级请求偏好覆盖全局', () => {
         p: {
           ...MINIMAL.providers.p,
           models: {
-            m: { contextWindow: 1000, cacheTtlMs: 300_000, presets: { long: { request: { cacheTtl: '1h' } } } },
+            m: {
+              contextWindow: 1000,
+              cacheTtlMs: 300_000,
+              presets: { long: { request: { cacheTtl: '1h' } } },
+            },
             big: { contextWindow: 1000, cacheTtlMs: 10_800_000, request: { cacheTtl: '1h' } },
           },
         },
@@ -500,8 +525,12 @@ describe('config / 模型级请求偏好覆盖全局', () => {
     })
     const loaded = await load()
     expect(loaded.model.cacheTtlMs).toBe(300_000)
-    expect(selectModel(loaded, { provider: 'p', model: 'm', preset: 'long' }, {}).model.cacheTtlMs).toBe(3_600_000)
-    expect(selectModel(loaded, { provider: 'p', model: 'big' }, {}).model.cacheTtlMs).toBe(10_800_000)
+    expect(
+      selectModel(loaded, { provider: 'p', model: 'm', preset: 'long' }, {}).model.cacheTtlMs,
+    ).toBe(3_600_000)
+    expect(selectModel(loaded, { provider: 'p', model: 'big' }, {}).model.cacheTtlMs).toBe(
+      10_800_000,
+    )
   })
 })
 
@@ -631,11 +660,13 @@ describe('config / taskModels（task-trunk 规则 14）', () => {
   it('use 必填、未知字段报错', async () => {
     await writeGlobal({ ...MINIMAL, taskModels: [{ provider: 'p', model: 'm' }] })
     await expect(load()).rejects.toThrow(/taskModels/)
-    await writeGlobal({ ...MINIMAL, taskModels: [{ provider: 'p', model: 'm', use: 'x', note: 'y' }] })
+    await writeGlobal({
+      ...MINIMAL,
+      taskModels: [{ provider: 'p', model: 'm', use: 'x', note: 'y' }],
+    })
     await expect(load()).rejects.toThrow(/未知的配置项 note/)
   })
 })
-
 
 describe('config / imageModel', () => {
   it('未配置为 null；配了借 provider 的 baseUrl 与展开后的 apiKey，model 不必登记', () => {
@@ -645,11 +676,47 @@ describe('config / imageModel', () => {
       providers: { p: { ...MINIMAL.providers.p, apiKey: '${IMG_KEY}' } },
       imageModel: { provider: 'p', model: 'gpt-image-x' },
     })
-    expect(resolveImageModel(cfg, { IMG_KEY: 'k' })).toEqual({ model: 'gpt-image-x', baseUrl: 'https://api.test', apiKey: 'k' })
+    expect(resolveImageModel(cfg, { IMG_KEY: 'k' })).toEqual({
+      model: 'gpt-image-x',
+      baseUrl: 'https://api.test',
+      apiKey: 'k',
+    })
     expect(() => resolveImageModel(cfg, {})).toThrow(/环境变量 IMG_KEY/)
   })
   it('provider 不存在报错并列出已配置的', () => {
     const cfg = configSchema.parse({ ...MINIMAL, imageModel: { provider: 'nope', model: 'x' } })
     expect(() => resolveImageModel(cfg)).toThrow(/imageModel 的 provider "nope".*p/)
+  })
+})
+
+describe('writeWorkspaceSummaryInContext（上下文面板开关落盘）', () => {
+  let dir: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'sc-sumctx-'))
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('没配过的项目：建文件、只写这一个键', async () => {
+    await writeWorkspaceSummaryInContext(dir, false)
+    const json = JSON.parse(await readFile(join(dir, '.simple-code/settings.json'), 'utf8'))
+    expect(json).toEqual({ memory: { summaryInContext: false } })
+  })
+
+  it('已有配置：保留其他键，只改这一个', async () => {
+    const path = join(dir, '.simple-code/settings.json')
+    await mkdir(join(dir, '.simple-code'), { recursive: true })
+    await writeFile(
+      path,
+      JSON.stringify({ memory: { summaryModel: 'x' }, recall: { mode: 'off' } }),
+      'utf8',
+    )
+    await writeWorkspaceSummaryInContext(dir, true)
+    const json = JSON.parse(await readFile(path, 'utf8'))
+    expect(json).toEqual({
+      memory: { summaryModel: 'x', summaryInContext: true },
+      recall: { mode: 'off' },
+    })
   })
 })

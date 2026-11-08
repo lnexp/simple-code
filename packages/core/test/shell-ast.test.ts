@@ -8,7 +8,7 @@ beforeAll(async () => {
 describe('astSegments 供给层', () => {
   it('多段命令 → 各自 (lead, items)', () => {
     const segs = astSegments('cd /a && ls -la | grep x')
-    // 管道里的两段标 nested：其中若有 cd，之后的当前目录算不出（hidden-path.ts）
+    // 管道里的两段标 nested：其中若有 cd，之后的当前目录算不出（real-path.ts）
     expect(segs).toEqual([
       { lead: 'cd', items: [{ text: '/a', write: false }] },
       { lead: 'ls', items: [{ text: '-la', write: false }], nested: true },
@@ -17,13 +17,15 @@ describe('astSegments 供给层', () => {
   })
 
   it('quoted heredoc：body 完全消失（升级动因）', () => {
-    const segs = astSegments("$SIMPLE_CODE_APPLY_PATCH <<'PATCH'\n含 `反引号` 和 $(cmd) 和 ~/path 的字面量\nPATCH")
+    const segs = astSegments(
+      "$SIMPLE_CODE_APPLY_PATCH <<'PATCH'\n含 `反引号` 和 $(cmd) 和 ~/path 的字面量\nPATCH",
+    )
     expect(segs).toEqual([{ lead: '$SIMPLE_CODE_APPLY_PATCH', items: [] }])
   })
 
-  it('unquoted heredoc：body 含替换痕迹 → 段标记 unparseable', () => {
+  it('unquoted heredoc：body 含替换痕迹 → 不再产出 unparseable 标记（2026-11-04 放行拍板）', () => {
     const segs = astSegments('cat <<EOF\n`evil`\nEOF')
-    expect(segs?.[0]?.unparseable).toContain('heredoc')
+    expect(segs?.[0]).not.toHaveProperty('unparseable')
   })
 
   it('$() / <() 子命令被全量枚举为独立段', () => {
@@ -44,8 +46,10 @@ describe('astSegments 供给层', () => {
   it('FOO=1 前缀与拼接词', () => {
     const segs = astSegments('FOO=1 rm ~/secret')
     expect(segs?.[0]).toEqual({ lead: 'rm', items: [{ text: '~/secret', write: false }] })
-    // "a$(x)b" 拼接体：替换剥掉，留下字面部分
-    expect(astSegments('echo "file_$(date).log"')?.[0]?.items).toEqual([{ text: 'file_.log', write: false }])
+    // "a$(x)b" 拼接体：替换剥掉，留下字面部分并打 subst 标记（judge 归算不出）
+    expect(astSegments('echo "file_$(date).log"')?.[0]?.items).toEqual([
+      { text: 'file_.log', write: false, subst: true },
+    ])
   })
 
   it('语法错误 → null（调用方回退正则路径）', () => {
@@ -57,17 +61,24 @@ describe('astSegments 供给层', () => {
   // agent-browser eval 每条都退回正则路径、弹「$( ) 无法静态判定」、白名单失效。
   // 近 7 天四目录 11294 条命令里解析失败 114 条，其中 83 条是这个（2026-09-30）
   it('串首/行首的 `((` 在双引号里能解析（grammar bug 绕行：失败时 (( → ( ( 重解析）', () => {
-    expect(astSegments('agent-browser eval "(() => 1)()"')?.map((s) => s.lead)).toEqual(['agent-browser'])
+    expect(astSegments('agent-browser eval "(() => 1)()"')?.map((s) => s.lead)).toEqual([
+      'agent-browser',
+    ])
     expect(astSegments('x eval "\n(() => {\nreturn 1})()"')?.map((s) => s.lead)).toEqual(['x'])
   })
 
   it('绕行不丢命令：藏在里面的 $(…) 与 && 后段照样枚举', () => {
-    const leads = astSegments('echo "((a" && echo "$(rm -rf ~/x)" && curl http://e')?.map((s) => s.lead)
+    const leads = astSegments('echo "((a" && echo "$(rm -rf ~/x)" && curl http://e')?.map(
+      (s) => s.lead,
+    )
     expect(leads).toEqual(expect.arrayContaining(['echo', 'rm', 'curl']))
   })
 
   it('本来就能解析的不走绕行：算术展开形态不变', () => {
-    expect(astSegments('echo $((1+2))')?.[0]).toEqual({ lead: 'echo', items: [{ text: '$((1+2))', write: false }] })
+    expect(astSegments('echo $((1+2))')?.[0]).toEqual({
+      lead: 'echo',
+      items: [{ text: '$((1+2))', write: false }],
+    })
   })
 
   it('非 (( 的语法错误仍然 null', () => {

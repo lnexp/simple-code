@@ -129,6 +129,16 @@ describe('task-bin', () => {
     expect(out.join('')).toContain('配置默认 gw-openai/glm-x')
     expect(out.join('')).toContain('- gw/org-x（effort high）：改代码')
     expect(await taskMain(['--model'], env(b.port), async () => 'x')).toBe(3)
-    expect(parseArgs(['--model', 'a', '做', '事'])).toEqual({ model: 'a', list: false, rest: ['做', '事'] })
+    expect(parseArgs(['--model', 'a', '做', '事'])).toEqual({
+      model: 'a',
+      list: false,
+      rest: ['做', '事'],
+    })
+    expect(parseArgs(['--lean', '做', '事'])).toEqual({
+      list: false,
+      rest: ['做', '事'],
+      lean: true,
+    })
+    expect(parseArgs(['做', '事'])).toEqual({ list: false, rest: ['做', '事'] })
   })
 })

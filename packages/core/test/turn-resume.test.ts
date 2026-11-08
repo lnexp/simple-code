@@ -74,7 +74,8 @@ async function project() {
     let session: Session | null = null
     const stream: LoopDeps['stream'] = () =>
       (async function* () {
-        if (round === 'fail') throw new LLMStreamError({ kind: 'invalid_request', message: 'bad', retryable: false })
+        if (round === 'fail')
+          throw new LLMStreamError({ kind: 'invalid_request', message: 'bad', retryable: false })
         if (round === 'abort') {
           yield { type: 'text_start' } as StreamEvent
           // 中断那段故意跑 40ms：续接后耗时 ≥ 40 才说明是累加的，不是被覆盖
@@ -91,9 +92,12 @@ async function project() {
 
   const turns = () => {
     const db = openDbReadOnly(join(root, '.simple-code/memory/state.db'))
-    const rows = db.all<{ id: number; end_state: string | null; elapsed_ms: number | null; ended_at: string | null }>(
-      `SELECT id, end_state, elapsed_ms, ended_at FROM turns ORDER BY id`,
-    )
+    const rows = db.all<{
+      id: number
+      end_state: string | null
+      elapsed_ms: number | null
+      ended_at: string | null
+    }>(`SELECT id, end_state, elapsed_ms, ended_at FROM turns ORDER BY id`)
     db.close()
     return rows
   }
@@ -173,6 +177,47 @@ describe('turn 续接：session.send', () => {
     expect(first?.elapsed_ms).toBeGreaterThanOrEqual(40)
     expect(second?.elapsed_ms).toBeGreaterThanOrEqual(first?.elapsed_ms ?? 0)
     expect(Date.parse(second?.ended_at ?? '')).toBeGreaterThan(Date.parse(first?.ended_at ?? ''))
+  })
+})
+
+describe('错误轮摘要落库（2026-11-06 三缺口之二）', () => {
+  const user = (text: string): Message => ({ role: 'user', parts: [{ type: 'text', text }] })
+
+  it('finishTurn 带 errorMessage 落库，lastTurnError 读回；续写变 done 后返回 null', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'sc-turn-err-'))
+    dirs.push(dir)
+    const store = openStore(dir)
+    const turn = store.beginTurn({ model: 'p/m', effort: null })
+    store.save([user('一')])
+    store.finishTurn(turn, 10, 'error', '上下文前缀在非压缩点被改写：messages 第 38 条起不同')
+    expect(store.lastTurnError()).toEqual({
+      message: '上下文前缀在非压缩点被改写：messages 第 38 条起不同',
+      endState: 'error',
+    })
+    // 续写（用户再发一条）后 end_state 更新，提示自动消失
+    store.finishTurn(turn, 20, 'done')
+    expect(store.lastTurnError()).toBeNull()
+    store.close()
+  })
+
+  it('错误轮没带 message（老数据/别的路径）时 message 为空串，不炸', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'sc-turn-err-'))
+    dirs.push(dir)
+    const store = openStore(dir)
+    const turn = store.beginTurn({ model: 'p/m', effort: null })
+    store.finishTurn(turn, 10, 'error')
+    expect(store.lastTurnError()).toEqual({ message: '', endState: 'error' })
+    store.close()
+  })
+
+  it('最后一轮 done 时 lastTurnError 为 null', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'sc-turn-err-'))
+    dirs.push(dir)
+    const store = openStore(dir)
+    const turn = store.beginTurn({ model: 'p/m', effort: null })
+    store.finishTurn(turn, 10, 'done')
+    expect(store.lastTurnError()).toBeNull()
+    store.close()
   })
 })
 

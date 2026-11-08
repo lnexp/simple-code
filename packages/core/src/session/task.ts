@@ -12,13 +12,13 @@
  * 不再复制 live 行（每任务约 1MB）、不再占 reserved 锚、不再跳 sequence，
  * 也不要求主任务静止：开/关都只写自己的行和 segments 表。
  */
-import { join } from 'node:path'
+
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { openDb, type Db, type SqlValue } from './db.ts'
-import { MEMORY_RELATIVE } from './store.ts'
-import { copyMarker, type TaskScope } from './store.ts'
+import { join } from 'node:path'
+import { type Db, openDb, type SqlValue } from './db.ts'
 import { MIGRATIONS, SCHEMA } from './schema.sql.ts'
 import { closeSegments, markPulled, registerLegacySegments, TRUNK } from './segments.ts'
+import { copyMarker, MEMORY_RELATIVE, type TaskScope } from './store.ts'
 
 /** task.ts 的写库函数自己开裸连接——不走 openStore（那是会话的事）。
  * 连接要自带 schema：库通常已存在（对话先建），但「先派活后说话」的
@@ -52,9 +52,17 @@ export type TaskManifest = {
    * reload 恢复时不补回调（没有「派出那一轮」可被打断）；第一轮开跑时去掉
    */
   awaitingFirstMessage?: true
+  /** 用户参与过（手打过消息，或 via='user' 开的）：robot 完成提醒的分流
+   *  判据（2026-11-06 用户定）——agent 派、无人参与的任务完成只回调主
+   *  任务，不弹 robot；用户一旦发过话就恢复提醒 */
+  userTouched?: true
   /**
-   * task-v3 遗产：升级时还开着的老任务才有。forkTurn = 继承上界（owner IS NULL 且
-   * id ≤ forkTurn 的轮对它可见），stepFloor = 继承段的 step 上界。其余号段字段
+   * 继承上界（owner IS NULL 且 id ≤ forkTurn 的轮对它可见），stepFloor = 继承段
+   * 的 step 上界。只剩 v3 遗产来源（升级时还开着的老任务）——--fork 功能
+   * 2026-11-06 用户拍板取消：角色污染压不住（一句框架句敌不过整段主任务
+   * 人格历史），system 分叉又毁缓存，不值得
+   * （2026-11-05：开任务时把主任务 live 行复制一份归任务，方案执行型任务
+   * 带完整现场起跑——用户拍板默认 new、说 fork 才 fork）。其余号段字段
    * 只在迁移时读（segments.ts registerLegacySegments）
    */
   forkTurn?: number
@@ -131,7 +139,12 @@ export const taskResultText = (task: string, status: string, reply: string): str
 export function postTaskResult(root: string, owner: string, text: string): void {
   const db = openTaskDb(root)
   try {
-    db.run(`INSERT INTO task_results(owner, text, created_at) VALUES(?, ?, ?)`, owner, text, new Date().toISOString())
+    db.run(
+      `INSERT INTO task_results(owner, text, created_at) VALUES(?, ?, ?)`,
+      owner,
+      text,
+      new Date().toISOString(),
+    )
   } finally {
     db.close()
   }
@@ -168,7 +181,7 @@ export function lastTaskReply(root: string, owner: string): string {
 export function createTask(
   root: string,
   name: string,
-  opts: { parent?: string; awaitingFirstMessage?: boolean } = {},
+  opts: { parent?: string; awaitingFirstMessage?: boolean; userTouched?: boolean } = {},
 ): TaskManifest {
   const db = openTaskDb(root)
   try {
@@ -182,6 +195,7 @@ export function createTask(
       createdAt: new Date().toISOString(),
       ...(opts.parent !== undefined ? { parent: opts.parent, callback: 'pending' as const } : {}),
       ...(opts.awaitingFirstMessage === true ? { awaitingFirstMessage: true as const } : {}),
+      ...(opts.userTouched === true ? { userTouched: true as const } : {}),
     }
     db.transaction(() => {
       db.run(
@@ -193,7 +207,10 @@ export function createTask(
         m.owner,
         TRUNK,
       )
-      for (const { id } of db.all<{ id: number }>(`SELECT segment_id AS id FROM segment_pulls WHERE owner = ?`, TRUNK))
+      for (const { id } of db.all<{ id: number }>(
+        `SELECT segment_id AS id FROM segment_pulls WHERE owner = ?`,
+        TRUNK,
+      ))
         markPulled(db, m.owner, id)
     })
     writeTaskManifest(root, m)
@@ -218,7 +235,11 @@ export function flipTaskLive(root: string, owner: string): number {
   const db = openTaskDb(root)
   try {
     const own = `turn_id IN (SELECT id FROM turns WHERE owner = ?)`
-    const flipped = db.all<{ c: number }>(`SELECT COUNT(*) AS c FROM messages WHERE state = 'live' AND ${own}`, owner)[0]?.c ?? 0
+    const flipped =
+      db.all<{ c: number }>(
+        `SELECT COUNT(*) AS c FROM messages WHERE state = 'live' AND ${own}`,
+        owner,
+      )[0]?.c ?? 0
     db.transaction(() => {
       db.run(
         `UPDATE messages SET state = 'unloaded'
@@ -257,7 +278,7 @@ export function flipTaskLive(root: string, owner: string): number {
  * 私有摘要）——那是它窗口里的脚手架，不是经历
  */
 /** finalizeTask 各步改动行数——task_close 对账用 */
-export type FinalizeCounts = {
+type FinalizeCounts = {
   sumDeleted: number
   msgDeleted: number
   segments: number
@@ -265,7 +286,8 @@ export type FinalizeCounts = {
 
 export function finalizeTask(root: string, owner: string): FinalizeCounts {
   const db = openTaskDb(root)
-  const count = (sql: string, ...p: SqlValue[]): number => db.all<{ c: number }>(`SELECT COUNT(*) AS c ${sql}`, ...p)[0]?.c ?? 0
+  const count = (sql: string, ...p: SqlValue[]): number =>
+    db.all<{ c: number }>(`SELECT COUNT(*) AS c ${sql}`, ...p)[0]?.c ?? 0
   const counts: FinalizeCounts = { sumDeleted: 0, msgDeleted: 0, segments: 0 }
   try {
     const legacy = scopeOf(readTaskManifest(root, owner))
@@ -281,10 +303,22 @@ export function finalizeTask(root: string, owner: string): FinalizeCounts {
           owner,
           ceil,
         )
-        counts.sumDeleted = count(`FROM summaries WHERE owner = ? AND covers_from <= ?`, owner, ceil)
+        counts.sumDeleted = count(
+          `FROM summaries WHERE owner = ? AND covers_from <= ?`,
+          owner,
+          ceil,
+        )
         db.run(`DELETE FROM summaries WHERE owner = ? AND covers_from <= ?`, owner, ceil)
-        counts.msgDeleted = count(`FROM messages WHERE owner = ? AND turn_id NOT IN (SELECT id FROM turns WHERE owner = ?)`, owner, owner)
-        db.run(`DELETE FROM messages WHERE owner = ? AND turn_id NOT IN (SELECT id FROM turns WHERE owner = ?)`, owner, owner)
+        counts.msgDeleted = count(
+          `FROM messages WHERE owner = ? AND turn_id NOT IN (SELECT id FROM turns WHERE owner = ?)`,
+          owner,
+          owner,
+        )
+        db.run(
+          `DELETE FROM messages WHERE owner = ? AND turn_id NOT IN (SELECT id FROM turns WHERE owner = ?)`,
+          owner,
+          owner,
+        )
         db.run(`DELETE FROM migrations WHERE name = ?`, copyMarker(owner))
       }
       // 段内行被跨段父行收编的先解开（superseded_by 有外键）；它们在

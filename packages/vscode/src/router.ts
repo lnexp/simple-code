@@ -1,7 +1,19 @@
-import type { TaskDispatchRequest, TaskDispatchResponse, TaskModelsRequest, TaskModelsResponse } from '@simple-code/core'
-import type { ToHost, ToWebview } from './protocol.ts'
+import type {
+  TaskDispatchRequest,
+  TaskDispatchResponse,
+  TaskModelsRequest,
+  TaskModelsResponse,
+  TaskSendListRequest,
+  TaskSendListResponse,
+  TaskSendRequest,
+  TaskSendResponse,
+  WakeRequest,
+  WakeResponse,
+} from '@simple-code/core'
 import type { Bridge } from './bridge.ts'
+import type { ToHost, ToWebview } from './protocol.ts'
 import type { RobotFolderView } from './robot-feed.ts'
+import { createWakeCenter } from './wake-center.ts'
 
 /**
  * 多根工作区的文件夹路由（design.md §7）。
@@ -48,6 +60,11 @@ export type Router = {
   dispatchFromAgent: (req: TaskDispatchRequest) => Promise<TaskDispatchResponse>
   /** bin --models（规则 14）：root 所在文件夹配置里的 taskModels */
   taskModels: (req: TaskModelsRequest) => Promise<TaskModelsResponse>
+  /** task_send：root 所在目录发消息 / 列任务（loop-interrupt.md 实现项 2） */
+  taskSend: (req: TaskSendRequest) => TaskSendResponse
+  taskSendList: (req: TaskSendListRequest) => TaskSendListResponse
+  /** $SIMPLE_CODE_WAKE：注册闹钟（wake-center 全局，投递按 root 找 bridge） */
+  wake: (req: WakeRequest) => WakeResponse
   /** 桌面机器人：各已打开目录的现状（只含建过 bridge 的——没打开过的目录不可能有事） */
   robotFolders: () => RobotFolderView[]
   /** 面板此刻显示的目录与任务（null = 主任务）。§5.1 seen 的判据之一 */
@@ -62,6 +79,10 @@ export type Router = {
 
 export function createRouter(deps: RouterDeps): Router {
   const bridges = new Map<string, Bridge>()
+  // 闹钟的到点投递：root 定位 bridge，owner 定位主任务（''）或任务（task-xx）
+  const wakeCenter = createWakeCenter((root, owner, text) => {
+    bridges.get(root)?.wakeFire(owner, text)
+  })
   let active = ''
   /** webview 报来的「正显示哪个任务」（view_task） */
   let shownTask: string | null = null
@@ -147,7 +168,8 @@ export function createRouter(deps: RouterDeps): Router {
         case 'ready':
           webviewReady = true
           // 机器人点了跳转、面板是被 focus 命令拉起来的：直接落到目标目录
-          if (pendingFocus !== null && deps.folders().includes(pendingFocus.folder)) active = pendingFocus.folder
+          if (pendingFocus !== null && deps.folders().includes(pendingFocus.folder))
+            active = pendingFocus.folder
           // seed 已设过 active（上次选择）就不动它——「没 spawn」不是重置
           // active 的理由，否则 seed 被 [0] 顶掉，出现先连 [0] 再跳的闪换
           if (active === '') active = pick()
@@ -198,10 +220,10 @@ export function createRouter(deps: RouterDeps): Router {
       }
     },
 
-    dispatchFromAgent: async ({ root, brief, owner, model }) => {
+    dispatchFromAgent: async ({ root, brief, owner, model, lean }) => {
       const b = bridges.get(root)
       if (!b) return { ok: false, error: `本窗口没有打开「${root}」的 SC 会话` }
-      return b.dispatchFromAgent(brief, owner, model)
+      return b.dispatchFromAgent(brief, owner, model, lean)
     },
 
     taskModels: async ({ root }) => {
@@ -210,13 +232,25 @@ export function createRouter(deps: RouterDeps): Router {
       return b.taskModels()
     },
 
+    taskSend: ({ root, task, text }) => {
+      const b = bridges.get(root)
+      if (!b) return { ok: false, error: `本窗口没有打开「${root}」的 SC 会话` }
+      const error = b.taskSendFromAgent(task, text)
+      return error === null ? { ok: true } : { ok: false, error }
+    },
+
+    taskSendList: ({ root }) => {
+      const b = bridges.get(root)
+      if (!b) return { ok: false, error: `本窗口没有打开「${root}」的 SC 会话` }
+      return { ok: true, tasks: b.taskSendList() }
+    },
+    wake: (req) => wakeCenter.add(req),
+
     robotFolders: () =>
-      deps
-        .folders()
-        .flatMap((folder) => {
-          const b = bridges.get(folder)
-          return b ? [{ folder, ...b.robotView() }] : []
-        }),
+      deps.folders().flatMap((folder) => {
+        const b = bridges.get(folder)
+        return b ? [{ folder, ...b.robotView() }] : []
+      }),
 
     showing: () => ({ folder: active, task: shownTask }),
 
@@ -240,6 +274,7 @@ export function createRouter(deps: RouterDeps): Router {
     dispose: () => {
       for (const b of bridges.values()) b.dispose()
       bridges.clear()
+      wakeCenter.dispose() // 闹钟随面板走：停用即清（不持久化的拍板）
     },
   }
 }

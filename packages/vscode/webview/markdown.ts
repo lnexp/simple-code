@@ -1,15 +1,15 @@
 import DOMPurify from 'dompurify'
-import { marked } from 'marked'
 import hljs from 'highlight.js/lib/core'
 import bash from 'highlight.js/lib/languages/bash'
 import css from 'highlight.js/lib/languages/css'
 import diff from 'highlight.js/lib/languages/diff'
+import javascript from 'highlight.js/lib/languages/javascript'
 import json from 'highlight.js/lib/languages/json'
 import markdownLang from 'highlight.js/lib/languages/markdown'
 import python from 'highlight.js/lib/languages/python'
 import typescript from 'highlight.js/lib/languages/typescript'
 import xml from 'highlight.js/lib/languages/xml'
-import javascript from 'highlight.js/lib/languages/javascript'
+import { marked } from 'marked'
 import { linkifyDom } from './pathlink.ts'
 
 /**

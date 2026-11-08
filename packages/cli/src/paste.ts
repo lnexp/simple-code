@@ -1,5 +1,5 @@
-import { StringDecoder } from 'node:string_decoder'
 import { Transform } from 'node:stream'
+import { StringDecoder } from 'node:string_decoder'
 
 /**
  * 括号粘贴（bracketed paste）拦截层。
@@ -42,8 +42,7 @@ function holdLen(buf: string): number {
 }
 
 /** 数行数。末尾换行不算一行（粘贴常带尾换行，多算会虚报） */
-const lineCount = (text: string): number =>
-  text.replace(/\n$/, '').split('\n').length
+const lineCount = (text: string): number => text.replace(/\n$/, '').split('\n').length
 
 export function bracketPaste(input: NodeJS.ReadableStream, box: PasteBox): Transform {
   const decoder = new StringDecoder('utf8')
