@@ -258,6 +258,9 @@ extension AppDelegate {
     si.submenu = skins
     m.addItem(si)
     m.addItem(menuItem("打开皮肤目录", #selector(openSkinDir)))
+    let pin = menuItem("常驻桌面", #selector(togglePinned))
+    pin.state = pinned ? .on : .off
+    m.addItem(pin)
     m.addItem(.separator())
     m.addItem(menuItem("关闭机器人", #selector(disable)))
     return m
@@ -271,7 +274,16 @@ extension AppDelegate {
     skinName = i.representedObject as? String ?? "default"
     Config.set("skin", skinName)
     skin = loadSkin(skinName)   // 选中时重新读文件：改了图再选一次就生效
+    shownSkin = nil
     log("skin -> \(skinName)")
+    refresh()
+  }
+
+  /// 常驻桌面开关：关着时没事就藏起来，只留菜单栏图标
+  @objc func togglePinned() {
+    pinned.toggle()
+    Config.set("pinned", pinned)
+    log("pinned -> \(pinned)")
     refresh()
   }
   @objc func openSkinDir() {
