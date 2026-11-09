@@ -110,7 +110,9 @@ extension AppDelegate {
   }
 
   /// AX 提窗：激活应用后按标题找出连接对应的编辑器窗口（形如「文件 — 目录」「目录 — App」），
-  /// 还原最小化、AXRaise、设为 main。只激活不 open 路径——那会被 Cursor 开成 agent window
+  /// 还原最小化、AXRaise、设为 main。只激活不 open 路径——那会被 Cursor 开成 agent window。
+  /// workspace.name 对工作区文件带「 (Workspace)」后缀，窗口标题不带（如
+  /// 「file — ultradata-acquire — Cursor」），contains 会永远匹配不上——先剥掉再比
   private func raiseWindow(_ app: URL, _ oc: NSWorkspace.OpenConfiguration, _ windowName: String) {
     guard let bundleId = Bundle(url: app)?.bundleIdentifier,
           let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first else {
@@ -129,6 +131,8 @@ extension AppDelegate {
       var winsRef: CFTypeRef?
       guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &winsRef) == .success,
             let wins = winsRef as? [AXUIElement] else { return log("raise: 拿不到窗口（缺辅助功能授权？）") }
+      let key = windowName.hasSuffix(" (Workspace)")
+        ? String(windowName.dropLast(" (Workspace)".count)) : windowName
       var hit: AXUIElement?
       for w in wins {
         var sub: CFTypeRef?
@@ -137,10 +141,10 @@ extension AppDelegate {
         var t: CFTypeRef?
         guard AXUIElementCopyAttributeValue(w, kAXTitleAttribute as CFString, &t) == .success,
               let title = t as? String, !title.isEmpty else { continue }
-        if title == windowName { hit = w; break }
-        if hit == nil && title.contains(windowName) { hit = w }
+        if title == key { hit = w; break }
+        if hit == nil && title.contains(key) { hit = w }
       }
-      guard let win = hit else { return log("raise: 没有标题含「\(windowName)」的窗口") }
+      guard let win = hit else { return log("raise: 没有标题含「\(key)」的窗口") }
       var mini: CFTypeRef?
       if AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute as CFString, &mini) == .success,
          (mini as? Bool) == true {
@@ -254,6 +258,9 @@ extension AppDelegate {
     si.submenu = skins
     m.addItem(si)
     m.addItem(menuItem("打开皮肤目录", #selector(openSkinDir)))
+    let pin = menuItem("常驻桌面", #selector(togglePinned))
+    pin.state = pinned ? .on : .off
+    m.addItem(pin)
     m.addItem(.separator())
     m.addItem(menuItem("关闭机器人", #selector(disable)))
     return m
@@ -267,7 +274,16 @@ extension AppDelegate {
     skinName = i.representedObject as? String ?? "default"
     Config.set("skin", skinName)
     skin = loadSkin(skinName)   // 选中时重新读文件：改了图再选一次就生效
+    shownSkin = nil
     log("skin -> \(skinName)")
+    refresh()
+  }
+
+  /// 常驻桌面开关：关着时没事就藏起来，只留菜单栏图标
+  @objc func togglePinned() {
+    pinned.toggle()
+    Config.set("pinned", pinned)
+    log("pinned -> \(pinned)")
     refresh()
   }
   @objc func openSkinDir() {

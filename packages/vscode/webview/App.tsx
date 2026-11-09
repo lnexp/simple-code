@@ -140,7 +140,8 @@ export function App() {
   /** 选中的任务名。null = 对话视图。切换任务 = 切目录同款体感（2026-09-22
    *  拍板）：整个面板跟着换——对话流、控件区、上下文环、输入目标 */
   const [branch, setBranch] = useState<string | null>(null)
-  /** 输入框的「开任务」模式：+ 按钮或 /task 触发，回车按名称开空任务（规则 13）、Esc 取消 */
+  /** 输入框的「开任务」模式：+ 按钮触发，回车把输入当第一条消息开任务并立即跑（同 /task，
+   *  2026-11-09 起取代规则 13 的「只输名称开空任务」）、Esc 取消 */
   const [branchDraft, setBranchDraft] = useState(false)
   /** 各目录最后选中的任务（切走存、切回恢复）。与 view/bg/approvals 的
    *  「不做多目录缓存」不同类：选中是 UI 指针不是内容镜像，没有对账
@@ -401,7 +402,7 @@ export function App() {
     return () => window.removeEventListener('message', onMessage)
   }, [])
 
-  /** 派分支（`/task` 前缀）：brief 是第一条消息，开了就跑。
+  /** 派分支（`/task` 前缀、+ 按钮的新任务输入）：brief 是第一条消息，开了就跑。
    *  名字算法与宿主一致（首行 20 字）——tasks 快照里认出它才自动选中 */
   const dispatchBranch = (brief: string): void => {
     // 名字算法与宿主一致（首行 20 字）——tasks 快照里认出它才自动选中。
@@ -414,18 +415,8 @@ export function App() {
     post({ type: 'task_dispatch', brief, ...(branch !== null ? { from: branch } : {}) })
   }
 
-  /** 开空任务（+ 按钮，规则 13）：输入是名称，开好 idle、自动选中——先切模型
-   *  再发第一条。text 空 = 选中时不落用户气泡 */
-  const createBranch = (name: string): void => {
-    pendingBranch.current = {
-      name: name.split('\n', 1)[0]?.slice(0, 20).trim() || '任务',
-      text: '',
-    }
-    post({ type: 'task_create', name, ...(branch !== null ? { from: branch } : {}) })
-  }
-
   const send = (text: string, images: ImageRef[] = []) => {
-    // `/task <描述>`：开任务并立刻跑的键盘入口（+ 按钮只输名称、不跑）。不落对话气泡——
+    // `/task <描述>`：开任务并立刻跑的键盘入口（+ 按钮现在同样开跑）。不落对话气泡——
     // 不 post send。闸门在宿主（对话在跑会 fatal 拒掉）
     if (text.startsWith('/task ') && text.trim() !== '/task') {
       const brief = text.slice('/task '.length).trim()
@@ -634,7 +625,7 @@ export function App() {
         // 开分支模式的醒目提示：placeholder 变化太弱（灰字、易错过），
         // 用户点了 + 分支以为没反应，随手打的字被当任务书派出（2026-09-22）
         <div className="branch-draft-bar">
-          <span>⑂ 下一条输入将作为任务名称，开出空任务（可先切模型再发消息）</span>
+          <span>⑂ 下一条输入将作为新任务的第一条消息，首行作任务名，回车即开跑</span>
           <button type="button" onClick={() => setBranchDraft(false)}>
             取消（Esc）
           </button>
@@ -682,7 +673,8 @@ export function App() {
         branchDraft={branchDraft}
         onNewBranch={(name) => {
           setBranchDraft(false)
-          createBranch(name)
+          // 2026-11-09：输入不再只当任务名，同时作为首条消息立即开跑（与 /task 一致）
+          dispatchBranch(name)
         }}
         onCancelBranchDraft={() => setBranchDraft(false)}
         onSend={send}
@@ -1247,9 +1239,9 @@ function Composer({
   task: string | undefined
   /** 工作区根：拖入路径在项目内时显示相对路径（dropPaths.toDisplayPath） */
   folder: string
-  /** 输入框的「开分支」模式：回车 = 按名称开空任务（规则 13） */
+  /** 输入框的「开分支」模式：回车 = 输入作第一条消息开任务并开跑（同 /task） */
   branchDraft: boolean
-  /** 开分支模式回车：输入是任务名称（规则 13） */
+  /** 开分支模式回车：brief 是新任务的第一条消息（已拼好附件路径），首行作任务名 */
   onNewBranch: (name: string) => void
   onCancelBranchDraft: () => void
   onSend: (text: string, images: ImageRef[]) => void
@@ -1344,11 +1336,15 @@ function Composer({
     // 模型前插进去（send running 时 tasks.push 入队）。用户气泡本地
     // append，Enter 立刻可见，不用等回显
     if (trimmed === '' && images.length === 0 && attached.length === 0) return
-    // 开分支模式：输入是任务名称，不进当前流；图和附件留在输入框，等第一条消息
+    // 开分支模式：输入是新任务的第一条消息，不进当前流。附件路径接在正文后面——
+    // 任务名取首行，放前面（composeWithAttachments 的顺序）任务名会变成路径；
+    // 图留在输入框——task_dispatch 只带文字，开好后可在新任务里接着发
     if (branchDraft) {
       if (trimmed === '') return
       setText('')
-      onNewBranch(trimmed)
+      const brief = attached.length === 0 ? trimmed : `${trimmed}\n\n${attached.join('\n')}`
+      setAttached([])
+      onNewBranch(brief)
       return
     }
     setText('')
@@ -1433,7 +1429,7 @@ function Composer({
         value={text}
         placeholder={
           branchDraft
-            ? '新任务的名称（Enter 开任务，Esc 取消）'
+            ? '新任务的第一句话（首行作任务名，Enter 开任务，Esc 取消）'
             : running
               ? '正在跑……（Enter 插话，当前命令跑完后处理）'
               : task === undefined

@@ -2,7 +2,7 @@
   "name": "simplecode-robot",
   "displayName": "SimpleCode Robot",
   "description": "SimpleCode 的桌面机器人（仅 macOS）：别的应用盖住 VS Code 时，在机器人上看到审批卡和任务结束提醒，直接点「允许」或跳回对应任务。",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "lnexp",
   "main": "./dist/extension.cjs",
   "engines": {
