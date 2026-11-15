@@ -734,9 +734,6 @@ export function hydrateItems(
     meta?: FooterMeta | null
     elapsedMs?: number | null
     finishedAt?: number | null
-    /** fold 窗口版（2026-11-06）标记：stepId 在恢复窗口外的存根行。
-     * 连续段聚合成一条「已摘要」占位，不逐行渲染 */
-    stubbed?: boolean
   })[],
 ): ChatItem[] {
   const items: ChatItem[] = []
@@ -746,24 +743,11 @@ export function hydrateItems(
   /** 每行处理**前** items 的长度（循环开头记，continue 跳不到）。行 i 的
    *  产出区间 = [rowStarts[i], rowStarts[i+1])；页脚在轮的区间内定位 */
   const rowStarts: number[] = []
-  let stubRun = 0
 
   for (let r = 0; r < rows.length; r++) {
     rowStarts.push(items.length)
     const message = rows[r]
     if (!message) continue
-    if (message.stubbed) {
-      stubRun++
-      continue
-    }
-    if (stubRun > 0) {
-      items.push({
-        kind: 'notice',
-        text: `上方 ${stubRun} 行已摘要折叠——重开面板可查看完整历史`,
-        resumable: false,
-      })
-      stubRun = 0
-    }
     if (message.turnId !== undefined && !turnStarts.has(message.turnId)) {
       turnStarts.set(message.turnId, items.length)
     }
@@ -892,14 +876,6 @@ export function hydrateItems(
       // 实时路：中断轮本来也没有页脚
       ...(row.finishedAt != null ? { finishedAt: row.finishedAt } : {}),
     }
-  }
-  if (stubRun > 0) {
-    // 尾部整段存根（窗口截断在轮中间）：占位收尾
-    items.push({
-      kind: 'notice',
-      text: `上方 ${stubRun} 行已摘要折叠——重开面板可查看完整历史`,
-      resumable: false,
-    })
   }
   return stubbed.size > 0 ? items.filter((i) => !stubbed.has(i)) : items
 }

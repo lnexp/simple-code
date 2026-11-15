@@ -1,4 +1,4 @@
-import type { BgProcessInfo, MemoryStats } from '@simple-code/core'
+import type { BgProcessInfo, Effort, MemoryStats, ModelRef } from '@simple-code/core'
 import {
   memo,
   type MouseEvent as ReactMouseEvent,
@@ -10,19 +10,25 @@ import {
   useState,
 } from 'react'
 import type {
+  ActiveEditor,
   ApprovalRequest,
+  Attendance,
   FolderState,
   RegionsInfo,
+  TaskDraftDefaults,
   TaskState,
   ToWebview,
+  TurnQueueView,
 } from '../src/protocol.ts'
 import { EffortPicker, FolderTabs, ModelPicker, PresetPicker } from './controls.tsx'
 import { ContextPanel, compactText } from './ctx-panel.tsx'
+import { attachLabel, CurrentFileButton } from './currentFile.tsx'
 import {
   composeWithAttachments,
   hasOsFileDrag,
   isExplorerDrag,
   parseExplorerPaths,
+  osFileDragPaths,
   toDisplayPath,
 } from './dropPaths.ts'
 import {
@@ -47,8 +53,10 @@ import { MemoryPanel } from './memory-panel.tsx'
 import { Menu } from './menu.tsx'
 import { findPathTokens } from './pathlink.ts'
 import { groupTurns } from './steps.ts'
+import { draftChoice, draftControls, NEW_DRAFT, pickModel, type TaskDraft } from './task-draft.ts'
 import { useThrottledText } from './throttle.ts'
 import { MTurnView } from './timeline.tsx'
+import { TurnQueueBar } from './turn-queue-bar.tsx'
 import { post } from './vscode.ts'
 
 /**
@@ -82,6 +90,29 @@ const noControls: Controls = {
   contextWindow: 0,
 }
 
+type PageState = {
+  cursor: number | null
+  more: boolean
+  loading: boolean
+  epoch?: number
+}
+
+const freshPage = (epoch?: number): PageState => ({
+  cursor: null,
+  more: true,
+  loading: false,
+  ...(epoch === undefined ? {} : { epoch }),
+})
+
+/** 分页回包与当前等待态是否对齐：丢弃重推基线前的旧页与并发双链的后到副本
+ *  （2026-11-12 真项目：task_open 重推 task_hydrate 把 loading 清回 false，
+ *  与此前刚发出的 task_fetchHistory 形成双链乒乓，每页 prepend 两遍） */
+const acceptsPage = (cur: PageState, msg: { epoch?: number; from?: number | null }): boolean => {
+  if (msg.epoch !== undefined && msg.epoch !== cur.epoch) return false
+  if (msg.from !== undefined && (!cur.loading || !cur.more || msg.from !== cur.cursor)) return false
+  return true
+}
+
 export function App() {
   const [view, setView] = useState<ChatView>(emptyView)
   const [running, setRunning] = useState(false)
@@ -92,6 +123,8 @@ export function App() {
   const [zoom, setZoom] = useState<string | null>(null)
   const [controls, setControls] = useState<Controls>(noControls)
   const [fatal, setFatal] = useState<string | null>(null)
+  /** 底栏「当前文件」按钮的数据：宿主推的活动编辑器（全窗口一份，不跟分支/文件夹） */
+  const [activeEditor, setActiveEditor] = useState<ActiveEditor | null>(null)
   /** 上下文分析面板（点底栏「上下文 X」）。数据按需拉取，不进 ChatView */
   const [ctxOpen, setCtxOpen] = useState(false)
   const [memOpen, setMemOpen] = useState(false)
@@ -137,11 +170,22 @@ export function App() {
   const [tasks, setTasks] = useState<TaskState[]>([])
   /** 各任务的投影（webview 端增量 reduce；选中时宿主 task_open 补基线） */
   const [taskViews, setTaskViews] = useState<Record<string, ChatView>>({})
+  /** 排队发送（Ctrl+Enter）的快照：宿主全量推，主任务一份 + 各任务按名字。
+   *  只来自当前目录的 bridge（router 不放行后台目录的），切目录时 attach 补推 */
+  const [turnQueue, setTurnQueue] = useState<{
+    main: TurnQueueView
+    tasks: Record<string, TurnQueueView>
+  }>({ main: { paused: false, items: [] }, tasks: {} })
   /** 选中的任务名。null = 对话视图。切换任务 = 切目录同款体感（2026-09-22
    *  拍板）：整个面板跟着换——对话流、控件区、上下文环、输入目标 */
   const [branch, setBranch] = useState<string | null>(null)
-  /** 输入框的「开任务」模式：+ 按钮或 /task 触发，回车按名称开空任务（规则 13）、Esc 取消 */
+  /** 输入框的「新任务」状态：+ 按钮进入，这条消息发出即开任务（规则 13，
+   *  2026-11-14 改：首行作名称，不再先输名称开空任务）、Esc 取消 */
   const [branchDraft, setBranchDraft] = useState(false)
+  /** 新任务状态里先选的模型/档位/审批（任务还没建，先记在这里，随第一条带走） */
+  const [draft, setDraft] = useState<TaskDraft>(NEW_DRAFT)
+  /** 新任务状态的控件初值（宿主 state.taskDraft：配置默认模型、各模型档位等） */
+  const [taskDraft, setTaskDraft] = useState<TaskDraftDefaults | undefined>(undefined)
   /** 各目录最后选中的任务（切走存、切回恢复）。与 view/bg/approvals 的
    *  「不做多目录缓存」不同类：选中是 UI 指针不是内容镜像，没有对账
    *  问题，清它只丢用户意图——派任务自动选中（盯它干活）、切个目录
@@ -161,24 +205,32 @@ export function App() {
    * more = 还有更早的（false 就不再触发）；loading 防抖——scroll 事件
    * 一帧能来几十次，没它会对着宿主连发几十条 fetchHistory
    */
-  const [history, setHistory] = useState<{
-    cursor: number | null
-    more: boolean
-    loading: boolean
-  }>({ cursor: null, more: true, loading: false })
+  const [history, setHistory] = useState<PageState>(freshPage)
   /** 消息处理在事件回调里（非渲染期），读 state 要走 ref 镜像——
    *  否则拿到的是挂载那次渲染的旧值（finishTurn 漂移翻过这个车） */
   const viewRef = useRef(view)
   viewRef.current = view
   const branchRef = useRef(branch)
   branchRef.current = branch
+  /** 任务视图的分页状态（per 任务）：主视图的 history 是全局单份，任务
+   *  各翻各的页，切任务互不串。ref 是同步权威（同 folderRef）：onScroll 与
+   *  useEffect 或同批 IPC 在重渲染前背靠背触发时，不等下一次渲染即见新值 */
+  const [taskHistory, setTaskHistory] = useState<Record<string, PageState>>({})
+  const taskHistoryRef = useRef<Record<string, PageState>>({})
   // 桌面机器人判「这条你在面板里看得到、不用提醒」要知道正显示哪个任务
   // （desktop-robot.md §5.1）。切目录时 swapFolder 换 branch，这里跟着报
   useEffect(() => {
     post({ type: 'view_task', task: branch })
   }, [branch])
-  const historyRef = useRef(history)
-  historyRef.current = history
+  const historyRef = useRef<PageState>(freshPage())
+  const putHistory = (next: PageState): void => {
+    historyRef.current = next
+    setHistory(next)
+  }
+  const putTaskHistory = (name: string, next: PageState): void => {
+    taskHistoryRef.current = { ...taskHistoryRef.current, [name]: next }
+    setTaskHistory((t) => ({ ...t, [name]: next }))
+  }
   /** 当前目录的同步权威。只在 swapFolder 里赋值（消息处理时）——不在
    *  渲染期赋值：attach 的 folders/state/tasks 是同一批连续消息，React
    *  的 flush 排在整批之后，渲染期赋值会让 tasks 的 folder 守卫读到旧
@@ -209,11 +261,13 @@ export function App() {
     const saved = lastBranch.current.get(next) ?? null
     restoreBranch.current = saved
     setView(emptyView())
-    setHistory({ cursor: null, more: true, loading: false })
+    putHistory(freshPage())
     setBgItems([])
     setApprovals([])
     setTasks([])
     setTaskViews({})
+    taskHistoryRef.current = {}
+    setTaskHistory({})
     setBranch(saved)
     setBranchDraft(false)
     // 切目录后旧目录的 pendingBranch 不清的话，新目录恰有同名任务会被
@@ -254,11 +308,34 @@ export function App() {
           lastTiming: msg.lastTiming ?? null,
           queued: msg.queued ?? [],
         })
-        setHistory({ cursor: null, more: true, loading: false })
+        putHistory(freshPage(msg.epoch))
       } else if (msg.type === 'historyPage') {
+        const cur = historyRef.current
+        if (!acceptsPage(cur, msg)) return
         // 更早的一页，prepend。滚回原来的位置由 Log 的 sticky 逻辑处理
+        putHistory({
+          cursor: msg.next,
+          more: msg.next !== null,
+          loading: false,
+          ...(cur.epoch === undefined ? {} : { epoch: cur.epoch }),
+        })
         setView((v) => ({ ...v, items: [...msg.items, ...v.items] }))
-        setHistory({ cursor: msg.next, more: msg.next !== null, loading: false })
+      } else if (msg.type === 'task_historyPage') {
+        const cur = taskHistoryRef.current[msg.name] ?? freshPage()
+        if (!acceptsPage(cur, msg)) return
+        putTaskHistory(msg.name, {
+          cursor: msg.next,
+          more: msg.next !== null,
+          loading: false,
+          ...(cur.epoch === undefined ? {} : { epoch: cur.epoch }),
+        })
+        setTaskViews((v) => ({
+          ...v,
+          [msg.name]: {
+            ...(v[msg.name] ?? emptyView()),
+            items: [...msg.items, ...(v[msg.name]?.items ?? [])],
+          },
+        }))
       } else if (msg.type === 'memory_data') {
         setMemStats(msg.stats)
       } else if (msg.type === 'reflect_result') {
@@ -284,6 +361,7 @@ export function App() {
           summaryInContext: msg.summaryInContext,
           contextWindow: msg.contextWindow,
         })
+        setTaskDraft(msg.taskDraft)
         // 跑完了（正常结束、中断、报错都走这条）——给页脚记时间
         if (wasRunning.current && !msg.running) {
           const stopped = stopRequested.current
@@ -306,7 +384,8 @@ export function App() {
         setFolderList(msg.folders)
         swapFolder(msg.active)
         setFolder(msg.active)
-      } else if (msg.type === 'approval_request') {
+      } else if (msg.type === 'active_editor') setActiveEditor(msg.editor)
+      else if (msg.type === 'approval_request') {
         // 只显示当前目录的卡（用户拍板：彻底隔离）。后台目录的卡等用户
         // 切过去时 attach 重推——它 5 分钟超时 deny 是隔离语义的一部分
         if (msg.folder === folderRef.current) setApprovals((a) => [...a, msg])
@@ -314,6 +393,7 @@ export function App() {
         // 关卡按 (folder, id)：后台文件夹的卡带 folder，active 的不带。
         // 两个 bridge 的 id 序列各自从 1 起，只看 id 会关错
         setApprovals((a) => a.filter((x) => x.id !== msg.id || x.folder !== msg.folder))
+      else if (msg.type === 'turnQueue') setTurnQueue({ main: msg.main, tasks: msg.tasks })
       else if (msg.type === 'bg_processes') {
         // 只认当前目录的快照（router 对 active 也注入 folder）；后台目录
         // 的变化切回时 attach 会补推
@@ -349,15 +429,13 @@ export function App() {
             setBranch(pending.name)
             // brief 即刻可见：宿主镜像里的 pendingTexts 气泡要等下一次
             // task_hydrate 才到，这里先落乐观版（内容一致，替换无感）。
-            // 空任务（+ 按钮只输名称）没有第一条消息，不落
-            if (pending.text !== '')
-              setTaskViews((v) => ({
-                ...v,
-                [pending.name]: {
-                  ...(v[pending.name] ?? emptyView()),
-                  items: [...(v[pending.name]?.items ?? []), { kind: 'user', text: pending.text }],
-                },
-              }))
+            setTaskViews((v) => ({
+              ...v,
+              [pending.name]: {
+                ...(v[pending.name] ?? emptyView()),
+                items: [...(v[pending.name]?.items ?? []), { kind: 'user', text: pending.text }],
+              },
+            }))
             post({ type: 'task_open', task: pending.name })
           }
         }
@@ -370,7 +448,7 @@ export function App() {
         setBranch(msg.task)
         if (msg.task !== null) post({ type: 'task_open', task: msg.task })
       } else if (msg.type === 'task_hydrate') {
-        if (msg.folder === folderRef.current)
+        if (msg.folder === folderRef.current) {
           setTaskViews((v) => ({
             ...v,
             [msg.name]: {
@@ -381,6 +459,8 @@ export function App() {
               queued: msg.queued ?? [],
             },
           }))
+          putTaskHistory(msg.name, freshPage(msg.epoch))
+        }
       } else if (msg.type === 'task_agent')
         // 高频流（跟 agent 同级）：路由只放 active，不用再判 folder
         setTaskViews((v) => ({
@@ -414,18 +494,24 @@ export function App() {
     post({ type: 'task_dispatch', brief, ...(branch !== null ? { from: branch } : {}) })
   }
 
-  /** 开空任务（+ 按钮，规则 13）：输入是名称，开好 idle、自动选中——先切模型
-   *  再发第一条。text 空 = 选中时不落用户气泡 */
-  const createBranch = (name: string): void => {
-    pendingBranch.current = {
-      name: name.split('\n', 1)[0]?.slice(0, 20).trim() || '任务',
-      text: '',
-    }
-    post({ type: 'task_create', name, ...(branch !== null ? { from: branch } : {}) })
+  /** 「+ 任务」发第一条消息（规则 13）：带上新任务状态里选的，宿主建好即发、
+   *  回 select_task 切过去（名字宿主定，可能带序号，这里不猜）。用户气泡由
+   *  切过去时的基线带来（宿主镜像 pendingTexts） */
+  const createBranch = (name: string, text: string, images: ImageRef[]): void => {
+    const choice = draftChoice(taskDraft, draft)
+    post({
+      type: 'task_create',
+      name,
+      text,
+      ...(images.length > 0 ? { images } : {}),
+      ...(branch !== null ? { from: branch } : {}),
+      ...(choice !== undefined ? { choice } : {}),
+      attendance: draft.attendance,
+    })
   }
 
   const send = (text: string, images: ImageRef[] = []) => {
-    // `/task <描述>`：开任务并立刻跑的键盘入口（+ 按钮只输名称、不跑）。不落对话气泡——
+    // `/task <描述>`：开任务并立刻跑的键盘入口（+ 按钮是先选模型再写第一条）。不落对话气泡——
     // 不 post send。闸门在宿主（对话在跑会 fatal 拒掉）
     if (text.startsWith('/task ') && text.trim() !== '/task') {
       const brief = text.slice('/task '.length).trim()
@@ -519,14 +605,22 @@ export function App() {
             view={branch === null ? view : (taskViews[branch] ?? emptyView())}
             running={branch === null ? running : t?.status === 'running'}
             model={(branch === null ? controls.current : t?.current)?.model ?? null}
-            history={branch === null ? history : { cursor: null, more: false, loading: false }}
+            history={branch === null ? history : (taskHistory[branch] ?? { cursor: null, more: true, loading: false })}
             approvals={approvals}
             onApprovalReply={onApprovalReply}
             onFetchTop={() => {
-              const h = historyRef.current
-              if (!h.more || h.loading) return
-              setHistory({ ...h, loading: true })
-              post({ type: 'fetchHistory', cursor: h.cursor })
+              if (branchRef.current === null) {
+                const h = historyRef.current
+                if (!h.more || h.loading) return
+                putHistory({ ...h, loading: true })
+                post({ type: 'fetchHistory', cursor: h.cursor })
+              } else {
+                const b = branchRef.current
+                const th = taskHistoryRef.current[b] ?? freshPage()
+                if (!th.more || th.loading) return
+                putTaskHistory(b, { ...th, loading: true })
+                post({ type: 'task_fetchHistory', task: b, cursor: th.cursor })
+              }
             }}
             // 「继续」按钮 = 替用户说一句「继续」：走同一个 send（对话/任务
             // 分流、气泡上屏都在里面），core 续进上一轮（turn-resume.md）
@@ -625,7 +719,11 @@ export function App() {
               ? '正在开任务（点此取消）'
               : '开一个新任务（带已合回的历史摘要，不带当前对话）'
           }
-          onClick={() => setBranchDraft(!branchDraft)}
+          onClick={() => {
+            // 每次进新任务状态都从默认起（上次没发出去的选择不带过来）
+            if (!branchDraft) setDraft(NEW_DRAFT)
+            setBranchDraft(!branchDraft)
+          }}
         >
           {branchDraft ? '取消 ⑂' : '+ 任务'}
         </button>
@@ -634,15 +732,24 @@ export function App() {
         // 开分支模式的醒目提示：placeholder 变化太弱（灰字、易错过），
         // 用户点了 + 分支以为没反应，随手打的字被当任务书派出（2026-09-22）
         <div className="branch-draft-bar">
-          <span>⑂ 下一条输入将作为任务名称，开出空任务（可先切模型再发消息）</span>
+          <span>⑂ 新任务：下一条消息发出即开任务，第一行作任务名称（可先切模型、深度、审批）</span>
           <button type="button" onClick={() => setBranchDraft(false)}>
             取消（Esc）
           </button>
         </div>
       )}
+      <TurnQueueBar
+        view={branch === null ? turnQueue.main : turnQueue.tasks[branch]}
+        onCancel={(id) => post({ type: 'turnQueueCancel', id })}
+      />
       <Composer
         running={
-          branch === null ? running : tasks.find((x) => x.name === branch)?.status === 'running'
+          // 新任务还没建、没在跑：控件可选、出发送键（当前流在跑也一样）
+          branchDraft
+            ? false
+            : branch === null
+              ? running
+              : tasks.find((x) => x.name === branch)?.status === 'running'
         }
         view={branch === null ? view : (taskViews[branch] ?? emptyView())}
         onOpenMemory={() => {
@@ -653,6 +760,11 @@ export function App() {
           post({ type: 'reflect_panel' })
         }}
         controls={(() => {
+          // 新任务状态：控件显示的是待开任务的选择（task-draft.ts）
+          if (branchDraft) {
+            const { preset: _mainPreset, ...shared } = controls
+            return { ...shared, ...draftControls(controls.models, taskDraft, draft) }
+          }
           // 控件区跟分支走（2026-09-22 拍板）：模型/深度/预设/窗口是分支
           // session 自己的账（TaskState 带来），预设列表、贴图通道也是（模型级）；
           // models 借主干——配置全 folder 一份
@@ -679,13 +791,32 @@ export function App() {
         // Picker 的选择打到分支 session（setModel/setEffort 带 task）
         task={branch ?? undefined}
         folder={folder}
+        activeEditor={activeEditor}
         branchDraft={branchDraft}
-        onNewBranch={(name) => {
+        draftPick={
+          branchDraft
+            ? {
+                model: (c: ModelRef) => setDraft((d) => pickModel(d, taskDraft?.model, c)),
+                effort: (e: Effort | null) => setDraft((d) => ({ ...d, effort: e })),
+                attendance: (m: Attendance) => setDraft((d) => ({ ...d, attendance: m })),
+              }
+            : undefined
+        }
+        onNewBranch={(name, text, images) => {
           setBranchDraft(false)
-          createBranch(name)
+          createBranch(name, text, images)
         }}
         onCancelBranchDraft={() => setBranchDraft(false)}
         onSend={send}
+        onQueue={(text, images) =>
+          // 不落本地气泡：宿主发出时补推基线，它才上屏（turn-queue-bar.tsx）
+          post({
+            type: 'turnQueueAdd',
+            text,
+            ...(images.length > 0 ? { images } : {}),
+            ...(branch !== null ? { task: branch } : {}),
+          })
+        }
         onStop={() => {
           // 停止打到当前看着的流：任务的轮走 task_stop，对话的走 interrupt
           if (branch !== null) {
@@ -938,11 +1069,27 @@ function Log({
     lastTop.current = el.scrollTop
     // 触顶拉历史：40px 内就发——等到 scrollTop === 0 才发的话最后一屏
     // 恰好填满时用户拉不动，卡在没有加载更多的死区里
-    // 空列表不算触顶：切目录先清空视图，scrollTop 被夹到 0 也会来一次
-    // scroll，基线还没到就抢先拉一页（某真库这页带图 623ms，
-    // 跟基线争宿主，「正在加载更早的消息」就是它）
+    fetchIfAtTop(el)
+  }
+
+  // 空列表不算触顶：切目录先清空视图，scrollTop 被夹到 0 也会来一次
+  // scroll，基线还没到就抢先拉一页（某真库这页带图 623ms，
+  // 跟基线争宿主，「正在加载更早的消息」就是它）
+  const fetchIfAtTop = (el: HTMLDivElement) => {
     if (el.scrollTop < 40 && view.items.length > 0 && history.more && !history.loading) onFetchTop()
   }
+
+  /**
+   * 渲染后也判一次触顶：滚不动就没有 scroll 事件，只靠 onScroll 会卡死——
+   * 底稿不满一屏（2026-11-11 真项目：最近 100 步全在一轮里，折叠
+   * 后一屏装得下，夹具实测 scrollHeight === clientHeight），或翻回来的页并进
+   * 同一个折叠过程没长高、视口还停在 0。layout effect 先排好跟随/还原位置，
+   * 这里读到的就是最终位置；满屏跟随在底部时 scrollTop 远大于 40，不触发
+   */
+  useEffect(() => {
+    const el = ref.current
+    if (el) fetchIfAtTop(el)
+  })
 
   /**
    * .log 里渲染出来的内联交互统一走这一个委托（dangerouslySetInnerHTML
@@ -1231,10 +1378,13 @@ function Composer({
   controls,
   task,
   folder,
+  activeEditor,
   branchDraft,
+  draftPick,
   onNewBranch,
   onCancelBranchDraft,
   onSend,
+  onQueue,
   onStop,
   onNotice,
   onOpenRegions,
@@ -1247,12 +1397,25 @@ function Composer({
   task: string | undefined
   /** 工作区根：拖入路径在项目内时显示相对路径（dropPaths.toDisplayPath） */
   folder: string
-  /** 输入框的「开分支」模式：回车 = 按名称开空任务（规则 13） */
+  activeEditor: ActiveEditor | null
+  /** 输入框的「新任务」状态：这条消息发出即开任务（规则 13） */
   branchDraft: boolean
-  /** 开分支模式回车：输入是任务名称（规则 13） */
-  onNewBranch: (name: string) => void
+  /** 新任务状态下控件的选择不发宿主、交给它（任务还没建；webview/task-draft.ts）。
+   *  undefined = 普通状态，选择照常打到当前 session */
+  draftPick:
+    | {
+        model: (choice: ModelRef) => void
+        effort: (effort: Effort | null) => void
+        attendance: (mode: Attendance) => void
+      }
+    | undefined
+  /** 新任务状态发出：name = 用户打的字（宿主取首行作名称），text = 含附件的
+   *  第一条消息 */
+  onNewBranch: (name: string, text: string, images: ImageRef[]) => void
   onCancelBranchDraft: () => void
   onSend: (text: string, images: ImageRef[]) => void
+  /** Ctrl+Enter：排队，目标这一轮正常结束后再发（docs/proposals/queued-sends.md） */
+  onQueue: (text: string, images: ImageRef[]) => void
   onStop: () => void
   onNotice: (text: string) => void
   /** 点「上下文 X」：开面板 + 按需拉取分区快照（state 在 App，数据不进 ChatView） */
@@ -1291,13 +1454,25 @@ function Composer({
           ty === 'codeeditors',
       )
     const onEnter = (e: DragEvent): void => {
-      if (!carriesHostData(e.dataTransfer)) return
+      // 每次拖动会话首报（诊断 A/B 分叉）：dragenter 进来了但 drop 没来 =
+      // dragover 判据漏 preventDefault（B，我们可修）；dragenter 都没进 =
+      // VS Code 挂起指针事件，事件根本不路由进 webview（A，平台层）
+      if (depth === 0)
+        post({
+          type: 'drop_debug',
+          phase: 'enter',
+          kinds: Array.from(e.dataTransfer?.types ?? []),
+          fileCount: e.dataTransfer?.files.length ?? 0,
+          fileMeta: [],
+          explorerLike: false,
+        })
+      if (!carriesHostData(e.dataTransfer) && !hasOsFileDrag(e.dataTransfer)) return
       e.preventDefault()
       depth++
       setDragOver(true)
     }
     const onOver = (e: DragEvent): void => {
-      if (!carriesHostData(e.dataTransfer)) return
+      if (!carriesHostData(e.dataTransfer) && !hasOsFileDrag(e.dataTransfer)) return
       e.preventDefault()
       if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
     }
@@ -1309,6 +1484,22 @@ function Composer({
       const host = carriesHostData(e.dataTransfer)
       if (!host && !(e.dataTransfer && e.dataTransfer.files.length > 0)) return
       e.preventDefault() // textarea 原生插入 payload 的防御，见上
+      // drop 形态诊断（常驻观测）：9 月判据只在 Cursor 实测过，VS Code
+      // 正式版的 Explorer 拖到底给 files 还是只给私有类型，出了问题要能查
+      const d = e.dataTransfer
+      post({
+        type: 'drop_debug',
+        kinds: Array.from(d?.types ?? []),
+        fileCount: d?.files.length ?? 0,
+        fileMeta: Array.from(d?.files ?? []).map((f) => ({
+          name: f.name,
+          size: f.size,
+          ...(typeof (f as File & { path?: string }).path === 'string'
+            ? { path: (f as File & { path?: string }).path }
+            : {}),
+        })),
+        explorerLike: d !== null && isExplorerDrag(d),
+      })
       depth = 0
       setDragOver(false)
       const dt = e.dataTransfer
@@ -1320,7 +1511,19 @@ function Composer({
         }
         setAttached((cur) => [...cur, ...lines.filter((p) => !cur.includes(p))])
       } else if (hasOsFileDrag(dt)) {
-        onNotice('仅支持从 VS Code 资源管理器拖入（图片继续用粘贴）')
+        // Finder 拖（2026-11-09 翻案）：OS 级拖动不触发 VS Code 的挂起/浮层
+        // 机制（那只管 VS Code 内部 DOM 拖动源），drop 稳定进 webview——CC/
+        // OC 的稳定拖放就是这条路。webview 跑在 Electron 里，File 对象带
+        // 非标准扩展属性 path = 真实磁盘路径（2026-09-08 拍板「Finder 拖
+        // 没有路径」时不知道这一点）。产物仍是路径（不读内容、图片不
+        // 内联），对齐路径哲学；path 缺失才兜底提示
+        const paths = osFileDragPaths(dt?.files ?? [])
+        if (paths.length === 0) {
+          onNotice('这个拖入来源拿不到文件路径：请从访达（Finder）拖文件，或粘贴路径文本')
+          return
+        }
+        const lines = paths.map((p) => toDisplayPath(p, folder))
+        setAttached((cur) => [...cur, ...lines.filter((p) => !cur.includes(p))])
       }
     }
     document.addEventListener('dragenter', onEnter)
@@ -1338,24 +1541,22 @@ function Composer({
   /** 单图上限。没有的话一张 40MB 截图既撑请求体也撑 store，三端都遭殃 */
   const MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
-  const submit = () => {
+  const submit = (queue = false) => {
     const trimmed = text.trim()
     // running 不拦：插话进 core 的任务队列，当前命令跑完、下一次请求
     // 模型前插进去（send running 时 tasks.push 入队）。用户气泡本地
     // append，Enter 立刻可见，不用等回显
     if (trimmed === '' && images.length === 0 && attached.length === 0) return
-    // 开分支模式：输入是任务名称，不进当前流；图和附件留在输入框，等第一条消息
-    if (branchDraft) {
-      if (trimmed === '') return
-      setText('')
-      onNewBranch(trimmed)
-      return
-    }
     setText('')
     setImages([])
     const payload = composeWithAttachments(trimmed, attached)
     setAttached([])
-    onSend(payload, images)
+    // 新任务状态：这条就是新任务的第一条消息，不进当前流。名字取用户打的字
+    // （附件拼在 payload 前面，不能拿它取首行）。Ctrl+Enter 同 Enter——新任务
+    // 空闲，排队也是立刻发
+    if (branchDraft) onNewBranch(trimmed, payload, images)
+    else if (queue) onQueue(payload, images)
+    else onSend(payload, images)
   }
 
   /** 粘贴板里的图 → base64。不拦 e.preventDefault：文本粘贴走默认路径，
@@ -1416,8 +1617,8 @@ function Composer({
       {attached.length > 0 && (
         <div className="attach-files">
           {attached.map((p, i) => (
-            <div key={`f${i}`} className="file-chip" title={p}>
-              <span className="file-chip-name">{p}</span>
+            <div key={`f${i}`} className="file-chip" title={attachLabel(p)}>
+              <span className="file-chip-name">{attachLabel(p)}</span>
               <button
                 type="button"
                 aria-label="移除附件"
@@ -1433,9 +1634,9 @@ function Composer({
         value={text}
         placeholder={
           branchDraft
-            ? '新任务的名称（Enter 开任务，Esc 取消）'
+            ? '新任务的第一条消息，第一行作名称（Enter 开任务，Esc 取消）'
             : running
-              ? '正在跑……（Enter 插话，当前命令跑完后处理）'
+              ? '正在跑……（Enter 插话，当前命令跑完后处理；Ctrl+Enter 排队，这一轮跑完再发）'
               : task === undefined
                 ? '说点什么（Enter 发送，Shift+Enter 换行）'
                 : `对任务「${task}」说点什么（Enter 发送，Shift+Enter 换行）`
@@ -1453,7 +1654,9 @@ function Composer({
           // 中文输入到一半按 Enter 就把半截话发出去了
           if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
             e.preventDefault()
-            submit()
+            // Ctrl 与 Cmd 都排队（2026-11-14 用户改定：mac 上按 Cmd 顺手）。
+            // metaKey 在 Windows 上是 Win 键，Win+Enter 也排队，无害
+            submit(e.ctrlKey || e.metaKey)
           }
         }}
       />
@@ -1492,11 +1695,21 @@ function Composer({
           <i className="codicon codicon-database" aria-hidden="true" />
           <span className="bar-word">记忆</span>
         </button>
+        <CurrentFileButton
+          editor={activeEditor}
+          root={folder}
+          attached={attached}
+          onAdd={(a) =>
+            setAttached((cur) =>
+              cur.some((x) => attachLabel(x) === attachLabel(a)) ? cur : [...cur, a],
+            )
+          }
+        />
         <div className="bar-right">
           {/* 审批三态（2026-11-04 拍板）：每次询问=弹卡等人（默认）；
               一律拒绝=ask 立即按超时拒（模型读到「无人处理，非用户拒绝」，
               卡不生成）；一律放行=触发即放行。跟分支走（各分支独立） */}
-          <Menu
+          <Menu<Attendance>
             icon={
               controls.attendance === 'attended'
                 ? 'person'
@@ -1539,11 +1752,13 @@ function Composer({
               },
             ]}
             onPick={(mode) =>
-              post({
-                type: 'setAttendance',
-                mode,
-                ...(task !== undefined ? { task } : {}),
-              })
+              draftPick !== undefined
+                ? draftPick.attendance(mode)
+                : post({
+                    type: 'setAttendance',
+                    mode,
+                    ...(task !== undefined ? { task } : {}),
+                  })
             }
           />
           {/* 模型/深度/预设跟分支走：选择带 task 打到分支 session */}
@@ -1552,12 +1767,14 @@ function Composer({
             overridden={controls.effortOverridden}
             running={running}
             task={task}
+            {...(draftPick !== undefined ? { onPick: draftPick.effort } : {})}
           />
           <ModelPicker
             current={controls.current}
             models={controls.models}
             running={running}
             task={task}
+            {...(draftPick !== undefined ? { onPick: draftPick.model } : {})}
           />
           {/* 预设紧挨模型右侧：它从属于模型，隔开会看不出这层关系。
               没配 presets 的模型整个不渲染，那时这一排跟以前一模一样 */}
@@ -1567,6 +1784,7 @@ function Composer({
             current={controls.current}
             running={running}
             task={task}
+            {...(draftPick !== undefined ? { onPick: draftPick.model } : {})}
           />
           {running ? (
             <button
@@ -1582,10 +1800,10 @@ function Composer({
             <button
               type="button"
               className="send-btn"
-              onClick={submit}
+              onClick={() => submit()}
               disabled={text.trim() === ''}
-              title={branchDraft ? '开分支（Enter）' : '发送（Enter）'}
-              aria-label={branchDraft ? '开分支' : '发送'}
+              title={branchDraft ? '开任务（Enter）' : '发送（Enter）'}
+              aria-label={branchDraft ? '开任务' : '发送'}
             >
               <PlaneIcon />
             </button>

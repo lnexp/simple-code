@@ -795,6 +795,11 @@ ${WRAP_INDENT}
 .usage {
   color: var(--vscode-descriptionForeground); font-size: 0.85em;
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  /* 和「当前文件」按钮一起挤时它先缩到底。收缩量按 shrink×宽度分摊，权重要
+     大到按钮分到的 < 1/64px（布局精度，截成 0）——1000 时按钮还分到 0.11px，
+     文件名就出省略号（2026-11-10 实测）。按钮自己的权重不能 < 1：flex 规定
+     权重和 < 1 时只分摊那个比例，耗时缩没以后底栏会溢出 */
+  flex-shrink: 1000000;
 }
 /* 窄侧栏先整段让掉耗时统计，再让掉「上下文」「记忆」两个字（只留图标和数字），
    位置留给模型名——不让路时 480px 宽模型名被挤成「gl…」。耗时统计在场时
@@ -823,6 +828,26 @@ ${WRAP_INDENT}
 }
 /* svg 的 block 去掉行内基线下沉，不然 flex 居中会偏几 px（同 send-btn） */
 .usage-ring { display: block; flex: none; }
+/* 底栏「当前文件」按钮（2026-11-10 方案 1，currentFile.tsx）：形状同上下文/
+   记忆胶囊，但**可收缩**——文件名省略号让位给右侧控件；耗时统计比它先让
+   （.usage 的 flex-shrink）。≤634px 只留图标，悬停看全名。图标字号与间距
+   沿用胶囊默认（16px、gap 6，同「记忆」）——2026-11-11 前是 13px/3px，比邻居小一号 */
+.bar button.usage-ctx.cur-file {
+  flex: 0 1 auto; min-width: 0; overflow: hidden; padding: 2px 7px 2px 4px;
+}
+.cur-file .codicon { flex: none; }
+/* 文件名:行号是一个 span，挤时省略号吃**开头**（同 .file-chip-name 的 rtl），
+   行号留到最后。分成两个 span 时文件名先挤没，行号接着被按钮硬切成
+   「:1280-13」；给按钮最小宽保住行号，640~720px 底栏又会溢出、挤走发送键 */
+.cur-file .cf-label {
+  min-width: 0; max-width: 18em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  direction: rtl; text-align: left;
+}
+.bar button.usage-ctx.cur-file.is-added { opacity: 0.55; cursor: default; }
+.bar button.usage-ctx.cur-file.is-added:hover {
+  background: none; color: var(--vscode-descriptionForeground);
+}
+@media (max-width: 634px) { .cur-file .cf-label { display: none; } }
 /* 上下文分析面板（方案 A）：底部锚定的小浮层，遮罩轻——它不是模态对话框 */
 .ctx-mask {
   position: fixed; inset: 0; z-index: 90;
@@ -1168,6 +1193,30 @@ code a[data-open-path]:hover {
   color: var(--vscode-descriptionForeground); font-size: 11px;
 }
 .branch-draft-bar button:hover { color: var(--vscode-foreground); text-decoration: underline; }
+/* 排队发送（Ctrl+Enter）：输入框上方，一条一行。全文可见但限高——长消息
+   在条目内滚动，不把输入框顶出屏幕 */
+.turn-queue { display: flex; flex-direction: column; gap: 2px; margin: 2px 8px; }
+.turn-queue-paused {
+  padding: 2px 8px; font-size: 11px; color: var(--vscode-foreground);
+  background: color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 18%, transparent);
+  border-radius: 4px;
+}
+.turn-queue-item {
+  display: flex; align-items: flex-start; gap: 6px; padding: 2px 4px 2px 8px;
+  border: 1px dashed color-mix(in srgb, var(--vscode-foreground) 25%, transparent);
+  border-radius: 4px; font-size: 12px;
+}
+.turn-queue-tag { flex: none; font-size: 11px; color: var(--vscode-descriptionForeground); }
+.turn-queue-text {
+  flex: 1; min-width: 0; max-height: 4.5em; overflow: auto;
+  white-space: pre-wrap; word-break: break-word;
+}
+.turn-queue-img { color: var(--vscode-descriptionForeground); }
+.turn-queue-item button {
+  flex: none; border: none; background: none; cursor: pointer; padding: 0 4px;
+  color: var(--vscode-descriptionForeground); font-size: 13px; line-height: 1.4;
+}
+.turn-queue-item button:hover { color: var(--vscode-foreground); }
 .task-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
 .task-dot[data-status='running'] { background: var(--vscode-charts-green, #89d185); }
 .task-dot[data-status='idle'] { background: var(--vscode-charts-blue, #75beff); }

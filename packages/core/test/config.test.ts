@@ -1,5 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -329,6 +329,10 @@ describe('config / 工作区黑名单', () => {
     const { value, stripped } = stripDenied({
       provider: 'evil',
       model: 'evil',
+      taskModels: [{ provider: 'p', model: 'm', use: 'x' }],
+      imageModel: { provider: 'p', model: 'm' },
+      visionModel: { provider: 'p', model: 'm' },
+      memory: { summaryModel: { provider: 'p', model: 'm' }, budget: 1 },
       providers: { a: { baseUrl: 'x', apiKey: 'y', protocol: 'keep' } },
       bash: { envPassthrough: ['ANTHROPIC_API_KEY'], sandbox: 'none', maxOutputChars: 100 },
       // mcp.* 不在黑名单：settings 的 strict schema 已不认任何 mcp 键，
@@ -338,14 +342,19 @@ describe('config / 工作区黑名单', () => {
     expect(stripped.sort()).toEqual([
       'bash.envPassthrough',
       'bash.sandbox',
+      'imageModel',
+      'memory.summaryModel',
       'model',
       'provider',
       'providers.a.apiKey',
       'providers.a.baseUrl',
+      'taskModels',
+      'visionModel',
     ])
     // 只剥黑名单项，同层的其他字段留着
     expect(value).toEqual({
       providers: { a: { protocol: 'keep' } },
+      memory: { budget: 1 },
       mcp: { servers: { whatever: { command: 'curl' } } }, // 原样保留
       bash: { maxOutputChars: 100 },
     })
@@ -439,6 +448,20 @@ describe('config / 工作区黑名单', () => {
     expect(loaded.config.provider).toBe('p')
     expect(loaded.config.providers.p?.baseUrl).toBe('https://api.test')
     expect(loaded.config.providers.p?.apiKey).toBe('sk-literal')
+    expect(loaded.warnings).toEqual([])
+  })
+
+  it('globalOnly：只读全局配置，folder 是 ~ 也不炸（生图路由用）', async () => {
+    // 凭据代理的 /image/generations 没有工作区上下文，靠 loadConfig(homedir())
+    // 只读全局。2026-11-04 家目录禁令落地后这句直接抛错，生图 100% 挂
+    // （真机复现：任意生图都回 500「工作区不能是用户主目录」）。globalOnly
+    // 跳过禁令与工作区覆盖——这里用真实 homedir() 当 folder 覆盖这条路径，
+    // globalPath 指向临时文件，不读用户真实配置
+    const cfgPath = join(root, 'g.json')
+    await writeFile(cfgPath, JSON.stringify(MINIMAL))
+    await expect(loadConfig(homedir(), { globalPath: cfgPath })).rejects.toThrow('用户主目录')
+    const loaded = await loadConfig(homedir(), { globalOnly: true, globalPath: cfgPath })
+    expect(loaded.config.provider).toBe('p')
     expect(loaded.warnings).toEqual([])
   })
 })
@@ -655,6 +678,47 @@ describe('config / taskModels（task-trunk 规则 14）', () => {
     await expect(load()).rejects.toThrow(/taskModels\[0\] "nope".*已配置的：m/s)
     await writeGlobal({ ...MINIMAL, taskModels: [{ provider: 'q', model: 'm', use: 'x' }] })
     await expect(load()).rejects.toThrow(/taskModels\[0\] 的 provider "q"/)
+  })
+
+  it('指向 claudeAgentSdk 模型时与主模型同三道校验（2026-11-12 补——原先漏校验，任务内部静默退回默认模型）', async () => {
+    const sdkModels = {
+      m: { contextWindow: 200_000 },
+      s: { contextWindow: 200_000, claudeAgentSdk: true },
+    }
+    const base = {
+      ...MINIMAL,
+      providers: { ...MINIMAL.providers, p: { ...MINIMAL.providers.p, models: sdkModels } },
+    }
+    // 协议不符：openai-chat 的 provider 上挂 SDK 模型
+    await writeGlobal({
+      ...base,
+      providers: {
+        ...base.providers,
+        o: { protocol: 'openai-chat', baseUrl: 'https://x', apiKey: 'k', models: sdkModels },
+      },
+      taskModels: [{ provider: 'o', model: 's', use: 'x' }],
+    })
+    await expect(load()).rejects.toThrow(/taskModels\[0\] "s".*仅支持 anthropic-messages/)
+    // 没 path
+    await writeGlobal({ ...base, taskModels: [{ provider: 'p', model: 's', use: 'x' }] })
+    await expect(load()).rejects.toThrow(/taskModels\[0\] "s".*claudeAgentSdkPath/)
+    // 没 summaryModel
+    await writeGlobal({
+      ...base,
+      claudeAgentSdkPath: '/sdk',
+      taskModels: [{ provider: 'p', model: 's', use: 'x' }],
+    })
+    await expect(load()).rejects.toThrow(/taskModels\[0\] "s".*summaryModel/)
+    // 三道齐了：通过（对照）
+    await writeGlobal({
+      ...base,
+      claudeAgentSdkPath: '/sdk',
+      memory: { summaryModel: { provider: 'p', model: 'm' } },
+      taskModels: [{ provider: 'p', model: 's', use: 'x' }],
+    })
+    await expect((await load()).config.taskModels).toEqual([
+      { provider: 'p', model: 's', use: 'x' },
+    ])
   })
 
   it('use 必填、未知字段报错', async () => {

@@ -30,8 +30,10 @@ export function imageRoutes(load: () => Promise<ImageModel | null>): RouteResolv
 
 /** 每次请求现读全局 settings.json（改了不用 reload）。宿主进程的 env 展开 apiKey */
 export async function loadImageModel(): Promise<ImageModel | null> {
-  // 传 home：工作区设置路径与全局重合，loadConfig 只读全局一份
-  const loaded = await loadConfig(homedir())
+  // 只读全局一份：生图路由没有工作区上下文，也不该受工作区配置影响
+  // （原靠「传 home 让工作区路径撞上全局路径」绕，2026-11-04 家目录禁令
+  //   落地后传 home 直接抛错，生图全挂——改走 globalOnly）
+  const loaded = await loadConfig(homedir(), { globalOnly: true })
   return resolveImageModel(loaded.config)
 }
 

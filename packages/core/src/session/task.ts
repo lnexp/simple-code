@@ -48,14 +48,18 @@ export type TaskManifest = {
   /** 完成回调：pending = 派出那一轮结束时还要回调一次；done = 已回调。老 manifest 没有 = 不回调 */
   callback?: 'pending' | 'done'
   /**
-   * 只输名称开的空任务（规则 13）：还没发过第一条消息。第一条消息前拼任务框架句、
-   * reload 恢复时不补回调（没有「派出那一轮」可被打断）；第一轮开跑时去掉
+   * 「+ 任务」开的任务（规则 13）：还没发过第一条消息。第一条消息前拼任务框架句、
+   * reload 恢复时不补回调（没有「派出那一轮」可被打断）；第一轮开跑时去掉。
+   * 2026-11-14 起建好即发第一条；之前只输名称开的空任务可能长期停在这一态
    */
   awaitingFirstMessage?: true
   /** 用户参与过（手打过消息，或 via='user' 开的）：robot 完成提醒的分流
    *  判据（2026-11-06 用户定）——agent 派、无人参与的任务完成只回调主
    *  任务，不弹 robot；用户一旦发过话就恢复提醒 */
   userTouched?: true
+  /** goal 模式（goal-mode.md，2026-11-09）：任务书拼 GOAL_DISCIPLINE、终止
+   *  回调附审核提醒。老 manifest 没有 = 普通任务 */
+  goal?: true
   /**
    * 继承上界（owner IS NULL 且 id ≤ forkTurn 的轮对它可见），stepFloor = 继承段
    * 的 step 上界。只剩 v3 遗产来源（升级时还开着的老任务）——--fork 功能
@@ -131,8 +135,29 @@ export const TASK_RESULT_HEAD = '〔任务结果〕'
 
 /** 回调插进登记者上下文的原文：头一行「任务名 · 状态」，其后是派出那一轮最后
  *  一条回复，不截断——登记者看不到别人没合回的内容，不给原文就拿不到结果 */
-export const taskResultText = (task: string, status: string, reply: string): string =>
-  `${TASK_RESULT_HEAD}${task} · ${status}\n${reply === '' ? '（没有回复文本）' : reply}`
+export const taskResultText = (
+  task: string,
+  status: string,
+  reply: string,
+  goal = false,
+): string =>
+  `${TASK_RESULT_HEAD}${task} · ${status}\n${reply === '' ? '（没有回复文本）' : reply}` +
+  (goal ? `\n${GOAL_AUDIT_REMINDER}` : '')
+
+/** goal 模式（docs/proposals/goal-mode.md）：任务以验收标准为完成定义，跑到达成
+ *  或判定不可能，完不成向用户说明原因。子任务纪律前置进任务书（反思同款：
+ *  纪律是产品的一部分，接单第一屏就是，不靠模型记得） */
+export const GOAL_DISCIPLINE = `〔goal 模式纪律〕本任务以任务书的验收标准为完成定义，跑到标准为真或判定无法达成为止——不是跑完一轮就交差：
+- 目标不许缩水：本轮做不完就继续，别把「能做完的部分」当完成。
+- 完成自审：宣布完成前核对验收标准（跑测试、看 diff、命令输出），不是感觉。
+- 被审批拒：跳过这块继续能做的，被拒操作记下来留给用户，不停不等。
+- 真做不了：终止时说明原因（哪步卡死、试过什么、差什么）。`
+
+/** goal 任务书 = 纪律前置 + 原任务书 */
+export const wrapGoalBrief = (brief: string): string => `${GOAL_DISCIPLINE}\n\n${brief}`
+
+/** goal 任务终止回调的审核提醒（父任务收结果那一刻最需要纪律） */
+export const GOAL_AUDIT_REMINDER = `〔goal 审核提醒〕这是 goal 模式任务的结果：审产物不听自述——跑测试 / 看 diff / 核对任务书的验收标准。未达成 → task_send 续命并说清还差什么；连续 2~3 次无进展 → 判无法达成，向用户说明原因；被审批卡住 ≠ 失败，指引它跳过被拒部分继续。`
 
 /** 给登记者（owner 键：主任务 ''）投一条回调。登记者在下一个安全点取走
  *  （store.takeTaskResults） */
@@ -173,7 +198,7 @@ export function lastTaskReply(root: string, owner: string): string {
  * （那些经历已在副本里，不再拉）。不调模型、不碰任何会话的行，任何时刻都能开。
  *
  * **不开段**：段等第一轮开始时开（store beginTurn → segmentForTurn）。只输名称的
- * 空任务可能隔很久才发第一条消息（规则 13），段若此刻就开，「open 却零 step」的段
+ * 空任务（11-14 前的规则 13）可能隔很久才发第一条消息，段若此刻就开，「open 却零 step」的段
  * 会被别人的摘要合并链跨过、之后才写进内容，被 applyMerges 当嵌套根误收（复审
  * 2026-10-30）。之间主干新合回的段，第一个请求按 firstPull 拉（run.ts）。
  * manifest 落盘在事务外——崩溃窗口的语义是「库里有摘要副本没 manifest」：无人读，无害
@@ -181,7 +206,12 @@ export function lastTaskReply(root: string, owner: string): string {
 export function createTask(
   root: string,
   name: string,
-  opts: { parent?: string; awaitingFirstMessage?: boolean; userTouched?: boolean } = {},
+  opts: {
+    parent?: string
+    awaitingFirstMessage?: boolean
+    userTouched?: boolean
+    goal?: boolean
+  } = {},
 ): TaskManifest {
   const db = openTaskDb(root)
   try {
@@ -196,6 +226,7 @@ export function createTask(
       ...(opts.parent !== undefined ? { parent: opts.parent, callback: 'pending' as const } : {}),
       ...(opts.awaitingFirstMessage === true ? { awaitingFirstMessage: true as const } : {}),
       ...(opts.userTouched === true ? { userTouched: true as const } : {}),
+      ...(opts.goal === true ? { goal: true as const } : {}),
     }
     db.transaction(() => {
       db.run(

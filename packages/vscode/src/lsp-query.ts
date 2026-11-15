@@ -51,7 +51,9 @@ export async function handleQuery(exec: Exec, req: LspRequest): Promise<string> 
     )
     if (cmd === 'symbols') {
       const lines = formatSymbols(res ?? [])
-      return lines.length > 0 ? lines.join('\n') : '无结果：该文件没有语言服务，或文件为空'
+      return lines.length > 0
+        ? lines.join('\n')
+        : '无结果：该文件没有符号或没有语言服务（纯 re-export 的出口文件天然无符号）'
     }
     if (cmd === 'hover') {
       const texts = (res ?? [])

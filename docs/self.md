@@ -28,6 +28,7 @@ VS Code 多根窗口里每个 folder 是独立 session，上下文不串。
 | 产品内建段（你开头读的这些） | 对话历史（会降分辨率、卸载到磁盘） |
 | 用户级 `~/.simple-code/AGENTS.md` + 项目根 `AGENTS.md` 全文（各 ≤2k token，用户级在前、冲突以项目级为准；建会话读一次、压缩点刷新，超限截断/保旧版） | 工具输出正文（body 截断，要精读自己 cat） |
 | notes / 教训 / 事件的**索引行**（name + description） | 三者的**正文**——只在你 `read` 时才进上下文 |
+| wiki 词条**目录页** `notes/wiki/index.md` 全文（不分 note 预算） | 词条**正文**——同样 `read` 时才进 |
 
 推论：**写 note/lesson 时，description 是唯一常驻的那行**，它决定「将来
 的你会不会想起来点开」——写清治什么症状、什么时候该读，别写成标题的同义
@@ -61,7 +62,7 @@ VS Code 多根窗口里每个 folder 是独立 session，上下文不串。
 - 宽搜/正则/多词混合直接 `grep memory 的 turns 目录`（jsonl 全量，不截断）
 - state.db（SQLite + FTS5）也有全文索引，sqlite3 直接查
 
-## 3. note 四类型（记录 / 教训 / 原则 / 目标）
+## 3. note 五类型（记录 / 教训 / 原则 / 目标 / 词条）
 
 - **note**（`"$SIMPLE_CODE_NOTE" write/read/list`）：决策、约定、一次性事实，
   一笔记一事。四类型共用 2100 估算 token 预算——**索引里没有 ≠ 不存在**，
@@ -78,6 +79,17 @@ VS Code 多根窗口里每个 folder 是独立 session，上下文不串。
   检索价值，「症状 X 其实是原因 Y，别去查 Z」才有
 - **skill**（`"$SIMPLE_CODE_SKILL"`）：任务说明书，仅用户点名才用
 - **note 是活文档**：同一条结论变了就写新版本顶掉，不追加续写
+- **词条（`--type wiki`，`.simple-code/notes/wiki/`）**：反思任务维护，一个机制
+  一条（现在怎么工作/为什么这样/坑/没解决的，每句带出处）；头部 files/verified
+  记对照过的文件与 commit，代码改过反思会跟着改写。目录页 `notes/wiki/index.md`
+  按大块分组、每条一行，整页常驻（不分上面那 2100 预算）。read 词条时开头提示
+  verified 之后 files 有没有新提交；`"$SIMPLE_CODE_NOTE" lint` 查目录页漏列/多列、
+  [[链接]]、别名重复、头部缺字段，APPLY_PATCH 改到词条目录时也附这份检查（只提示
+  不拦截）。主任务照常只写 note；读到与代码对不上的词条当场订正
+- **反思**：记忆面板的「反思」按钮，或自动——任何任务开轮时，距上次反思
+  ≥24h 且之后所有任务合计 ≥30 轮，就派一个「反思」任务（停着的旧反思先关）。
+  只在 VS Code 里；终端 sc 不触发。上次派出时间在 `.simple-code/reflect.json`，
+  runlog 里 `ev: reflect_auto` 一次派出一行
 - **event**（`"$SIMPLE_CODE_EVENT" list/search/read/progress/describe/rename`）：
   事件档案，活跃战役的状态板（`.simple-code/events/`，机制产出：摘要落库后
   单次归类判断+原子追加进展）。查「之前那件事做到哪了」优先用它，别拼摘要
@@ -118,6 +130,15 @@ VS Code 多根窗口里每个 folder 是独立 session，上下文不串。
   一条回复原文插回你的上下文（你在跑就是下一个请求前，空闲就等下次说话），
   只回调一次。经历按段合回主干，别的任务在压缩点拉到。终端 sc 里无桥
   （退出码 2）
+- **goal 模式**（`"$SIMPLE_CODE_TASK" --goal` → 读纪律 → `--goal --go` 正式派）：
+  目标模式任务——以任务书里的验收标准为完成定义，跑到达成或判定不可能，
+  完不成带原因终止，没有寂静终止。两段式准入：首调 `--goal` 不派单，返回
+  父任务纪律（目标写成最终状态、验收标准必须可观察、派单后立即设 awake
+  兜底、审产物不听自述、连续 2~3 次无进展判无法达成向用户说明原因）；
+  了解纪律后 `--goal --go <<'MD' 任务书 MD` 正式派单（任务书 = 目标 + 验收
+  标准 + 预期时长）。任务书自动前置子任务纪律（不许缩水、完成前自审、被
+  审批拒跳过并记录、做不了说明原因）；〔任务结果〕对 goal 任务附审核提醒。
+  机制对齐 Codex / Claude Code / Cursor 的 /goal
 - **续派**（`"$SIMPLE_CODE_TASK_SEND"`）：无参列出全部任务（名字、状态、
   最近一句）；带任务名和文本 = 往该任务发消息——跑着就插话排队（下一轮
   请求前模型看到），停着就点火唤醒开新轮。返回只代表桥受理（消息进了
@@ -158,15 +179,16 @@ VS Code 多根窗口里每个 folder 是独立 session，上下文不串。
 `command/args/env`。websearch 凭据在
 `~/.simple-code/websearch.json`（`exaApiKey` 可写 `${EXA_API_KEY}`：有宿主时
 bin 经凭据代理 `POST /websearch`，key 只在宿主展开；无代理时 bin 自己读
-文件直连，`${VAR}` 从当前环境展开）；审批静态规则（askCommands/hiddenAllow/
-networkAllow/nonPathFrom）在 `~/.simple-code/approval.json`。
+文件直连，`${VAR}` 从当前环境展开）；审批静态规则（askCommands/
+denyCommands/nonPathFrom）在 `~/.simple-code/approval.json`，「始终允许」
+记在它的 paths（目录前缀，读写同权）。
 
 常用键（速查，全量看 schema）：模型——`provider/model/baseUrl/apiKey/
 protocol/contextWindow/maxTokens/thinking/effort/cacheTtlMs`，多模型注册
 `models[]`；记忆——`memory.stubTokens`（默认 16k，摘要进场水位）、
 `memory.hotLeaves`（默认 8）；工具——`envPassthrough`（bash 子进程可见
 的白名单）；`maxIterations`（默认
-2000，单轮步数上限）；`sandbox`、timeout/输出上限系列。
+5000，单轮步数上限）；`sandbox`、timeout/输出上限系列。
 
 **生效时机**：建 session 时**只读一次**。改了配置：VS Code 侧
 FileSystemWatcher 标记 reload、跑到轮边界生效（跑着/挂审批不打断）；

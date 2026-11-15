@@ -9,7 +9,9 @@
  * 闹钟（docs/loop-interrupt.md §5，实现项 3）：唤醒 = turn 的中断——到点给
  * **设闹钟的这个会话**（root+owner）发〔wake〕消息，跑着=插话、停着=开新 turn。
  * --note 是自己留给自己的备忘（不是 --say——闹钟不是用户说话）。
- * 不持久化：重启即丢。周期靠醒来自己设下一个，不做原生周期闹钟（拍板）。
+ * 持久化在 <root>/.simple-code/wake.json（2026-11-09 拍板）：重载恢复、
+ * 过点补投迟到的叫醒；任务只能 awake 自己（--list/--cancel 只见自己的）。
+ * 周期靠醒来自己设下一个，不做原生周期闹钟（拍板）。
  *
  * 退出码：0 已设；1 宿主拒绝（参数错/超上限）；2 无桥；3 时间写法错。
  */
@@ -19,9 +21,12 @@ import {
   TASK_TOKEN_HEADER,
   type WakeResponse,
 } from '@simple-code/core/src/session/task-endpoint.ts'
+import { dropWakeAlarm, renderWakeList } from '@simple-code/core/src/session/wake-store.ts'
 
 const USAGE =
   `用法："$SIMPLE_CODE_WAKE" --after 30m [--note "备忘"]，或 --at 08:00，或 --until-ok "命令" [--every 30m]\n` +
+  `      "$SIMPLE_CODE_WAKE" --list          只列自己（本任务）设的闹钟\n` +
+  `      "$SIMPLE_CODE_WAKE" --cancel <id>    取消自己设的（id 来自 --list 或设时的回执）\n` +
   `时长写法：30s / 5m / 2h / 1h30m。唤醒回到设闹钟的这个会话\n`
 
 /** "30s"/"5m"/"2h"/"1h30m" → 毫秒。null = 写法不认识 */
@@ -48,6 +53,8 @@ export async function main(): Promise<number> {
   let untilOk: string | undefined
   let every: number | undefined
   let note: string | undefined
+  let list = false
+  let cancelId: string | undefined
   for (let i = 0; i < args.length; i++) {
     const a = args[i] ?? ''
     const next = args[i + 1]
@@ -88,6 +95,15 @@ export async function main(): Promise<number> {
       }
       note = next
       i++
+    } else if (a === '--list') {
+      list = true
+    } else if (a === '--cancel') {
+      if (next === undefined || next === '') {
+        process.stdout.write(USAGE)
+        return 3
+      }
+      cancelId = next
+      i++
     } else if (a === '--help' || a === '-h') {
       process.stdout.write(USAGE)
       return 0
@@ -95,12 +111,6 @@ export async function main(): Promise<number> {
       process.stdout.write(USAGE)
       return 3
     }
-  }
-  const port = process.env[TASK_PORT_ENV]
-  const token = process.env[TASK_TOKEN_ENV]
-  if (port === undefined || token === undefined) {
-    process.stdout.write('无任务桥：不在 VS Code 宿主里（或宿主已关闭）\n')
-    return 2
   }
   let roots: unknown = []
   try {
@@ -110,6 +120,26 @@ export async function main(): Promise<number> {
   }
   const root = Array.isArray(roots) && typeof roots[0] === 'string' ? roots[0] : process.cwd()
   const owner = process.env.SIMPLE_CODE_OWNER ?? ''
+  // list/cancel 直读持久层（wake.json），不依赖宿主桥——窗口没开也管得了
+  if (list) {
+    process.stdout.write(`${renderWakeList(root, owner)}\n`)
+    return 0
+  }
+  if (cancelId !== undefined) {
+    const error = dropWakeAlarm(root, cancelId, owner)
+    if (error !== null) {
+      process.stdout.write(`${error}\n`)
+      return 1
+    }
+    process.stdout.write(`已取消 ${cancelId}\n`)
+    return 0
+  }
+  const port = process.env[TASK_PORT_ENV]
+  const token = process.env[TASK_TOKEN_ENV]
+  if (port === undefined || token === undefined) {
+    process.stdout.write('无任务桥：不在 VS Code 宿主里（或宿主已关闭）\n')
+    return 2
+  }
   try {
     const res = await fetch(`http://127.0.0.1:${port}/wake`, {
       method: 'POST',
@@ -132,7 +162,9 @@ export async function main(): Promise<number> {
     }
     const desc =
       after !== undefined
-        ? `${Math.round(after / 60000)} 分钟后`
+        ? after < 60_000
+          ? `${Math.round(after / 1000)} 秒后`
+          : `${Math.round(after / 60000)} 分钟后`
         : at !== undefined
           ? at
           : '条件满足时'

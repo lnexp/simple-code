@@ -18,7 +18,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   let cards = NSStackView()
   let server = Server()
   var skinName = Config.skin
-  var skin: [String: NSImage] = [:]
+  var skin: [String: SkinImage] = [:]
+  var shownSkin: String?               // 正在显示的「皮肤/状态」：没变就不重设，免得动图被 refresh 打断从头播
+  var pinned = Config.pinned           // 常驻桌面：没事也显示
   var statusItem: NSStatusItem!
   var anchor = NSPoint.zero            // 面板右下角（屏幕坐标），拖动后写回 config.json 的 position
   var firstSeen: [String: Date] = [:]  // 卡片第一次出现的时间：1 秒内「允许」不响应（防误点，§5.2）
@@ -152,7 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     for k in knownKeys.subtracting(keys) { firstSeen[k] = nil }
     knownKeys = keys
     let st = robotState(items)
-    robotImg.layer?.contents = skin[st]
+    showSkin(st)
     badge.stringValue = "\(items.count)"
     badge.isHidden = items.isEmpty
     cards.arrangedSubviews.forEach { $0.removeFromSuperview() }
@@ -179,17 +181,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       if rest > 0 { cards.addArrangedSubview(footerPill(used > 0 ? "还有 \(rest) 条 ▾" : "\(rest) 条 ▾")) }
     }
     layout(hasCards: !cards.arrangedSubviews.isEmpty)
-    // 有事才出现（D3+D5，用户定 2026-10-31）：没事时只留菜单栏图标
-    let visible = !items.isEmpty
+    // 有事才出现（D3+D5，用户定 2026-10-31）：没事时只留菜单栏图标；开了「常驻桌面」就一直在（2026-11-09 加）
+    let visible = pinned || !items.isEmpty
     if visible { panel.orderFrontRegardless() } else { panel.orderOut(nil) }
     if visible && !fresh.isEmpty { bounce() }
-    if let img = skin[st]?.copy() as? NSImage {
+    if let img = skin[st]?.image.copy() as? NSImage {
       img.size = NSSize(width: 18, height: 18)
       statusItem.button?.image = img
     }
     statusItem.menu = buildMenu()
     tick()
     log("refresh state=\(st) items=\(items.count) visible=\(visible) fresh=\(fresh.sorted())")
+  }
+
+  /// 换机器人的图：静态图直接放进 layer；动图（gif / APNG）用逐帧关键帧动画无限循环
+  func showSkin(_ st: String) {
+    let key = "\(skinName)/\(st)"
+    guard key != shownSkin, let l = robotImg.layer else { return }
+    shownSkin = key
+    l.removeAnimation(forKey: "skin")
+    guard let s = skin[st] else { l.contents = nil; return }
+    guard !s.frames.isEmpty else { l.contents = s.image; return }
+    l.contents = s.frames[0]
+    let total = s.delays.reduce(0, +)
+    var t = 0.0, times: [NSNumber] = []
+    for d in s.delays { times.append(NSNumber(value: t / total)); t += d }
+    times.append(1)   // discrete 模式 keyTimes 要比 values 多一个
+    let a = CAKeyframeAnimation(keyPath: "contents")
+    a.values = s.frames
+    a.keyTimes = times
+    a.calculationMode = .discrete
+    a.duration = total
+    a.repeatCount = .infinity
+    a.isRemovedOnCompletion = false
+    l.add(a, forKey: "skin")
   }
 
   func layout(hasCards: Bool) {

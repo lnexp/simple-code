@@ -1147,30 +1147,3 @@ describe('模型切换分割线（实时，model_switch 事件）', () => {
     expect(shape).toEqual(['user', 'process', 'assistant', 'divider', 'user'])
   })
 })
-
-describe('fold 窗口外的存根行聚合成占位（2026-11-06）', () => {
-  const row = (text: string, stubbed = false) => ({
-    role: 'user' as const,
-    parts: [{ type: 'text' as const, text }],
-    turnId: 1,
-    stubbed,
-  })
-  it('连续 stubbed 行聚成一条 notice，窗口内正常渲染', () => {
-    const items = hydrateItems([
-      row('老1', true),
-      row('老2', true),
-      row('老3', true),
-      row('新1'),
-      row('新2'),
-    ])
-    expect(items.map((i) => i.kind)).toEqual(['notice', 'user', 'user'])
-    expect(items[0]).toMatchObject({
-      kind: 'notice',
-      text: '上方 3 行已摘要折叠——重开面板可查看完整历史',
-    })
-  })
-  it('无 stubbed 行时零占位（冷启动全量基线形态不变）', () => {
-    const items = hydrateItems([row('新1'), row('新2')])
-    expect(items.map((i) => i.kind)).toEqual(['user', 'user'])
-  })
-})

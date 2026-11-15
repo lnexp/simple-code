@@ -28,6 +28,15 @@ const DENYLIST = [
   'providers.*.models.*.presets.*.extraBody',
   'bash.envPassthrough', // 可以把 API key 加回白名单，绕过 §12 的裁剪
   'bash.sandbox', // 将来有沙箱时，不能让仓库自己关掉
+  // 模型选择的引用键：taskModels/imageModel/visionModel/memory.summaryModel
+  // 指向 providers 里的模型名。仓库写的名字多半是提交者私有的——别的
+  // 机器没有那个 provider，打开项目即因「provider 不存在」启动失败
+  // （checkTaskModels 的 throw 是响的）。模型选择跟顶层 model 一样，
+  // 属于用户，不属仓库（2026-11-12 补，对齐顶层 model 的理由）
+  'taskModels',
+  'imageModel',
+  'visionModel',
+  'memory.summaryModel',
 ] as const
 
 export type StripResult = {

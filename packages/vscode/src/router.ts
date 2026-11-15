@@ -81,7 +81,10 @@ export function createRouter(deps: RouterDeps): Router {
   const bridges = new Map<string, Bridge>()
   // 闹钟的到点投递：root 定位 bridge，owner 定位主任务（''）或任务（task-xx）
   const wakeCenter = createWakeCenter((root, owner, text) => {
-    bridges.get(root)?.wakeFire(owner, text)
+    // fire 前 ensure：bridge 是 lazy 的（目录被选中才 spawn），恢复的闹钟
+    // 到点时目录可能还没被切过——spawn 一个非 active 的 bridge 只投信箱，
+    // 不打扰 UI（bridgePost 对非 active 只放行状态类）
+    ;(bridges.get(root) ?? spawn(root)).wakeFire(owner, text)
   })
   let active = ''
   /** webview 报来的「正显示哪个任务」（view_task） */
@@ -136,6 +139,10 @@ export function createRouter(deps: RouterDeps): Router {
     return b
   }
 
+  // 持久化闹钟的恢复（真源 <root>/.simple-code/wake.json）：面板重建即
+  // 重挂/补投，不等目录被选中（fire 前 ensure bridge）
+  wakeCenter.restore(deps.folders())
+
   /** 切换主体。目标不在列表里 = 无操作（webview 只发列表里的） */
   const switchTo = (folder: string): void => {
     if (folder === active || !deps.folders().includes(folder)) return
@@ -149,6 +156,11 @@ export function createRouter(deps: RouterDeps): Router {
   }
 
   const selectTask = (task: string | null): void => {
+    // 乐观更新：robot focus 后宿主立即 refresh 判 seen，等 webview 回发
+    // view_task 就晚了（select_task 选中同一任务时 branch 不变、
+    // useEffect 不触发，回发根本不来）。webview 随后的 view_task 是
+    // 同值覆盖，无冲突
+    shownTask = task
     deps.post({ type: 'select_task', task })
   }
 
@@ -208,6 +220,7 @@ export function createRouter(deps: RouterDeps): Router {
       // 移出工作区的：轮也要中断——它的记忆目录已经不在射程里
       for (const [folder, b] of bridges) {
         if (list.includes(folder)) continue
+        wakeCenter.stopRoot(folder) // 目录不在射程：停它的 timer（文件留着）
         b.dispose()
         bridges.delete(folder)
       }
@@ -220,10 +233,10 @@ export function createRouter(deps: RouterDeps): Router {
       }
     },
 
-    dispatchFromAgent: async ({ root, brief, owner, model, lean }) => {
+    dispatchFromAgent: async ({ root, brief, owner, model, lean, goal }) => {
       const b = bridges.get(root)
       if (!b) return { ok: false, error: `本窗口没有打开「${root}」的 SC 会话` }
-      return b.dispatchFromAgent(brief, owner, model, lean)
+      return b.dispatchFromAgent(brief, owner, model, lean, goal)
     },
 
     taskModels: async ({ root }) => {
@@ -274,7 +287,7 @@ export function createRouter(deps: RouterDeps): Router {
     dispose: () => {
       for (const b of bridges.values()) b.dispose()
       bridges.clear()
-      wakeCenter.dispose() // 闹钟随面板走：停用即清（不持久化的拍板）
+      wakeCenter.dispose() // 只清内存 timer；wake.json 在，重建时 restore 恢复
     },
   }
 }

@@ -84,6 +84,9 @@ export type SideModel = {
 export type LoadOptions = {
   globalPath?: string
   env?: NodeJS.ProcessEnv
+  /** 只读全局配置：跳过工作区覆盖与 ~ 工作区禁令。给凭据代理的生图路由用——
+   *  它没有工作区上下文（2026-11-04 家目录禁令落地后传 home 会直接抛错） */
+  globalOnly?: boolean
 }
 
 /**
@@ -173,7 +176,7 @@ export async function loadConfig(
   // ~ 工作区禁令（v2 §2.2，2026-11-04 拍板）：home 当工作区会让「项目内」
   // 豁免罩住整个用户目录——~/.ssh、~/.zshrc 全变成「项目内隐藏路径」。
   // 提前报错而不是静默放行，用户把文件夹指到具体项目即可
-  if (resolvePath(folderPath) === homedir()) {
+  if (!options.globalOnly && resolvePath(folderPath) === homedir()) {
     throw new Error(
       `工作区不能是用户主目录（~）：这会让项目内豁免罩住整个 home。\n请打开一个具体的项目文件夹。`,
     )
@@ -190,9 +193,10 @@ export async function loadConfig(
   const wsAbs = resolvePath(workspacePath)
   const sameAsGlobal =
     wsAbs === resolvePath(globalPath) || wsAbs === resolvePath(GLOBAL_CONFIG_PATH)
-  const { value: workspace, stripped } = sameAsGlobal
-    ? { value: null, stripped: [] }
-    : stripDenied(await readJson(workspacePath))
+  const { value: workspace, stripped } =
+    options.globalOnly || sameAsGlobal
+      ? { value: null, stripped: [] }
+      : stripDenied(await readJson(workspacePath))
 
   const merged = deepMerge(global ?? {}, workspace ?? {})
   const config = parse(merged)
@@ -349,6 +353,23 @@ function checkTaskModels(config: Config): void {
       throw new Error(
         `taskModels[${i}] "${t.model}" 不在 provider "${t.provider}" 的 models 里。已配置的：${known}`,
       )
+    }
+    // SDK 模型与主模型同三道（2026-11-12 补）：漏校验时加载不响、派单
+    // 也不响，任务内部 setModel 抛错被自愈路径吞掉，全程悄悄退回默认模型
+    const spec = provider.models[t.model]!
+    if (spec.claudeAgentSdk) {
+      if (resolveProtocol(provider.protocol).name !== 'anthropic-messages')
+        throw new Error(
+          `taskModels[${i}] "${t.model}" 启用 claudeAgentSdk，但仅支持 anthropic-messages 协议`,
+        )
+      if (!config.claudeAgentSdkPath)
+        throw new Error(
+          `taskModels[${i}] "${t.model}" 启用 claudeAgentSdk，必须配置用户级 claudeAgentSdkPath`,
+        )
+      if (config.memory.summaryModel === null)
+        throw new Error(
+          `taskModels[${i}] "${t.model}" 启用 claudeAgentSdk，必须显式配置可直连的 memory.summaryModel`,
+        )
     }
   })
 }

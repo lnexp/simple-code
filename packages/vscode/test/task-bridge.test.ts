@@ -218,3 +218,30 @@ describe('pickTaskModel（规则 14）', () => {
     expect(pickTaskModel([], 'opus')).toContain('没配 taskModels')
   })
 })
+
+describe('派任务桥 goal 字段', () => {
+  it('goal:true 透传给 dispatcher（--go 过闸后的正式派单）', async () => {
+    const b = await bridge()
+    const res = await post(b.url, {
+      brief: '跑通测试\n验收：npm test 全过',
+      root: '/w/a',
+      owner: '',
+      goal: true,
+    })
+    expect(res.status).toBe(200)
+    expect(b.got[0]).toMatchObject({ goal: true })
+  })
+
+  it('goal 非 true → 400 不派（首调纪律在 CLI 层，桥只认真派单）', async () => {
+    const b = await bridge()
+    const res = await post(b.url, { brief: 'x', root: '/w/a', owner: '', goal: 'yes' })
+    expect(res.status).toBe(400)
+    expect(b.got.length).toBe(0)
+  })
+
+  it('不带 goal 字段 = 普通任务，dispatcher 收到的请求没有 goal 键', async () => {
+    const b = await bridge()
+    await post(b.url, { brief: '普通调研', root: '/w/a', owner: '' })
+    expect(b.got[0]).not.toHaveProperty('goal')
+  })
+})

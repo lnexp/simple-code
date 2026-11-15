@@ -30,17 +30,27 @@ import {
   hydrateItems,
   replayWithUsers,
 } from '../webview/events.ts'
-import type { ApprovalRequest, Attendance, ToHost, ToWebview } from './protocol.ts'
+import type {
+  ApprovalRequest,
+  Attendance,
+  TaskDraftDefaults,
+  ToHost,
+  ToWebview,
+} from './protocol.ts'
 import { REFLECT_TASK_BOOK } from './reflect.ts'
+import { createAutoReflect, recordReflectStart } from './reflect-auto.ts'
 import { type RobotTaskView, type TurnEnd, turnTracker } from './robot-feed.ts'
 import { pickTaskModel } from './task-bridge.ts'
+import { draftDefaults } from './task-draft.ts'
 import {
   createTaskCenter,
+  FOLD_RECENT_STEPS,
   readModel,
   type TaskApprovalQ,
   type TaskChoiceStore,
   type TaskSummaryStore,
 } from './tasks.ts'
+import { createTurnQueue } from './turn-queue.ts'
 
 const _execFile = promisify(execFileCb)
 
@@ -62,17 +72,22 @@ export type BridgeDeps = {
    * 注进去，闭包引用 bridge 内的中枢——开关、pending、超时全在 bridge 管，
    * session/core 对 UI 形态无感
    */
-  session: (requestApproval: NonNullable<SessionOptions['requestApproval']>) => Promise<Session>
+  session: (
+    requestApproval: NonNullable<SessionOptions['requestApproval']>,
+    onTurnStart: NonNullable<SessionOptions['onTurnStart']>,
+  ) => Promise<Session>
   /**
    * 任务 session 工厂（task-v3）：同一个库，`task=owner 域` + `skipLock`
    * （同进程对话已持锁）。bridge 不自己建——session 的构造全在 panel 层
-   * （vscode-impl.md §7 的接线纪律），这里只拿工厂
+   * （vscode-impl.md §7 的接线纪律），这里只拿工厂。onTurnStart 与主任务
+   * 的是同一个（自动反思，reflect-auto.ts）
    */
   taskSession: (
     task: TaskManifest,
     requestApproval: (
       q: TaskApprovalQ,
     ) => Promise<'allow' | 'always' | 'deny' | 'timeout' | { deny: string }>,
+    onTurnStart: NonNullable<SessionOptions['onTurnStart']>,
   ) => Promise<Session>
   /** 任务模型选择的持久化（透传 TaskCenter）。不传 = 任务配置内存态 */
   choiceStore?: TaskChoiceStore
@@ -171,6 +186,7 @@ export type Bridge = {
     owner: string,
     model?: string,
     lean?: boolean,
+    goal?: true,
   ) => Promise<TaskDispatchResponse>
   /** bin --models：本目录配置里的 taskModels 与配置默认模型（规则 14） */
   taskModels: () => Promise<TaskModelsResponse>
@@ -181,7 +197,7 @@ export type Bridge = {
   taskSendList: () => TaskSendListEntry[]
   /** 闹钟唤醒的定向投递（wake-center → 同一条 send 路）：owner='' 主任务
    *  点火；task-xx 找 manifest.owner 匹配的任务投递。任务已关 = 静默作废
-   *  （闹钟不持久化的同款兜底） */
+   *  （闹钟的持久层只管定时器，不救已关闭的任务） */
   wakeFire: (owner: string, text: string) => void
   /**
    * 扩展停用。中断正在跑的 loop 并关 session——进程都要没了，没有
@@ -192,9 +208,6 @@ export type Bridge = {
 
 /** 历史分页一页多少条。50 条 ≈ 两三屏，够了；太大则一次 DOM 里塞太多块 */
 const HISTORY_PAGE = 50
-/** fold 恢复窗口（2026-11-06 拍板）：最近 N 个不同 step 恢复原文，
- * 窗口外聚合成占位。100 step ≈ 3-5 屏，翻更老内容重开面板（全量基线） */
-const FOLD_RECENT_STEPS = 100
 
 export function createBridge(deps: BridgeDeps): Bridge {
   /**
@@ -240,6 +253,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
    * 换模型时 core 自己会清掉预设，UI 各记一份就会分叉 */
   let preset: string | undefined
   let presets: string[] = []
+  /** 「+ 任务」新任务状态的控件初值（task-draft.ts），与 models 同时生成一次 */
+  let taskDraft: TaskDraftDefaults | null = null
   let imagesEnabled = false
   /** 当前模型的上下文窗口。底栏的环形水位要拿它当分母——页脚那个
    *  「上下文 X」本来就按窗口报，两处口径必须一样 */
@@ -375,6 +390,16 @@ export function createBridge(deps: BridgeDeps): Bridge {
   // 就多一份。turn 结束时折叠（fold）进基线，重放清零——只存一轮的量，
   // 面板开一天也不会攒出无界内存
   let baseItems: ChatItem[] = []
+  /** baseItems 对应的分页起点（historyRowsWindowed 的 floor）：键序在它之下
+   *  的归分页。随 fold 前移 */
+  let baseFloor: number | null = null
+  /** webview 手里那份底稿的分页起点——最近一次推 hydrate 时的 baseFloor。
+   *  **不能用 baseFloor**：轮末 fold 只换宿主的 baseItems、不推 hydrate，
+   *  webview 还是旧底稿 + 增量事件；按新起点翻页，旧起点到新起点之间那段
+   *  会被再翻一遍，界面重复 */
+  let postedFloor: number | null = null
+  /** 最近一次真正投达 webview 的主基线世代号（与 postedFloor 同拍推进） */
+  let hydrateEpoch = 0
   /** 事件 + 到达宿主的墙钟。重放把钟一起带走（reduce 纯化），mirrorItems
    *  幂等——切回时 hydrate 出来的秒表是真实起点，不再被重放时刻的假钟顶掉 */
   let replay: Array<{ ev: AgentEvent; at: number }> = []
@@ -435,15 +460,30 @@ export function createBridge(deps: BridgeDeps): Bridge {
    * 时序前提：core 的 persist 挂在事件流的 finally 里，bridge 的 for-await
    * 退出时它已经跑完——这里读到的一定是定稿后的
    */
+  // fold 分段观测（2026-11-09 巡检：大库中位 ~1s 未定位）：闭包层持有，
+  // fold 赋值、轮末 logRun 读
+  let foldDbMs = 0
+  let foldHydrateMs = 0
+
   const fold = (session: Session): void => {
     // historyRows：行带 turnId/meta/elapsedMs，基线里每轮尾部 assistant
     // 自带页脚（当时的模型·耗时，落盘事实）。messages() 不带——live 轮的
     // 页脚只有 lastFooter 一条内存路，重启就丢
     // 窗口版（2026-11-06 拍板）：全量恢复在 379MB 库上冷读 ~650ms/轮、
-    // 且九成行在可视区外。只恢复最近 FOLD_RECENT_STEPS 个 step 的原文，
-    // 窗口外的存根行由 hydrateItems 聚合成「已摘要」占位；重开面板
-    // （session_open 基线）仍走全量 historyRows
-    baseItems = hydrateItems(session.historyRowsWindowed(FOLD_RECENT_STEPS))
+    // 且九成行在可视区外。底稿只装最近 FOLD_RECENT_STEPS 个 step，窗口外
+    // 的往上翻页取（2026-11-10 起含 live 行，见 historyRowsWindowed）
+    // fold 分段观测（2026-11-09 巡检：大库中位 ~1s 未定位）：db=窗口恢复
+    // （withTurns/historyOriginals/turnsInfo 全在里面），hydrate=装配
+    {
+      const t0 = performance.now()
+      const { rows, floor } = session.historyRowsWindowed(FOLD_RECENT_STEPS)
+      const t1 = performance.now()
+      baseItems = hydrateItems(rows)
+      baseFloor = floor
+      const t2 = performance.now()
+      foldDbMs = Math.round(t1 - t0)
+      foldHydrateMs = Math.round(t2 - t1)
+    }
     // 错误轮的占位（2026-11-06 三缺口之二）：error notice 只在 webview
     // 内存里，reload 即丢——用户回看时那轮像正常结束。end_state 已落库
     // （turn-resume 判据在用），这里补读 error_message 拼一条 notice。
@@ -477,6 +517,22 @@ export function createBridge(deps: BridgeDeps): Bridge {
 
   // ── 任务中心（task-v3）──────────────────────────────────────
   // 审批中枢在上面刚定义好——任务中心的 labeled 审批闭包引用它
+  const postMainHydrate = (): void => {
+    const mirror = mirrorView()
+    if (ready) {
+      postedFloor = baseFloor
+      hydrateEpoch++
+    }
+    post({
+      type: 'hydrate',
+      epoch: hydrateEpoch,
+      items: mirror.items,
+      contextTokens: mirror.contextTokens,
+      ...(mirror.lastTiming ? { lastTiming: mirror.lastTiming } : {}),
+      ...(mirror.queued.length > 0 ? { queued: mirror.queued } : {}),
+    })
+  }
+
   /**
    * 主任务取走投给它的任务回调（task-trunk 规则 12）并重推视图——回调是插进
    * 历史的一条消息，基线重读即可显示。在跑 = loop 下一个请求前自己取（带
@@ -486,19 +542,21 @@ export function createBridge(deps: BridgeDeps): Bridge {
     if (running || session.takeTaskResults() === 0) return
     fold(session)
     baseItems = withFooter(baseItems)
-    const mirror = mirrorView()
-    post({
-      type: 'hydrate',
-      items: mirror.items,
-      contextTokens: mirror.contextTokens,
-      ...(mirror.lastTiming ? { lastTiming: mirror.lastTiming } : {}),
-      ...(mirror.queued.length > 0 ? { queued: mirror.queued } : {}),
-    })
+    postMainHydrate()
   }
+  // 自动反思（reflect-auto.ts）：主任务与其他任务开轮都查门槛，两个 session
+  // 工厂传同一个回调。autoReflect 要 tasks、在它后面建；回调到开轮才调用，
+  // 那时早已建好
+  const onTurnStart: NonNullable<SessionOptions['onTurnStart']> = (turnsSince) =>
+    autoReflect(turnsSince)
   const tasks = createTaskCenter({
     folder: deps.folder,
-    post,
-    session: deps.taskSession,
+    post: (msg) => {
+      if (!ready) return false
+      deps.post(msg)
+      return true
+    },
+    session: (manifest, approve) => deps.taskSession(manifest, approve, onTurnStart),
     requestApproval,
     // 任务级历史摘要开关的持久化（Memento，键 = owner）与默认值兜底
     ...(deps.summaryStore !== undefined ? { summaryStore: deps.summaryStore } : {}),
@@ -516,7 +574,36 @@ export function createBridge(deps: BridgeDeps): Bridge {
     ...(deps.choiceStore !== undefined ? { choiceStore: deps.choiceStore } : {}),
     ...(deps.attendanceStore !== undefined ? { attendanceStore: deps.attendanceStore } : {}),
     ...(deps.setTimer !== undefined ? { setTimer: deps.setTimer } : {}),
+    // 排队发送（下面的 turnQueue）：任务的轮末与关闭。回调到时早已建好
+    turnEnded: (owner, end) => turnQueue.turnEnded(owner, end),
+    closed: (owner) => turnQueue.drop(owner),
   })
+  const autoReflect = createAutoReflect({ folder: deps.folder, tasks })
+  /**
+   * 排队发送（turn-queue.ts，docs/proposals/queued-sends.md）：Ctrl+Enter 的
+   * 消息，目标这一轮正常结束就发队首。发出走现有路径（主任务 send / 任务
+   * tasks.send），发完补推一次基线让这条用户消息即刻上屏——它不是 webview
+   * 发的，webview 没有本地乐观气泡；基线由宿主镜像出，位置就是它真正进
+   * 历史的位置（空闲才发 = 末尾）
+   */
+  const turnQueue = createTurnQueue({
+    busy: (owner) => (owner === '' ? running : tasks.busyOf(owner)),
+    dispatch: (owner, item) => {
+      if (owner === '') {
+        void send(item.text, item.images).catch(() => {})
+        postMainHydrate()
+        return
+      }
+      const name = tasks.nameOfOwner(owner)
+      if (name === null) return
+      const error = tasks.send(name, item.text, item.images)
+      if (error !== null) post({ type: 'fatal', message: error })
+      else tasks.open(name)
+    },
+    changed: () => postTurnQueue(),
+  })
+  const postTurnQueue = (): void =>
+    post({ type: 'turnQueue', ...turnQueue.view(tasks.nameOfOwner) })
   /** 派活（task-trunk 规则 7）：不等主任务静止。from = 在哪个任务里开的（webview
    *  当前 tab；省略 = 主任务），登记为父任务，派出那一轮结束回调给它（规则 12） */
   const dispatchTask = (brief: string, from?: string): void => {
@@ -541,7 +628,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // 改回去就该能自己爬起来，而不是加一层「不让它坏」的机制
     if (pending === null) {
       const mine: Promise<Session> = (closing ?? Promise.resolve())
-        .then(() => deps.session(requestApproval))
+        .then(() => deps.session(requestApproval, onTurnStart))
         .catch((error: unknown) => {
           // 只清自己那一份：失败的 catch 可能排在 closeSession + 重建之后，
           // 无条件 pending = null 会把刚建好的新 session 误清（实测会）
@@ -587,6 +674,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
     // （真机踩过：UI 显示 model-a，请求全是 model-b）。
     // 恢复本身幂等（setModel 同模型早退），重复跑无害
     if (models.length === 0) models = listModels(session.config.config)
+    taskDraft ??= draftDefaults(session.config, session.defaultModel, models)
     const saved = deps.savedChoice()
     if (saved) {
       try {
@@ -629,6 +717,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
       summaryInContext,
       imagesEnabled,
       contextWindow,
+      ...(taskDraft === null ? {} : { taskDraft }),
     })
 
   /**
@@ -666,7 +755,10 @@ export function createBridge(deps: BridgeDeps): Bridge {
             const tail = lastRegionLine(session.memoryRoot, session.owner)
             if (tail) lastContextTokens = regionsEstimate(tail)
           }
-          const rows = session.historyRows()
+          // 冷启动也走窗口版（2026-11-10）：全量底稿在 live 集合不连续时
+          // 错位——整轮卸载的 turn 夹在 live 中间，分页却整页插到底稿顶上
+          const { rows, floor } = session.historyRowsWindowed(FOLD_RECENT_STEPS)
+          baseFloor = floor
           const tRows = performance.now()
           const hydrated = await toHydrateRows(rows)
           const tThumb = performance.now()
@@ -701,14 +793,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         // 复用活 session 的重连（轮在跑）或基线本就同步过：不重捕
         logRun({ ev: 'session_open', folder: deps.folder, warm: 'live' })
       }
-      const mirror = mirrorView()
-      post({
-        type: 'hydrate',
-        items: mirror.items,
-        contextTokens: mirror.contextTokens,
-        ...(mirror.lastTiming ? { lastTiming: mirror.lastTiming } : {}),
-        ...(mirror.queued.length > 0 ? { queued: mirror.queued } : {}),
-      })
+      postMainHydrate()
       // 切回补推（webview 是无状态投影，切走即清空）：后台进程清单 + 还在
       // 等答复的审批卡。不补的话前者永远空、后者只能等 5 分钟超时 deny
       for (const [, { card }] of pendingApprovals) post(card)
@@ -900,11 +985,17 @@ export function createBridge(deps: BridgeDeps): Bridge {
         ev: 'turn_end_host',
         folder: deps.folder,
         foldMs,
+        foldDbMs,
+        foldHydrateMs,
         items: baseItems.length,
         absorbMs,
         notifyMs,
         tailMs: lap(),
       })
+      // 排队发送放最后：发下一条会同步把 running 置回 true，释放/重载得先
+      // 做完（关掉的 session 由 getSession 等 closing 收尾后重建，面板关着
+      // 也照发——与闹钟、任务回调一致）
+      if (lastTurn !== null) turnQueue.turnEnded('', lastTurn.end)
     }
   }
 
@@ -916,6 +1007,8 @@ export function createBridge(deps: BridgeDeps): Bridge {
     releaseAfterTurn = false // 接回来了：即使之前约了「跑完释放」也作废
     // 立刻回一次状态。webview 靠这条知道自己连上了
     pushState()
+    // 排队快照：webview 是无状态投影（重载/切目录后是空的或别的目录的）
+    postTurnQueue()
     // 顺手把 session 建起来，好让模型清单能填进选择器。
     //
     // **这是把「惰性」的边界从「第一次发消息」挪到「打开面板」**，而
@@ -956,7 +1049,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
     },
     pendingApprovals: () => pendingApprovals.size,
     rehydrateTasks: () => tasks.rehydrate(),
-    dispatchFromAgent: async (brief, owner, model, lean) => {
+    dispatchFromAgent: async (brief, owner, model, lean, goal) => {
       // 列表取本目录主任务 session 的配置（热重载跟着走）；配置坏了 getSession
       // 抛，桥回 500 带原因
       const hit =
@@ -969,7 +1062,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
         model: hit.model,
         ...(hit.effort ? { effort: hit.effort } : {}),
       }
-      const r = await tasks.dispatchUnique(brief, owner, choice, lean)
+      const r = await tasks.dispatchUnique(brief, owner, choice, lean, goal)
       return 'name' in r ? { ok: true, name: r.name } : { ok: false, error: r.error }
     },
     taskModels: async () => {
@@ -1001,6 +1094,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
           attach()
           return
         case 'send':
+          // 用户手动发话：解除排队暂停（闹钟、任务回调直调 send，不经这里，
+          // 它们开的轮正常结束不解除——docs/proposals/queued-sends.md）
+          turnQueue.resume('')
           void send(msg.text, msg.images)
           return
         case 'setModel':
@@ -1067,10 +1163,36 @@ export function createBridge(deps: BridgeDeps): Bridge {
         case 'task_dispatch':
           dispatchTask(msg.brief, msg.from)
           return
-        case 'task_create':
-          void tasks.create(msg.name, tasks.ownerOf(msg.from)).then((error) => {
-            if (error !== null) post({ type: 'fatal', message: error })
+        case 'drop_debug':
+          // webview 拖放形态观测（App.tsx onDrop 常驻上报）：判据修错的
+          // 账，事后要能对着真实数据复盘
+          logRun({
+            ev: 'drop_debug',
+            // phase 字段缺省 = drop 时刻；dragenter 首报带 phase（onEnter
+            // 里 types 是 drag 阶段残缺形态，drop 时才给全）
+            folder: deps.folder,
+            ...(msg.phase !== undefined ? { phase: msg.phase } : {}),
+            kinds: msg.kinds,
+            fileCount: msg.fileCount,
+            fileMeta: msg.fileMeta,
+            explorerLike: msg.explorerLike,
           })
+          return
+        case 'task_create':
+          // 建好即发；名字宿主定（可能带序号），回 select_task 让面板切过去
+          void tasks
+            .create(
+              { name: msg.name, text: msg.text, ...(msg.images ? { images: msg.images } : {}) },
+              tasks.ownerOf(msg.from),
+              {
+                ...(msg.choice ? { choice: msg.choice } : {}),
+                ...(msg.attendance ? { attendance: msg.attendance } : {}),
+              },
+            )
+            .then((r) => {
+              if ('error' in r) post({ type: 'fatal', message: r.error })
+              else post({ type: 'select_task', task: r.name })
+            })
           return
         case 'reflect_panel':
           // 计数是纯 fs 扫描，同步算即可；folder 记忆库按目录（FolderPicker 切换后重取）
@@ -1085,6 +1207,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
           return
         case 'reflect_start': {
           void tasks.dispatch(REFLECT_TASK_BOOK, tasks.ownerOf(msg.from)).then((error) => {
+            // 按钮派的也记：它失败了（没写收尾 event），自动反思照样等满 24h，
+            // 不在下一轮就把它关掉重派
+            if (error === null) recordReflectStart(deps.folder)
             post({
               type: 'reflect_result',
               ok: error === null,
@@ -1103,6 +1228,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
               return
             }
             const error = await tasks.dispatch(REFLECT_TASK_BOOK, tasks.ownerOf(msg.from))
+            if (error === null) recordReflectStart(deps.folder)
             post({
               type: 'reflect_result',
               ok: error === null,
@@ -1112,10 +1238,27 @@ export function createBridge(deps: BridgeDeps): Bridge {
           return
         }
         case 'task_send': {
+          // 同 send：手动发话解除该任务的排队暂停。ownerOf 对不存在的任务
+          // 回 ''（= 主任务），不能拿它去解主任务的暂停
+          const owner = tasks.ownerOf(msg.task)
+          if (owner !== '') turnQueue.resume(owner)
           const error = tasks.send(msg.task, msg.text, msg.images)
           if (error !== null) post({ type: 'fatal', message: error })
           return
         }
+        case 'turnQueueAdd': {
+          // 任务名翻 owner；ownerOf 对不存在的任务回 ''，要拦住，否则排进主任务
+          const owner = msg.task === undefined ? '' : tasks.ownerOf(msg.task)
+          if (msg.task !== undefined && owner === '') {
+            post({ type: 'fatal', message: `没有任务「${msg.task}」` })
+            return
+          }
+          turnQueue.add(owner, msg.text, msg.images)
+          return
+        }
+        case 'turnQueueCancel':
+          turnQueue.cancel(msg.id)
+          return
         case 'task_open':
           // 只补基线，不报错——切走的瞬间任务被关闭是正常竞态
           tasks.open(msg.task)
@@ -1186,10 +1329,17 @@ export function createBridge(deps: BridgeDeps): Bridge {
           return
         }
         case 'fetchHistory': {
+          const from = msg.cursor
           void (async () => {
             try {
               const session = await getSession()
-              const page = await session.historyPage(msg.cursor, HISTORY_PAGE)
+              // 第一页（cursor=null）从 webview 手里那份底稿的起点翻；没有
+              // 起点 = 底稿没有 live 行，只翻 unloaded
+              const floor = postedFloor
+              const epoch = hydrateEpoch
+              const page = await session.historyPage(from ?? floor, HISTORY_PAGE, {
+                live: floor !== null,
+              })
               post({
                 type: 'historyPage',
                 // 整行传（含 turnId/meta/elapsedMs）：hydrateItems 按轮给
@@ -1197,11 +1347,50 @@ export function createBridge(deps: BridgeDeps): Bridge {
                 // 常驻（用户拍板：落盘的是当时的值，之后换模型不改写）
                 items: hydrateItems(page.rows),
                 next: page.next,
+                epoch,
+                from,
               })
             } catch (error) {
               post({
                 type: 'fatal',
                 message: error instanceof Error ? error.message : String(error),
+              })
+            }
+          })()
+          return
+        }
+        case 'task_fetchHistory': {
+          // 任务视图的往上翻页：走任务自己的 session（owner 域）。
+          // 任务已不在列表（关闭）= 空页收尾，webview 的 loading 得有人收
+          const from = msg.cursor
+          void (async () => {
+            try {
+              const session = await tasks.sessionOf(msg.task)
+              if (!session) {
+                post({ type: 'task_historyPage', name: msg.task, items: [], next: null, from })
+                return
+              }
+              const floor = tasks.floorOf(msg.task)
+              const epoch = tasks.epochOf(msg.task)
+              const page = await session.historyPage(from ?? floor, HISTORY_PAGE, {
+                live: floor !== null,
+              })
+              post({
+                type: 'task_historyPage',
+                name: msg.task,
+                items: hydrateItems(page.rows),
+                next: page.next,
+                epoch,
+                from,
+              })
+            } catch {
+              post({
+                type: 'task_historyPage',
+                name: msg.task,
+                items: [],
+                next: null,
+                epoch: tasks.epochOf(msg.task),
+                from,
               })
             }
           })()

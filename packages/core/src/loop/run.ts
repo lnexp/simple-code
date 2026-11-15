@@ -718,7 +718,11 @@ async function* runStep(ctx: LoopContext): AsyncIterable<AgentEvent> {
   // 截断→干活→截断→干活→截断就被停掉（2026-10-24 Terminal-Bench 实测；
   // CC query.ts:1720 每进下一步清零 maxOutputTokensRecoveryCount）
   if (!needsResume(ctx)) ctx.resumeCount = 0
-  ctx.lastUsage = acc.usage
+  // 服务端多轮的 usage 是各轮累加的计费量（Usage.serverRounds）：当基线会把
+  // 50k 的上下文算成 307k，误触发 budget 卸载改写历史，网关续传校验对不上
+  // 就 409（2026-11-14 网关多轮事故）。不当基线＝下一轮全量
+  // 估算，和第一轮一样
+  ctx.lastUsage = acc.usage.serverRounds ? undefined : acc.usage
   // 同一次请求：真实 usage（API 计数，底栏打底用的就是它）× 估算（面板用的
   // 字符密度估法）。usage 全 0 = 渠道没报（网关常见），照记——那本身就是信息
   logRun({
@@ -732,6 +736,7 @@ async function* runStep(ctx: LoopContext): AsyncIterable<AgentEvent> {
     cacheWrite: acc.usage.cacheCreationInputTokens,
     output: acc.usage.outputTokens,
     estimated: Math.round(ctx.lastEstimate ?? 0),
+    ...(acc.usage.serverRounds ? { rounds: acc.usage.serverRounds } : {}),
   })
   // 拒答是 HTTP 200、内容为空：不透传的话用户只看到模型「什么都没说」，
   // 为什么被拒全在被丢掉的 explanation 里（Accumulator.refusal 的注释）。

@@ -1077,6 +1077,29 @@ describe('上下文卸载', () => {
     expect(estimated).toBeLessThan(1500 * 0.5) // 且确实是大幅下降，不是蹭过线
   })
 
+  it('服务端多轮的 usage 不当预算基线——各轮累加的量会把小上下文算成超预算', async () => {
+    // 2026-11-14：网关在服务端替模型跑了 5 轮 web_search，usage 报 5 轮累加的
+    // 307k，真实上下文约 50k。当基线误触发 budget 卸载、改写历史，网关续传校验
+    // 历史对不上 → 409 history_mismatch（网关多轮事故）
+    const unloadsAfter = async (extra: Partial<Usage>) => {
+      const heavy: Usage = { ...usage(), inputTokens: 3000, ...extra }
+      const step = calls('c1').map((ev) => (ev.type === 'finish' ? { ...ev, usage: heavy } : ev))
+      const m = spyMemory()
+      // 历史估算约 420，在预算 900 以内；两条 bulky 卸得动（太短的消息卸了
+      // 也省不出东西，触发了也是卸 0 条，对照组就证不了前提）
+      const messages: Message[] = [
+        bulky('user', 200),
+        bulky('assistant', 200),
+        { role: 'user', parts: [{ type: 'text', text: '跑一下' }] },
+      ]
+      await drive({ memory: m.memory, messages, rounds: [step, says('好')] })
+      return m.unloadedCount()
+    }
+    // 对照组先证前提：同样 3000（> 预算 900）不带轮次，照常按基线触发卸载
+    expect(await unloadsAfter({})).toBeGreaterThan(0)
+    expect(await unloadsAfter({ serverRounds: 5 })).toBe(0)
+  })
+
   it('保底区 = min(floorTokens, 预算 × targetRatio)——两个都是上限（2026-09-28 由 max 改 min）', async () => {
     // 预算 600（窗口 1000 − maxTokens 400），四条 300 + 短 user。三组各钉一面：
     const msgs = (): Message[] => [

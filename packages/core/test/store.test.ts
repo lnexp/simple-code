@@ -4,6 +4,7 @@ import { basename, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Message, Part } from '../src/llm/types.ts'
+import { estimateMessageTokens } from '../src/loop/tokens.ts'
 import { listBucketFiles, resolveBucketFile } from '../src/session/buckets.ts'
 import { lastRegionLine, MEMORY_RELATIVE, openStore, type Store } from '../src/session/store.ts'
 import { createTask, scopeOf } from '../src/session/task.ts'
@@ -410,15 +411,17 @@ describe('历史分页（historyPage）', () => {
 
     const reopened = openStore(dir)
     const page1 = reopened.historyPage(null, 2)
-    // 最新 unloaded 是「老4」，第一页取它和「老3」，翻回正序
+    // 最新 unloaded 是「老4」，limit 2 取到「老3」；老3 和老2 同一个 step（assistant
+    // 起头切 step：[老1] [老2 老3] [老4 新1]），整 step 截页把老2 补进来，翻回正序
     expect(page1.rows.map((r) => r.parts[0])).toEqual([
+      { type: 'text', text: '老2' },
       { type: 'text', text: '老3' },
       { type: 'text', text: '老4' },
     ])
-    expect(page1.next).toBe(3) // 老3 的 id，下一页从它之下起
+    expect(page1.next).not.toBeNull() // [老2 老3] 那个 step 的 id，下一页从它之前起
 
     const page2 = reopened.historyPage(page1.next, 2)
-    expect(page2.rows.map((r) => (r.parts[0] as { text: string }).text)).toEqual(['老1', '老2'])
+    expect(page2.rows.map((r) => (r.parts[0] as { text: string }).text)).toEqual(['老1'])
     expect(page2.next).toBeNull() // 到底了
     reopened.close()
   })
@@ -485,7 +488,7 @@ describe('历史分页（historyPage）', () => {
     const reopened = openStore(dir)
     const text = (r: { parts: Part[] }) => (r.parts[0] as { text: string }).text
     expect(reopened.historyPage(null, 10).rows.map(text)).toEqual(['问1', '答1原文', '答2原文'])
-    // 分页游标仍是 id，但「更早」按同一个排序键算
+    // 分页游标是 step id，「更早」按同一个 turn/step 排序键算
     const page1 = reopened.historyPage(null, 2)
     expect(page1.rows.map(text)).toEqual(['答1原文', '答2原文'])
     const page2 = reopened.historyPage(page1.next, 2)
@@ -1261,7 +1264,7 @@ describe('摘要候选优先给还占着 context 的 turn', () => {
     const db = new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'))
     const plan = db
       .prepare(`EXPLAIN QUERY PLAN ${sql}`)
-      .all(null, null)
+      .all()
       .map((row) => String(row.detail))
       .join('\n')
     db.close()
@@ -1500,6 +1503,56 @@ describe('一次性压实积压（compactLegacyBacklog）', () => {
     expect(whileRunning).not.toContain(last) // 前提：跑着的时候确实排除了它
     expect(store.nextSegmentToSummarize(1_000_000, null)?.turn).toBe(last)
 
+    store.close()
+  })
+
+  it('**在跑的长轮：中间攒满的段先摘，开头那段（含提问）和末尾那截等轮末**', async () => {
+    // 2026-11-13 真项目 task-ets47u：一轮跑 79 分钟 428 步，整轮不当候选，
+    // 中途压缩卸下的 362 条存根一条 L0 都没有，挂到下一次压缩（51k，设计
+    // 16k；note long-turn-l0-lag-stub-pileup）
+    const dir = await workspace()
+    const store = openStore(dir)
+    const turn = store.beginTurn({ model: 'p/m', effort: null })
+    const answers = Array.from({ length: 7 }, (_, i) => assistantSays(`答${i}${'字'.repeat(300)}`))
+    store.save([userSays('问一'), ...answers])
+    const ids = [...new Set(stepIdsOf(dir).map((s) => s.id))]
+    expect(ids).toHaveLength(8) // 前提：提问一个 step，七个回答各一个
+    // 一段装得下「提问 + 两个回答」：开头那段 = ids[0..2]，之后两两一段，末尾剩 ids[7]
+    const t = (m: Message) => estimateMessageTokens(m.parts)
+    const budget = t(userSays('问一')) + t(answers[0] as Message) * 2
+
+    const cover = (seg: { from: number; to: number }) =>
+      store.addSummary({
+        level: 0,
+        coversFrom: seg.from,
+        coversTo: seg.to,
+        name: '',
+        text: 'x',
+        status: 'ready',
+        inContext: false,
+        supersededBy: null,
+        head: null,
+        archivePath: null,
+      })
+    const drain = (active: number | null) => {
+      const out: [number, number][] = []
+      for (let seg = store.nextSegmentToSummarize(budget, active); seg && out.length < 9; ) {
+        out.push([seg.from, seg.to])
+        cover(seg)
+        seg = store.nextSegmentToSummarize(budget, active)
+      }
+      return out
+    }
+
+    expect(drain(turn)).toEqual([
+      [ids[3], ids[4]],
+      [ids[5], ids[6]],
+    ])
+    store.finishTurn(turn, 1, 'done')
+    expect(drain(null)).toEqual([
+      [ids[0], ids[2]],
+      [ids[7], ids[7]],
+    ])
     store.close()
   })
 

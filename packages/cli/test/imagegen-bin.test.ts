@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -62,6 +62,37 @@ test('checkOutPath：只许项目内、非隐藏目录，.simple-code/tmp 例外
   expect(checkOutPath(root, '.git/a.png').ok).toBe(false)
   expect(checkOutPath(root, '.simple-code/memory/a.png').ok).toBe(false)
   expect(checkOutPath(root, 'docs/.hidden/a.png').ok).toBe(false)
+})
+
+test('checkOutPath：工作区内软链指向项目外或隐藏目录（含悬空软链）被拦，项目内合法软链放行', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'imagegen-sym-'))
+  try {
+    const root = join(base, 'proj')
+    const outside = join(base, 'outside')
+    await mkdir(join(root, 'assets'), { recursive: true })
+    await mkdir(join(root, 'docs'), { recursive: true })
+    await mkdir(join(root, '.git'), { recursive: true })
+    await mkdir(join(root, '.simple-code', 'tmp'), { recursive: true })
+    await mkdir(outside, { recursive: true })
+
+    await symlink(outside, join(root, 'ext-dir'))
+    await symlink(join(outside, 'not-yet.png'), join(root, 'docs', 'dangling.png'))
+    await symlink(join(root, '.git'), join(root, 'git-link'))
+    await symlink(join(root, '.git'), join(root, '.simple-code', 'tmp', 'escape'))
+    await symlink('../assets', join(root, 'docs', 'assets-link'))
+
+    expect(checkOutPath(root, 'ext-dir/sub/a.png').ok).toBe(false)
+    expect(checkOutPath(root, 'docs/dangling.png').ok).toBe(false)
+    expect(checkOutPath(root, 'git-link/a.png').ok).toBe(false)
+    expect(checkOutPath(root, '.simple-code/tmp/escape/a.png').ok).toBe(false)
+    // 对照组：指向项目内普通目录的软链放行
+    expect(checkOutPath(root, 'docs/assets-link/a.png')).toEqual({
+      ok: true,
+      abs: join(root, 'docs', 'assets-link', 'a.png'),
+    })
+  } finally {
+    await rm(base, { recursive: true, force: true })
+  }
 })
 
 describe('placeImage', () => {
@@ -175,10 +206,13 @@ describe('imagegenMain', () => {
     expect(io.out()).toContain('cat.webp 已存在，另存为 cat-df7e70e5.webp')
   })
 
-  test('参数错不发请求：.gif、越界路径 → 3；无代理 → 2', async () => {
+  test('--help / -h：用法进 stdout、退出 0，不发请求；参数错 → 3；无代理 → 2', async () => {
     const root = await mkdtemp(join(tmpdir(), 'imagegen-'))
     const { env, seen } = await fakeProxy(() => [200, '{}'])
-    capture()
+    const io = capture()
+    expect(await imagegenMain(['--help'], {}, root)).toBe(0)
+    expect(await imagegenMain(['-h'], {}, root)).toBe(0)
+    expect(io.out()).toContain('用法：imagegen')
     expect(await imagegenMain(['猫', 'a.gif'], env, root)).toBe(3)
     expect(await imagegenMain(['猫', '../a.png'], env, root)).toBe(3)
     expect(seen).toEqual([])
@@ -196,5 +230,32 @@ describe('imagegenMain', () => {
     expect(io.err()).toContain('invalid size')
     expect(await imagegenMain(['猫', 'a.png'], env, root)).toBe(1)
     expect(io.err()).toContain('响应里没有图片')
+  })
+
+  test('默认 root 从 cwd 向上认工作区根（.simple-code/memory）；显式传 root 不变', async () => {
+    const ws = await mkdtemp(join(tmpdir(), 'imagegen-ws-'))
+    try {
+      const sub = join(ws, 'packages', 'sub')
+      await mkdir(join(ws, '.simple-code', 'memory'), { recursive: true })
+      await mkdir(sub, { recursive: true })
+      const png = Buffer.from('ws-png')
+      const { env } = await fakeProxy(() => [
+        200,
+        JSON.stringify({ data: [{ b64_json: png.toString('base64') }], output_format: 'png' }),
+      ])
+      vi.spyOn(process, 'cwd').mockReturnValue(sub)
+      capture()
+
+      expect(await imagegenMain(['图', '.simple-code/tmp/a.png'], env)).toBe(0)
+      expect(await readFile(join(ws, '.simple-code/tmp/a.png'))).toEqual(png)
+      expect(await imagegenMain(['图', 'docs/x.png'], env)).toBe(0)
+      expect(await readFile(join(ws, 'docs/x.png'))).toEqual(png)
+
+      // 对照：显式传 root 仍按传入的目录解析
+      expect(await imagegenMain(['图', 'local.png'], env, sub)).toBe(0)
+      expect(await readFile(join(sub, 'local.png'))).toEqual(png)
+    } finally {
+      await rm(ws, { recursive: true, force: true })
+    }
   })
 })

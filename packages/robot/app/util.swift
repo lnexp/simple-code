@@ -1,5 +1,6 @@
 // 路径、日志、颜色、皮肤、配置（docs/proposals/desktop-robot.md §6、§7）
 import Cocoa
+import ImageIO
 
 let home = FileManager.default.homeDirectoryForCurrentUser.path
 let runDir = home + "/.simple-code/run"
@@ -57,16 +58,48 @@ func skinList() -> [(name: String, path: String)] {
   return r
 }
 
+/// 一个状态的图：image 是静态图（菜单栏图标用它）；frames 非空 = 动图（gif / APNG），按 delays 循环播放
+struct SkinImage {
+  let image: NSImage
+  var frames: [CGImage] = []
+  var delays: [Double] = []
+}
+
+/// 多帧图拆成帧序列；单帧或解不出来返回 nil。每帧时长读 gif / APNG 各自的字段，没写或过小按 0.1 秒
+func animFrames(_ path: String) -> ([CGImage], [Double])? {
+  guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
+  let n = CGImageSourceGetCount(src)
+  guard n > 1 else { return nil }
+  var frames: [CGImage] = [], delays: [Double] = []
+  for i in 0..<n {
+    guard let img = CGImageSourceCreateImageAtIndex(src, i, nil) else { continue }
+    let p = CGImageSourceCopyPropertiesAtIndex(src, i, nil) as? [CFString: Any] ?? [:]
+    let g = p[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+    let a = p[kCGImagePropertyPNGDictionary] as? [CFString: Any]
+    let d = (g?[kCGImagePropertyGIFUnclampedDelayTime] ?? g?[kCGImagePropertyGIFDelayTime]
+             ?? a?[kCGImagePropertyAPNGUnclampedDelayTime] ?? a?[kCGImagePropertyAPNGDelayTime]) as? Double ?? 0
+    frames.append(img)
+    delays.append(d >= 0.02 ? d : 0.1)
+  }
+  return frames.count > 1 ? (frames, delays) : nil
+}
+
 /// 缺的状态先用本皮肤的 idle，再用默认皮肤的同名图；扩展名按 svg → png → gif 找。缺文件不报错
-func loadSkin(_ name: String) -> [String: NSImage] {
+func loadSkin(_ name: String) -> [String: SkinImage] {
   let all = skinList()
   let dir = all.first { $0.name == name }?.path ?? all[0].path
   let def = all[0].path
-  func find(_ d: String, _ s: String) -> NSImage? {
-    for e in ["svg", "png", "gif"] { if let i = NSImage(contentsOfFile: "\(d)/\(s).\(e)") { return i } }
+  func find(_ d: String, _ s: String) -> SkinImage? {
+    for e in ["svg", "png", "gif"] {
+      let p = "\(d)/\(s).\(e)"
+      guard let i = NSImage(contentsOfFile: p) else { continue }
+      var r = SkinImage(image: i)
+      if e != "svg", let (f, d) = animFrames(p) { r.frames = f; r.delays = d }
+      return r
+    }
     return nil
   }
-  var out: [String: NSImage] = [:]
+  var out: [String: SkinImage] = [:]
   for s in stateNames { out[s] = find(dir, s) ?? find(dir, "idle") ?? find(def, s) }
   return out
 }
@@ -88,6 +121,8 @@ enum Config {
     }
   }
   static var skin: String { read()["skin"] as? String ?? "default" }
+  /// 常驻桌面：没事时也显示机器人（默认关 = 有事才出现）
+  static var pinned: Bool { read()["pinned"] as? Bool ?? false }
   /// 面板右下角（屏幕坐标）。不在任何屏幕上（换了显示器）就当没存过
   static var anchor: NSPoint? {
     guard let p = read()["position"] as? [String: Any], let x = p["x"] as? Double, let y = p["y"] as? Double else { return nil }

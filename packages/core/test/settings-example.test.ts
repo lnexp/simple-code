@@ -33,4 +33,32 @@ describe('示例配置', () => {
 
     expect(configSchema.safeParse(withTypo).success).toBe(false)
   })
+
+  it('根示例的各配置段与 schema 默认值一致（防 envPassthrough 等字段漂移）', async () => {
+    const rawJson = JSON.parse(
+      await readFile(new URL('../../../settings.example.json', import.meta.url), 'utf8'),
+    ) as { bash?: { envPassthrough?: string[] } }
+    const example = configSchema.parse(rawJson)
+    const defaults = configSchema.parse({
+      provider: 'p',
+      model: 'm',
+      providers: {
+        p: {
+          protocol: 'openai-chat',
+          baseUrl: 'https://api.example.com',
+          apiKey: 'sk-x',
+          models: { m: { contextWindow: 128_000 } },
+        },
+      },
+    })
+
+    // 原始 JSON 必须显式写出完整 envPassthrough，不能靠缺省填充空过
+    expect(rawJson.bash?.envPassthrough).toEqual(defaults.bash.envPassthrough)
+    expect(example.bash).toEqual(defaults.bash)
+    expect(example.webfetch).toEqual(defaults.webfetch)
+    expect(example.loop).toEqual(defaults.loop)
+    expect(example.memory).toEqual(defaults.memory)
+    expect(example.recall).toEqual(defaults.recall)
+    expect(example.visionModel).toBe(defaults.visionModel)
+  })
 })

@@ -1,7 +1,12 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
-import { listTypedNotes, searchTypedNotes, writeTypedNote } from '../src/tools/note-library.ts'
+import {
+  listTypedNotes,
+  relatedNotes,
+  searchTypedNotes,
+  writeTypedNote,
+} from '../src/tools/note-library.ts'
 
 const goalBody = (text: string) =>
   `## 这件事是什么\n事\n## 目标\n${text}\n## 当前范围与边界\n不可越权\n## 怎样算达到目标\n有证据`
@@ -51,6 +56,36 @@ it('严格写入格式不妨碍旧文件读搜，新原则为候选，旧名不�
   expect(text).toContain('type: principle')
   expect(() => writeTypedNote(r, { ...input, body }, 'principle')).toThrow('已存在')
   expect(searchTypedNotes(r, '历史裸正文')).toContain('old')
+})
+
+it('relatedNotes：互引摊开一跳邻居，前缀名不误命中，孤岛为空', () => {
+  const r = root()
+  put(r, 'notes/hub.md', '综述：见 note spoke，接替 review-x')
+  put(r, 'notes/spoke.md', '正文引用 hub')
+  put(r, 'notes/goal/g.md', '孤岛')
+  put(r, 'notes/review-x.md', '正文')
+  put(r, 'notes/prefix-a.md', '正文提到 review-x-v2 长名')
+  const hub = relatedNotes(r, 'hub')
+  expect(hub).toContain('本条提及')
+  expect(hub).toContain('spoke')
+  expect(hub).toContain('review-x')
+  const spoke = relatedNotes(r, 'spoke')
+  expect(spoke).toContain('提及本条')
+  expect(spoke).toContain('hub')
+  // review-x 的邻居：hub 提及它；prefix-a 提到的是更长的 review-x-v2，不得误连
+  const rx = relatedNotes(r, 'review-x')
+  expect(rx).toContain('hub')
+  expect(rx).not.toContain('prefix-a')
+  expect(relatedNotes(r, 'g')).toBe('')
+})
+
+it('relatedNotes：by: 接替链算边，read 侧附加格式与正文分隔', () => {
+  const r = root()
+  put(r, 'notes/old-way.md', '---\nname: old-way\nstatus: superseded\nby: new-way\n---\n\n旧结论')
+  put(r, 'notes/new-way.md', '正文提到 old-way 的历史')
+  const rel = relatedNotes(r, 'old-way')
+  expect(rel).toContain('new-way') // by: 在 front matter 里也算「本条提及」
+  expect(relatedNotes(r, 'new-way')).toContain('old-way')
 })
 
 it('goal 写入超预算当场提醒（2026-11-03：别等 session 建立时才截断）', () => {

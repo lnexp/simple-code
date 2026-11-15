@@ -16,7 +16,9 @@
  * 原子的：任何一个文件操作失败，全部不落盘。stdout 出摘要（+N/-M），
  * 错误进 stderr、exit 1——配合 bash 的输出合并，模型一眼能看到失败原因。
  */
-import { applyPatch } from '@simple-code/core/src/tools/applypatch.ts'
+import { applyPatch, parsePatch } from '@simple-code/core/src/tools/applypatch.ts'
+import { scanNoteFiles } from '@simple-code/core/src/tools/note-files.ts'
+import { lintReport, wikiRootsOf } from '@simple-code/core/src/tools/wiki.ts'
 import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts'
 
 async function readStdin(): Promise<string> {
@@ -25,15 +27,37 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-const raw = process.argv[2] ?? (await readStdin())
+const USAGE =
+  "用法：apply_patch <<'PATCH' … PATCH（补丁文本从 stdin 读，须以 *** Begin Patch 开头、*** End Patch 结尾）"
+
+const arg = process.argv[2]
+if (arg === '--help' || arg === '-h') {
+  process.stdout.write(`${USAGE}\n`)
+  process.exit(0)
+}
+const raw = arg ?? (await readStdin())
 if (raw.trim() === '') {
-  process.stderr.write("用法：apply_patch <<'PATCH' … PATCH（补丁文本从 stdin 读）\n")
+  process.stderr.write(`${USAGE}\n`)
   process.exit(2)
 }
+const root = findWorkspaceRoot(process.cwd())
 try {
-  const summary = await applyPatch(findWorkspaceRoot(process.cwd()), raw)
+  const summary = await applyPatch(root, raw)
   process.stdout.write(`${summary}\n`)
 } catch (err) {
   process.stderr.write(`apply_patch 失败：${err instanceof Error ? err.message : String(err)}\n`)
   process.exit(1)
+}
+// 改到词条目录（含别的项目的绝对路径）就跟一份检查——补丁已落盘，检查只提示；
+// 检查自身出错也不能让上面已成功的补丁看起来失败
+try {
+  const paths = parsePatch(raw).flatMap((h) =>
+    h.kind === 'update' && h.moveTo ? [h.path, h.moveTo] : [h.path],
+  )
+  for (const wikiRoot of wikiRootsOf(root, paths)) {
+    const where = wikiRoot === root ? '' : `（${wikiRoot}）`
+    process.stdout.write(`${where}${lintReport(wikiRoot, scanNoteFiles(wikiRoot, 'wiki'))}\n`)
+  }
+} catch (err) {
+  process.stdout.write(`wiki 检查没跑完：${err instanceof Error ? err.message : String(err)}\n`)
 }

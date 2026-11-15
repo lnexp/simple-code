@@ -32,6 +32,27 @@ import type { ChatItem, ChatView } from '../webview/events.ts'
  * 按无人处理拒（模型读到「当前无人处理审批，不是用户拒绝」）；关闭=触发即放行 */
 export type Attendance = 'attended' | 'unattended' | 'off'
 
+/** 排队发送的一个目标（主任务或某任务）的队列快照（turn-queue.ts）。
+ *  paused：上一轮被停止/出错，等用户手动发消息、那一轮正常结束才接着发 */
+export type TurnQueueView = {
+  paused: boolean
+  items: Array<{ id: number; text: string; imageCount: number }>
+}
+
+/** 「+ 任务」新任务状态的控件初值（task-trunk.md 规则 13）：任务发第一条消息
+ *  才建，此前没有 session 可读，宿主按配置预先算好。model = 任务的默认模型
+ *  （配置默认，不是主任务当前选的）；perModel 与 state.models 同序，解析失败
+ *  的模型为 null（那项不显示档位/预设） */
+export type TaskDraftDefaults = {
+  model: ModelRef
+  perModel: Array<{
+    effort: Effort
+    presets: string[]
+    imagesEnabled: boolean
+    contextWindow: number
+  } | null>
+}
+
 export type ToHost =
   /**
    * webview 挂载完毕，可以收事件了。
@@ -98,12 +119,35 @@ export type ToHost =
    * null——从最新的归档行起）。响应是一条 historyPage
    */
   | { type: 'fetchHistory'; cursor: number | null }
+  /** 任务视图往上翻 unloaded 历史（同 fetchHistory，带任务名路由到任务 session） */
+  | { type: 'task_fetchHistory'; task: string; cursor: number | null }
   /** 开任务并立刻跑（`/task`），不等主任务静止。brief 是任务的第一条消息；
    *  from = 在哪个任务 tab 里开的（省略 = 主任务），登记为父任务（完成回调回给它） */
   | { type: 'task_dispatch'; brief: string; from?: string }
-  /** 只输名称开空任务（任务条 + 按钮，规则 13）：建好 idle，先切模型再发第一条。
-   *  from 同 task_dispatch */
-  | { type: 'task_create'; name: string; from?: string }
+  /** 拖放形态观测（webview onDrop 上报，宿主转 runlog ev=drop_debug）：
+  判据修错的账要能对着真实数据复盘 */
+  | {
+      type: 'drop_debug'
+      kinds: string[]
+      fileCount: number
+      fileMeta: Array<{ name: string; size: number; path?: string }>
+      explorerLike: boolean
+      /** enter = dragenter 首报（types 残缺形态）；缺省 = drop 时刻（types 完整） */
+      phase?: 'enter'
+    }
+  /** 「+ 任务」（规则 13，2026-11-14 改）：第一条消息即开。text = 第一条消息
+   *  （含附件）；name = 用户打的字，宿主取首行 20 字作任务名、同名加序号。
+   *  choice / attendance = 新任务状态里先选的（省略 = 默认）。建好即发，宿主
+   *  回 select_task 让面板切过去。from 同 task_dispatch */
+  | {
+      type: 'task_create'
+      name: string
+      text: string
+      images?: ImageInput[]
+      from?: string
+      choice?: ModelRef & { effort?: Effort }
+      attendance?: Attendance
+    }
   /** 记忆面板：取计数四元组 + 上次反思，响应一条 memory_data（reflect-trigger.md） */
   | { type: 'reflect_panel' }
   /** 点「反思」：以产品内置指令任务书开任务（不读文件、无 skill） */
@@ -123,6 +167,11 @@ export type ToHost =
   /** 面板正显示哪个任务（null = 主任务）。桌面机器人据此判「这条你看得到」，
    *  不提醒（desktop-robot.md §5.1） */
   | { type: 'view_task'; task: string | null }
+  /** Ctrl+Enter 排队（docs/proposals/queued-sends.md）：目标这一轮正常结束
+   *  后作为新一轮发出。task 省略 = 主任务。空闲且没暂停 = 宿主立刻发 */
+  | { type: 'turnQueueAdd'; text: string; images?: ImageInput[]; task?: string }
+  /** 取消一条排队（按 id：队首可能恰在此刻发出，按序号会删错条） */
+  | { type: 'turnQueueCancel'; id: number }
 
 export type ToWebview =
   /** core 的事件**原样透传**，不在宿主侧翻译。翻译是 webview 的事 */
@@ -152,6 +201,9 @@ export type ToWebview =
    *  时快照要能到达 webview——但只更新**那个目录**的桶，不动当前显示
    *  （用户拍板：进程条按目录隔离，互不干扰） */
   | { type: 'bg_processes'; items: BgProcessInfo[]; folder?: string }
+  /** 排队发送的全量快照（有变化就推、attach 补推）。tasks 按任务名——
+   *  webview 只认任务名；宿主内部按 owner 存 */
+  | { type: 'turnQueue'; main: TurnQueueView; tasks: Record<string, TurnQueueView> }
   /**
    * `current` / `models` 在 session 建起来之前分别是 null 和空数组——配置是
    * 惰性加载的（bridge.ts 的 `getSession` 注释），面板刚打开时还不知道配了
@@ -206,6 +258,8 @@ export type ToWebview =
        * （建之前 contextTokens 也是 0，那时按钮本来就不渲染）
        */
       contextWindow: number
+      /** 新任务状态的控件初值。session 建好后才有（配置惰性加载） */
+      taskDraft?: TaskDraftDefaults
     }
   /**
    * 扩展侧出了 webview 自己看不到的错（配置加载失败、拿不到文件锁、core 抛了
@@ -222,6 +276,8 @@ export type ToWebview =
   | {
       type: 'hydrate'
       items: ChatItem[]
+      /** 基线世代号：分页回包核对它，丢弃重推基线前在途的旧页（2026-11-12 双链重复） */
+      epoch?: number
       contextTokens?: number
       lastTiming?: ChatView['lastTiming']
       /** 排队中、core 还没投进历史的插话（ChatView.queued）；不带 = 没有 */
@@ -229,9 +285,25 @@ export type ToWebview =
     }
   /**
    * fetchHistory 的响应：更早的一页（正序，prepend 即可）。`next` 是下一页
-   * cursor，null = 到底。**空页 + null 也合法**（没有任何归档时第一拉就是）
+   * cursor，null = 到底。**空页 + null 也合法**（没有任何归档时第一拉就是）。
+   * epoch/from：核对基线世代与请求游标，防重推基线或并发拉取引发双份 prepend
    */
-  | { type: 'historyPage'; items: ChatItem[]; next: number | null }
+  | {
+      type: 'historyPage'
+      items: ChatItem[]
+      next: number | null
+      epoch?: number
+      from?: number | null
+    }
+  /** 任务历史的上一页（prepend 进该任务的 items）。next = null = 到底 */
+  | {
+      type: 'task_historyPage'
+      name: string
+      items: ChatItem[]
+      next: number | null
+      epoch?: number
+      from?: number | null
+    }
   | { type: 'fatal'; message: string }
   /**
    * 上下文分区快照（regions.jsonl 尾行 + 窗口/输出预留拼成）。null =
@@ -246,6 +318,12 @@ export type ToWebview =
    * 单根没有这个概念，不占空间
    */
   | { type: 'folders'; folders: FolderState[]; active: string }
+  /**
+   * 编辑器当前文件/选区（底栏「当前文件」按钮，2026-11-10 方案 1）。宿主在
+   * ready、切编辑器、选区变化（200ms 防抖）时推；null = 当前不是文件（设置
+   * 页、输出面板、没开编辑器）——按钮不渲染
+   */
+  | { type: 'active_editor'; editor: ActiveEditor | null }
   /**
    * 分身任务的全量快照（有变化才发）。folder 由路由注入（approval 同款）：
    * 任务跟目录走，切走即清、切回由宿主镜像补发
@@ -266,6 +344,8 @@ export type ToWebview =
       name: string
       items: ChatItem[]
       folder?: string
+      /** 同 hydrate：基线世代号，丢弃基线替换前已发出的旧分页回包 */
+      epoch?: number
       /** 同 hydrate：底栏水位/上一轮用量，不带的话切回任务底栏清空 */
       contextTokens?: number
       lastTiming?: ChatView['lastTiming']
@@ -313,6 +393,15 @@ export type FolderState = {
    * 不显示卡片是为了不让人在缺少对话上下文的情况下点允许
    */
   pendingApprovals: number
+}
+
+/** 活动编辑器：绝对路径 + 选区（1 起、含两端整行）。没选区 start/end 都不带；
+ *  text 只在选区 ≤ SELECTION_TEXT_LIMIT 行时带（editor-ref.ts） */
+export type ActiveEditor = {
+  path: string
+  start?: number
+  end?: number
+  text?: string
 }
 
 /** 上下文分析面板的数据：regions.jsonl 最后一条 + 当时的窗口口径 */
