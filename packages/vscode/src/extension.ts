@@ -81,7 +81,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // 此前日志里没有任何带版本的事件，reload 是否装上新版只能靠猜
   logRun({ ev: 'ext_activate', version: context.extension.packageJSON.version })
   await wireBins()
-  const lspServer = startLspBridge()
+  const lspServer = await startLspBridge()
   // 凭据代理（docs/proposals/credential-proxy.md）：url 型 MCP server 的密钥
   // 只在本进程展开，bin 经 127.0.0.1 访问。起不来不挡激活——只影响 url 型
   // server（bin 报无代理），记一行留证
@@ -108,7 +108,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const panel = new ChatPanel(context.extensionUri, context.workspaceState)
   // 派任务桥（task-trunk 规则 11）：bin 经 127.0.0.1 + token 把任务书交给面板
-  const taskServer = startTaskBridge({
+  const taskServer = await startTaskBridge({
     dispatch: (req) => panel.dispatchFromAgent(req),
     models: (req) => panel.taskModels(req),
     send: (req) => Promise.resolve(panel.taskSend(req)),
@@ -137,7 +137,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('simpleCode.installRobot', installRobot),
     // 多根工作区：文件夹增删时路由层要清失效 bridge / 回落 active（design.md §7）
     vscode.workspace.onDidChangeWorkspaceFolders(() => panel.setFolders()),
+    // 底栏「当前文件」按钮：切编辑器、拖选时推给面板。拖选一路连发，防抖 200ms
+    // （OpenChamber 同值）
+    ...watchActiveEditor(() => panel.postActiveEditor()),
   )
+}
+
+function watchActiveEditor(push: () => void): vscode.Disposable[] {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const later = (): void => {
+    clearTimeout(timer)
+    timer = setTimeout(push, 200)
+  }
+  return [
+    vscode.window.onDidChangeActiveTextEditor(later),
+    vscode.window.onDidChangeTextEditorSelection(later),
+    // 切到图片/PDF/notebook 标签不一定有上面两个事件（activeTextEditor 已经
+    // 是空的时候不会再变）；换组时活动标签也跟着变
+    vscode.window.tabGroups.onDidChangeTabs(later),
+    vscode.window.tabGroups.onDidChangeTabGroups(later),
+    { dispose: () => clearTimeout(timer) },
+  ]
 }
 
 /**

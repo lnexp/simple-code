@@ -16,9 +16,10 @@ import type {
 import { forwardBlock, forwardLine, getSession, logRun, scopeOf } from '@simple-code/core'
 import * as vscode from 'vscode'
 import { createBridge } from './bridge.ts'
+import { editorRef, tabRef } from './editor-ref.ts'
 import { renderHtml } from './html.ts'
 import { bestCandidate } from './openfile-resolve.ts'
-import type { Attendance, ToHost } from './protocol.ts'
+import type { Attendance, ToHost, ToWebview } from './protocol.ts'
 import { type RemoteSyncResult, syncRemoteSettings } from './remote.ts'
 import type { RobotFolderView } from './robot-feed.ts'
 import { createRouter, type Router } from './router.ts'
@@ -127,15 +128,16 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         createBridge({
           // post 由路由层注入（后台过滤）；这里只接最终出口——view 可能换
           post: (msg) => void post(msg),
-          session: async (requestApproval) =>
-            getSession(f, { requestApproval, ...(await this.remoteGlobalPath()) }),
+          session: async (requestApproval, onTurnStart) =>
+            getSession(f, { requestApproval, onTurnStart, ...(await this.remoteGlobalPath()) }),
           // 任务 session（task-v3）：同一个库同一个 root，owner 域 +
           // skipLock（同进程对话已持锁，第二个 acquireLock 会撞自己）
-          taskSession: async (manifest, requestApproval) =>
+          taskSession: async (manifest, requestApproval, onTurnStart) =>
             getSession(f, {
               task: scopeOf(manifest),
               skipLock: true,
               requestApproval,
+              onTurnStart,
               ...(await this.remoteGlobalPath()),
             }),
           // 分支模型选择的持久化（2026-09-22 拍板）：键 = 任务目录本身，
@@ -234,6 +236,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     if (this.settingsWatchers.length === 0) this.watchSettings()
 
     view.webview.onDidReceiveMessage((msg: ToHost) => {
+      // 当前文件按钮的初值：webview 的监听在 ready 之前就挂好了，这时推不丢
+      if (msg.type === 'ready') this.postActiveEditor()
       this.router?.handle(msg)
     })
     view.onDidChangeVisibility(() => this.onRobotChange?.())
@@ -252,6 +256,21 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.router?.dispose()
     for (const w of this.settingsWatchers) w.dispose()
     this.settingsWatchers = []
+  }
+
+  /** 底栏「当前文件」按钮（editor-ref.ts）。全窗口一份，不跟文件夹走，所以不过
+   *  router。只认 file：diff 左侧（git:）、未保存的 untitled 都没路径可给。
+   *  文本编辑器带选区；不是（图片/PDF 预览、notebook，activeTextEditor 为空）
+   *  就看活动标签，只带路径 */
+  postActiveEditor(): void {
+    const ed = vscode.window.activeTextEditor
+    const doc = ed?.document
+    const editor =
+      ed !== undefined && doc !== undefined && doc.uri.scheme === 'file'
+        ? editorRef(doc.uri.fsPath, ed.selection, (i) => doc.lineAt(i).text)
+        : tabRef(vscode.window.tabGroups.activeTabGroup.activeTab?.input)
+    const msg: ToWebview = { type: 'active_editor', editor }
+    void this.view?.webview.postMessage(msg)
   }
 
   /** 文件夹增删（onDidChangeWorkspaceFolders）。转发给路由层：

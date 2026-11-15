@@ -14,9 +14,9 @@ import type {
   SummaryStatus,
   UnloadedRef,
 } from '../loop/assemble.ts'
-import type { RegionSizes } from '../loop/regions.ts'
+import { isStubMessage, type RegionSizes } from '../loop/regions.ts'
 import { estimateMessageTokens } from '../loop/tokens.ts'
-import { takeSegment } from '../loop/turns.ts'
+import { takeOpenTurnSegment, takeSegment, uncoveredRuns } from '../loop/turns.ts'
 import { logRun } from '../runlog.ts'
 import type { RawSink } from '../tools/types.ts'
 import { bucketedRel, ensureBucketFile, migrateToBuckets } from './buckets.ts'
@@ -170,8 +170,9 @@ export type Store = {
    * 按 step 摘等于把它摘九遍（§1.1）。`budgetTokens` 是单段上限，
    * 超了就切（§4.3）。
    *
-   * `activeTurn` 是**正在跑的那个 turn**，整个排除；idle 时传 null，
-   * 一个都不排除。为什么不能只排除最后一个 step，见 nextSegment 的注释。
+   * `activeTurn` 是**正在跑的那个 turn**：只摘它中间攒满的段，开头那段（含
+   * 提问）和末尾还在长的那截等它结束（turns.ts takeOpenTurnSegment）；idle
+   * 时传 null。为什么不能只排除最后一个 step，见 nextSegment 的注释。
    */
   nextSegmentToSummarize(budgetTokens: number, activeTurn: number | null): Segment | null
   /**
@@ -256,18 +257,22 @@ export type Store = {
   /** live 消息连同它们的 turn 归属。拼装（`assembleContext`）要按 turn 对齐 */
   liveWithTurns(): LiveMessage[]
   /**
-   * 历史分页（往上拉加载）：读 `unloaded` 原文行，按 id 从新到旧翻页，
-   * 返回时翻回正序（老→新），供 UI 直接 prepend。
+   * 历史分页（往上拉加载）：读 `unloaded` 原文行，按 (turn, step, id) 从新到
+   * 旧翻页，返回时翻回正序（老→新），供 UI 直接 prepend。
    *
    * - cursor=null：第一页，从最新的 unloaded 行起（即紧贴 live 区下方）
+   * - cursor / next 是 **step id**（不是 messages.id，理由见 beforeStep），
+   *   一页按整 step 截：凑够 limit 行后补齐最老那个 step
    * - 返回的 next：下一页的 cursor；null = 到底。**hasMore 的判定在
    *   SQL 里数一次**，不靠「返回条数 < limit」——那要假设没有并发写入，
    *   而后台摘要线程恰好会并发地翻行状态
+   * - live：live 行也进分页（窗口版底稿，游标从窗口第一个 step 起），见 historyStates
    */
   historyPage(
     cursor: number | null,
     limit: number,
     restoredIds?: readonly number[],
+    live?: boolean,
   ): { rows: HistoryRow[]; next: number | null }
   /** 回放基线用原文替换 live 存根；返回已展示行 id，分页不重复取。 */
   historyOriginals(
@@ -337,6 +342,10 @@ export type Store = {
   /** 库内最后一轮的本地日期（M-D，与时间戳同格式）——send 入口比对今天，
    *  跨天则注入日期变更告知（2026-11-02 拍板，同 model_switch 模式） */
   lastTurnDay(): string | null
+  /** at（ms）之后开始的轮数，**不分 owner**：主任务与其他任务平权（note
+   *  task-parity）。自动反思的门槛计数（vscode reflect-auto.ts）。fork 插的
+   *  reserved 锚不是真的一轮，不算 */
+  turnsSince(at: number): number
   /**
    * 取走「合并待压缩」标记（读并删，一次性）。finalizeTask（任务合并还俗）
    * 落的——合并改写了主任务的前缀（经历摘要进场），这个改写必须搭压缩的
@@ -849,7 +858,7 @@ function buildStore(
       //
       // **按 live 顺序整 step 重插。** 早卸的原文 id 小、这会儿才留下的 id 大，
       // 原地翻的话 step 内顺序就乱（续接的「继续」和被中断的回复同 step）；
-      // 重插让 step 内 id 序 = 真实顺序，跨 step 由 historyKey 按 step 排
+      // 重插让 step 内 id 序 = 真实顺序，跨 step 由 historyKeys 按 step 排
       const rows = liveRowIds(db, msgVis)
       type Row = {
         id: number
@@ -941,9 +950,9 @@ function buildStore(
         ?.u ?? 0) === 1,
 
     nextSegmentToSummarize: (budgetTokens, activeTurn) =>
-      // 没在跑时，以 aborted/error 结束的最后一轮也不当候选（turn-resume.md）：
-      // 下一次 send 可能续进去，现在摘了，续进来的内容会成为同一轮的第二段，
-      // 摘要照样割裂。等 send 定了续还是开新轮，它才够格
+      // 没在跑时，以 aborted/error 结束的最后一轮也按「没结束」切（turn-resume.md）：
+      // 下一次 send 可能续进去，现在把末尾那截摘了，续进来的内容会成为同一轮的
+      // 另一段，摘要照样割裂。等 send 定了续还是开新轮，它才算结束
       nextSegment(
         db,
         budgetTokens,
@@ -1266,6 +1275,13 @@ function buildStore(
       return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()} 周${'日一二三四五六'[d.getDay()]}`
     },
 
+    turnsSince: (at) =>
+      // started_at 是 toISOString（createTurn），同格式字符串比较即时间序
+      db.all<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM turns WHERE started_at > ? AND state != 'reserved'`,
+        new Date(at).toISOString(),
+      )[0]?.n ?? 0,
+
     consumeMergePending: () => {
       // 标记是主任务的：任务会话不吃它（吃了就把主任务的压缩车票撕了）
       if (scope) return false
@@ -1277,52 +1293,14 @@ function buildStore(
     historyOriginals: (live, recentSteps) =>
       restoreHistoryOriginals(db, live, scope?.owner ?? null, recentSteps),
 
-    historyPage: (cursor, limit, restoredIds = []) => {
-      const params: SqlValue[] = []
+    historyPage: (cursor, limit, restoredIds = [], live = false) => {
       // JOIN turns 带出每轮的 meta。state/id 两张表都有，条件必须加 m. 前缀
-      const own = `m.${ownerEq}`
-      const where =
-        cursor === null
-          ? `m.state = 'unloaded' AND ${own}`
-          : `m.state = 'unloaded' AND ${own} AND (${historyKey('m')}) < (SELECT ${historyKey('c')} FROM messages c WHERE c.id = ?)`
-      if (cursor !== null) params.push(cursor)
-      const rows = db.all<{
-        id: number
-        turnId: number
-        role: string
-        content_json: string
-        meta: string | null
-        elapsed_ms: number | null
-        started_at: string
-        ended_at: string | null
-      }>(
-        `SELECT m.id, m.turn_id AS turnId, m.role, m.content_json, t.meta, t.elapsed_ms, t.started_at, t.ended_at
-         FROM messages m JOIN turns t ON t.id = m.turn_id
-         WHERE ${where} AND ${turnCondT}
-           AND m.id NOT IN (SELECT value FROM json_each(?))
-         ORDER BY ${historyKeyDesc('m')} LIMIT ?`,
-        ...params,
-        JSON.stringify(restoredIds),
-        limit,
-      )
-      // 翻回正序（老→新），prepend 的语义
-      rows.reverse()
-      const next =
-        rows.length > 0 && hasRowBelow(db, rows[0]?.id ?? 0, msgVis, restoredIds)
-          ? (rows[0]?.id ?? null)
-          : null
-      return {
-        rows: rows.map((r) => ({
-          id: r.id,
-          turnId: r.turnId,
-          role: r.role as HistoryRow['role'],
-          parts: JSON.parse(r.content_json).parts as Part[],
-          meta: r.meta === null ? null : (JSON.parse(r.meta) as TurnMeta),
-          elapsedMs: r.elapsed_ms,
-          finishedAt: finishedAtOf(r),
-        })),
-        next,
-      }
+      const q = { limit, restoredIds, live, own: `m.${ownerEq}`, turnCondT, msgVis }
+      // live 存根滤掉后整页可能为空：接着往下翻，免得 webview 收到空页、
+      // 滚动位置不变、不再触发下一次拉取
+      let page = historyPageOnce(db, cursor, q)
+      while (page.rows.length === 0 && page.next !== null) page = historyPageOnce(db, page.next, q)
+      return page
     },
 
     turnsInfo: (turnIds) => {
@@ -1825,23 +1803,116 @@ function createTurn(db: Db, meta: string | null, owner: string | null): number {
   return lastRowId(db)
 }
 
-/** 该 id 之下还有没有 unloaded 行。有 = 还有上一页（hasMore） */
+/**
+ * 分页可见的行状态。全量底稿只翻 unloaded 原文。窗口版底稿只装最近 N 步、
+ * 游标从窗口第一个 step 开始，起点之前的 live 行也得翻出来——用户
+ * 消息、没卸载过的回复从来没有 unloaded 原文，只查 unloaded 的话它们两头都
+ * 不出（2026-11-10 真项目「中间消息丢失」）。live 存根由 historyPageOnce 滤掉，
+ * 原文是同 step 的 unloaded 行
+ */
+const historyStates = (live: boolean): string =>
+  live ? `m.state IN ('unloaded', 'live')` : `m.state = 'unloaded'`
+
+type HistoryPageQuery = {
+  limit: number
+  restoredIds: readonly number[]
+  live: boolean
+  own: string
+  turnCondT: string
+  msgVis: string
+}
+
+function historyPageOnce(
+  db: Db,
+  cursor: number | null,
+  q: HistoryPageQuery,
+): { rows: HistoryRow[]; next: number | null } {
+  const select = (where: string, params: number[], limit: number | null) =>
+    db.all<{
+      id: number
+      turnId: number
+      stepId: number
+      role: HistoryRow['role']
+      state: string
+      content_json: string
+      meta: string | null
+      elapsed_ms: number | null
+      started_at: string
+      ended_at: string | null
+    }>(
+      `SELECT m.id, m.turn_id AS turnId, m.step_id AS stepId, m.role, m.state, m.content_json,
+              t.meta, t.elapsed_ms, t.started_at, t.ended_at
+       FROM messages m JOIN turns t ON t.id = m.turn_id
+       WHERE ${historyStates(q.live)} AND ${q.own} AND ${q.turnCondT}
+         AND m.id NOT IN (SELECT value FROM json_each(?)) ${where}
+       ORDER BY ${historyKeyDesc('m')}${limit === null ? '' : ' LIMIT ?'}`,
+      JSON.stringify(q.restoredIds),
+      ...params,
+      ...(limit === null ? [] : [limit]),
+    )
+  const rows =
+    cursor === null ? select('', [], q.limit) : select(`AND ${beforeStep('m')}`, [cursor], q.limit)
+  // 整 step 截页：LIMIT 切在 step 中间时补齐最老那个 step 的其余行——游标是
+  // step（beforeStep），不补的话这几行永远翻不到
+  const last = rows.at(-1)
+  if (last !== undefined) {
+    rows.push(
+      ...select(
+        'AND m.turn_id = ? AND m.step_id = ? AND m.id < ?',
+        [last.turnId, last.stepId, last.id],
+        null,
+      ),
+    )
+  }
+  // 翻回正序（老→新），prepend 的语义
+  rows.reverse()
+  // next 按滤存根之前的最老一个 step 算：滤掉的行也已翻过
+  const oldest = rows[0]?.stepId
+  const next =
+    oldest !== undefined && hasRowBelow(db, oldest, q.msgVis, q.restoredIds, q.live) ? oldest : null
+  const out: HistoryRow[] = []
+  for (const r of rows) {
+    const message = { role: r.role, parts: JSON.parse(r.content_json).parts as Part[] }
+    if (r.state === 'live' && isStubMessage(message)) continue
+    out.push({
+      id: r.id,
+      turnId: r.turnId,
+      ...message,
+      meta: r.meta === null ? null : (JSON.parse(r.meta) as TurnMeta),
+      elapsedMs: r.elapsed_ms,
+      finishedAt: finishedAtOf(r),
+    })
+  }
+  return { rows: out, next }
+}
+
+/** 该 step 之前还有没有可翻的行。有 = 还有上一页（hasMore） */
 function hasRowBelow(
   db: Db,
-  id: number,
+  stepId: number,
   msgVis: string,
   restoredIds: readonly number[] = [],
+  live = false,
 ): boolean {
   return (
     db.all(
-      `SELECT 1 AS x FROM messages m WHERE m.state = 'unloaded' AND ${msgVis}
+      `SELECT 1 AS x FROM messages m WHERE ${historyStates(live)} AND ${msgVis}
          AND m.id NOT IN (SELECT value FROM json_each(?))
-         AND (${historyKey('m')}) < (SELECT ${historyKey('c')} FROM messages c WHERE c.id = ?) LIMIT 1`,
+         AND ${beforeStep('m')} LIMIT 1`,
       JSON.stringify(restoredIds),
-      id,
+      stepId,
     ).length > 0
   )
 }
+
+/**
+ * 分页游标 = step id：键序在该 step 之前的行（不含该 step）。**不能用
+ * messages.id**：replaceLive 每次落盘把 live 行删了重插、prune 重插 unloaded
+ * 原文，id 都会换——旧 id 查不到键，整页为空、next=null，界面提前显示「没有
+ * 更早的了」（2026-11-13）。steps 行从不删，开库 backfillSteps 保证每行有 step_id
+ */
+const beforeStep = (a: string): string =>
+  `(${a}.turn_id, COALESCE(${a}.step_id, 0)) < (SELECT s.turn_id, s.id FROM steps s WHERE s.id = ?)`
 
 /**
  * 历史页的时间轴：turn → step → id。**不能只按 id**：prune 时才留下的原文
@@ -1853,7 +1924,6 @@ const historyKeys = (a: string): string[] => [
   `COALESCE(${a}.step_id, 0)`,
   `${a}.id`,
 ]
-const historyKey = (a: string): string => historyKeys(a).join(', ')
 const historyKeyDesc = (a: string): string =>
   historyKeys(a)
     .map((k) => `${k} DESC`)
@@ -2141,7 +2211,8 @@ function segmentMessagesOf(db: Db, segment: Segment): Message[] {
 function nextSegment(
   db: Db,
   budgetTokens: number,
-  activeTurn: number | null,
+  /** 没结束的 turn：正在跑的，或以 aborted/error 结束、可能被续的最后一轮 */
+  openTurn: number | null,
   stepVis: string,
   sumVis: string,
   /** 「占着 context」只数自己的 live 行（messages.owner 判据，无别名） */
@@ -2156,16 +2227,18 @@ function nextSegment(
       `SELECT covers_from, covers_to FROM summaries WHERE ${sumVis}`,
     ),
   )
-  // **排除整个正在跑的 turn，不是只排除最后一个 step。**
+  // **没结束的 turn（openTurn）不能按结束的切，也不能整个排除。**
   //
   // 原来是 `s.id < MAX(id)`。真机验证（2026-09-03）照出它的后果：摘要每个
   // step 跑完都被踢一脚，那时「除最后一个之外」的 step 只剩刚跑完的那一个,
   // 于是一个 turn 出了三条摘要（covers 1-1 / 2-2 / 3-3）——切段预算 16k
   // 一次都没机会起作用，退回了 §1.1 说的「一个 turn 摘九遍」。
   //
-  // 排除整个 turn 之后，只有已经结束的 turn 才够格当候选，takeSegment 拿到的
-  // 是完整的 turn，该切才切。**idle 时传 null**：那会儿最后一个 turn 也结束了，
-  // 排除它等于让空闲摘要永远够不着最需要摘的那一轮
+  // 后来改成整个排除，长轮又出了反方向的病：一轮跑一个多小时，中途压缩卸下的
+  // 几百个 step 没有 L0，存根顶不掉（2026-11-13，note long-turn-l0-lag-stub-pileup）。
+  // 现在没结束的 turn 只摘中间攒满的段，规则见 turns.ts takeOpenTurnSegment。
+  // **idle 时传 null**：那会儿最后一个 turn 也结束了，按没结束切的话空闲摘要
+  // 永远够不着最需要摘的那一轮的末尾
   const rows = db.all<{ id: number; turn_id: number; holds_context: number }>(
     // holds_context 用非相关的 IN，先走 messages_live(state, id) 取出 live 行（几百条）
     // 的 step_id。原来是逐个 step 的 EXISTS：走 messages_step 找到行后回表取
@@ -2178,13 +2251,8 @@ function nextSegment(
      ) AS holds_context
      FROM steps s
      JOIN messages m ON m.step_id = s.id -- 空消息的 step 不当候选
-     -- 写成 "? IS NULL OR ..." 而不是 "turn_id IS NOT ?"：后者在 activeTurn
-     -- 为 null 时的含义是「turn_id 不为 null」，靠「turn_id 从来不是 null」
-     -- 才碰巧对，是偶然的正确
-     WHERE ${stepVis} AND (? IS NULL OR s.turn_id <> ?)
+     WHERE ${stepVis}
      GROUP BY s.id ORDER BY s.id`,
-    activeTurn,
-    activeTurn,
   )
 
   const turns = new Map<number, { id: number; holds: boolean }[]>()
@@ -2198,21 +2266,25 @@ function nextSegment(
       Number(right.some((s) => s.holds)) - Number(left.some((s) => s.holds)) || leftId - rightId,
   )
 
+  const size = (id: number) =>
+    stepMessagesOf(db, id).reduce((sum, m) => sum + estimateMessageTokens(m.parts), 0)
   for (const [turn, steps] of ordered) {
-    // **取第一段连续未覆盖的 step，遇到已覆盖的就断。** 直接 filter 掉已覆盖的
-    // 会把两侧接起来，covers 就跨过一个洞了——洞不报错，只是那截历史从此
-    // 既不在 context 里也不在任何摘要里
-    const start = steps.findIndex((s) => !covered(s.id))
-    if (start === -1) continue
-    const rest = steps.slice(start)
-    const end = rest.findIndex((s) => covered(s.id))
-    const run = end === -1 ? rest : rest.slice(0, end)
-
-    const sized = run.map((s) => ({
-      id: s.id,
-      tokens: stepMessagesOf(db, s.id).reduce((sum, m) => sum + estimateMessageTokens(m.parts), 0),
-    }))
-    const segment = takeSegment(sized, budgetTokens)
+    const ids = steps.map((s) => s.id)
+    const runs = uncoveredRuns(ids, covered)
+    // 结束了的 turn 取第一段连续未覆盖的 step
+    const segment =
+      turn === openTurn
+        ? takeOpenTurnSegment({
+            runs,
+            first: ids[0] ?? 0,
+            last: ids[ids.length - 1] ?? 0,
+            size,
+            budget: budgetTokens,
+          })
+        : takeSegment(
+            (runs[0] ?? []).map((id) => ({ id, tokens: size(id) })),
+            budgetTokens,
+          )
     const first = segment[0]
     const last = segment[segment.length - 1]
     if (first && last) return { from: first.id, to: last.id, turn }

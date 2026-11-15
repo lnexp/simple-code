@@ -62,4 +62,30 @@ describe('REFLECT_TASK_BOOK', () => {
     expect(REFLECT_TASK_BOOK).toContain('没跑检索的不能判「新错误」')
     expect(REFLECT_TASK_BOOK).toContain("grep -m1 '^created'")
   })
+
+  // 2026-11-12 用户定：反思的产物就是 wiki 词条（note reflection-design-memory-5w1h）。
+  // 一个机制一条、原地改写；头部三字段供到期判定（git log verified..HEAD -- files）；
+  // description 带文件名才接得上触及提醒
+  // 2026-11-13 用户定：词条是 wiki 类型 + 目录页，不是 general 加 wiki- 前缀
+  it('产物是词条：wiki 类型、目录页、头部三字段、四节、到期判定、改写先备份、自查跑 lint', () => {
+    expect(REFLECT_TASK_BOOK).toContain('write --type wiki')
+    expect(REFLECT_TASK_BOOK).toContain('.simple-code/notes/wiki/index.md')
+    expect(REFLECT_TASK_BOOK).toContain('新建、改名、作废词条的同一轮改目录页')
+    expect(REFLECT_TASK_BOOK).not.toContain('wiki-<机制名>')
+    expect(REFLECT_TASK_BOOK).not.toContain('wiki-*.md')
+    for (const key of ['aliases:', 'files:', 'verified:']) expect(REFLECT_TASK_BOOK).toContain(key)
+    for (const s of ['## 现在怎么工作', '## 为什么这样', '## 坑', '## 没解决的'])
+      expect(REFLECT_TASK_BOOK).toContain(s)
+    expect(REFLECT_TASK_BOOK).toContain('git log --oneline <verified>..HEAD -- <files>')
+    expect(REFLECT_TASK_BOOK).toContain('.simple-code/tmp/wiki-backup-')
+    expect(REFLECT_TASK_BOOK).toContain('带上 files 里的文件名')
+    expect(REFLECT_TASK_BOOK).toContain('"$SIMPLE_CODE_NOTE" lint 清零')
+    // 2026-11-12 首跑后用户定：被词条完整覆盖的综述 superseded 到词条，
+    // 否则过时的综述 description 和词条一起被提醒（review-approval 实例）
+    expect(REFLECT_TASK_BOOK).toContain('把综述头部 status 改为 superseded、加 by: <词条名>')
+    expect(REFLECT_TASK_BOOK).not.toContain('不改它')
+    // 旧综述规格的「撞名拒绝防重写」与词条的原地改写相反，不能残留
+    expect(REFLECT_TASK_BOOK).not.toContain('撞名拒绝')
+    expect(REFLECT_TASK_BOOK).not.toContain('综述（主题加工的产物）规格')
+  })
 })

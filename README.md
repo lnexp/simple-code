@@ -116,7 +116,8 @@ export SIMPLE_CODE_API_KEY=sk-...
 ├── notes/                            # 根目录存普通记录
 │   ├── lesson/                       # 教训：一个症状一个文件
 │   ├── principle/                    # 原则：判断、边界与依据
-│   └── goal/                         # 目标：事、目标、边界、完成依据
+│   ├── goal/                         # 目标：事、目标、边界、完成依据
+│   └── wiki/                         # 词条：一个机制一条，index.md 是目录页
 ├── events/                           # 事件档案：按事归档，一事一文件
 ├── skills/                           # 技能：某类事该怎么做
 ├── diagnosis/                        # 自我诊断账本
@@ -126,8 +127,8 @@ export SIMPLE_CODE_API_KEY=sk-...
 
 SQLite 仅为**加速层**；同一份内容同时按轮次写入 JSONL，**纯文本副本才是正本**。数据库可以重建，可读性并不依赖于它。
 
-note 统一管理普通记录、教训、原则、目标，使用 `"$SIMPLE_CODE_NOTE" list/read/search/write`
-和 `--type general|lesson|principle|goal`。旧项目的 `lessons/`、`principles/` 仍可原位读取，
+note 统一管理普通记录、教训、原则、目标、词条，使用 `"$SIMPLE_CODE_NOTE" list/read/search/write`
+和 `--type general|lesson|principle|goal|wiki`。旧项目的 `lessons/`、`principles/` 仍可原位读取，
 升级不自动搬迁；同名冲突会列出路径，不覆盖。旧 LESSON 命令已移除。
 
 当前 goal 的事、目标、边界和完成依据，以及按 LRU 入选的生效原则常驻；引用和经过按需读取。
@@ -137,11 +138,15 @@ note 统一管理普通记录、教训、原则、目标，使用 `"$SIMPLE_CODE
 四类共享 `memory.noteBudgetTokens`（默认 2100 估算 token），`memory.noteRatios` 默认
 35%/10%/20%/35%。当前目标超份额时可借其他类额度，总量不增、边界不截断。
 
+词条（`--type wiki`）由反思维护：一个机制一条，写它现在怎么工作、为什么这样、踩过的坑，每句带出处。
+目录页 `notes/wiki/index.md` 按大块分组、每条一行，整页常驻，不占上面的预算。读词条时，若头部
+`files` 里的文件在 `verified` 之后有新提交，开头会先提示；`note lint` 检查目录页漏列、链接和别名。
+
 ### 想得起来
 
 记住不难，难的是该用的时候想起来。SC 在两处主动提示，都以 `〔recall·async〕` 行贴在工具结果之后：
 
-- **按话题**：你发消息后，一个副模型对照你的话，从四类 note、skills、events 的描述里挑出相关条目，并用它给出的关键词匹配历史摘要。
+- **按话题**：你发消息后，一个副模型对照你的话，从五类 note、skills、events 的描述里挑出相关条目，并用它给出的关键词匹配历史摘要。
 - **按动作**：agent 执行命令时碰到某个文件或程序（比如改 `approval.ts`、跑 `gh`），描述里写到它的条目会被提示「先读这条」，行尾标「触及」。
 
 只给线索，读不读由 agent 判断。这项**默认不开**：按话题挑条目每轮要多一次副模型请求，在配置里写 `"recall": { "mode": "on" }` 开启（按动作的提示也随它开关）。
@@ -157,7 +162,9 @@ note 统一管理普通记录、教训、原则、目标，使用 `"$SIMPLE_CODE
 
 ### 反思
 
-底栏「记忆」按钮打开记忆面板，其中的「反思」会派一个后台任务整理 notes、lessons、events：订正过时条目、合并事件碎片、选一个主题写综述，并做自我诊断——回看上次反思以来你的纠正，判断哪些是「库里明明有、却又犯了」的重复错误，记进 `.simple-code/diagnosis/self-diagnosis.md`。做完交一份报告：写了什么、改了什么、放弃了什么，你可以当场订正。
+底栏「记忆」按钮打开记忆面板，其中的「反思」会派一个后台任务整理 notes、lessons、events：订正过时条目、合并事件碎片、把碎片整理进词条（代码改过的词条跟着改写），并做自我诊断——回看上次反思以来你的纠正，判断哪些是「库里明明有、却又犯了」的重复错误，记进 `.simple-code/diagnosis/self-diagnosis.md`。做完交一份报告：写了什么、改了什么、放弃了什么，你可以当场订正。
+
+反思也会自动跑：任何任务开始一轮时，若距上次反思满 24 小时、且之后所有任务合计满 30 轮，就派一个反思任务（仅 VS Code 扩展；终端 `sc` 不触发）。
 
 ## 审批
 

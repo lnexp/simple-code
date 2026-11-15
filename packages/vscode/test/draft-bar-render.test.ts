@@ -26,7 +26,7 @@ describe('开任务草稿条渲染', () => {
       await act(async () => {
         btn?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
       })
-      expect(div.innerHTML).toContain('作为新任务的第一条消息') // + 任务回车即开跑（同 /task）
+      expect(div.innerHTML).toContain('第一行作任务名称') // 规则 13（11-14 改）：第一条消息即开
     } catch (e) {
       error = e
     }
@@ -34,7 +34,7 @@ describe('开任务草稿条渲染', () => {
     root.unmount()
   })
 
-  it('草稿模式回车：输入作第一条消息发 task_dispatch（同 /task），不发 task_create / send', async () => {
+  it('草稿模式回车：输入即第一条消息发 task_create（规则 13），不发 task_dispatch', async () => {
     // 截获发往宿主的消息：webview/vscode.ts 的 post 惰性取 acquireVsCodeApi
     const posted: { type: string }[] = []
     ;(globalThis as Record<string, unknown>).acquireVsCodeApi = () => ({
@@ -63,8 +63,13 @@ describe('开任务草稿条渲染', () => {
     await act(async () => {
       ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
     })
-    expect(posted).toContainEqual({ type: 'task_dispatch', brief: '查群聊' })
-    expect(posted.some((m) => m.type === 'task_create' || m.type === 'send')).toBe(false)
+    expect(posted).toContainEqual({
+      type: 'task_create',
+      name: '查群聊',
+      text: '查群聊',
+      attendance: 'unattended',
+    })
+    expect(posted.some((m) => m.type === 'task_dispatch' || m.type === 'send')).toBe(false)
     root.unmount()
   })
 })

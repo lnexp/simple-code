@@ -16,10 +16,21 @@ import { logSearchText } from './search-log.ts'
 // 工作区根：cwd 可能是子目录（workspace-root.ts）
 const root = findWorkspaceRoot(process.cwd())
 
-const [, , sub, target] = process.argv
+const USAGE =
+  '用法：skill list | skill read <name> | skill search <关键词>（编辑走 "$SIMPLE_CODE_APPLY_PATCH"；用户级 ~/.simple-code 写走 bash 保留审批）'
+
+const argv = process.argv.slice(2)
+const [sub, target] = argv
 
 try {
-  if (sub === 'list') {
+  if (
+    sub === 'help' ||
+    sub === '--help' ||
+    sub === '-h' ||
+    (sub !== 'search' && (argv.includes('--help') || argv.includes('-h')))
+  ) {
+    console.log(USAGE)
+  } else if (sub === 'list') {
     console.log(listSkills(root).join('\n'))
   } else if (sub === 'search' && target) {
     const out = searchSkills(root, target)
@@ -28,10 +39,8 @@ try {
   } else if (sub === 'read' && target) {
     console.log(readSkill(root, target))
   } else {
-    console.log(
-      '用法：skill list | skill read <name> | skill search <关键词>（编辑走 "$SIMPLE_CODE_APPLY_PATCH"；用户级 ~/.simple-code 写走 bash 保留审批）',
-    )
-    process.exitCode = sub === 'help' ? 0 : 1
+    console.log(USAGE)
+    process.exitCode = 1
   }
 } catch (e) {
   console.error(String(e instanceof Error ? e.message : e))

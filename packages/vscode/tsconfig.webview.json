@@ -46,6 +46,10 @@
     "test/branch-approval-badge.test.ts",
     "test/turn-memo.test.ts",
     "test/bottom-area.test.ts",
-    "test/scroll-restore-wiring.test.ts"
+    "test/scroll-restore-wiring.test.ts",
+    "test/current-file-wiring.test.ts",
+    "test/task-history-dup.test.ts",
+    "test/turn-queue-render.test.ts",
+    "test/task-draft-render.test.ts"
   ]
 }

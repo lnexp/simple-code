@@ -366,14 +366,16 @@ describe('multi 同质 external_dir 的批量 always（2026-09-21 方案 1）', 
     }
   })
 
-  it('单触发 external_dir 也带键（2026-11-04 简化：一律可始终允许）', () => {
+  it('单触发 external_dir 也带键（2026-11-04 简化，2026-11-11 读写一致：一律可始终允许）', () => {
     const a = mk()
     try {
-      const v = ask(`ls ${a}`)
-      expect(v.kind).toBe('ask')
-      if (v.kind === 'ask') {
-        expect(v.category).toBe('external_dir')
-        expect(v.alwaysPaths).toEqual([a])
+      for (const cmd of [`ls ${a}`, `echo x > ${a}/f.txt`]) {
+        const v = ask(cmd)
+        expect(v.kind, cmd).toBe('ask')
+        if (v.kind === 'ask') {
+          expect(v.category).toBe('external_dir')
+          expect(v.alwaysPaths).toEqual([a])
+        }
       }
     } finally {
       rm(a)

@@ -2,6 +2,20 @@
  * Explorer 拖文件 → 路径文本（2026-09-08 拍板：只支持 VS Code 资源管理器
  * 拖入；产物一律是路径——图片也不内联，模型用 view_image 按需看；项目内
  * 相对、项目外绝对。OS Finder 拖不支持，preventDefault 挡掉原生行为即可）。
+ * Explorer 拖入的 Shift 机制（mjbvz 在 microsoft/vscode#182449 的解释，
+ * webviewElement.ts#L688）：拖动中按住 Shift 期间浮层消失、drop 才落进
+ * webview。但这是平台烂尾工程：修复 #209211（2024-06）引入回归后被
+ * 整体 revert（#225000，2024-08），1.142.0 上仍复现（#339278，
+ * 2026-10）「按 Shift 拖 webview 收不到任何 drag 事件」；mac 上
+ * Shift+按下文件是列表多选语义、根本拖不动。结论：**拖放通道无可靠
+ * 姿势，成功率随竞态**（用户真机：同操作有时成功有时失败）。
+ * 可靠替代 = Explorer 右键「复制路径」（⌥⌘C）→ 输入框粘贴——路径
+ * 文本与拖放产物等价。别再给用户教「先按 Shift 再拖」类的姿势建议。
+ * Finder 拖翻案（同日）：OS 级拖动不触发 VS Code 挂起机制，drop 稳定进
+ * webview；Electron 的 File 对象带非标准 path 属性（真实磁盘路径）——
+ * CC/OpenChamber 的稳定拖放全走这条路。onDrop 的 OS 分支读 file.path
+ * 进 attached（路径哲学不变：不读内容、图片不内联）。dragover 判据
+ * 对 'Files' 类型也 preventDefault，否则只有 textarea 原生默认可放。
  *
  * 宿主不兼容是难点：Explorer 拖**不给 File 对象**，只在私有类型里给埋着路径的 payload；
  * OS 拖才给 File。判据 = files 空 && types 命中私有类型。`text/uri-list` 和
@@ -44,6 +58,15 @@ export function isExplorerDrag(dt: DropData | null): boolean {
 /** OS Finder/浏览器拖（有真 File 对象）。不支持，但调用方要认出来做 notice */
 export function hasOsFileDrag(dt: DropData | null): boolean {
   return dt !== null && dt.files?.length > 0
+}
+
+/** Finder/OS 拖的路径提取（2026-11-09 翻案）：Electron 的 File 对象带非标准
+ *  path 属性（真实磁盘路径），有就收、没有就跳——调用方对空数组兜底提示 */
+export function osFileDragPaths(files: ArrayLike<{ path?: string }>): string[] {
+  return Array.from(files).reduce<string[]>((acc, f) => {
+    if (typeof f.path === 'string' && f.path !== '') acc.push(f.path)
+    return acc
+  }, [])
 }
 
 export function parseExplorerPaths(dt: DropData | null): string[] {

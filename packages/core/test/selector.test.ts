@@ -200,27 +200,54 @@ describe('请求与解析', () => {
     expect(previousReply([{ role: 'user', parts: [{ type: 'text', text: '第一句' }] }])).toBe('')
   })
 
-  it('在场已 read 的条目：认四类 bin 的 read，不认 search/非 bash', () => {
+  it('在场已 read 的条目：认四类 bin 的 read，不认 search/非 bash；NOTE 不带 --type 按当前文件解析', async () => {
+    const root = await workspace()
+    const put = async (dir: string, name: string) => {
+      await mkdir(join(root, '.simple-code', 'notes', ...(dir ? [dir] : [])), { recursive: true })
+      await writeFile(
+        join(root, '.simple-code', 'notes', ...(dir ? [dir] : []), `${name}.md`),
+        `---\nname: ${name}\n---\n`,
+      )
+    }
+    await put('', 'recall-llm-selector-pending') // 只在普通记录
+    await put('wiki', 'approval-judge') // 只在词条
+    await put('lesson', 'twin') // 两类同名：不带 --type 的 read 报错，什么也没读到
+    await put('principle', 'twin')
+    await put('lesson', 'clash') // 同类新旧目录内容不同：read 报冲突，同样没读到
+    await mkdir(join(root, '.simple-code', 'lessons'), { recursive: true })
+    await writeFile(
+      join(root, '.simple-code', 'lessons', 'clash.md'),
+      '---\nname: clash\n---\n旧\n',
+    )
     const call = (name: string, command: string) =>
       ({
         role: 'assistant',
         parts: [{ type: 'tool_call', id: command, name, input: { command } }],
       }) as never
-    const got = readInContext([
-      call('bash', '"$SIMPLE_CODE_NOTE" read recall-llm-selector-pending | grep -n x'),
-      call(
-        'bash',
-        'cd x && "$SIMPLE_CODE_LESSON" read env-pair; "${SIMPLE_CODE_EVENT}" read cue-zero',
-      ),
-      call('bash', '"$SIMPLE_CODE_NOTE" search prefix-guard'),
-      call('bash', '"$SIMPLE_CODE_NOTE" read same --type principle'),
-      call('bash', '"$SIMPLE_CODE_NOTE" --type goal read same'),
-      call('bash', '"$SIMPLE_CODE_NOTE" read new-lesson --type lesson'),
-      call('view_image', '"$SIMPLE_CODE_SKILL" read deploy'),
-    ])
+    const got = readInContext(
+      [
+        call('bash', '"$SIMPLE_CODE_NOTE" read recall-llm-selector-pending | grep -n x'),
+        call('bash', '"$SIMPLE_CODE_NOTE" read approval-judge'),
+        call('bash', '"$SIMPLE_CODE_NOTE" read twin'),
+        call('bash', '"$SIMPLE_CODE_NOTE" read clash'),
+        call('bash', '"$SIMPLE_CODE_NOTE" read no-such-note'),
+        call(
+          'bash',
+          'cd x && "$SIMPLE_CODE_LESSON" read env-pair; "${SIMPLE_CODE_EVENT}" read cue-zero',
+        ),
+        call('bash', '"$SIMPLE_CODE_NOTE" search prefix-guard'),
+        call('bash', '"$SIMPLE_CODE_NOTE" read same --type principle'),
+        call('bash', '"$SIMPLE_CODE_NOTE" --type goal read same'),
+        call('bash', '"$SIMPLE_CODE_NOTE" read new-lesson --type lesson'),
+        call('view_image', '"$SIMPLE_CODE_SKILL" read deploy'),
+      ],
+      root,
+    )
     expect(got).toEqual(
       new Set([
+        // 不带 --type：只记实际读到的那一类；twin 两类同名、no-such-note 不存在，都没读到
         'note:recall-llm-selector-pending',
+        'wiki:approval-judge',
         'lesson:env-pair',
         'event:cue-zero',
         'principle:same',

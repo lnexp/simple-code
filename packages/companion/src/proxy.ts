@@ -28,7 +28,17 @@ const ROUTE = /^\/sc-p\/([^/]+)(\/.*)?$/
 /** settings 端点白名单带出的段。mcp/bash 不带——里面是本机命令和真实凭据，
  * 端点挂在远端 localhost 上对远端任何本地进程开放（泄露面实测抓到过），
  * 远端也没有那些本机路径 */
-const WHITELIST = ['provider', 'model', 'request', 'memory', 'visionModel'] as const
+// taskModels/imageModel 同属模型选择引用，远端要用就得带上（2026-11-12 补：
+// 漏带导致 Remote-SSH 下 task --models 丢清单、生图 500）
+const WHITELIST = [
+  'provider',
+  'model',
+  'request',
+  'memory',
+  'visionModel',
+  'imageModel',
+  'taskModels',
+] as const
 
 export type ProviderConn = { baseUrl: string; apiKey?: string } & Record<string, unknown>
 
@@ -42,12 +52,30 @@ export type LocalSettings = { providers?: Record<string, ProviderConn> } & Recor
  */
 export function remoteSettingsPayload(raw: LocalSettings, port: number): Record<string, unknown> {
   const providers: Record<string, unknown> = {}
-  for (const [name, v] of Object.entries(raw.providers ?? {}))
+  for (const [name, v] of Object.entries(raw.providers ?? {})) {
+    // claudeAgentSdk 剥掉：SDK 在本机进程跑、claudeAgentSdkPath 是本机路径
+    // 且不在白名单——远端留着 true 却没有 path，loadConfig 三道校验必炸，
+    // 连面板都打不开。远端用不了 SDK 模型，剥了才是真话。models 深一层
+    // 拷贝再改，不污染 readSettings 返回的对象
+    const models = (v as { models?: Record<string, unknown> }).models
     providers[name] = {
       ...v,
+      ...(models
+        ? {
+            models: Object.fromEntries(
+              Object.entries(models).map(([mn, mv]) => [
+                mn,
+                mv && typeof mv === 'object' && 'claudeAgentSdk' in (mv as Record<string, unknown>)
+                  ? { ...(mv as Record<string, unknown>), claudeAgentSdk: undefined }
+                  : mv,
+              ]),
+            ),
+          }
+        : {}),
       baseUrl: `http://127.0.0.1:${port}/sc-p/${encodeURIComponent(name)}`,
       apiKey: 'via-local-proxy',
     }
+  }
   const pick: Record<string, unknown> = {}
   for (const k of WHITELIST) if (raw[k] !== undefined) pick[k] = raw[k]
   return { ...pick, providers }
@@ -147,7 +175,13 @@ export function createProxyServer(deps: ProxyDeps): Server {
       }
       if (body) init.body = body
       const up = await fetchImpl(url, init)
-      res.writeHead(up.status, Object.fromEntries(up.headers))
+      // fetch 已解压：原 content-encoding/长度头会让远端按错的格式读
+      // （对照 credential-proxy 的 DROP_RESPONSE）。头值收到 string：
+      // Object.fromEntries 丢重复键，headers 这儿没有重复场景
+      const resHeaders = Object.fromEntries(up.headers)
+      delete resHeaders['content-encoding']
+      delete resHeaders['content-length']
+      res.writeHead(up.status, resHeaders)
       if (up.body) {
         // SSE 流式：读一块转一块，模型 token 逐个到达
         const reader = up.body.getReader()

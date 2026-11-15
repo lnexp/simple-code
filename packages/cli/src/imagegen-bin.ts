@@ -11,13 +11,15 @@
  * 3 参数错（扩展名/路径/参数，不发请求、不计费）。
  */
 import { createHash } from 'node:crypto'
-import { access, mkdir, writeFile } from 'node:fs/promises'
+import { lstatSync, readlinkSync, realpathSync } from 'node:fs'
+import { lstat, mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   PROXY_PORT_ENV,
   PROXY_TOKEN_ENV,
   PROXY_TOKEN_HEADER,
 } from '@simple-code/core/src/proxy/endpoint.ts'
+import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts'
 
 const USAGE =
   '用法：imagegen "<指令>" <输出路径(.png/.jpg/.jpeg/.webp)> [--size WxH] [--quality <档位>] [--n 张数，默认 1]'
@@ -88,29 +90,57 @@ export function sniffFormat(bytes: Buffer): string | undefined {
 
 const EXT_OF: Record<string, string> = { png: '.png', jpeg: '.jpg', webp: '.webp' }
 
+/** 逐级 realpath（含悬空软链展开）；循环软链返回 null */
+function resolveReal(p: string, depth = 0): string | null {
+  if (depth > 40) return null
+  const cur = resolve(p)
+  try {
+    return realpathSync(cur)
+  } catch {
+    const parent = dirname(cur)
+    if (parent === cur) return cur
+    const realParent = resolveReal(parent, depth)
+    if (realParent === null) return null
+    const next = join(realParent, basename(cur))
+    try {
+      if (lstatSync(next).isSymbolicLink())
+        return resolveReal(resolve(realParent, readlinkSync(next)), depth + 1)
+    } catch {}
+    return next
+  }
+}
+
+function checkRel(root: string, abs: string, out: string): string | null {
+  const rel = relative(root, abs)
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return `输出路径须在项目目录内：${out}`
+  const parts = rel.split(sep)
+  const inScTmp = parts[0] === '.simple-code' && parts[1] === 'tmp'
+  if (!inScTmp && parts.some((p) => p.startsWith('.')))
+    return `输出路径不能在隐藏目录里（.simple-code/tmp 除外）：${out}`
+  return null
+}
+
 /**
- * 输出路径只许落在项目目录（= bash 当前目录）内，不许进隐藏目录——
- * `.simple-code/tmp` 例外（用户定）。审批只看命令文本、认不出 bin 参数是
- * 写路径，所以 bin 自己守。返回绝对路径或错误
+ * 输出路径只许落在项目目录内，不许进隐藏目录——`.simple-code/tmp` 例外（用户定）。
+ * 审批认不出 bin 参数是写路径，bin 自己做字面 + realpath 双核验防软链绕出
  */
 export function checkOutPath(
   root: string,
   out: string,
 ): { ok: true; abs: string } | { ok: false; error: string } {
   const abs = resolve(root, out)
-  const rel = relative(root, abs)
-  if (rel === '' || rel.startsWith('..') || isAbsolute(rel))
-    return { ok: false, error: `输出路径须在项目目录内：${out}` }
-  const parts = rel.split(sep)
-  const inScTmp = parts[0] === '.simple-code' && parts[1] === 'tmp'
-  if (!inScTmp && parts.some((p) => p.startsWith('.'))) {
-    return { ok: false, error: `输出路径不能在隐藏目录里（.simple-code/tmp 除外）：${out}` }
-  }
-  return { ok: true, abs }
+  const litErr = checkRel(resolve(root), abs, out)
+  if (litErr !== null) return { ok: false, error: litErr }
+  const realRoot = resolveReal(root)
+  const realAbs = resolveReal(abs)
+  if (realRoot === null || realAbs === null)
+    return { ok: false, error: `输出路径含无法解析的软链：${out}` }
+  const realErr = checkRel(realRoot, realAbs, out)
+  return realErr !== null ? { ok: false, error: realErr } : { ok: true, abs }
 }
 
 const exists = (p: string): Promise<boolean> =>
-  access(p).then(
+  lstat(p).then(
     () => true,
     () => false,
   )
@@ -216,8 +246,12 @@ async function saveAll(
 export async function imagegenMain(
   argv: string[],
   env: NodeJS.ProcessEnv = process.env,
-  root = process.cwd(),
+  root = findWorkspaceRoot(process.cwd()),
 ): Promise<number> {
+  if (argv.includes('--help') || argv.includes('-h')) {
+    process.stdout.write(`${USAGE}\n`)
+    return 0
+  }
   const parsed = parseImagegenArgs(argv)
   if (!parsed.ok) return fail(parsed.error, 3)
   const { args } = parsed

@@ -368,6 +368,38 @@ describe('bash / 环境变量白名单', () => {
     }
   })
 
+  it('宿主注入的 bin 与桥环境变量键集 ⊆ envPassthrough 默认值', () => {
+    // 对照两处宿主注入点显式列出，防新增工具注入了 env 却漏加白名单（如 SIMPLE_CODE_SC）：
+    // - packages/vscode/src/extension.ts（wireBins + activate 里的 LSP/凭据代理/任务桥）
+    // - packages/cli/src/run.ts（injectLocalTools + ensureCredentialProxy）
+    const hostInjectedKeys = [
+      'SIMPLE_CODE_WEBFETCH',
+      'SIMPLE_CODE_WEBSEARCH',
+      'SIMPLE_CODE_MCP',
+      'SIMPLE_CODE_APPLY_PATCH',
+      'SIMPLE_CODE_MEMORY',
+      'SIMPLE_CODE_NOTE',
+      'SIMPLE_CODE_EVENT',
+      'SIMPLE_CODE_SKILL',
+      'SIMPLE_CODE_LSP',
+      'SIMPLE_CODE_LSP_PORT',
+      'SIMPLE_CODE_PROXY_PORT',
+      'SIMPLE_CODE_PROXY_TOKEN',
+      'SIMPLE_CODE_IMAGEGEN',
+      'SIMPLE_CODE_DOC',
+      'SIMPLE_CODE_TASK',
+      'SIMPLE_CODE_TASK_PORT',
+      'SIMPLE_CODE_TASK_TOKEN',
+      'SIMPLE_CODE_TASK_SEND',
+      'SIMPLE_CODE_WAKE',
+      'SIMPLE_CODE_SC',
+    ]
+    const passthrough = new Set(defaultPassthrough())
+    expect(hostInjectedKeys.filter((k) => !passthrough.has(k))).toEqual([])
+    // 对照组：白名单不是按 SIMPLE_CODE_* 前缀通放
+    expect(passthrough.has('SIMPLE_CODE_API_KEY')).toBe(false)
+  })
+
   it('白名单里没有的名字不会凭空造出空变量', async () => {
     const tool = createBashTool({ ...config, envPassthrough: ['PATH', 'DEFINITELY_NOT_SET_XYZ'] })
     const r = await tool.execute({ command: 'env' }, ctx())
@@ -618,19 +650,22 @@ describe('审批 always 白名单（approval.json）', () => {
     mkdirSync(outsideDir, { recursive: true })
     try {
       const decisions: Array<'allow' | 'always' | 'deny'> = []
+      const seen: Array<Parameters<NonNullable<ToolContext['requestApproval']>>[0]> = []
       const ra = (q: Parameters<NonNullable<ToolContext['requestApproval']>>[0]) => {
-        void q
+        seen.push(q)
         const d = decisions.shift() ?? 'deny'
         return Promise.resolve(d)
       }
-      // 第一次：写外部目录弹卡，选 always（记该目录）——读侧已随
-      // 2026-09-17 项目外读放行，白名单只对写有意义
+      // 第一次：写外部目录弹卡，带 paths 始终允许键（2026-11-11 读写统一），选 always 记该目录
       decisions.push('always')
       await run({ command: `touch ${outsideDir}/x` }, { requestApproval: ra })
-      // 第二次：同目录下别的文件免审
+      expect(seen[0]?.always).toEqual({ kind: 'paths', dirs: [realpathSync(outsideDir)] })
+      // 第二次：同目录下别的文件读写均免审
       decisions.push('deny') // 若再问会被拒 → 报错；不问则放行
-      const r = await run({ command: `touch ${outsideDir}/y` }, { requestApproval: ra })
+      const r = await run({ command: `echo hi > ${outsideDir}/y` }, { requestApproval: ra })
       expect(r.isError).toBe(false)
+      const rRead = await run({ command: `cat ${outsideDir}/y` }, { requestApproval: ra })
+      expect(rRead.output).toContain('hi')
       // 邻居目录不在前缀内，照弹（deny 生效证明问了）
       const r2 = await run({ command: `touch ${root}/../zz` }, { requestApproval: ra })
       expect(r2.isError).toBe(true)

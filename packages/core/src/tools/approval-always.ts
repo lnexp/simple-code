@@ -138,7 +138,7 @@ function append(root: string, key: 'paths', value: string): void {
 export const appendPath = (root: string, dir: string): void => append(root, 'paths', dir)
 
 const COMMENT =
-  '审批「始终允许」写这里（paths/nonPathFrom/hiddenRead/hiddenWrite）；askCommands 是手写的静态审批规则。删行即回收'
+  '审批「始终允许」写这里（paths/nonPathFrom）；askCommands 是手写的静态审批规则。删行即回收'
 
 /** 记一条「命令 lead 的第 from 位起不是路径」。同键已存在且位相同不重写；
  * 位不同取更小的（更早的豁免位覆盖更晚的——用户后点「第 2 位」时，

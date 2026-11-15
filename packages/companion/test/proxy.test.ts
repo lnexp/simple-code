@@ -24,6 +24,22 @@ const fixture: LocalSettings = {
   bash: { approval: {} },
 }
 
+/** 模型选择引用键 + SDK 模型都在（2026-11-12：远端要用/要剥） */
+const fixtureRich: LocalSettings = {
+  ...fixture,
+  imageModel: { provider: 'p1', model: 'img' },
+  taskModels: [{ provider: 'p1', model: 'm1', use: '子任务' }],
+  model: 'm1',
+  providers: {
+    ...fixture.providers,
+    p1: {
+      ...fixture.providers!.p1,
+      baseUrl: 'https://up1.example.com/',
+      models: { m1: {}, img: { claudeAgentSdk: true } },
+    },
+  },
+}
+
 /** 起临时口的服务器，返回 base url 和捕获的转发调用 */
 const start = async (readSettings: () => LocalSettings) => {
   const seen: { url?: URL; headers?: Record<string, string>; body?: string }[] = []
@@ -88,6 +104,50 @@ describe('本机代理（伴生扩展）', () => {
     expect(seen[0]?.headers?.['x-api-key']).toBe('literal-key')
     expect(seen[0]?.headers?.authorization).toBe('Bearer literal-key')
     expect(seen[0]?.body).toContain('hello')
+  })
+
+  it('settings 端点：带出 imageModel/taskModels；providers 里的 claudeAgentSdk 剥掉；不污染原对象', async () => {
+    const { base } = await start(() => fixtureRich)
+    const res = await fetch(`${base}${SETTINGS_PATH}`)
+    const payload = (await res.json()) as Record<string, any>
+    // 白名单补的两个键（2026-11-12：漏带导致远端 task --models 丢清单、生图 500）
+    expect(payload.imageModel).toEqual({ provider: 'p1', model: 'img' })
+    expect(payload.taskModels).toEqual([{ provider: 'p1', model: 'm1', use: '子任务' }])
+    // SDK 标记剥掉：远端没有 claudeAgentSdkPath，留着 true 会让 loadConfig 三道校验炸
+    expect(payload.providers.p1.models.img.claudeAgentSdk).toBeUndefined()
+    expect('claudeAgentSdk' in payload.providers.p1.models.img).toBe(false)
+    expect(payload.providers.p1.models.m1).toEqual({})
+    // 纯函数：原对象的 models 不被改写（readSettings 可能被缓存）
+    expect(
+      (fixtureRich.providers!.p1 as { models?: Record<string, any> }).models?.img,
+    ).toMatchObject({ claudeAgentSdk: true })
+  })
+
+  it('转发响应剥 content-encoding / content-length：fetch 已解压，原头会让远端二次解压失败', async () => {
+    const server = createProxyServer({
+      // apiKey 用字面量：fixture.p1 的 ${TEST_KEY_1} 要环境变量，与本用例无关
+      readSettings: () => ({
+        ...fixture,
+        providers: { p1: { baseUrl: 'https://up1.example.com/', apiKey: 'literal' } },
+      }),
+      fetchImpl: (async () =>
+        new Response('decoded-bytes', {
+          status: 200,
+          headers: { 'content-encoding': 'gzip', 'content-length': '999', 'x-upstream': 'keep' },
+        })) as typeof fetch,
+    })
+    servers.push(server)
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const { port } = server.address() as AddressInfo
+    const res = await fetch(`http://127.0.0.1:${port}/sc-p/p1/v1/messages`, {
+      method: 'POST',
+      body: 'x',
+    })
+    expect(res.headers.get('content-encoding')).toBeNull()
+    expect(res.headers.get('content-length')).toBeNull()
+    expect(res.headers.get('x-upstream')).toBe('keep')
+    expect(await res.text()).toBe('decoded-bytes')
   })
 
   it('同一端口多上游：两个 provider 各回各自 baseUrl（launchd 版做不到的）', async () => {

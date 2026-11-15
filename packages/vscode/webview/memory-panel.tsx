@@ -35,7 +35,7 @@ export function MemoryPanel({
   const running =
     reflectTask !== null && (reflectTask.status === 'running' || reflectTask.status === 'closing')
   const present = reflectTask !== null && !running
-  // NOTE 工具入口统一，但四类分别展示；每条记录只计入一项。
+  // NOTE 工具入口统一，但五类分别展示；每条记录只计入一项。
   const libs =
     stats === null
       ? []
@@ -44,6 +44,7 @@ export function MemoryPanel({
           { label: 'lesson', color: LESSON, n: stats.lessons.total },
           { label: 'principle', color: PRINCIPLE, n: stats.principles.total },
           { label: 'goal', color: GOAL, n: stats.goals.total },
+          { label: 'wiki', color: PINK, n: stats.wikis.total },
           { label: 'event', color: EVENT, n: stats.events.total },
           { label: 'skill', color: TEAL, n: stats.skills },
         ]
@@ -139,3 +140,4 @@ const PRINCIPLE = 'var(--vscode-charts-yellow, #cca700)'
 const GOAL = 'var(--vscode-charts-green, #89d185)'
 const EVENT = 'var(--vscode-charts-orange, #d18616)'
 const TEAL = 'var(--ctx-teal)'
+const PINK = 'var(--ctx-pink)'

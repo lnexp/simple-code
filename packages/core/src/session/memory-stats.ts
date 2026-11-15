@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path'
 import { GLOBAL_CONFIG_PATH } from '../config/load.ts'
 import { EVENTS_INDEX_LIMIT, eventsDir, loadEvents } from '../tools/events.ts'
 import { type NoteType, scanNoteFiles } from '../tools/note-files.ts'
+import { wikiListed } from '../tools/wiki.ts'
 import { buildNoteBudget, DEFAULT_NOTE_BUDGET, type NoteBudgetConfig } from './note-budget.ts'
 
 /** 记忆面板的计数（docs/proposals/reflect-trigger.md §3.2）：真实可见性
@@ -13,11 +14,13 @@ import { buildNoteBudget, DEFAULT_NOTE_BUDGET, type NoteBudgetConfig } from './n
 export type LibraryStat = { total: number; visible: number; hidden: number; superseded: number }
 export type LastReflect = { date: string; theme: string }
 export type MemoryStats = {
-  /** 仅 general；四种 note 类型分别计数，不相互包含。 */
+  /** 仅 general；五种 note 类型分别计数，不相互包含。 */
   notes: LibraryStat
   lessons: LibraryStat
   principles: LibraryStat
   goals: LibraryStat
+  /** 词条不进 note 预算，常驻的是目录页：visible = 目录页列着的现行词条 */
+  wikis: LibraryStat
   events: LibraryStat
   skills: number
   summaries: number
@@ -35,7 +38,10 @@ export function computeMemoryStats(
   const stat = (type: NoteType): LibraryStat => {
     const group = files.filter((f) => f.type === type)
     const superseded = group.filter((f) => f.meta.status === 'superseded').length
-    const visible = selected.filter((f) => f.type === type).length
+    const listed = type === 'wiki' ? wikiListed(root) : null
+    const visible = listed
+      ? group.filter((f) => f.meta.status !== 'superseded' && listed.has(f.name)).length
+      : selected.filter((f) => f.type === type).length
     return { total: group.length, visible, hidden: group.length - visible - superseded, superseded }
   }
   // events 按 updated/created 倒序取前 EVENTS_INDEX_LIMIT；无作废概念
@@ -52,6 +58,7 @@ export function computeMemoryStats(
     lessons: stat('lesson'),
     principles: stat('principle'),
     goals: stat('goal'),
+    wikis: stat('wiki'),
     events,
     skills:
       countSkills(join(root, '.simple-code', 'skills')) + countSkills(join(globalDir, 'skills')),
@@ -74,26 +81,28 @@ const countSummaries = (dir: string): number => {
 
 /** 上次反思：events/memory-reflect-*.md 里 created（回退 mtime）最新的一条。
  *  失败任务不写收尾事件——这个口径天然 = 上次**成功**的反思 */
-const lastReflectOf = (root: string): LastReflect | null => {
+const latestReflect = (root: string): { at: number; theme: string } | null => {
   const dir = eventsDir(root)
   if (!existsSync(dir)) return null
-  let best: LastReflect | null = null
-  let bestAt = 0
+  let best: { at: number; theme: string } | null = null
   for (const f of readdirSync(dir)) {
     if (!f.startsWith('memory-reflect-') || !f.endsWith('.md')) continue
     const path = join(dir, f)
     const m = /^created:\s*(.+)$/m.exec(readFileSync(path, 'utf8'))
     const at = (m !== null && Date.parse(m[1]!.trim())) || statSync(path).mtimeMs
-    if (at > bestAt) {
-      bestAt = at
-      const d = new Date(at)
-      const mm = String(d.getMonth() + 1).padStart(2, '0')
-      const dd = String(d.getDate()).padStart(2, '0')
-      best = {
-        date: `${d.getFullYear()}-${mm}-${dd}`,
-        theme: f.slice('memory-reflect-'.length, -'.md'.length),
-      }
-    }
+    if (at > (best?.at ?? 0)) best = { at, theme: f.slice('memory-reflect-'.length, -'.md'.length) }
   }
   return best
+}
+
+/** 上次反思的时刻（ms）：自动反思门槛的起点之一（vscode reflect-auto.ts） */
+export const lastReflectAt = (root: string): number | null => latestReflect(root)?.at ?? null
+
+const lastReflectOf = (root: string): LastReflect | null => {
+  const best = latestReflect(root)
+  if (best === null) return null
+  const d = new Date(best.at)
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  return { date: `${d.getFullYear()}-${mm}-${dd}`, theme: best.theme }
 }

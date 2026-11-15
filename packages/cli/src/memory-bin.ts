@@ -27,8 +27,18 @@ function arg(name: string): string | undefined {
   return i === -1 ? undefined : process.argv[i + 1]
 }
 
-const [sub, target, ..._rest] = process.argv.slice(2)
+const argv = process.argv.slice(2)
+const [sub, target] = argv
 
+if (
+  sub === 'help' ||
+  sub === '--help' ||
+  sub === '-h' ||
+  (sub !== 'search' && (argv.includes('--help') || argv.includes('-h')))
+) {
+  process.stdout.write(`${usage}\n`)
+  process.exit(0)
+}
 if (sub === 'show' && target) {
   try {
     const out = await runShow(process.cwd(), target, {

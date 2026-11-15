@@ -279,6 +279,29 @@ describe('openai-responses / buildRequest', () => {
     ])
   })
 
+  it('历史里的裸串 input（截断遗留）回放时归一成对象——arguments 不能是 JSON 字符串', () => {
+    // 2026-09-27 实案：max_tokens 截断把工具参数拦腰砍断，input 落库为裸串。
+    // openai-chat / anthropic-messages 已走 asToolInput，此处曾漏（2026-11-12
+    // 函数级复现：裸串直接 stringify 出 '"{\\"command\\":\\"ls' 必被上游 400）
+    const input = wireInput([
+      {
+        role: 'assistant',
+        parts: [
+          {
+            type: 'tool_call',
+            id: 'call_1',
+            name: 'bash',
+            input: '{"command":"ls' as unknown as Record<string, unknown>,
+          },
+        ],
+      },
+    ])
+    expect(input[0]).toMatchObject({
+      type: 'function_call',
+      arguments: '{"_raw":"{\\"command\\":\\"ls"}',
+    })
+  })
+
   it('输入侧是 input_text，输出侧是 output_text', () => {
     const user = wireInput([{ role: 'user', parts: [{ type: 'text', text: 'u' }] }])
     const assistant = wireInput([{ role: 'assistant', parts: [{ type: 'text', text: 'a' }] }])

@@ -364,6 +364,22 @@ describe('AGENTS.md', () => {
     expect(system).not.toContain('notes 索引')
   })
 
+  // 2026-11-13 用户定：词条目录页整页常驻，词条本身不进 note 的 LRU 索引
+  it('wiki 目录页整页进 system（没有普通 note 也进），词条描述不单独进索引', async () => {
+    const system = await systemAfterRound(async (dir) => {
+      const wiki = join(dir, '.simple-code', 'notes', 'wiki')
+      await mkdir(wiki, { recursive: true })
+      await writeFile(join(wiki, 'index.md'), '## 审批\n- approval — 审批判定（approval.ts）\n')
+      await writeFile(
+        join(wiki, 'approval.md'),
+        '---\nname: approval\ntype: wiki\ndescription: 词条描述不该进索引\n---\n\n# A',
+      )
+    })
+    expect(system).toContain('## wiki 词条目录')
+    expect(system).toContain('### 审批\n- approval — 审批判定（approval.ts）')
+    expect(system).not.toContain('词条描述不该进索引')
+  })
+
   it('经验沉淀规则：持续工作主动建立 goal，原则先写 candidate', async () => {
     const system = await systemAfterRound()
     expect(system).toContain('先检查当前项目是否有 current: true 的 goal')
@@ -453,7 +469,7 @@ describe('AGENTS.md', () => {
     expect(withAll).toContain('recall/search 撞到内容与现实矛盾的条目')
     expect(withAll).toContain('完成某 event 挂账的下一步时，当场 progress 闭环一行')
     expect(withAll).not.toContain('$SIMPLE_CODE_LESSON')
-    expect(withAll).toContain('note 统一记录/教训/原则/目标："$SIMPLE_CODE_NOTE" read <name>')
+    expect(withAll).toContain('note 统一记录/教训/原则/目标/词条："$SIMPLE_CODE_NOTE" read <name>')
     expect(withAll).toContain('以 git、notes 与 events 为准')
     // 没注入的环境：DOC 不指路、不教 LSP、不提事件归档——说了就是误导
     expect(none).not.toContain('$SIMPLE_CODE_DOC')

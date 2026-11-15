@@ -47,7 +47,20 @@ describe('lspMain', () => {
     expect(await lspMain(['refs', 'a.ts:1'])).toBe(2)
   })
 
-  it('参数错退 3', async () => {
+  it('--help / -h 退 0 且用法写 stdout；参数错退 3', async () => {
+    delete process.env.SIMPLE_CODE_LSP_PORT
+    const out: string[] = []
+    const orig = process.stdout.write.bind(process.stdout)
+    process.stdout.write = ((s: string) => (
+      out.push(String(s)), true
+    )) as typeof process.stdout.write
+    try {
+      expect(await lspMain(['--help'])).toBe(0)
+      expect(await lspMain(['-h'])).toBe(0)
+    } finally {
+      process.stdout.write = orig
+    }
+    expect(out.join('')).toContain('用法：')
     process.env.SIMPLE_CODE_LSP_PORT = '59999'
     expect(await lspMain([])).toBe(3)
   })
