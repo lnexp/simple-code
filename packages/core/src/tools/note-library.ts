@@ -1,12 +1,19 @@
-/** 四类型共用检索/写入；旧格式只读时不强制满足新写入格式。 */
+/** 五类型共用检索/写入；旧格式只读时不强制满足新写入格式。 */
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { estimateTextTokens } from '../loop/tokens.ts'
 import { decayCutoff, decayNotice, parseStamp } from './decay.ts'
 import { LESSON_SECTIONS } from './lesson.ts'
-import { type NoteFile, type NoteType, noteWritePath, scanNoteFiles } from './note-files.ts'
+import {
+  type NoteFile,
+  type NoteType,
+  noteWritePath,
+  resolveNoteFile,
+  scanNoteFiles,
+} from './note-files.ts'
 import { matchTerms, splitSearchTerms } from './search-terms.ts'
 import { localStamp } from './timestamp.ts'
+import { WIKI_SECTIONS } from './wiki.ts'
 
 type QueryOptions = { type?: NoteType; all?: boolean }
 type WriteInput = { name: string; title: string; description: string; body: string }
@@ -28,6 +35,7 @@ function hidden(file: NoteFile, all?: boolean): boolean {
     file.issue ||
     file.type === 'principle' ||
     file.type === 'goal' ||
+    file.type === 'wiki' ||
     file.meta.status === 'superseded'
   )
     return false
@@ -94,12 +102,41 @@ export function noteSection(body: string, name: string): string {
     .trim()
 }
 
+/** 引用边界：前后都不是名字字符（小写、数字、连字符），防 `review-x`
+ *  误命中正文里更长的 `review-x-v2` 前缀段。 */
+const nameBoundary = (name: string): RegExp =>
+  new RegExp(`(?<![a-z0-9-])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z0-9-])`)
+
+/**
+ * 「读到一条，顺藤一簇」：note 名互引即图——`by:` 链、正文「见 note x」都是
+ * 边，read 尾部摊开一跳邻居（本条提及谁、谁提及本条）。边只来自正文里
+ * 真实写下的名字，孤岛保持干净；补边靠写新条目时顺手引用，不回头改旧条目。
+ * 每次全库重读（与 scanNoteFiles 的惯例一致），145 条毫秒级，不做缓存。
+ */
+export function relatedNotes(root: string, name: string, options: QueryOptions = {}): string {
+  const entry = resolveNoteFile(root, name, options.type)
+  const self = entry.copies[0]!.text
+  const outgoing = new Set<string>()
+  const incoming = new Set<string>()
+  for (const file of scanNoteFiles(root)) {
+    if (file.name === name) continue // 同名（含本条与跨类型同名）不算邻居
+    if (nameBoundary(file.name).test(self)) outgoing.add(file.name)
+    if (nameBoundary(name).test(file.copies[0]!.text)) incoming.add(file.name)
+  }
+  const lines = [
+    outgoing.size ? `  本条提及：${[...outgoing].sort().join('、')}` : '',
+    incoming.size ? `  提及本条：${[...incoming].sort().join('、')}` : '',
+  ].filter(Boolean)
+  return lines.length ? `相关：\n${lines.join('\n')}` : ''
+}
+
 export function validateNoteBody(body: string, type: NoteType): void {
   const required: Record<NoteType, readonly string[]> = {
     general: [],
     lesson: LESSON_SECTIONS.map((s) => s.label),
     principle: ['判断', '适用边界', '依据'],
     goal: GOAL_SECTIONS,
+    wiki: WIKI_SECTIONS,
   }
   const missing = required[type].filter((section) => !noteSection(body, section))
   // 旧手工原则使用「来源与推导」，可读和生效均接受；不要求为升级重写真实文件。

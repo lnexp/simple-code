@@ -170,6 +170,8 @@ export const bashConfig = strictObject({
       'SIMPLE_CODE_TASK_SEND',
       // 闹钟（loop-interrupt.md 实现项 3）：与上面同一个桥（路径 env 独立）
       'SIMPLE_CODE_WAKE',
+      // 一次性子 agent CLI（extension.ts / cli run.ts）：无任务桥时的并行回落
+      'SIMPLE_CODE_SC',
     ]),
 })
 

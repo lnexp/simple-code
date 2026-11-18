@@ -1,5 +1,5 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
@@ -233,6 +233,60 @@ describe('scMain', () => {
     expect(h.stdout()).toContain('p/v\t256000\tyes')
     expect(h.stdout()).not.toContain('TEST_KEY')
     expect(h.stdout()).not.toContain('example.invalid')
+  })
+  it('~ 下 --models 不炸且列出全局模型；对照组：~ 下跑任务仍撞家目录禁令', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'sc-sc-'))
+    dirs.push(dir)
+    const globalPath = join(dir, 'settings.json')
+    await writeFile(globalPath, JSON.stringify(CONFIG), 'utf8')
+    const list = io({ argv: ['--models'], globalPath, cwd: homedir() })
+    expect(await scMain(list.argv, list.io)).toBe(0)
+    expect(list.stderr()).toBe('')
+    expect(list.stdout()).toContain('p/m\t100000\tno')
+    expect(list.stdout()).toContain('p/v\t256000\tyes')
+    // 对照组：家目录禁令对建会话路径未削弱
+    const run = io({ argv: ['任务'], globalPath, cwd: homedir() })
+    expect(await scMain(run.argv, run.io)).toBe(2)
+    expect(run.stderr()).toContain('用户主目录')
+  })
+  it('项目下 --models 照旧读合并配置；--root 覆盖时按目标目录解析', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'sc-sc-'))
+    dirs.push(base)
+    const globalPath = join(base, 'global.json')
+    await writeFile(globalPath, JSON.stringify(CONFIG), 'utf8')
+    const proj = join(base, 'proj')
+    const other = join(base, 'other')
+    await mkdir(join(proj, '.simple-code'), { recursive: true })
+    await mkdir(other, { recursive: true })
+    await writeFile(
+      join(proj, '.simple-code', 'settings.json'),
+      JSON.stringify({
+        providers: {
+          p: {
+            models: {
+              m: { contextWindow: 200_000 },
+              ws: { contextWindow: 64_000, capabilities: { images: true } },
+            },
+          },
+        },
+      }),
+      'utf8',
+    )
+    // 1. 项目目录下跑 --models：合并工作区配置（窗口覆盖 + 新增模型）
+    const inProj = io({ argv: ['--models'], globalPath, cwd: proj })
+    expect(await scMain(inProj.argv, inProj.io)).toBe(0)
+    expect(inProj.stdout()).toContain('p/m\t200000\tno')
+    expect(inProj.stdout()).toContain('p/ws\t64000\tyes')
+    // 2. ~ 下带 --root <proj> 跑 --models：按 --root 目标读合并配置
+    const fromHomeWithRoot = io({ argv: ['--root', proj, '--models'], globalPath, cwd: homedir() })
+    expect(await scMain(fromHomeWithRoot.argv, fromHomeWithRoot.io)).toBe(0)
+    expect(fromHomeWithRoot.stdout()).toContain('p/m\t200000\tno')
+    expect(fromHomeWithRoot.stdout()).toContain('p/ws\t64000\tyes')
+    // 3. 项目目录下带 --root <other> 跑 --models：按 other 读，不含 proj 覆盖
+    const overrideOther = io({ argv: ['--root', other, '--models'], globalPath, cwd: proj })
+    expect(await scMain(overrideOther.argv, overrideOther.io)).toBe(0)
+    expect(overrideOther.stdout()).toContain('p/m\t100000\tno')
+    expect(overrideOther.stdout()).not.toContain('p/ws')
   })
   it('没任务（无参数、stdin 非 tty 且为空）：退出码 2', async () => {
     const h = io({ argv: [], stdin: '' })

@@ -6,12 +6,12 @@ import { type ApprovalConfig, type ApprovalVerdict, classify } from '../src/tool
 import { warmupShellParser } from '../src/tools/shell-ast.ts'
 
 /**
- * 路径审批（2026-11-04 简化拍板）：项目内全放（含 .env——用户要拦自己配
- * askCommands）、项目外一律 ask 且一律可「始终允许」（键=目录前缀，读写
- * 同权）、任何位置的 .simple-code/memory 写 deny、审批配置（approval.json）
- * 写 deny（2026-11-05 拍板：配置是审批的根基，压过批键）。这文件测的是
- * 「项目内/项目外怎么算出来」——位置真实性计算（cd、..、子 shell、变量
- * 代入、symlink、PWD）都在这里。走 AST 路径（预热）——生产上绝大多数
+ * 路径审批（2026-11-04 简化，2026-11-11 读写统一）：项目内全放（含 .env——
+ * 用户要拦自己配 askCommands）、项目外一律 ask 且读写均附「始终允许」键
+ * （键=目录前缀，读写同权）、任何位置的 .simple-code/memory 写 deny、审批
+ * 配置（approval.json）写 deny（2026-11-05 拍板：配置是审批的根基，压过批键）。
+ * 这文件测的是「项目内/项目外怎么算出来」——位置真实性计算（cd、..、子 shell、
+ * 变量代入、symlink、PWD）都在这里。走 AST 路径（预热）——生产上绝大多数
  * 命令走它。
  */
 const tmp = (p: string) => realpathSync(mkdtempSync(join(tmpdir(), p)))
@@ -336,21 +336,40 @@ describe('项目外一律 ask，一律可始终允许（键=目录前缀，读�
     expect(v.kind, cmd).toBe('ask')
     return v.kind === 'ask' ? v.alwaysPaths : undefined
   }
-  it('~ 直下与任意项目外：键=文件所在目录', () => {
+  it('~ 直下与任意项目外：键=文件所在目录（2026-11-11 拍板：读写完全一致）', () => {
     expect(keys(`cat ${HOME}/.ssh/id_rsa`)).toEqual([join(HOME, '.ssh')])
     expect(keys(`cat ${HOME}/.m2/repository/axis-1.4.jar`)).toEqual([join(HOME, '.m2/repository')])
     expect(keys(`ls ${HOME}/.ssh/*`)).toEqual([join(HOME, '.ssh')])
     expect(keys(`cat ${OTHER}/web/.env.production`)).toEqual([join(OTHER, 'web')])
-    // 写卡不给键（写外面必须每次看着——2026-11-04 简化保留写卡的裸弹）
-    expect(keys(`echo x >> ${HOME}/.zshrc`)).toBeUndefined()
-    // ~/.simple-code 子树 2026-11-05 起免审（含写），例子换 ~ 下普通隐藏目录
-    expect(keys(`echo x > ${HOME}/.cache/a.log`)).toBeUndefined()
+    // 写卡与读一致给键（测试夹具 HOME 是临时目录而非 os.homedir()，.zshrc 父目录即 HOME）
+    expect(keys(`echo x >> ${HOME}/.zshrc`)).toEqual([HOME])
+    expect(keys(`echo x > ${HOME}/.cache/a.log`)).toEqual([join(HOME, '.cache')])
+    // 写项目外与读同一目录的键完全相同（重定向写与写动词均同）
+    expect(keys(`echo x > ${OTHER}/a.txt`)).toEqual([OTHER])
+    expect(keys(`echo x > ${OTHER}/a.txt`)).toEqual(keys(`cat ${OTHER}/a.txt`))
+    expect(keys(`echo x > ${OTHER}/web/a.txt`)).toEqual([join(OTHER, 'web')])
+    expect(keys(`rm ${OTHER}/web/.env.production`)).toEqual([join(OTHER, 'web')])
+    // 真机 ~ 直下文件（dirname === homedir()）：过宽防线读写一致均不给键
+    expect(keys('cat ~/.zshrc')).toBeUndefined()
+    expect(keys('echo x >> ~/.zshrc')).toBeUndefined()
   })
-  it('批过键就放：读写同权（hiddenRead/hiddenWrite 已并，2026-11-05 收敛）', () => {
+  it('批过键就放：读写同权闭环（批写卡拿到的键后，同目录读写直接 allow）', () => {
+    const granted = keys(`echo x > ${OTHER}/a.txt`)
+    expect(granted).toEqual([OTHER]) // 前提：未批时写项目外弹 ask 且带目录键
+    const cfgGranted = { alwaysPaths: granted ?? [] }
+    allow(`echo x > ${OTHER}/a.txt`, cfgGranted)
+    allow(`echo x > ${OTHER}/web/b.txt`, cfgGranted)
+    allow(`cat ${OTHER}/web/.env.production`, cfgGranted)
+    // 对照：未批的另一项目外目录照弹
+    expect(judge(`echo x > ${HOME}/.cache/a.log`, cfgGranted).kind).toBe('ask')
     allow(`cat ${HOME}/.ssh/id_rsa`, { alwaysPaths: [join(HOME, '.ssh')] })
     allow(`cat ${HOME}/.ssh/none`, { alwaysPaths: [join(HOME, '.ssh')] }) // 不存在也罩
     allow(`echo x > ${HOME}/.cache/a.log`, { alwaysPaths: [join(HOME, '.cache')] })
-    denied(`echo x > ${HOME}/.simple-code/memory/x`, { alwaysPaths: [HOME] }) // 批键罩不住 memory 禁令
+    // 防回归：memory 写与 approval.json 写仍是 deny，批键罩不住
+    denied(`echo x > ${HOME}/.simple-code/memory/x`, { alwaysPaths: [HOME] })
+    denied(`echo x > ${OTHER}/.simple-code/memory/x`, { alwaysPaths: [OTHER] })
+    denied('echo "{}" > .simple-code/approval.json', { alwaysPaths: [ROOT] })
+    denied('echo "{}" > ~/.simple-code/approval.json', { alwaysPaths: [HOME] })
   })
   it('通配结尾的键=父目录（真机上等于家目录/根时被 dirHint 过滤掉不给）', () => {
     // 测试夹具的 HOME 是临时目录、不是 process 的 homedir()，过滤不了——
@@ -362,17 +381,41 @@ describe('项目外一律 ask，一律可始终允许（键=目录前缀，读�
     allow(`grep x "$HOME/.simple-code/bin/self.md"`)
     allow(`echo x > ${HOME}/.simple-code/bin/self.md`)
   })
-  it('多处触发合并成 multi，键齐全时批量给', () => {
+  it('多处触发合并成 multi，键齐全时批量给（含读写混排）', () => {
     const v = judge(`cat ${OTHER}/web/a.txt; cat ${HOME}/.cache/b.log; cat ${HOME}/.nvm/c`)
     expect(v).toMatchObject({
       kind: 'ask',
       category: 'multi',
       alwaysPaths: [join(OTHER, 'web'), join(HOME, '.cache'), join(HOME, '.nvm')],
     })
-    // 掺一处记不成键的（键收敛到根，dirHint 判过宽）：整张不给
+    // 同时读写两个项目外目录：跨段合并走 multi 给双目录键，与纯读一致
+    const rw = judge(`cat ${OTHER}/web/a.txt | tee ${HOME}/.cache/b.log`)
+    expect(rw).toMatchObject({
+      kind: 'ask',
+      category: 'multi',
+      alwaysPaths: [join(OTHER, 'web'), join(HOME, '.cache')],
+    })
+    const rwSeq = judge(`cat ${OTHER}/web/a.txt && echo x > ${HOME}/.cache/b.log`)
+    expect(rwSeq).toMatchObject({
+      kind: 'ask',
+      category: 'multi',
+      alwaysPaths: [join(OTHER, 'web'), join(HOME, '.cache')],
+    })
+    // 单段内双路径（如 `cat A/x > B/y`）：段内维持既有首中即返（pathRules firstAsk），
+    // 先出 A 的键，批完 A 后再出 B 的写键（与单段纯读 `cat A/x B/y` 逻辑一致）
+    expect(keys(`cat ${OTHER}/web/a.txt > ${HOME}/.cache/b.log`)).toEqual([join(OTHER, 'web')])
+    expect(
+      keys(`cat ${OTHER}/web/a.txt > ${HOME}/.cache/b.log`, {
+        alwaysPaths: [join(OTHER, 'web')],
+      }),
+    ).toEqual([join(HOME, '.cache')])
+    // 掺一处记不成键的（键收敛到根/家目录，dirHint 判过宽）：读写同样整张不给
     const w = judge(`cat ${OTHER}/web/a.txt; ls /x`)
     expect(w).toMatchObject({ kind: 'ask', category: 'multi' })
     expect(w).not.toHaveProperty('alwaysPaths')
+    const wWrite = judge(`cat ${OTHER}/web/a.txt; echo x > /x`)
+    expect(wWrite).toMatchObject({ kind: 'ask', category: 'multi' })
+    expect(wWrite).not.toHaveProperty('alwaysPaths')
   })
 })
 
@@ -480,5 +523,77 @@ describe('$() 命令替换的拼接串（2026-11-05 真机：git rev-parse 残�
   })
   it('纯字面双引号串不误伤：照常判', () => {
     external('cat "/etc/hosts"')
+  })
+  it('$( ) 残片照常推进位置状态机，不掩护后续真实路径参数', () => {
+    // script 位（firstPositionalLeft）：字面与含 $( ) 同判，后续外部路径照弹
+    external('sed -n "1,+12p" /etc/passwd')
+    external('sed -n "$(echo 1),+12p" /etc/passwd')
+    external('sed -n "$(echo 1)-" /etc/passwd')
+    // -e 的值位（skipNextValue）：字面与含 $( ) 同判，后续禁令路径照拒
+    denied('sed -i -e "s/a/b/" .simple-code/approval.json')
+    denied('sed -i -e "s/$(echo a)/b/" .simple-code/approval.json')
+    denied('sed -i -e "s/$(echo a)/b/" .simple-code/memory/state.db')
+    denied('sed -i -e "$(echo a)done" .simple-code/approval.json')
+    // 反向对照：后续是项目内普通文件时照放（残片以 / 开头也不误弹 script 位）
+    allow('sed -n "/$(echo x)/,+12p" .gitignore')
+    allow('sed -i -e "s/$(echo a)/b/" .gitignore')
+    // positionalSeen 照加：位 1 的 $( ) 路径记算不出且占住位次，位 2 正常进 nonPathFrom
+    external('xcli get "$(pwd)/f.pptx" /slide[2]')
+    const seen: string[] = []
+    allow('xcli get "$(pwd)/f.pptx" /slide[2]', {
+      nonPathFrom: { xcli: 2 },
+      onUnparsed: (t) => seen.push(t),
+    })
+    expect(seen).toEqual(['/f.pptx'])
+  })
+})
+
+describe('规则 0 的 WAKE 特例：--until-ok 内层命令递归过审批', () => {
+  it('不带 --until-ok 或内层命令落在项目内：allow', () => {
+    allow('"$SIMPLE_CODE_WAKE" --after 30m')
+    allow('"$SIMPLE_CODE_WAKE" --at 08:00 --note "晨醒汇总"')
+    allow('"$SIMPLE_CODE_WAKE" --until-ok "test -f package.json"')
+    // --note 的值里含 --until-ok 文本不误当条件命令
+    allow('"$SIMPLE_CODE_WAKE" --after 30m --note "--until-ok sudo rm -rf /"')
+  })
+  it('内层命令读项目外路径：原样返回 ask（external_dir），空格与等号两种写法一致', () => {
+    external('"$SIMPLE_CODE_WAKE" --until-ok "cat /etc/passwd"')
+    external('"$SIMPLE_CODE_WAKE" --until-ok="cat /etc/passwd"')
+  })
+  it('内层命令命中禁令（sudo / memory 写 / approval.json 写 / denyCommands）：deny 且带前缀', () => {
+    const v1 = denied('"$SIMPLE_CODE_WAKE" --until-ok "sudo rm -rf /"')
+    expect(v1.kind === 'deny' && v1.reason.startsWith('闹钟条件命令：')).toBe(true)
+    const v2 = denied('"$SIMPLE_CODE_WAKE" --until-ok "echo x > .simple-code/memory/state.db"')
+    expect(v2.kind === 'deny' && v2.reason.startsWith('闹钟条件命令：')).toBe(true)
+    const v3 = denied('"$SIMPLE_CODE_WAKE" --until-ok "echo {} > .simple-code/approval.json"')
+    expect(v3.kind === 'deny' && v3.reason.startsWith('闹钟条件命令：')).toBe(true)
+    const v4 = denied('"$SIMPLE_CODE_WAKE" --until-ok "rm -rf build"', {
+      denyCommands: ['rm -rf *'],
+    })
+    expect(v4.kind === 'deny' && v4.reason.startsWith('闹钟条件命令：')).toBe(true)
+    // 段级形态（cd && wake）同样拦截
+    denied('cd packages && "$SIMPLE_CODE_WAKE" --until-ok "sudo rm -rf /"')
+  })
+  it('嵌套 wake --until-ok 超过一层：直接按 ask 处理（单引号与双引号转义均拦）', () => {
+    expect(
+      judge(
+        '"$SIMPLE_CODE_WAKE" --until-ok \'"$SIMPLE_CODE_WAKE" --until-ok "test -f package.json"\'',
+      ).kind,
+    ).toBe('ask')
+    expect(
+      judge(
+        '"$SIMPLE_CODE_WAKE" --until-ok "\\"$SIMPLE_CODE_WAKE\\" --until-ok \\"test -f package.json\\""',
+      ).kind,
+    ).toBe('ask')
+  })
+  // 不写 "$SIMPLE_CODE_WAKE" 也能调到同一个 bin：直接给路径、经 sh/bash 套脚本、
+  // 或进到目录后 ./sc-wake。~/.simple-code 子树免审，光认变量形态会漏
+  it('按路径调用 wake（~/.simple-code/bin/sc-wake、sh 套脚本、./sc-wake）：一样递归判', () => {
+    denied('~/.simple-code/bin/sc-wake --until-ok "sudo rm -rf /"')
+    denied(`${HOME}/.simple-code/bin/sc-wake --until-ok "sudo rm -rf /"`)
+    denied('sh ~/.simple-code/bin/sc-wake --until-ok "sudo rm -rf /"')
+    denied('cd ~/.simple-code/bin && ./sc-wake --until-ok "sudo rm -rf /"')
+    external('~/.simple-code/bin/sc-wake --until-ok "cat /etc/passwd"')
+    allow('~/.simple-code/bin/sc-wake --until-ok "test -f package.json"')
   })
 })

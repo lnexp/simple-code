@@ -133,6 +133,15 @@ const TOKEN_RE = /(?:[^\s"']+|"[^"]*"|'[^']*')+/g
 const SEGMENT_SPLIT_RE = /(?:&&|\|\||[;|&])/
 
 export function classify(command: string, root: string, cfg: ApprovalConfig): ApprovalVerdict {
+  return classifyAt(command, root, cfg, 0)
+}
+
+function classifyAt(
+  command: string,
+  root: string,
+  cfg: ApprovalConfig,
+  depth: number,
+): ApprovalVerdict {
   const cmd = command.trim()
   // 第 2 层的真实路径上下文（real-path.ts）：cwd 随顶层 cd 逐段更新
   const real: RealCtx = {
@@ -143,18 +152,24 @@ export function classify(command: string, root: string, cfg: ApprovalConfig): Ap
   }
 
   // 规则 0：自家 bin。引号形态固定（宿主注入的就是 "$SIMPLE_CODE_X"）。
-  // 例外：APPLY_PATCH 的 heredoc 里藏着任意路径的写操作（补审批闭环的
-  // 洞——别的自家 bin 都是固定语义，唯有它把「写哪」完全交给补丁内容），
-  // 抽出路径逐个过 pathVerdict（写意图）
+  // 例外 1：APPLY_PATCH 的 heredoc 里藏着任意路径的写操作（别的自家 bin
+  // 都是固定语义，唯有它把「写哪」完全交给补丁内容），抽出路径逐个过 pathVerdict。
+  // 例外 2：WAKE 的 --until-ok 在宿主侧跑任意 shell 命令，抽出内层命令递归过 classify
   if (cmd.startsWith('"$SIMPLE_CODE_')) {
     if (cmd.startsWith('"$SIMPLE_CODE_APPLY_PATCH"')) {
       const v = patchVerdict(cmd, root, cfg, real)
       if (v) return v
       // 无引号 heredoc 的 body 展开风险不再弹卡（2026-11-04 拍板——
       // 解释器与 $( ) 均已放行，同层风险一并接受）
+      return { kind: 'allow' }
     }
-    // 其余自家 bin（NOTE/LESSON 的 write 吃 heredoc stdin）语义固定，照放
-    return { kind: 'allow' }
+    if (cmd === '"$SIMPLE_CODE_WAKE"' || /^"\$SIMPLE_CODE_WAKE"\s/.test(cmd)) {
+      const v = wakeTopVerdict(cmd, root, cfg, depth)
+      if (v) return v
+    } else {
+      // 其余自家 bin（NOTE/LESSON 的 write 吃 heredoc stdin）语义固定，照放
+      return { kind: 'allow' }
+    }
   }
 
   // AST 路径：正则层那套「含 $( / 反引号就问」在这里不需要——$() 里的
@@ -169,7 +184,7 @@ export function classify(command: string, root: string, cfg: ApprovalConfig): Ap
     for (const s of segs) {
       followScopes(entered, s.scopes ?? [], real)
       applyAssigns(s.assigns, real, runtime)
-      const v = judge(s.lead, s.items, root, cfg, real, cmd)
+      const v = judge(s.lead, s.items, root, cfg, real, { rawCmd: cmd, depth })
       // deny（禁令档）立即短路：memory 写、sudo 不参与段合并——合并卡
       // 是 ask 语义（always 键采集），禁令没有「允许一次」可谈
       if (v.kind === 'deny') return v
@@ -193,7 +208,7 @@ export function classify(command: string, root: string, cfg: ApprovalConfig): Ap
   // always 键——多处触发无法收敛成安全粒度（同隐藏路径的口径）
   const asks: Extract<ApprovalVerdict, { kind: 'ask' }>[] = []
   for (const seg of splitSegments(cmd)) {
-    const v = classifySegment(seg, root, cfg, real, cmd)
+    const v = classifySegment(seg, root, cfg, real, { rawCmd: cmd, depth })
     if (v.kind === 'deny') return v
     if (v.kind === 'ask') asks.push(v)
     trackCd(
@@ -520,8 +535,16 @@ function judge(
   root: string,
   cfg: ApprovalConfig,
   real: RealCtx,
-  rawCmd?: string,
+  extra?: { rawCmd?: string; depth?: number },
 ): ApprovalVerdict {
+  const rawCmd = extra?.rawCmd
+  const depth = extra?.depth ?? 0
+  // --until-ok 是「参数即命令」的入口：不管用什么写法调到 wake（宿主注入的
+  // "$SIMPLE_CODE_WAKE"、~/.simple-code/bin/sc-wake 路径、sh 套一层脚本），
+  // 内层命令都要过审批——否则 ~/.simple-code 子树免审就把任意外部命令送进去
+  if (items.some((it) => it.text === '--until-ok' || it.text.startsWith('--until-ok=')))
+    return wakeSegmentVerdict(items, root, cfg, depth)
+
   // 段级自家 bin（规则 0 的分段形态：`cd x && "$SIMPLE_CODE_Y" <<'H' …`）。
   // 两条路径都需要：AST 下 heredoc body 本就不进 token，这条让正则回退
   // 在冷启动窗口也能放行 apply_patch 补丁
@@ -529,6 +552,9 @@ function judge(
     if (unquote(lead) === '$SIMPLE_CODE_APPLY_PATCH' && rawCmd) {
       const v = patchVerdict(rawCmd, root, cfg, real)
       if (v) return v
+    }
+    if (unquote(lead) === '$SIMPLE_CODE_WAKE') {
+      return wakeSegmentVerdict(items, root, cfg, depth)
     }
     return { kind: 'allow' }
   }
@@ -545,6 +571,16 @@ function judge(
   // 含 lead 占位，AST 不含，后面「第一个位置参数」的起算要区分
   const fromFallback = lead === ''
   if (fromFallback && head < items.length) lead = unquote(items[head]?.text ?? '')
+  if (fromFallback && lead.startsWith('$SIMPLE_CODE_')) {
+    if (lead === '$SIMPLE_CODE_APPLY_PATCH' && rawCmd) {
+      const v = patchVerdict(rawCmd, root, cfg, real)
+      if (v) return v
+    }
+    if (lead === '$SIMPLE_CODE_WAKE') {
+      return wakeSegmentVerdict(items.slice(head + 1), root, cfg, depth)
+    }
+    return { kind: 'allow' }
+  }
 
   // 透传前缀（nohup/timeout/env/xargs …）后面才是真正执行的命令：内层
   // 整段先判一次，再按外层照旧判（只收紧不放宽）。按命令名判的规则只
@@ -552,7 +588,7 @@ function judge(
   // … &`、`nohup appctl release create …` 发布闸静默放行
   const inner = passthroughInner(lead, fromFallback ? items.slice(head + 1) : items)
   if (inner) {
-    const v = judge(inner.lead, inner.items, root, cfg, real, rawCmd)
+    const v = judge(inner.lead, inner.items, root, cfg, real, extra)
     if (v.kind !== 'allow') return v
   }
 
@@ -672,20 +708,13 @@ function pathRules(
     // 在丢掉引号信息前解析确定的变量路径，随后走全部审批规则。
     // 只在 hiddenVerdict 展开会漏掉 paths 白名单与 .simple-code 读豁免。
     t = expandPathPrefix(item.text, t, real)
-    // $( ) 拼接的残片（shell-ast 的 subst 标记）：真实落点要执行替换才知道，
-    // 静态判不出——归「算不出」放行 + 日志，不能把残片当绝对路径判
-    // （2026-11-05 真机：ls "$(git rev-parse --show-toplevel)/common/…" 弹卡）
-    if (item.subst) {
-      cfg.onUnparsed?.(t, `路径算不出（$( ) 替换的拼接串）：${t}`)
-      continue
-    }
-    if (t === '' || t === '-') continue
-    if (SHELL_RESERVED.has(t)) continue // 段中/段尾骨架词（done 等）
+    if (!item.subst && (t === '' || t === '-')) continue
+    if (!item.subst && SHELL_RESERVED.has(t)) continue // 段中/段尾骨架词（done 等）
     if (skipNextValue) {
       skipNextValue = false
       continue
     }
-    if (t.startsWith('-')) {
+    if (t.startsWith('-') && t !== '-') {
       // script 类 flag（-e/-f，含组合形态）一出现，位置参数全是文件——
       // 位置参数豁免整体关闭。-f 的值不走 skipNextValue，落回正常判定
       if (isNonPathScriptFlag(t)) skipNextValue = true
@@ -708,6 +737,14 @@ function pathRules(
     }
     const at = positionalSeen
     positionalSeen++
+    // $( ) 拼接的残片（shell-ast 的 subst 标记）：真实落点要执行替换才知道，
+    // 静态判不出——位置状态机照常推进（不能漏消 flag 值或 script 位而掩护
+    // 后面的真路径），到路径判定前归「算不出」放行 + 日志，不把残片当绝对路径判
+    // （2026-11-05 真机：ls "$(git rev-parse --show-toplevel)/common/…" 弹卡）
+    if (item.subst) {
+      cfg.onUnparsed?.(t, `路径算不出（$( ) 替换的拼接串）：${t}`)
+      continue
+    }
     const write = item.write || verbWrites
     // git 的 REV:path：冒号后是仓库历史里的路径，磁盘上不一定有——不查
     // 存在，按第 1 层看名字（`git show HEAD:.env` 拦）；始终允许与磁盘读同键
@@ -752,7 +789,7 @@ function classifySegment(
   root: string,
   cfg: ApprovalConfig,
   real: RealCtx,
-  rawCmd?: string,
+  extra?: { rawCmd?: string; depth?: number },
 ): ApprovalVerdict {
   const items: Item[] = []
   let pendingRedirect: 'write' | 'read' | false = false
@@ -763,7 +800,155 @@ function classifySegment(
     pendingRedirect = /^\d*&?>>?$/.test(token) ? 'write' : /^\d*<$/.test(token) ? 'read' : false
     items.push({ text: token, write: redirectedWrite, redirect })
   }
-  return judge('', items, root, cfg, real, rawCmd)
+  return judge('', items, root, cfg, real, extra)
+}
+
+/** wake 除 --until-ok 外的带值选项（与 packages/cli/src/wake.ts 参数解析同步）：
+ *  跳过它们的值，避免 `--note "--until-ok ..."` 把备忘文本误当条件命令 */
+const WAKE_VALUE_FLAGS = new Set(['--after', '--at', '--every', '--note', '--cancel'])
+
+/** 读取双引号片段（start 为开引号后一位）：还原 bash 双引号内的 \" \\ \$ \` 与续行 */
+function readDoubleQuoted(cmd: string, start: number): { text: string; end: number } | null {
+  let text = ''
+  for (let i = start; i < cmd.length; i++) {
+    const ch = cmd[i]!
+    if (ch === '"') return { text, end: i }
+    if (ch !== '\\') {
+      text += ch
+      continue
+    }
+    const next = cmd[++i]
+    if (next === undefined) return null
+    if (next === '\n') continue
+    text += next === '"' || next === '\\' || next === '$' || next === '`' ? next : `\\${next}`
+  }
+  return null
+}
+
+/** 单条简单命令按 bash 词法切词并去引号。
+ *  引号外遇管道/连接符/重定向/换行返回 'compound'（交分段路径），引号未闭合返回 'unclosed' */
+function shellWords(cmd: string): string[] | 'compound' | 'unclosed' {
+  const words: string[] = []
+  let cur = ''
+  let started = false
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]!
+    if (ch === "'") {
+      const end = cmd.indexOf("'", i + 1)
+      if (end === -1) return 'unclosed'
+      cur += cmd.slice(i + 1, end)
+      started = true
+      i = end
+    } else if (ch === '"') {
+      const dq = readDoubleQuoted(cmd, i + 1)
+      if (!dq) return 'unclosed'
+      cur += dq.text
+      started = true
+      i = dq.end
+    } else if (ch === '\\') {
+      const next = cmd[++i]
+      if (next === undefined) return 'unclosed'
+      if (next !== '\n') {
+        cur += next
+        started = true
+      }
+    } else if (/[\n;|&<>()]/.test(ch)) {
+      return 'compound'
+    } else if (/\s/.test(ch)) {
+      if (started) {
+        words.push(cur)
+        cur = ''
+        started = false
+      }
+    } else {
+      cur += ch
+      started = true
+    }
+  }
+  if (started) words.push(cur)
+  return words
+}
+
+/** 从 wake 参数列表提取 --until-ok 的命令值（支持 `--until-ok <cmd>` 与 `--until-ok=<cmd>`） */
+function extractWakeUntilCmds(args: string[]): string[] {
+  const out: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] ?? ''
+    if (WAKE_VALUE_FLAGS.has(a)) {
+      i++
+      continue
+    }
+    if (a === '--until-ok') {
+      const next = args[++i]
+      if (next !== undefined && next.trim() !== '') out.push(next)
+    } else if (a.startsWith('--until-ok=')) {
+      const val = a.slice('--until-ok='.length)
+      if (val.trim() !== '') out.push(val)
+    }
+  }
+  return out
+}
+
+/** 规则 0 的 WAKE 特例：对 --until-ok 内层命令递归 classify（最多一层；更深层直接 ask） */
+function wakeArgsVerdict(
+  args: string[],
+  root: string,
+  cfg: ApprovalConfig,
+  depth: number,
+): ApprovalVerdict {
+  const cmds = extractWakeUntilCmds(args)
+  if (cmds.length === 0) return { kind: 'allow' }
+  if (depth >= 1) {
+    return {
+      kind: 'ask',
+      category: 'ask_rule',
+      detail: '--until-ok',
+      reason: '闹钟条件命令嵌套超过一层，需人工确认',
+    }
+  }
+  const asks: Extract<ApprovalVerdict, { kind: 'ask' }>[] = []
+  for (const inner of cmds) {
+    const v = classifyAt(inner, root, cfg, depth + 1)
+    if (v.kind === 'deny') return { kind: 'deny', reason: `闹钟条件命令：${v.reason}` }
+    if (v.kind === 'ask') asks.push(v)
+  }
+  return mergeAsks(asks)
+}
+
+/** 顶层单条 "$SIMPLE_CODE_WAKE" 判定；返回 null 表示含复合结构，交下方分段路径 */
+function wakeTopVerdict(
+  cmd: string,
+  root: string,
+  cfg: ApprovalConfig,
+  depth: number,
+): ApprovalVerdict | null {
+  const words = shellWords(cmd)
+  if (words === 'compound') return null
+  if (words === 'unclosed') {
+    return {
+      kind: 'ask',
+      category: 'ask_rule',
+      detail: '--until-ok',
+      reason: '闹钟命令引号未闭合，需人工确认',
+    }
+  }
+  return wakeArgsVerdict(words.slice(1), root, cfg, depth)
+}
+
+/** 段级 "$SIMPLE_CODE_WAKE"（如 `cd x && "$SIMPLE_CODE_WAKE" --until-ok ...`）判定 */
+function wakeSegmentVerdict(
+  items: Item[],
+  root: string,
+  cfg: ApprovalConfig,
+  depth: number,
+): ApprovalVerdict {
+  const args = items
+    .filter((it) => !it.redirect)
+    .map((it) => {
+      const w = shellWords(it.text)
+      return Array.isArray(w) && w.length === 1 ? w[0]! : unquote(it.text)
+    })
+  return wakeArgsVerdict(args, root, cfg, depth)
 }
 
 /** 补丁标记行抽路径：Update/Add/Delete File 与 Move to（目标也是写——
@@ -974,13 +1159,13 @@ function pathVerdict(
   const r = root.endsWith('/') ? root : `${root}/`
   if (absT === root || absT.startsWith(r)) return { kind: 'allow' }
 
-  // 项目外：一律 ask，读带「始终允许」键（最深存在目录；家/根过宽不记）
+  // 项目外：一律 ask，读写均附「始终允许」键（最深存在目录；家/根过宽不记）
   return {
     kind: 'ask',
     category: 'external_dir',
     detail: t,
     reason: `要${write ? '写' : '读'}项目外路径：${t}`,
-    ...(write || dirHint(absT) === null ? {} : { alwaysPaths: [dirHint(absT) as string] }),
+    ...(dirHint(absT) === null ? {} : { alwaysPaths: [dirHint(absT) as string] }),
   }
 }
 

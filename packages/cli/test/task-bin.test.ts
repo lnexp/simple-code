@@ -2,6 +2,7 @@ import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parseArgs, rootOf, taskMain } from '../src/task-bin.ts'
+import { taskSendMain } from '../src/task-send.ts'
 
 const servers: Server[] = []
 afterEach(() => {
@@ -140,5 +141,56 @@ describe('task-bin', () => {
       lean: true,
     })
     expect(parseArgs(['做', '事'])).toEqual({ list: false, rest: ['做', '事'] })
+  })
+})
+
+describe('task-bin goal 模式', () => {
+  it('--goal 首调不派单：返回父任务纪律（无桥也能读），退出 0', async () => {
+    const out = quiet()
+    const code = await taskMain(['--goal'], {}, async () => '不该派出去的任务书')
+    expect(code).toBe(0)
+    const text = out.join('')
+    expect(text).toContain('〔goal 模式〕')
+    expect(text).toContain('--goal --go')
+    expect(text).toContain('awake')
+  })
+
+  it('--goal --go 正式派单：body 带 goal:true；--go 单独用 → 3', async () => {
+    const b = await fakeBridge({ ok: true, name: '跑通测试' })
+    quiet()
+    const code = await taskMain(
+      ['--goal', '--go'],
+      { SIMPLE_CODE_TASK_PORT: b.port, SIMPLE_CODE_TASK_TOKEN: 'tok' },
+      async () => '跑通测试\n验收：npm test 全过',
+    )
+    expect(code).toBe(0)
+    expect(b.got[0]?.body).toMatchObject({ goal: true })
+    const out = quiet()
+    expect(
+      await taskMain(
+        ['--go'],
+        { SIMPLE_CODE_TASK_PORT: '1', SIMPLE_CODE_TASK_TOKEN: 't' },
+        async () => 'x',
+      ),
+    ).toBe(3)
+    expect(out.join('')).toContain('先 --goal 读纪律')
+  })
+
+  it('parseArgs：goal/go 两个 flag 独立解析', () => {
+    const r = parseArgs(['--goal'])
+    expect(r?.goal).toBe(true)
+    expect(r?.go).toBeUndefined()
+    expect(parseArgs(['--goal', '--go'])).toMatchObject({ goal: true, go: true })
+    expect(parseArgs(['--lean'])).not.toHaveProperty('goal')
+  })
+})
+
+describe('task-send bin', () => {
+  it('--help / -h 打印用法并退出 0；缺消息文本退出 3', async () => {
+    const out = quiet()
+    expect(await taskSendMain(['--help'])).toBe(0)
+    expect(await taskSendMain(['-h'])).toBe(0)
+    expect(out.join('')).toContain('用法："$SIMPLE_CODE_TASK_SEND"')
+    expect(await taskSendMain(['某任务'])).toBe(3)
   })
 })

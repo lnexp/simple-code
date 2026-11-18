@@ -53,8 +53,8 @@ it('原文回放按 owner 隔离；同 step 的多条 user 按顺序配对，无
 })
 
 // 2026-11-06 fold 窗口版：只恢复最近 N 个不同 step 的原文，其余行
-// 原样返回（存根）、rows 始终与输入等长——webview 靠 stepId 窗口集
-// 打 stubbed 标聚合成占位
+// 原样返回（存根）、rows 始终与输入等长——session 再按 stepId 窗口集
+// 截出底稿，窗口外的走分页
 describe('恢复窗口（recentSteps）', () => {
   it('窗口外的行不恢复、窗口内的恢复，rows 等长', () => {
     const message = (text: string) => ({

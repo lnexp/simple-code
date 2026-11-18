@@ -39,12 +39,16 @@ export function ModelPicker({
   models,
   running,
   task,
+  onPick,
 }: {
   current: ModelRef | null
   models: ModelRef[]
   running: boolean
   /** 控件跟分支走（2026-09-22 拍板）：选择打到分支 session。undefined = 主干 */
   task: string | undefined
+  /** 给了就不发宿主、交给它——「+ 任务」新任务状态：任务还没建，选择先记在
+   *  webview，随第一条消息带过去（webview/task-draft.ts） */
+  onPick?: (choice: ModelRef) => void
 }) {
   // 配置还没加载完（session 是惰性建的）时整个不显示，不显示一个空下拉
   if (models.length === 0) return null
@@ -74,7 +78,9 @@ export function ModelPicker({
       // payload 直接带 ModelRef，不用下标/拼接串反查——模型名本身可以含
       // `/`，拼了还要猜从哪断（同 core ModelRef 的理由）
       onPick={(choice) =>
-        post({ type: 'setModel', choice, ...(task !== undefined ? { task } : {}) })
+        onPick !== undefined
+          ? onPick(choice)
+          : post({ type: 'setModel', choice, ...(task !== undefined ? { task } : {}) })
       }
     />
   )
@@ -95,6 +101,7 @@ export function PresetPicker({
   running,
   current,
   task,
+  onPick,
 }: {
   preset: string | undefined
   presets: string[]
@@ -102,6 +109,8 @@ export function PresetPicker({
   current: ModelRef | null
   /** 同 ModelPicker：选择打到分支 session */
   task: string | undefined
+  /** 同 ModelPicker（预设随模型选择一起记） */
+  onPick?: (choice: ModelRef) => void
 }) {
   if (presets.length === 0 || current === null) return null
 
@@ -136,16 +145,14 @@ export function PresetPicker({
       // `current` 自带 preset（readModel 带上了——不然 switchEffort 会把
       // 线路选择洗掉），所以选「默认」必须显式构造干净的选择，展开 current
       // 会带着旧 preset 发出去，等于没切
-      onPick={(name) =>
-        post({
-          type: 'setModel',
-          choice:
-            name === undefined
-              ? { provider: current.provider, model: current.model }
-              : { ...current, preset: name },
-          ...(task !== undefined ? { task } : {}),
-        })
-      }
+      onPick={(name) => {
+        const choice =
+          name === undefined
+            ? { provider: current.provider, model: current.model }
+            : { ...current, preset: name }
+        if (onPick !== undefined) onPick(choice)
+        else post({ type: 'setModel', choice, ...(task !== undefined ? { task } : {}) })
+      }}
     />
   )
 }
@@ -181,12 +188,15 @@ export function EffortPicker({
   overridden,
   running,
   task,
+  onPick,
 }: {
   effort: Effort | null
   overridden: boolean
   running: boolean
   /** 同 ModelPicker：选择打到分支 session */
   task: string | undefined
+  /** 同 ModelPicker。null = 撤掉覆盖、跟默认 */
+  onPick?: (effort: Effort | null) => void
 }) {
   // session 还没建起来时才不渲染。**不按模型能力过滤**——见上
   if (effort === null) return null
@@ -218,7 +228,9 @@ export function EffortPicker({
       disabled={running}
       options={options}
       onPick={(value) =>
-        post({ type: 'setEffort', effort: value, ...(task !== undefined ? { task } : {}) })
+        onPick !== undefined
+          ? onPick(value)
+          : post({ type: 'setEffort', effort: value, ...(task !== undefined ? { task } : {}) })
       }
     />
   )

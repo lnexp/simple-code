@@ -14,6 +14,7 @@
  * 宿主里 / 宿主已关闭）；3 参数错（任务书为空、--model 后没写名字）。
  */
 import {
+  PARENT_GOAL_BRIEFING,
   TASK_PORT_ENV,
   TASK_TOKEN_ENV,
   TASK_TOKEN_HEADER,
@@ -42,7 +43,7 @@ async function readStdin(): Promise<string> {
 
 const USAGE =
   `用法："$SIMPLE_CODE_TASK" [--model <名>] [--lean] "<任务书>"，或 "$SIMPLE_CODE_TASK" [--model <名>] <<'MD' … MD。` +
-  `任务书首行当任务名；"$SIMPLE_CODE_TASK" --models 列出可选模型\n`
+  `任务书首行当任务名；--goal 读目标模式派单纪律（再 --goal --go 正式派）；"$SIMPLE_CODE_TASK" --models 列出可选模型\n`
 
 /** 拆出 --model <名> / --models / --lean / --help，剩下的是任务书参数。
  *  null = --model 后没跟名字。--help 之外以 -- 开头的裸参（没有值语义的）
@@ -52,11 +53,15 @@ export function parseArgs(argv: string[]): {
   list: boolean
   rest: string[]
   lean?: true
+  goal?: true
+  go?: true
   help?: true
 } | null {
   const rest: string[] = []
   let model: string | undefined
   let lean = false
+  let goal = false
+  let go = false
   let list = false
   let help = false
   for (let i = 0; i < argv.length; i++) {
@@ -66,6 +71,8 @@ export function parseArgs(argv: string[]): {
       model = argv[++i]
       if (model === undefined || model === '') return null
     } else if (a === '--lean') lean = true
+    else if (a === '--goal') goal = true
+    else if (a === '--go') go = true
     else if (a === '--help' || a === '-h') help = true
     // 认识的 flag 之外的裸 --：按用法输出（防把 --help 这类当任务书派空任务）
     else if (a.startsWith('--') && a !== '--') help = true
@@ -74,6 +81,8 @@ export function parseArgs(argv: string[]): {
   return {
     ...(model !== undefined ? { model } : {}),
     ...(lean ? { lean: true } : {}),
+    ...(goal ? { goal: true } : {}),
+    ...(go ? { go: true } : {}),
     ...(help ? { help: true } : {}),
     list,
     rest,
@@ -139,6 +148,17 @@ export async function taskMain(
     process.stdout.write(USAGE)
     return 0
   }
+  // goal 两段式准入（goal-mode.md）：--goal 首调（不带 --go）不派单，返回
+  // 父任务纪律——任务书质量（目标写法/验收标准/awake 时长）在派单那一刻就
+  // 定了，纪律必须前置读到
+  if (args.goal && !args.go) {
+    process.stdout.write(PARENT_GOAL_BRIEFING + '\n')
+    return 0
+  }
+  if (args.go && !args.goal) {
+    process.stderr.write('--go 只配合 --goal 用（先 --goal 读纪律）。' + USAGE)
+    return 3
+  }
   const brief = args.list ? '' : (args.rest.length > 0 ? args.rest.join(' ') : await stdin()).trim()
   if (!args.list && brief === '') {
     process.stderr.write(USAGE)
@@ -160,6 +180,7 @@ export async function taskMain(
     owner: env.SIMPLE_CODE_OWNER ?? '',
     ...(args.model !== undefined ? { model: args.model } : {}),
     ...(args.lean ? { lean: true } : {}),
+    ...(args.goal ? { goal: true } : {}),
   })
   if (typeof body === 'string') {
     process.stderr.write(body)

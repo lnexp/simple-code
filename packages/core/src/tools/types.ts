@@ -15,10 +15,7 @@ export type ApprovalAsk = {
   parts?: ApprovalCategory[]
   /** 支持「始终允许」时的预览：选了会往 approval.json 记什么。没有
    * 这个字段 = 该卡不出第三键（不收敛的场景） */
-  always?:
-    | { kind: 'path'; dir: string }
-    | { kind: 'nonpath'; lead: string; from: number }
-    | { kind: 'paths'; dirs: string[] }
+  always?: { kind: 'nonpath'; lead: string; from: number } | { kind: 'paths'; dirs: string[] }
   /** 分身任务弹的卡：任务名，卡片标注来源（core 侧不填，宿主加） */
   task?: string
 }

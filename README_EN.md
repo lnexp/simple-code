@@ -116,7 +116,8 @@ Everything lives inside the project directory, almost all plain text:
 ├── notes/                            # general records in the root
 │   ├── lesson/                       # lessons: one symptom per file
 │   ├── principle/                    # principles: judgment, scope and evidence
-│   └── goal/                         # goals: work, outcome, boundaries and completion criteria
+│   ├── goal/                         # goals: work, outcome, boundaries and completion criteria
+│   └── wiki/                         # wiki entries: one per mechanism; index.md is the table of contents
 ├── events/                           # event archives: one event per file
 ├── skills/                           # skills: how to do a certain kind of task
 ├── diagnosis/                        # self-diagnosis ledger
@@ -126,7 +127,7 @@ Everything lives inside the project directory, almost all plain text:
 
 SQLite is only an **acceleration layer**; the same content is also written turn by turn as JSONL, and **the plain-text copy is the source of truth**. The database can be rebuilt; readability never depends on it.
 
-Use `"$SIMPLE_CODE_NOTE" list/read/search/write` with `--type general|lesson|principle|goal`.
+Use `"$SIMPLE_CODE_NOTE" list/read/search/write` with `--type general|lesson|principle|goal|wiki`.
 Legacy `lessons/` and `principles/` remain readable in place; upgrades do not move files or overwrite conflicts.
 The old LESSON command is removed. Set `current: true` and `status: active` on one goal to make it current;
 reading historical goals does not switch it. Use `paused` or `completed` for paused or finished goals.
@@ -136,11 +137,16 @@ at existing compaction points; evidence is read on demand. All four types share 
 (2100 estimated tokens by default), with configurable `memory.noteRatios` of 35%/10%/20%/35%.
 The current goal may borrow other types' space without exceeding the total or truncating its boundaries.
 
+Wiki entries (`--type wiki`) are maintained by reflection: one entry per mechanism, describing how it works now,
+why, and the pitfalls, each sentence with its source. The table of contents `notes/wiki/index.md` groups entries
+one line each and stays in context in full, outside the budget above. Reading an entry first warns if files in its
+`files` header have commits after `verified`; `note lint` checks the index, links and aliases.
+
 ### Recalling at the right moment
 
 Remembering is easy; recalling when it matters is the hard part. SC surfaces hints in two places, both as `〔recall·async〕` lines after a tool result:
 
-- **By topic**: after you send a message, a side model compares it against the four note types, skills and events, picks the relevant entries, and matches history summaries using the keywords it produces.
+- **By topic**: after you send a message, a side model compares it against the five note types, skills and events, picks the relevant entries, and matches history summaries using the keywords it produces.
 - **By action**: when a command the agent runs touches a file or program (e.g. editing `approval.ts`, running `gh`), entries whose description mentions it are surfaced as "read this first", marked "触及" (touched) at the end of the line.
 
 These are only hints; the agent decides whether to read them. **Off by default**: topic matching costs one extra side-model request per turn. Enable it with `"recall": { "mode": "on" }` in your settings (action hints follow the same switch).
@@ -156,7 +162,9 @@ Both are loaded, user-level first; on conflict the project wins. Each is capped 
 
 ### Reflection
 
-The "Memory" button in the bottom bar opens the memory panel, where "Reflect" launches a background task that tidies notes, lessons and events: correcting stale entries, merging event fragments, writing an overview on one topic, and running a self-diagnosis — reviewing your corrections since the last reflection, deciding which were repeat mistakes ("it was in the library, yet happened again"), and recording them in `.simple-code/diagnosis/self-diagnosis.md`. It ends with a report — what it wrote, what it changed, what it dropped — which you can correct on the spot.
+The "Memory" button in the bottom bar opens the memory panel, where "Reflect" launches a background task that tidies notes, lessons and events: correcting stale entries, merging event fragments, consolidating fragments into wiki entries (rewriting entries whose code has changed), and running a self-diagnosis — reviewing your corrections since the last reflection, deciding which were repeat mistakes ("it was in the library, yet happened again"), and recording them in `.simple-code/diagnosis/self-diagnosis.md`. It ends with a report — what it wrote, what it changed, what it dropped — which you can correct on the spot.
+
+Reflection also runs automatically: when any task starts a turn, if at least 24 hours have passed since the last reflection and all tasks together have run at least 30 turns since then, a reflection task is launched (VS Code extension only; the `sc` CLI does not trigger it).
 
 ## Approvals
 

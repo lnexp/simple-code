@@ -52,6 +52,7 @@ import { type BgProcessInfo, BgRegistry } from '../tools/bg.ts'
 import { readEventsIndex } from '../tools/events.ts'
 import type { Tool, ToolContext } from '../tools/types.ts'
 import { createViewImageTool } from '../tools/viewimage.ts'
+import { wikiIndexSection } from '../tools/wiki.ts'
 import { SC_VERSION } from '../version.ts'
 import { loadCueCandidates, matchSummaries } from './cue.ts'
 import { acquireLock } from './lock.ts'
@@ -151,16 +152,23 @@ export type Session = {
     elapsedMs: number | null
     finishedAt: number | null
   })[]
-  /** fold 的窗口版（2026-11-06 拍板）：只恢复最近 N 个不同 step 的原文，
-   * 窗口外的行带 stubbed: true（webview 聚合成一条「已摘要」占位）。
-   * 不传参 = 全量恢复（冷启动基线用） */
-  historyRowsWindowed(recentSteps: number): readonly (Message & {
-    turnId: number
-    meta: { model: string; effort: string | null } | null
-    elapsedMs: number | null
-    finishedAt: number | null
-    stubbed: boolean
-  })[]
+  /**
+   * 窗口版基线（2026-11-06 拍板）：rows 只含最近 N 个不同 step 的行（原文
+   * 已换回）。窗口外的一切——live 完整行、存根的原文、整轮卸载的 turn——
+   * 从 floor 往下翻页取（historyPage 带 live），按 (turn, step, id) 排序。
+   * floor = null：没有 live 行。
+   * 2026-11-10 改：原先窗口外 live 行留在 rows 里标 stubbed、webview 聚成
+   * 占位，用户消息跟着被吞且分页也翻不出（真项目「中间消息丢失」）
+   */
+  historyRowsWindowed(recentSteps: number): {
+    rows: readonly (Message & {
+      turnId: number
+      meta: { model: string; effort: string | null } | null
+      elapsedMs: number | null
+      finishedAt: number | null
+    })[]
+    floor: number | null
+  }
   /**
    * 历史分页（UI 往上拉加载用）。store 分页是纯读，但 Session 层不再直通：
    * tool_result 的原图要换成缩略图（HydrateRow），这个变换是异步的
@@ -171,6 +179,9 @@ export type Session = {
   historyPage(
     cursor: number | null,
     limit: number,
+    /** live: 窗口版基线的分页（游标从 historyRowsWindowed 的 floor 起，
+     *  live 行也翻）。不传 = 全量基线的分页，只翻 unloaded */
+    options?: { live?: boolean },
   ): Promise<{ rows: HydrateRow[]; next: number | null }>
   /**
    * 发一条消息并消费事件流。
@@ -304,6 +315,12 @@ export type SessionOptions = LoadOptions & {
    * 放行），ephemeral / 单测走这条路
    */
   requestApproval?: LoopDeps['requestApproval']
+  /**
+   * 每开始一轮（新轮或续接轮）调一次，宿主注入。用途：跨任务的周期检查
+   * （自动反思，vscode reflect-auto.ts）。turnsSince(at) = 本库 at（ms）之后
+   * 开始的轮数，不分 owner——主任务与其他任务平权。不传 = 不查（CLI、测试）
+   */
+  onTurnStart?: (turnsSince: (at: number) => number) => void
 }
 
 /**
@@ -672,7 +689,7 @@ export async function getSession(
                 const floor = store.liveStepFloor()
                 const seen = new Set([
                   ...(floor === null ? [] : store.asyncCuedNamesSince(floor)),
-                  ...readInContext(messages),
+                  ...readInContext(messages, folderPath),
                 ])
                 for (const n of offerSelection(store, anchor, seen)) seen.add(n)
                 offerTouch(store, anchor, seen)
@@ -779,7 +796,8 @@ export async function getSession(
    */
   let summarizing: Promise<void> | null = null
   /**
-   * 正在跑的那个 turn 的 id，**整个不当摘要候选**。
+   * 正在跑的那个 turn 的 id。它只摘中间攒满的段，开头那段（含提问）和末尾
+   * 还在长的那截等它结束（turns.ts takeOpenTurnSegment）。
    *
    * 只排除最后一个 step 是不够的：摘要每个 step 跑完都被踢一脚，那时「除最后
    * 一个之外」只剩刚跑完的那一个，于是一个 turn 出一条摘要变成出九条
@@ -1038,26 +1056,30 @@ export async function getSession(
     })
   }
 
-  // fold（每轮）走窗口版省冷读；冷启动基线走全量。两版共用一个实现。
-  // stubbed 按 stepId 窗口集判定（不能按「是否被恢复」判：窗口内最新
+  // 主任务面板（fold 与冷启动）走窗口版省冷读，任务视图走全量。两版共用
+  // 一个实现。窗口按 stepId 集合截（不能按「是否被恢复」判：窗口内最新
   // 消息本来就没有 unloaded 原文，不恢复也是全文）
   const historyRowsImpl = (recentSteps: number | undefined) => {
     if (!store)
-      return messages.map((m) => ({
-        ...m,
-        turnId: 0,
-        meta: null,
-        elapsedMs: null,
-        finishedAt: null,
-        stubbed: false,
-      }))
+      return {
+        rows: messages.map((m) => ({
+          ...m,
+          turnId: 0,
+          meta: null,
+          elapsedMs: null,
+          finishedAt: null,
+        })),
+        floor: null,
+      }
     const live = store.withTurns(messages)
     const allSteps = [...new Set(live.map((l) => l.stepId))]
     const windowSet = recentSteps === undefined ? null : new Set(allSteps.slice(-recentSteps))
     const restored = store.historyOriginals(live, recentSteps)
     historyRestoredIds = restored.restoredIds
-    const infos = store.turnsInfo(restored.rows.map((l) => l.turnId))
-    return restored.rows.map(({ message, turnId }, i) => {
+    const kept =
+      windowSet === null ? restored.rows : restored.rows.filter((l) => windowSet.has(l.stepId))
+    const infos = store.turnsInfo(kept.map((l) => l.turnId))
+    const rows = kept.map(({ message, turnId }) => {
       const info = infos.get(turnId)
       return {
         ...message,
@@ -1065,9 +1087,11 @@ export async function getSession(
         meta: info?.meta ?? null,
         elapsedMs: info?.elapsedMs ?? null,
         finishedAt: info?.finishedAt ?? null,
-        stubbed: windowSet !== null && !windowSet.has(live[i]!.stepId),
       }
     })
+    const first = windowSet === null ? undefined : kept[0]
+    // 起点是 step id（historyPage 的游标语义），不是行 id：live 行每次落盘都换 id
+    return { rows, floor: first === undefined ? null : first.stepId }
   }
 
   return {
@@ -1083,11 +1107,11 @@ export async function getSession(
     messages: () => messages,
     lastTurnError: () => store?.lastTurnError() ?? null,
 
-    historyRows: () => historyRowsImpl(undefined),
+    historyRows: () => historyRowsImpl(undefined).rows,
     historyRowsWindowed: (recentSteps: number) => historyRowsImpl(recentSteps),
-    historyPage: async (cursor, limit) => {
+    historyPage: async (cursor, limit, options) => {
       if (!store) return { rows: [], next: null } // ephemeral 会话没有历史
-      const page = store.historyPage(cursor, limit, historyRestoredIds)
+      const page = store.historyPage(cursor, limit, historyRestoredIds, options?.live ?? false)
       return { ...page, rows: await toHydrateRows(page.rows) }
     },
     isRunning: () => running !== null,
@@ -1325,6 +1349,7 @@ export async function getSession(
             effort: effortOverride ?? config.request.effort ?? null,
           }) ?? null
       }
+      options.onTurnStart?.((at) => store?.turnsSince(at) ?? 0)
       const userMessage: Message = { role: 'user', parts: userParts(text, images) }
       // 防重复：上一轮停在一条没被回复的用户消息上（如 PrefixBroken 拦在
       // 请求前），用户原话重发——不再追加第二遍，直接跑（官方客户端同款：
@@ -1500,7 +1525,7 @@ async function summarizeOnce(
   store: Store,
   config: LoadedConfig,
   fetchImpl: typeof fetch | undefined,
-  /** 正在跑的 turn，整个不当候选。idle 时是 null——那会儿没有「正在跑的」 */
+  /** 正在跑的 turn，只摘它中间攒满的段。idle 时是 null——那会儿没有「正在跑的」 */
   activeTurn: number | null,
   /** 事件归档根：项目根，不是 store.root（分身的 store 在任务目录） */
   eventsRoot: string,
@@ -2198,7 +2223,8 @@ async function readAgentsFile(path: string): Promise<string | null> {
 async function readNotesIndex(root: string, config: NoteBudgetConfig): Promise<string | null> {
   const result = buildNoteBudget(root, config)
   for (const message of result.warnings) logRun({ ev: 'note_warning', folder: root, message })
-  return result.text
+  // 词条目录页不分 note 预算、整页常驻（wiki.ts 文件头）；同存 notes 快照字段
+  return [result.text, wikiIndexSection(root)].filter(Boolean).join('\n\n') || null
 }
 
 /**
@@ -2317,7 +2343,7 @@ const toolRules = (env: NodeJS.ProcessEnv): string => {
   // 变为「沉淀讲什么时候记，约定讲什么时候用哪个」
   if (env.SIMPLE_CODE_NOTE !== undefined)
     lines.push(
-      '- note 统一记录/教训/原则/目标："$SIMPLE_CODE_NOTE" read <name> [--type general|lesson|principle|goal]；list/search 默认跨类型，--all 含历史。教训用 --type lesson。',
+      '- note 统一记录/教训/原则/目标/词条："$SIMPLE_CODE_NOTE" read <name> [--type general|lesson|principle|goal|wiki]；list/search 默认跨类型，--all 含历史。教训用 --type lesson。',
     )
   if (env.SIMPLE_CODE_MCP !== undefined)
     lines.push(
@@ -2384,7 +2410,7 @@ const contextRules = (env: NodeJS.ProcessEnv): string => {
     // 全价」——换个目录就不知道自己在花钱，会往 AGENTS.md 猛写、把该记 note
     // 的塞进常驻区。只写「谁常驻/谁不常驻」的相对关系，不写 2048/30 条这类
     // 参数：数字会变，写进 prompt 就是第二处真相，细节归 DOC（§1 常驻层）
-    '常驻上下文（每轮全价重发）：内建段 + 两份 AGENTS.md 全文 + 普通记录/教训/事件索引 + 入选原则的判断与边界 + 当前 goal 四节；其余正文与依据按需 read。放不进 AGENTS.md 的内容拆进 notes，别硬塞常驻区。' +
+    '常驻上下文（每轮全价重发）：内建段 + 两份 AGENTS.md 全文 + 普通记录/教训/事件索引 + 入选原则的判断与边界 + 当前 goal 四节 + wiki 词条目录页；其余正文与依据按需 read。放不进 AGENTS.md 的内容拆进 notes，别硬塞常驻区。' +
     // 〔recall〕线索行（recall 提案 §5）：装配期机械贴在用户消息后的碰撞
     // 结果。不说明的话模型会把它当用户的话或权威指令——它是证据不是结论
     '用户消息尾部可能出现〔recall〕行：系统按词面撞出的记忆线索，撞到≠相关——真相关就顺着 read/search 下钻，不相关直接忽略，不要复述它。' +
@@ -2417,8 +2443,8 @@ const growthRules = (lessons: string | null, env: NodeJS.ProcessEnv): string =>
   '②技能：用户点名，或不确定该怎么做时查用（求证链的第一步）——项目 `.simple-code/skills/<name>/SKILL.md` 与' +
   '用户 `~/.simple-code/skills/<name>/SKILL.md`（同名时用户级覆盖项目级），' +
   '目录名即名字，按 SKILL.md 内容执行；改项目级 SKILL.md 走 "$SIMPLE_CODE_APPLY_PATCH"，用户级写走 bash 审批。\n' +
-  '③note：general 记录结论，lesson 记教训，principle 记有依据的判断，goal 记当前事与目标。' +
-  '主 agent 在目标/授权内自主管理 goal：先检查当前项目是否有 current: true 的 goal；如果没有，而当前请求明确会跨多个请求继续推进一件事，主动用 NOTE write --type goal 建立项目目标，填写事、目标、当前范围与边界、怎样算达到目标。' +
+  '③note：general 记录结论，lesson 记教训，principle 记有依据的判断，goal 记当前事与目标，wiki 是反思维护的机制词条（读到与代码不符的当场订正）。' +
+        '主 agent 在目标/授权内自主管理 goal：先检查当前项目是否有 current: true 的 goal；如果没有，而当前请求明确会跨多个请求继续推进一件事，主动用 NOTE write --type goal 建立项目目标，填写事、目标、当前范围与边界、怎样算达到目标。注意：用户说「开启一个 goal 任务」指的是派任务的 goal 模式（$SIMPLE_CODE_TASK --goal，见 bash 工具描述），不是写本类型的 note。' +
   '一次性任务或目标不清楚时不要创建；不把设想当定案、不擅改目标或降低验收。' +
   '目标用 current: true 指定，其他目标取消 current；暂停/完成改 status: paused/completed。客观验收可自主完成，主观效果须用户确认。' +
   '出现可复用的判断时，先核对原话或其他依据；有依据才主动用 NOTE write --type principle 写 candidate，并记录判断、适用边界与依据。' +

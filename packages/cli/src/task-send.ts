@@ -41,8 +41,11 @@ async function call<T>(path: string, body: unknown): Promise<T | string> {
   }
 }
 
-async function main(): Promise<number> {
-  const args = process.argv.slice(2)
+export async function taskSendMain(args = process.argv.slice(2)): Promise<number> {
+  if (args[0] === '--help' || args[0] === '-h') {
+    process.stdout.write(USAGE)
+    return 0
+  }
   let roots: unknown = []
   try {
     roots = JSON.parse(process.env.SIMPLE_CODE_ROOTS ?? '[]')
@@ -86,4 +89,6 @@ async function main(): Promise<number> {
   return 0
 }
 
-process.exit(await main())
+if (process.argv[1] && import.meta.url.endsWith(process.argv[1].split('/').pop() ?? '')) {
+  taskSendMain().then((code) => process.exit(code))
+}

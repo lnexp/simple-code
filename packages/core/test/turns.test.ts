@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { type SizedStep, takeSegment } from '../src/loop/turns.ts'
+import {
+  type SizedStep,
+  takeOpenTurnSegment,
+  takeSegment,
+  uncoveredRuns,
+} from '../src/loop/turns.ts'
 
 const steps = (...tokens: number[]): SizedStep[] => tokens.map((t, i) => ({ id: i + 1, tokens: t }))
 
@@ -35,5 +40,57 @@ describe('按 token 预算切段', () => {
 
   it('对照：没有 step 就返回空', () => {
     expect(takeSegment([], 16_000)).toEqual([])
+  })
+})
+
+describe('一个 turn 里的连续未覆盖段', () => {
+  it('**被已覆盖的 step 隔开，不接起来**——接起来 covers 就跨过一个洞', () => {
+    const covered = new Set([3, 4, 7])
+    expect(uncoveredRuns([1, 2, 3, 4, 5, 6, 7, 8], (id) => covered.has(id))).toEqual([
+      [1, 2],
+      [5, 6],
+      [8],
+    ])
+  })
+
+  it('对照：全覆盖就没有段', () => {
+    expect(uncoveredRuns([1, 2], () => true)).toEqual([])
+  })
+})
+
+describe('没结束的 turn：只摘中间攒满的段', () => {
+  // 每个 step 1 token、预算 2：开头那段 = [1, 2]
+  const open = (runs: number[][], last: number, size = (_id: number) => 1) =>
+    ids(takeOpenTurnSegment({ runs, first: 1, last, size, budget: 2 }))
+
+  it('**开头那段（含提问）跳过，取它后面攒满的一段**', () => {
+    expect(open([[1, 2, 3, 4, 5]], 5)).toEqual([3, 4])
+  })
+
+  it('**含最后一个 step 的那截还在长，不摘**——摘了后面跑出来的只能另起一段', () => {
+    expect(open([[1, 2, 3, 4]], 4)).toEqual([])
+    expect(open([[1, 2, 3]], 3)).toEqual([])
+  })
+
+  it('开头那段被已覆盖的段截住后，从后面的段接着取', () => {
+    // [3, 4] 已摘：开头那段定死为 [1, 2]
+    expect(
+      open(
+        [
+          [1, 2],
+          [5, 6, 7],
+        ],
+        7,
+      ),
+    ).toEqual([5, 6])
+  })
+
+  it('**提问那个 step 自己就超预算时，它自己是开头那段**，后面照常摘', () => {
+    const size = (id: number) => (id === 1 ? 50 : 1)
+    expect(open([[1, 2, 3, 4]], 4, size)).toEqual([2, 3])
+  })
+
+  it('对照：第一段不从提问开始（提问已覆盖）时不跳', () => {
+    expect(open([[3, 4, 5]], 5)).toEqual([3, 4])
   })
 })

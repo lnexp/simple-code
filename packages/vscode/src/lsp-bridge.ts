@@ -15,7 +15,7 @@ import { createServer, type Server } from 'node:http'
 import * as vscode from 'vscode'
 import { handleQuery, type LspRequest } from './lsp-query.ts'
 
-export function startLspBridge(): Server {
+export async function startLspBridge(): Promise<Server> {
   // executeCommand 返回 Thenable，桥内部统一 Promise（catch 兜底在 handler 的 try 里）。
   // 参数真对象化：query 层（可测）传 plain object，宿主要 vscode.Uri/Position
   // 实例——shape 判断而不是 instanceof（query 层构造的就这两种形状）
@@ -81,13 +81,18 @@ export function startLspBridge(): Server {
       }
     })
   })
-  server.listen(0, '127.0.0.1', () => {
-    const addr = server.address()
-    if (addr && typeof addr === 'object') {
-      process.env.SIMPLE_CODE_LSP_PORT = String(addr.port)
-      // eslint-disable-next-line no-console -- 扩展日志里留一行，排查「桥为什么没起来」用
-      console.log(`[simple-code] lsp bridge on 127.0.0.1:${addr.port}`)
-    }
-  })
+  // await listen：端口写进 env 之后才算就绪——不 await 的话 activate
+  // 返回当拍首条 bash 可能抢在端口落 env 前执行，bin 拿不到端口
+  await new Promise<void>((res) =>
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address()
+      if (addr && typeof addr === 'object') {
+        process.env.SIMPLE_CODE_LSP_PORT = String(addr.port)
+        // eslint-disable-next-line no-console -- 扩展日志里留一行，排查「桥为什么没起来」用
+        console.log(`[simple-code] lsp bridge on 127.0.0.1:${addr.port}`)
+      }
+      res()
+    }),
+  )
   return server
 }

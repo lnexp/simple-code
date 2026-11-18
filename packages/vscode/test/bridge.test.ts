@@ -1,6 +1,6 @@
 import type {
   AgentEvent,
-  ApprovalCategory,
+  ApprovalAsk,
   Effort,
   HistoryRow,
   Message,
@@ -105,26 +105,34 @@ function fakeSession(options: { events?: AgentEvent[]; hang?: boolean; vision?: 
       meta: { model: string; effort: string | null } | null
       elapsedMs: number | null
     })[]
+    /** historyRowsWindowed 报的分页起点（默认 null = 没有 live 行） */
+    floor?: number | null
   } = { messages: [] }
   /** visionModel 副模型（null = 没配）。非视觉主模型下贴图走它转述 */
   const vision = options.vision ?? null
   /** historyPage 桩：翻页内容用例自己配；不配就「没有历史」 */
   let pages: { cursor: number | null; rows: HistoryRow[]; next: number | null }[] = []
+  /** historyPage 实收的游标与 live 开关（断言 bridge 的起点替换） */
+  const pageCalls: { cursor: number | null; live: boolean }[] = []
 
   const session = {
     root: '/tmp/x',
+    // 配置默认模型（「+ 任务」新任务状态的初值取它，不取当前选中的）
+    defaultModel: { provider: 'p', model: 'fake-model-1' },
     messages: () => mem.messages as readonly Message[],
     // 默认裸行；用例塞 mem.rows（带 meta/elapsedMs 的定稿历史）模拟
     // 「重启后基线从 turns 表读回页脚数据」
     historyRows: () =>
       mem.rows ?? mem.messages.map((m) => ({ ...m, turnId: 0, meta: null, elapsedMs: null })),
-    // fold 的窗口版（2026-11-06）：fake 里与全量同源、不打 stubbed 标
-    // ——要测占位渲染直接塞带 stubbed: true 的 rows
-    historyRowsWindowed: () =>
-      mem.rows ?? mem.messages.map((m) => ({ ...m, turnId: 0, meta: null, elapsedMs: null })),
+    // 窗口版基线：fake 里行与全量同源，起点由用例配 mem.floor
+    historyRowsWindowed: () => ({
+      rows: mem.rows ?? mem.messages.map((m) => ({ ...m, turnId: 0, meta: null, elapsedMs: null })),
+      floor: mem.floor ?? null,
+    }),
     lastTurnError: () => null,
-    historyPage: (cursor: number | null, _limit: number) => {
+    historyPage: (cursor: number | null, _limit: number, options?: { live?: boolean }) => {
       void _limit
+      pageCalls.push({ cursor, live: options?.live ?? false })
       const hit = pages.find((pg) => pg.cursor === cursor)
       return hit ? { rows: hit.rows, next: hit.next } : { rows: [], next: null }
     },
@@ -172,6 +180,7 @@ function fakeSession(options: { events?: AgentEvent[]; hang?: boolean; vision?: 
     setModel,
     setEffort,
     mem,
+    pageCalls,
     setPages: (p: { cursor: number | null; rows: HistoryRow[]; next: number | null }[]) => {
       pages = p
     },
@@ -216,14 +225,7 @@ function harness(
   const store = fakeStore(extra.saved ?? null)
   // 审批中枢测试要从外面拿到 bridge 注入 session 的那个回调
   let capturedApproval:
-    | ((q: {
-        command: string
-        toolCallId: string
-        category: ApprovalCategory
-        detail: string
-        reason: string
-        always?: { kind: 'path'; dir: string }
-      }) => Promise<'allow' | 'always' | 'deny' | 'timeout' | { deny: string }>)
+    | ((q: ApprovalAsk) => Promise<'allow' | 'always' | 'deny' | 'timeout' | { deny: string }>)
     | undefined
   const bridge = createBridge({
     post: (msg) => posted.push(msg),
@@ -300,6 +302,8 @@ describe('ready 握手', () => {
         imagesEnabled: false,
         contextWindow: 0,
       },
+      // 排队快照（turn-queue.ts）：webview 是无状态投影，重载/切目录后要补推
+      { type: 'turnQueue', main: { paused: false, items: [] }, tasks: {} },
     ])
   })
 
@@ -330,6 +334,13 @@ describe('ready 握手', () => {
       imagesEnabled: true,
       // 窗口同样是模型级：底栏环形水位拿它当分母
       contextWindow: 200_000,
+      // 新任务状态的初值（task-draft.ts）：默认模型 = 配置默认；假 config
+      // 不是真配置，selectModel 逐个解析都失败记 null——这里只验接线，真
+      // 解析见 task-draft.test.ts
+      taskDraft: {
+        model: { provider: 'p', model: 'fake-model-1' },
+        perModel: [null, null, null],
+      },
     })
   })
 })
@@ -1202,6 +1213,32 @@ describe('会话延续', () => {
     )
     expect(page?.items).toEqual([{ kind: 'user', text: '旧问题' }])
     expect(page?.next).toBe(12)
+  })
+
+  it('第一页从 webview 手里那份底稿的起点翻；轮末 fold 不推 hydrate 时起点不动', async () => {
+    // 2026-11-10：起点跟着 fold 走的话，webview 还是旧底稿 + 增量事件，
+    // 旧起点到新起点之间那段会被再翻一遍
+    const h = harness()
+    h.mem.floor = 40
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.mem.floor = 90
+    h.bridge.handle({ type: 'send', text: '问题' })
+    await settle()
+    h.bridge.handle({ type: 'fetchHistory', cursor: null })
+    await settle()
+    h.bridge.handle({ type: 'fetchHistory', cursor: 7 })
+    await settle()
+    expect(h.pageCalls).toEqual([
+      { cursor: 40, live: true },
+      { cursor: 7, live: true },
+    ])
+    // 重推 hydrate（切回/重开）后，webview 的底稿换成新的，起点跟着换
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'fetchHistory', cursor: null })
+    await settle()
+    expect(h.pageCalls.at(-1)).toEqual({ cursor: 90, live: true })
   })
 
   it('**dispose（扩展停用）中断 + 关，跟 detach 分家**', async () => {
