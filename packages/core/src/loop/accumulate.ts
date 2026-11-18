@@ -58,7 +58,9 @@ export function accumulate(state: Accumulator, ev: StreamEvent): [Accumulator, A
       return [{ ...state, usage: ev.usage }, []]
 
     case 'text_start':
-      return [{ ...state, open: { type: 'text', text: '' } }, [{ type: 'text_start' }]]
+      // 先结算没收尾的块：协议层漏发 end 时，直接覆盖 open 会把那段内容静默
+      // 丢掉（2026-11-14 openai-chat 推理/正文交错丢正文）
+      return [{ ...closeOpen(state), open: { type: 'text', text: '' } }, [{ type: 'text_start' }]]
 
     case 'text_delta':
       return [appendOpen(state, 'text', ev.text), [{ type: 'text_delta', text: ev.text }]]
@@ -67,7 +69,10 @@ export function accumulate(state: Accumulator, ev: StreamEvent): [Accumulator, A
       return [closeOpen(state), [{ type: 'text_end' }]]
 
     case 'reasoning_start':
-      return [{ ...state, open: { type: 'reasoning', text: '' } }, [{ type: 'reasoning_start' }]]
+      return [
+        { ...closeOpen(state), open: { type: 'reasoning', text: '' } },
+        [{ type: 'reasoning_start' }],
+      ]
 
     case 'reasoning_delta':
       return [appendOpen(state, 'reasoning', ev.text), [{ type: 'reasoning_delta', text: ev.text }]]
@@ -108,13 +113,13 @@ const toolCall = (id: string, name: string, input: unknown): ToolCallPart => ({
 })
 
 function appendOpen(state: Accumulator, kind: 'text' | 'reasoning', text: string): Accumulator {
+  if (state.open.type === kind) {
+    return { ...state, open: { ...state.open, text: state.open.text + text } }
+  }
   // 没有 start 就来 delta，说明协议层漏发了。按 kind 开一个而不是丢掉——
-  // 丢掉的话这段内容静默消失，比多开一个块严重得多
-  const open =
-    state.open.type === kind
-      ? { ...state.open, text: state.open.text + text }
-      : { type: kind, text }
-  return { ...state, open }
+  // 丢掉的话这段内容静默消失，比多开一个块严重得多。另一种块还开着就先
+  // 结算它，同一个道理
+  return { ...closeOpen(state), open: { type: kind, text } }
 }
 
 /** 把未收尾的块结算成 part。空文本的块不产出 part——空 text part 有些端点会 400 */

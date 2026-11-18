@@ -7,6 +7,7 @@
 //     .simple-code/notes/sc-a-form-and-subagent-dissolved.md
 // 判定依据是 stdin 形态而不是「谁在调」：管道那头没有问答的能力，
 // 恒拒绝是唯一安全默认；人在终端不带参数，自然进对话
+import { homedir } from 'node:os'
 import { isAbsolute, resolve } from 'node:path'
 import { Writable } from 'node:stream'
 import { type Effort, loadConfig, type ModelRef } from '@simple-code/core'
@@ -176,11 +177,13 @@ export async function scMain(argv: string[], io: ScIo): Promise<number> {
     io.stdout(`${SC_USAGE}\n`)
     return 0
   }
+  const rootAbs = p.root ? (isAbsolute(p.root) ? p.root : resolve(io.cwd, p.root)) : io.cwd
   if (p.listModelsFlag) {
-    // 只读配置列清单，不建 session 不拿锁。loadConfig 报错（无配置/
-    // 配置坏）走 runOnce 同一套 explain 太绕，这里直接给一行人话
+    // 只读配置列清单，不建 session 不拿锁。家目录下无工作区上下文，走
+    // globalOnly 避开 ~ 工作区禁令；项目目录下仍合并工作区级 settings.json
     try {
-      const loaded = await loadConfig(io.cwd, {
+      const loaded = await loadConfig(rootAbs, {
+        ...(resolve(rootAbs) === homedir() ? { globalOnly: true } : {}),
         ...(io.globalPath ? { globalPath: io.globalPath } : {}),
         ...(io.env ? { env: io.env } : {}),
       })
@@ -204,9 +207,7 @@ export async function scMain(argv: string[], io: ScIo): Promise<number> {
     }
   }
 
-  // 权限上限校验（在 help/models 之后：那两个不干活，不用拦）。两处
-  // 分支共用的 root 在这里一次算清
-  const rootAbs = p.root ? (isAbsolute(p.root) ? p.root : resolve(io.cwd, p.root)) : io.cwd
+  // 权限上限校验（在 help/models 之后：那两个不干活，不用拦）
   const denied = assertRootAllowed(
     rootAbs,
     io.env?.SIMPLE_CODE_ROOTS ?? process.env.SIMPLE_CODE_ROOTS,

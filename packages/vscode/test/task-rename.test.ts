@@ -82,12 +82,18 @@ describe('任务改名（双击行内编辑）', () => {
     app.send(tasksMsg(A, ['旧名']))
     const btn = app.host.querySelector<HTMLButtonElement>('.branch-strip .branch-open')
     expect(btn).not.toBeNull()
+    if (!btn) return
     // 先选中它（branch 指向旧名——迁移断言的前提）
-    act(() => btn.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+    act(() => {
+      btn.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
     // 双击进入编辑
-    act(() => btn.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })))
+    act(() => {
+      btn.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    })
     const input = app.host.querySelector<HTMLInputElement>('.branch-rename')
     expect(input).not.toBeNull()
+    if (!input) return
     act(() => {
       input.value = '  新名  '
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
@@ -107,10 +113,12 @@ describe('任务改名（双击行内编辑）', () => {
     // 旧引用是脱离文档的节点，事件到不了 React 的委托层
     const open = (): HTMLInputElement => {
       const btn = app.host.querySelector<HTMLButtonElement>('.branch-strip .branch-open')
-      act(() => btn.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })))
+      act(() => {
+        btn?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+      })
       const input = app.host.querySelector<HTMLInputElement>('.branch-rename')
       expect(input).not.toBeNull()
-      return input
+      return input as HTMLInputElement
     }
     const type = (input: HTMLInputElement, value: string, key: string): void =>
       act(() => {
@@ -133,8 +141,12 @@ describe('任务改名（双击行内编辑）', () => {
     app.send(state(A))
     app.send(tasksMsg(A, ['旧名']))
     const btn = app.host.querySelector<HTMLButtonElement>('.branch-strip .branch-open')
-    act(() => btn.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })))
+    act(() => {
+      btn?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    })
     const input = app.host.querySelector<HTMLInputElement>('.branch-rename')
+    expect(input).not.toBeNull()
+    if (!input) return
     act(() => {
       input.value = '一二三四五六七八九十一二三四五六七八九十一二三'
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))

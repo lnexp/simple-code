@@ -220,6 +220,13 @@ function onDelta(state: State, delta: Record<string, unknown>): [State, LLMEvent
   // OpenAI 不发，但它们都走 openai-chat——不接就把整段推理过程静默丢了
   const reasoning = asString(delta.reasoning_content)
   if (reasoning !== '') {
+    // 正文没收尾就来推理：网关在服务端替模型跑工具（web_search 等）时把几轮
+    // 拼成一条流，轮间是 推理→正文→推理。不先收尾，下游开推理块时把这段
+    // 正文覆盖掉，回传的历史就和网关存的对不上（2026-11-14 续传 409）
+    if (next.isTextOpen) {
+      events.push({ type: 'text_end' })
+      next = { ...next, isTextOpen: false }
+    }
     if (!next.isReasoningOpen) {
       events.push({ type: 'reasoning_start' })
       next = { ...next, isReasoningOpen: true }
@@ -318,12 +325,15 @@ const zeroUsage = (): Usage => ({
 function toUsage(raw: unknown): Usage {
   const u = asObject(raw)
   const cached = asNumber(asObject(u.prompt_tokens_details).cached_tokens, 0)
+  // 网关的扩展字段：服务端替模型跑了几轮工具，见 Usage.serverRounds
+  const rounds = asNumber(asObject(u.aigw).rounds, 0)
   return {
     inputTokens: Math.max(0, asNumber(u.prompt_tokens, 0) - cached),
     outputTokens: asNumber(u.completion_tokens, 0),
     cacheCreationInputTokens: 0, // 这个协议不区分写入与命中
     cacheReadInputTokens: cached,
     reasoningTokens: asNumber(asObject(u.completion_tokens_details).reasoning_tokens, 0),
+    ...(rounds > 1 ? { serverRounds: rounds } : {}),
   }
 }
 

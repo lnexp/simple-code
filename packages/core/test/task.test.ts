@@ -9,7 +9,7 @@
  * - 迁移：老库登记段，老任务的段与「已拉」照旧
  */
 
-import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -30,6 +30,7 @@ import {
   scopeOf,
   type TaskManifest,
   taskResultText,
+  wrapGoalBrief,
 } from '../src/session/task.ts'
 
 const dirs: string[] = []
@@ -987,5 +988,37 @@ describe('老库迁移（task-trunk.md「旧数据迁移」）', () => {
     const lines = calls.filter((c) => c.ev === 'segment_migrate')
     expect(lines).toHaveLength(1)
     expect(typeof lines[0]?.error).toBe('string')
+  })
+})
+
+describe('goal 模式（goal-mode.md）', () => {
+  it('wrapGoalBrief：纪律前置、原任务书保留', () => {
+    const brief = '跑通测试\n验收：npm test 全过'
+    const wrapped = wrapGoalBrief(brief)
+    expect(wrapped.startsWith('〔goal 模式纪律〕')).toBe(true)
+    expect(wrapped).toContain('不许缩水')
+    expect(wrapped.endsWith(brief)).toBe(true)
+  })
+
+  it('taskResultText：goal 附审核提醒，普通任务不附', () => {
+    const normal = taskResultText('普通', '完成', '好了')
+    expect(normal).not.toContain('goal')
+    const goal = taskResultText('目标', '完成', '好了', true)
+    expect(goal).toContain('〔goal 审核提醒〕')
+    expect(goal).toContain('审产物不听自述')
+  })
+
+  it('createTask 带 goal：manifest 持久化（reload 恢复后回调仍带提醒）', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sc-goal-'))
+    try {
+      const m = createTask(dir, '目标A', { parent: '', goal: true })
+      expect(m.goal).toBe(true)
+      const readBack = readTaskManifest(dir, m.owner)
+      expect(readBack?.goal).toBe(true)
+      const plain = createTask(dir, '普通B', { parent: '' })
+      expect(plain.goal).toBeUndefined()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

@@ -18,13 +18,13 @@
 import type { Message, Request } from '../llm/types.ts'
 import { decayCutoff } from '../tools/decay.ts'
 import { eventSignal, loadEvents } from '../tools/events.ts'
-import { scanNoteFiles } from '../tools/note-files.ts'
+import { type NoteFile, scanNoteFiles } from '../tools/note-files.ts'
 import { noteFileSignal } from '../tools/note-library.ts'
 import { listSkills } from '../tools/skill.ts'
 import { noteEligible } from './note-budget.ts'
 
 export type SelectorCandidate = {
-  kind: 'lesson' | 'note' | 'principle' | 'goal' | 'skill' | 'event'
+  kind: 'lesson' | 'note' | 'principle' | 'goal' | 'wiki' | 'skill' | 'event'
   name: string
   text: string
 }
@@ -56,30 +56,47 @@ export function previousReply(messages: Message[]): string {
 
 const READ_CMD = /\$\{?SIMPLE_CODE_(LESSON|NOTE|SKILL|EVENT)\}?"?\s+([^;|&\n]+)/g
 
-function readKey(kind: string, args: string): string | null {
+/** 不带 --type 的 NOTE read 按名字跨类型解析（note-files.ts resolveNoteFile）：恰好
+ *  一个类型有这个名字、且同类内容不冲突才读得到，否则 read 报错、什么也没读到。命令
+ *  文本看不出结果，按当前文件照同一规则解析——读不到的不算在场，免得两类同名时
+ *  两条都被当成读过、整轮不再推 */
+function untypedNoteKeys(files: NoteFile[], name: string): string[] {
+  const matches = files.filter((f) => f.name === name)
+  if (matches.length !== 1 || matches[0]!.conflict) return []
+  const type = matches[0]!.type
+  return [`${type === 'general' ? 'note' : type}:${name}`]
+}
+
+function readKeys(kind: string, args: string, untyped: (name: string) => string[]): string[] {
   const words = args.replace(/["']/g, '').trim().split(/\s+/)
   const index = words.indexOf('--type')
   const type = index >= 0 ? words[index + 1] : undefined
   if (index >= 0) words.splice(index, 2)
-  if (words[0] !== 'read' || !words[1]) return null
+  if (words[0] !== 'read' || !words[1]) return []
+  if (kind === 'NOTE' && !type) return untyped(words[1])
   const resolved = kind === 'NOTE' && type && type !== 'general' ? type : kind.toLowerCase()
-  return `${resolved}:${words[1]}`
+  return [`${resolved}:${words[1]}`]
 }
 
 /**
  * 在场消息里 bash 已经 read 过的条目（kind:name）——正文就在上下文里，
- * 再注入一次只是重复（2026-10-12：同 3 条 recall note 连续 4 轮注入）
+ * 再注入一次只是重复（2026-10-12：同 3 条 recall note 连续 4 轮注入）。
+ * root 只给不带 --type 的 NOTE read 解析用，有这种 read 时才扫一次 notes
  */
-export function readInContext(messages: Message[]): Set<string> {
+export function readInContext(messages: Message[], root: string): Set<string> {
   const out = new Set<string>()
+  let files: NoteFile[] | undefined
+  const untyped = (name: string) => {
+    files ??= scanNoteFiles(root)
+    return untypedNoteKeys(files, name)
+  }
   for (const m of messages)
     for (const p of m.parts) {
       if (p.type !== 'tool_call' || p.name !== 'bash') continue
       const command = (p.input as { command?: unknown } | null)?.command
       if (typeof command !== 'string') continue
       for (const [, kind, args] of command.matchAll(READ_CMD)) {
-        const key = readKey(kind!, args!)
-        if (key) out.add(key)
+        for (const key of readKeys(kind!, args!, untyped)) out.add(key)
       }
     }
   return out
@@ -146,6 +163,7 @@ const SELECTOR_SYSTEM = `你是经验库的检索选择器。第一条消息是�
 const SECTION_HEAD = {
   principle: '【principle 原则】',
   goal: '【goal 目标】',
+  wiki: '【wiki 词条】',
   lesson: '【lesson 教训】',
   note: '【note 结论】',
   skill: '【skill 技能】',
@@ -163,7 +181,7 @@ export function buildSelectorRequest(
   query: { user: string; previous: string },
   base: Omit<Request, 'messages' | 'system' | 'tools'>,
 ): Request {
-  const index = (['lesson', 'note', 'principle', 'goal', 'skill', 'event'] as const)
+  const index = (['lesson', 'note', 'principle', 'goal', 'wiki', 'skill', 'event'] as const)
     .map((kind) => {
       const lines = candidates
         .filter((c) => c.kind === kind)

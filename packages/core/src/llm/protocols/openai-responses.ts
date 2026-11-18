@@ -16,7 +16,7 @@ import {
   startTool,
   type ToolStream,
 } from './utils/tool-stream.ts'
-import { asArray, asNumber, asObject, asString, readRetryAfter } from './utils/wire.ts'
+import { asArray, asNumber, asObject, asString, asToolInput, readRetryAfter } from './utils/wire.ts'
 
 type WireItem = Record<string, unknown>
 
@@ -97,7 +97,11 @@ function toStandaloneItem(part: Part): WireItem | null {
         type: 'function_call',
         call_id: part.id,
         name: part.name,
-        arguments: JSON.stringify(part.input),
+        // asToolInput：历史里的裸串 input（截断遗留）归一成对象再序列化——
+        // 裸串直接 stringify 会让 arguments 变成 JSON 字符串而非对象，上游
+        // 400。另两个 adapter（anthropic-messages/openai-chat）已接，2026-11-12
+        // 函数级复现补齐此处
+        arguments: JSON.stringify(asToolInput(part.input)),
       }
     case 'tool_result':
       // 带图时 output 是 content items 数组（InputImage 直接进 responses

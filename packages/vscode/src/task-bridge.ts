@@ -132,7 +132,7 @@ export function createTaskBridge(opts: { token: string } & TaskBridgeHandlers): 
       if (parsed === null)
         return reply(413, { ok: false, error: `任务书超过 ${MAX_BRIEF_BYTES / 1024}KB` })
       if (parsed === undefined) return reply(400, { ok: false, error: '请求体不是 JSON' })
-      const { brief, owner, model, lean } = parsed
+      const { brief, owner, model, lean, goal } = parsed
       const dir = typeof parsed.root === 'string' ? parsed.root : ''
       if (dir === '') return reply(400, { ok: false, error: '缺 root' })
       root = dir
@@ -198,12 +198,15 @@ export function createTaskBridge(opts: { token: string } & TaskBridgeHandlers): 
         return reply(400, { ok: false, error: '--model 后要写模型名' })
       if (lean !== undefined && typeof lean !== 'boolean')
         return reply(400, { ok: false, error: 'lean 要是布尔' })
+      if (goal !== undefined && goal !== true)
+        return reply(400, { ok: false, error: 'goal 要是 true（--go 过闸后的正式派单）' })
       const req2: TaskDispatchRequest = {
         brief,
         root: dir,
         owner,
         ...(model !== undefined ? { model } : {}),
         ...(lean === true ? { lean: true } : {}),
+        ...(goal === true ? { goal: true } : {}),
       }
       return answer(() => opts.dispatch(req2))
     })
@@ -211,15 +214,19 @@ export function createTaskBridge(opts: { token: string } & TaskBridgeHandlers): 
 }
 
 /** 宿主启动入口：随机端口 + 随机 token，写进 process.env 供 bash 透传 */
-export function startTaskBridge(handlers: TaskBridgeHandlers): Server {
+export async function startTaskBridge(handlers: TaskBridgeHandlers): Promise<Server> {
   const token = randomBytes(24).toString('hex')
   const server = createTaskBridge({ token, ...handlers })
-  server.listen(0, '127.0.0.1', () => {
-    const addr = server.address()
-    if (addr && typeof addr === 'object') {
-      process.env[TASK_PORT_ENV] = String(addr.port)
-      process.env[TASK_TOKEN_ENV] = token
-    }
-  })
+  // await listen：同 startLspBridge——端口落 env 之前首拍 bash 可能先到
+  await new Promise<void>((res) =>
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address()
+      if (addr && typeof addr === 'object') {
+        process.env[TASK_PORT_ENV] = String(addr.port)
+        process.env[TASK_TOKEN_ENV] = token
+      }
+      res()
+    }),
+  )
   return server
 }

@@ -40,6 +40,11 @@ it('NOTE 真进程读旧 lesson，类型参数前后位置一致，缺值与拼�
   expect(run(root, ['list', '--type']).status).not.toBe(0)
   expect(run(root, ['list', '--type', 'leson']).status).not.toBe(0)
   expect(run(root, ['list', '--wat']).status).not.toBe(0)
+  for (const flag of ['--help', '-h', 'help']) {
+    const h = run(root, [flag])
+    expect(h.status, h.stderr).toBe(0)
+    expect(h.stdout).toContain('用法：')
+  }
 })
 
 it('NOTE 真进程统一四类型 list/search，新写入分类目录且撞名拒绝', () => {

@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
-import { computeMemoryStats } from '../src/index.ts'
+import { computeMemoryStats, lastReflectAt } from '../src/index.ts'
 import { buildNoteBudget } from '../src/session/note-budget.ts'
 
 /** 记忆面板计数（reflect-trigger.md §3.2）：四元组必须与索引选取同源——
@@ -50,6 +50,16 @@ for (const type of ['principle', 'goal']) {
   writeFileSync(join(dir, 'gone.md'), '---\nstatus: superseded\n---\n')
 }
 
+// wiki：w1 在目录页（可见）、w2 漏列（收起）、w3 作废；index.md 是目录不是词条
+{
+  const dir = join(root, '.simple-code', 'notes', 'wiki')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'index.md'), '## 面板\n- w1 — 翻页\n- w3 — 作废了\n')
+  writeFileSync(join(dir, 'w1.md'), '---\nname: w1\ntype: wiki\n---\n')
+  writeFileSync(join(dir, 'w2.md'), '---\nname: w2\ntype: wiki\n---\n')
+  writeFileSync(join(dir, 'w3.md'), '---\nname: w3\ntype: wiki\nstatus: superseded\n---\n')
+}
+
 // events：一条普通、一条 memory-reflect 收尾（created 最新）
 mkdirSync(join(root, '.simple-code', 'events'), { recursive: true })
 writeFileSync(
@@ -86,9 +96,20 @@ describe('computeMemoryStats', () => {
     expect(s.notes.total + s.lessons.total + s.principles.total + s.goals.total).toBe(34)
   })
 
+  it('wiki 单独计数：可见 = 目录页列着的现行词条，目录页本身不算条目', () => {
+    const s = computeMemoryStats(root, globalDir)
+    expect(s.wikis).toEqual({ total: 3, visible: 1, hidden: 1, superseded: 1 })
+    expect(s.notes.total).toBe(27) // 词条与目录页都不混进普通记录
+  })
+
   it('上次反思：memory-reflect- 前缀里 created 最新的一条，主题取文件名', () => {
     const s = computeMemoryStats(root, globalDir)
     expect(s.lastReflect).toEqual({ date: '2026-10-22', theme: 'recall-review' })
+  })
+
+  it('上次反思的时刻（自动反思门槛用）：created 按本地时间解析；没有收尾事件 = null', () => {
+    expect(lastReflectAt(root)).toBe(new Date(2026, 9, 22, 8, 0, 0).getTime())
+    expect(lastReflectAt(globalDir)).toBeNull()
   })
 
   it('events / lessons：不超限时可见=总数、收起=0', () => {

@@ -68,6 +68,10 @@ export function startRobot(
     try {
       await vscode.commands.executeCommand(opts.focusCommand)
       if (folder !== null) panel.robotFocus(folder, task)
+      // focus 完成立即重算 seen（2026-11-09 真机：点机器人跳回面板后
+      // 提醒不清——robot 是 nonactivating 面板、点它不改变窗口焦点，
+      // 选中同一任务时 branch 不变，refresh 的既有触发点全不响）
+      refresh()
     } catch (e) {
       logRun({ ev: 'robot_focus_failed', error: e instanceof Error ? e.message : String(e) })
     }

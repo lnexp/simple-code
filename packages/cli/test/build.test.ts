@@ -1,9 +1,10 @@
-import { execFile } from 'node:child_process'
-import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { execFile, spawnSync } from 'node:child_process'
+import { mkdir, mkdtemp, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import { ensureShims, type ShimEntry } from '@simple-code/core'
 import { beforeAll, describe, expect, it } from 'vitest'
 
 /**
@@ -69,4 +70,56 @@ describe('真入口判定', () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+})
+
+describe('全部 14 个 sc-* bin 的 --help / -h 契约', () => {
+  const ALL_BINS: Array<{ bin: string; dist: string }> = [
+    { bin: 'sc', dist: 'sc.js' },
+    { bin: 'sc-apply-patch', dist: 'apply-patch.js' },
+    { bin: 'sc-event', dist: 'event.js' },
+    { bin: 'sc-imagegen', dist: 'imagegen.js' },
+    { bin: 'sc-lsp', dist: 'lsp.js' },
+    { bin: 'sc-mcp', dist: 'mcp.js' },
+    { bin: 'sc-memory', dist: 'memory.js' },
+    { bin: 'sc-note', dist: 'note.js' },
+    { bin: 'sc-skill', dist: 'skill.js' },
+    { bin: 'sc-task', dist: 'task.js' },
+    { bin: 'sc-task-send', dist: 'task-send.js' },
+    { bin: 'sc-wake', dist: 'wake.js' },
+    { bin: 'sc-webfetch', dist: 'webfetch.js' },
+    { bin: 'sc-websearch', dist: 'websearch.js' },
+  ]
+
+  it('经 shim 真进程跑 --help 与 -h：全部 exit 0、stdout 含用法、零写盘', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'sc-help-'))
+    const binDir = join(tmp, 'bin')
+    const home = join(tmp, 'home')
+    const cwd = join(tmp, 'work')
+    await mkdir(home, { recursive: true })
+    await mkdir(cwd, { recursive: true })
+    try {
+      const entries: ShimEntry[] = ALL_BINS.map(({ bin, dist }) => ({
+        name: bin.toUpperCase().replaceAll('-', '_'),
+        bin,
+        script: `${root}packages/cli/dist/${dist}`,
+      }))
+      await ensureShims(entries, { binDir, nodeBin: process.execPath })
+
+      for (const { bin } of ALL_BINS) {
+        for (const flag of ['--help', '-h'] as const) {
+          const r = spawnSync(join(binDir, bin), [flag], {
+            cwd,
+            input: '',
+            encoding: 'utf8',
+            env: { ...process.env, HOME: home },
+          })
+          expect(r.status, `${bin} ${flag} stderr=${r.stderr}`).toBe(0)
+          expect(r.stdout, `${bin} ${flag} stdout`).toContain('用法：')
+        }
+      }
+      expect(await readdir(cwd)).toEqual([])
+    } finally {
+      await rm(tmp, { recursive: true, force: true })
+    }
+  }, 60_000)
 })

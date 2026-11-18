@@ -4,13 +4,7 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ToolDefinition } from '../llm/types.ts'
 import { classify } from './approval.ts'
-import {
-  appendNonPathFrom,
-  appendPath,
-  dirHint,
-  loadAlways,
-  loadUserApproval,
-} from './approval-always.ts'
+import { appendNonPathFrom, appendPath, loadAlways, loadUserApproval } from './approval-always.ts'
 import type { BgMeta } from './bg.ts'
 import { LOG_DEFAULT_LINES } from './memory.ts'
 import { truncateOutput } from './truncate.ts'
@@ -43,8 +37,8 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
     '后台进程在用户界面显示、由用户决定是否关闭，agent 结束任务前应收尾自己的服务。\n' +
     '【临时文件】一律写 `.simple-code/tmp/`（项目内、随项目走、重启不丢），先 `mkdir -p`；' +
     '不写 /tmp——macOS 的 /tmp 重启即清。\n' +
-    '【审批】路径出工作区（读放行仅限 .simple-code 子树，其余读也拦）、进隐藏目录（.env、.ssh 类）、' +
-    '发布类命令（git push、gh，内置默认）与 approval.json askCommands 配置的命令（用户级 ~/.simple-code/ 与项目级 .simple-code/，含私有 CLI，如 appctl workloads apply）——执行前会请用户放行；被拒时如实转告用户、说明需要什么，不要换写法绕。网络命令与 $()/解释器不单独拦（2026-11-05 拆层拍板：默认全放、要拦自己配）：出网写、发布仍须按 AGENTS.md 先获批准，不要因「会弹卡」放松。\n' +
+    '【审批】路径出工作区弹卡（读写同权附「始终允许」，家/根过宽不给）；~/.simple-code 子树与项目内全放（.env 不例外）；memory 写与审批配置 approval.json 写恒拒。' +
+    '命令维：sudo 恒拒；askCommands 配置的命令（用户级 ~/.simple-code/ 与项目级 .simple-code/，含私有 CLI，如 appctl workloads apply）拦下问询、denyCommands 拒。APPLY_PATCH 的 heredoc 逐路径过审，WAKE --until-ok 内层命令递归过审。被拒时如实转告用户、说明需要什么，不要换写法绕。网络命令与 $()/解释器不单独拦（2026-11-05 拆层拍板：默认全放、要拦自己配）：出网写、发布（git push、gh release 等）仍须按 AGENTS.md 先获批准，不要因「会弹卡」放松。\n' +
     '【网络】"$SIMPLE_CODE_WEBFETCH" <url>（HTML 转 markdown，可接管道）；"$SIMPLE_CODE_WEBSEARCH" <query>。\n' +
     '【自查】查 SC 自身运作（上下文分区/记忆/审批/排障）：grep "<关键词>" "$SIMPLE_CODE_DOC"。\n' +
     // LSP 命令格式按注入条件拼（2026-09-17 两次拍板）：env 里有桥才写这段——
@@ -69,12 +63,16 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
         '派出那一轮结束时结果以〔任务结果〕消息回到你这里，不用轮询；它的经历之后合回历史。' +
         // 规则 14：固定一句，列表不进描述——用户改 taskModels 不动 tools[0]
         '可加 --model <名> 指定模型（"$SIMPLE_CODE_TASK" --models 列出可选的及用途；不写 = 配置默认）。\n' +
+        'goal 模式（跑到验收标准达成或判定不可能）：先 "$SIMPLE_CODE_TASK" --goal 读派单纪律，' +
+        '再 --goal --go 正式派单。用户说「开启/来一个 goal 任务」指的就是本模式（派子任务），' +
+        '不是 note 的 goal 类型——2026-11-09 真机：模型把「开启一个 goal 任务」理解成 NOTE write --type goal。\n' +
         // 续派/闹钟（loop-interrupt 实现项 2/3）：同样只在宿主桥在时写；此前漏了这段，
         // 工具能调但模型不知道它们存在（2026-11-05 用户实测炸出）
         '【续派】"$SIMPLE_CODE_TASK_SEND"（无参列出任务：名字、状态、最近一句；带任务名和文本 = 往该任务发消息，' +
         'running 时入队插话、停着时点起新 turn）——追加指令、补背景都走它。\n' +
         '【闹钟】"$SIMPLE_CODE_WAKE" --after 30m / --at 08:00 / --until-ok "命令"（到点或条件满足时唤醒设闹钟的这个会话：' +
-        '跑着=插话、停着=开新 turn；--note 留给自己的备忘；不持久化，重启即丢，周期靠醒来自己设下一个）\n'
+        '跑着=插话、停着=开新 turn；--note 留给自己的备忘；持久化在项目 .simple-code/wake.json，重载恢复、过点补投；' +
+        '--list 只列本任务设的、--cancel <id> 取消本任务的；任务只能 awake 自己；周期靠醒来自己设下一个）\n'
       : '') +
     '【补丁】改既有文件用 "$SIMPLE_CODE_APPLY_PATCH" <<\'PATCH\'\n' +
     '*** Begin Patch\n*** Update File: 路径（相对工作区根）\n@@\n 照抄文件里已有的行（上下文）\n-要删的行\n+要加的行\n@@\n 另一处改动的上下文行\n-旧行\n+新行\n*** End Patch\nPATCH' +
@@ -93,10 +91,12 @@ const definitionOf = (config: BashConfig, env: NodeJS.ProcessEnv): ToolDefinitio
     '再一行 ---，其后是正文；新结论当场记一条）。' +
     '改内容用 "$SIMPLE_CODE_APPLY_PATCH"（.simple-code/notes/，免审批；write 撞同名拒绝，不覆盖）；' +
     '结论被推翻时不删，头里加 status: superseded 与 by: <接替的 note 名>，从此不进索引。\n' +
-    '所有 note 操作可加 --type general|lesson|principle|goal；list/search 默认跨类型，write 默认 general。' +
+    '所有 note 操作可加 --type general|lesson|principle|goal|wiki；list/search 默认跨类型，write 默认 general。' +
     'lesson 正文五个 ## 节：症状、当时怎么误判的、根因、修法、怎么验证的；principle：判断、适用边界、依据（默认 candidate，核实认可后改 active）；' +
     'goal：这件事是什么、目标、当前范围与边界、怎样算达到目标；头 current: true 指定当前目标，仅一个，状态 active/paused/completed/superseded。' +
     '新文件在 notes/<type>/（general 在根）；旧目录原位兼容，不自动迁移。当前 goal 和入选原则完整常驻，其余 read 按需。\n' +
+    'wiki 是词条：一个机制一条（现在怎么工作、为什么这样、坑、没解决的），由反思任务维护，目录页 notes/wiki/index.md 整页常驻；' +
+    'read 词条时开头提示 verified 之后代码改没改过，note lint 检查目录、[[链接]]、别名。\n' +
     '【技能】（点名或不确定怎么做时查用）"$SIMPLE_CODE_SKILL" list | read <name> | search <关键词>。' +
     '改项目级 SKILL.md 走 "$SIMPLE_CODE_APPLY_PATCH"（免审批）；用户级在 ~/.simple-code，写走 bash 审批。',
   parameters: {
@@ -223,9 +223,8 @@ async function checkApproval(
     }
   }
 
-  // always 预览：项目外
-  // 路径记目录（dirHint 算：目录记本身、文件记父目录，过宽不给）；
-  // multi 同质 external_dir 记一组目录（方案 1，approval.ts 算好带来）
+  // always 预览：项目外路径（单目录与 multi 批量目录，读写一致）均由
+  // approval.ts 经 dirHint 算进 alwaysPaths；元素寻址参数位走 nonPathFrom
   const alwaysHint =
     verdict.kind === 'ask'
       ? verdict.nonPathFrom !== undefined
@@ -233,14 +232,9 @@ async function checkApproval(
         : verdict.alwaysPaths !== undefined
           ? {
               kind: 'paths' as const,
-              dirs: verdict.alwaysPaths ?? [],
+              dirs: verdict.alwaysPaths,
             }
-          : verdict.category === 'external_dir'
-            ? (() => {
-                const dir = dirHint(verdict.detail)
-                return dir === null ? undefined : { kind: 'path' as const, dir }
-              })()
-            : undefined
+          : undefined
       : undefined
 
   // 中断兜底：宿主收到 abort 应自行 resolve 'deny'，但没做的话这里
@@ -266,7 +260,6 @@ async function checkApproval(
     try {
       if (alwaysHint.kind === 'nonpath')
         appendNonPathFrom(ctx.root, alwaysHint.lead, alwaysHint.from)
-      else if ('dir' in alwaysHint) appendPath(ctx.root, alwaysHint.dir)
       else for (const d of alwaysHint.dirs) appendPath(ctx.root, d)
     } catch (err) {
       process.stderr.write(

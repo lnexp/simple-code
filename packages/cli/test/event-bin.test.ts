@@ -72,9 +72,11 @@ describe('eventMain 订正口（2026-09-20）', () => {
     expect(after).toBeNull() // 关键：没变相新建
   })
 
-  it('用法提示含订正口；help 退 0、乱写退 1', async () => {
+  it('用法提示含订正口；help / --help / -h 退 0、乱写退 1', async () => {
     const dir = await fixture()
     expect(eventMain(['help'], dir)).toBe(0)
+    expect(eventMain(['--help'], dir)).toBe(0)
+    expect(eventMain(['-h'], dir)).toBe(0)
     expect(eventMain(['wat'], dir)).toBe(1)
     expect(eventMain([], dir)).toBe(1)
   })

@@ -1,5 +1,5 @@
 import { estimateTextTokens as tokens } from '../loop/tokens.ts'
-import { NOTE_TYPES, type NoteFile, type NoteType, scanNoteFiles } from '../tools/note-files.ts'
+import { type NoteFile, type NoteType, scanNoteFiles } from '../tools/note-files.ts'
 import {
   GOAL_SECTIONS,
   noteFileSignal,
@@ -8,7 +8,10 @@ import {
 } from '../tools/note-library.ts'
 
 const DEFAULT_NOTE_RATIOS = { general: 0.35, lesson: 0.1, principle: 0.2, goal: 0.35 }
-export type NoteBudgetConfig = { noteBudgetTokens: number; noteRatios: Record<NoteType, number> }
+/** wiki 不分这份预算：它的目录页整页常驻（wiki.ts wikiIndexSection） */
+const BUDGET_TYPES = ['general', 'lesson', 'principle', 'goal'] as const
+type BudgetType = Exclude<NoteType, 'wiki'>
+export type NoteBudgetConfig = { noteBudgetTokens: number; noteRatios: Record<BudgetType, number> }
 export const DEFAULT_NOTE_BUDGET: NoteBudgetConfig = {
   noteBudgetTokens: 2100,
   noteRatios: DEFAULT_NOTE_RATIOS,
@@ -33,7 +36,8 @@ const sectionNames = {
   principle: ['判断', '适用边界'],
   goal: GOAL_SECTIONS,
 }
-function render(file: NoteFile): string {
+type BudgetFile = NoteFile & { type: BudgetType }
+function render(file: BudgetFile): string {
   if (file.type === 'general')
     return `- ${file.name}${file.meta.description ? ` — ${file.meta.description}` : ''}`
   if (file.type === 'lesson') return `- ${file.name}`
@@ -46,8 +50,8 @@ function render(file: NoteFile): string {
 }
 const titles = { general: '普通记录', lesson: '教训', principle: '原则', goal: '当前目标' }
 function renderAll(files: NoteFile[]): string {
-  return NOTE_TYPES.map((type) => {
-    const entries = files.filter((f) => f.type === type)
+  return BUDGET_TYPES.map((type) => {
+    const entries = files.filter((f): f is BudgetFile => f.type === type)
     return entries.length
       ? `## note ${titles[type]}（--type ${type}）\n${entries.map(render).join('\n')}`
       : ''

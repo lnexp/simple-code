@@ -103,6 +103,7 @@ const stats: MemoryStats = {
   lessons: { total: 43, visible: 30, hidden: 13, superseded: 0 },
   principles: { total: 2, visible: 2, hidden: 0, superseded: 0 },
   goals: { total: 1, visible: 1, hidden: 0, superseded: 0 },
+  wikis: { total: 3, visible: 3, hidden: 0, superseded: 0 },
   events: { total: 125, visible: 30, hidden: 95, superseded: 0 },
   skills: 2,
   summaries: 628,
@@ -118,8 +119,8 @@ describe('记忆面板接线', () => {
 
     app.send({ type: 'memory_data', stats })
     const html = app.html()
-    // 六项互斥计数，四种 note 类型不再合并或重复叠加。
-    expect(html).toContain('共 242 条') // 69+43+2+1+125+2
+    // 七项互斥计数，五种 note 类型不再合并或重复叠加。
+    expect(html).toContain('共 245 条') // 69+43+2+1+3+125+2
     expect(html).toContain('ctx-stack')
     const rows = [...host!.querySelectorAll('.ctx-row')].map((row) => ({
       label: row.querySelector('.ctx-label')?.textContent,
@@ -127,14 +128,15 @@ describe('记忆面板接线', () => {
       pct: row.querySelector('.ctx-pct')?.textContent,
     }))
     expect(rows).toEqual([
-      { label: 'note', count: '69', pct: '29%' },
+      { label: 'note', count: '69', pct: '28%' },
       { label: 'lesson', count: '43', pct: '18%' },
       { label: 'principle', count: '2', pct: '1%' },
       { label: 'goal', count: '1', pct: '0%' },
-      { label: 'event', count: '125', pct: '52%' },
+      { label: 'wiki', count: '3', pct: '1%' },
+      { label: 'event', count: '125', pct: '51%' },
       { label: 'skill', count: '2', pct: '1%' },
     ])
-    expect(host!.querySelectorAll('.ctx-stack > span')).toHaveLength(6)
+    expect(host!.querySelectorAll('.ctx-stack > span')).toHaveLength(7)
     expect(html).not.toContain('收起')
     expect(html).toContain('另有 summary 628 份')
     expect(html).toContain('2026-10-22 · recall-review')

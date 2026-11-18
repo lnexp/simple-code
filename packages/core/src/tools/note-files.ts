@@ -4,8 +4,9 @@
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { stampLastRead } from './last-read.ts'
+import { WIKI_INDEX_NAME, wikiReadWarnings } from './wiki.ts'
 
-export const NOTE_TYPES = ['general', 'lesson', 'principle', 'goal'] as const
+export const NOTE_TYPES = ['general', 'lesson', 'principle', 'goal', 'wiki'] as const
 export type NoteType = (typeof NOTE_TYPES)[number]
 export type NoteFileCopy = { path: string; text: string; mtimeMs: number }
 export type NoteFile = {
@@ -32,7 +33,10 @@ export function noteFileMeta(text: string): Record<string, string> {
   const header = /^---\s*\n([\s\S]*?)\n---/.exec(text)?.[1]
   const meta: Record<string, string> = {}
   for (const line of header?.split('\n') ?? []) {
-    const field = /^(name|type|description|created|lastRead|status|by|current):\s*(.*)$/.exec(line)
+    const field =
+      /^(name|type|description|created|lastRead|status|by|current|aliases|files|verified):\s*(.*)$/.exec(
+        line,
+      )
     if (field) meta[field[1]!] = field[2]!.trim()
   }
   return meta
@@ -56,6 +60,8 @@ export function scanNoteFiles(root: string, type?: NoteType): NoteFile[] {
   for (const kind of type ? [type] : NOTE_TYPES) {
     for (const path of directories(root, kind).flatMap(filesIn)) {
       const name = path.split(/[\\/]/).pop()!.slice(0, -3)
+      // 词条目录页与词条同目录，但它是目录不是词条（wiki.ts）
+      if (kind === 'wiki' && name === WIKI_INDEX_NAME) continue
       const copy = { path, text: readFileSync(path, 'utf8'), mtimeMs: statSync(path).mtimeMs }
       const key = `${kind}:${name}`
       const existing = entries.get(key)
@@ -119,6 +125,8 @@ export function readNoteFile(root: string, name: string, type?: NoteType): strin
     warnings.push(`已作废${entry.meta.by ? `，现行见 ${entry.meta.by}` : ''}`)
   else if (entry.meta.status && entry.meta.status !== 'active')
     warnings.push(`状态：${entry.meta.status}，不作为当前生效规则`)
+  if (entry.type === 'wiki' && entry.meta.status !== 'superseded')
+    warnings.push(...wikiReadWarnings(root, entry, scanNoteFiles(root, 'wiki')))
   let text = copy.text
   // 相同副本只给一份盖章会在下一次扫描制造冲突；也不把一次 read 扩成双写。
   if (entry.copies.length > 1) warnings.push('存在相同副本，未更新 lastRead；请先按路径消除重复。')
@@ -135,6 +143,8 @@ export function readNoteFile(root: string, name: string, type?: NoteType): strin
 /** 只解析写入位置，不创建文件；实际写入仍必须用 wx 防止覆盖并发创建的文件。 */
 export function noteWritePath(root: string, name: string, type: NoteType): string {
   checkName(name)
+  if (type === 'wiki' && name === WIKI_INDEX_NAME)
+    throw new Error(`${WIKI_INDEX_NAME} 是词条目录页的文件名，词条换一个名字。`)
   const existing = scanNoteFiles(root, type).find((f) => f.name === name)
   if (existing)
     throw new Error(

@@ -3,6 +3,7 @@ import type { LLMEvent } from '../src/llm/events.ts'
 import { openaiChat } from '../src/llm/protocols/openai-chat.ts'
 import { parseSSE } from '../src/llm/protocols/utils/sse.ts'
 import type { Message, Request } from '../src/llm/types.ts'
+import { accumulate, emptyAccumulator, finishAccumulator } from '../src/loop/accumulate.ts'
 import { eventsFromFixture, readFixture, shape } from './helpers.ts'
 
 const FIXTURE = 'openai-chat.tool-call.sse'
@@ -229,6 +230,48 @@ describe('openai-chat / parseStream', () => {
     expect(shape(events)).toEqual(['reasoning_start', 'reasoning_delta', 'reasoning_end', 'finish'])
   })
 
+  it('推理与正文交错：推理到达先收尾正文，攒成消息回传与流原文逐字一致', async () => {
+    // 2026-11-14：网关在服务端替模型跑 web_search，几轮拼成一条流，轮与轮
+    // 之间是 推理→正文→推理→正文。推理到达时正文没收尾，accumulate 开新块
+    // 把没收尾的正文覆盖掉——回传的 content 只剩最后一段，网关续传时校验
+    // 历史对不上，409 history_mismatch（网关多轮事故）
+    const events = await feed([
+      choice({ reasoning_content: '先想' }),
+      choice({ content: '查一下' }),
+      choice({ reasoning_content: '再想' }),
+      choice({ content: '记下来' }),
+      choice({
+        tool_calls: [
+          { index: 0, id: 'c1', type: 'function', function: { name: 'bash', arguments: '{}' } },
+        ],
+      }),
+      choice({}, 'tool_calls'),
+    ])
+    expect(shape(events)).toEqual([
+      'reasoning_start',
+      'reasoning_delta',
+      'reasoning_end',
+      'text_start',
+      'text_delta',
+      'text_end',
+      'reasoning_start',
+      'reasoning_delta',
+      'reasoning_end',
+      'text_start',
+      'text_delta',
+      'tool_input_start',
+      'tool_input_delta',
+      'text_end',
+      'tool_input_end',
+      'finish',
+    ])
+    let acc = emptyAccumulator()
+    for (const llmEv of events) acc = accumulate(acc, llmEv)[0]
+    const msgs = wireMessages([finishAccumulator(acc)])
+    expect(msgs[1]?.content).toBe('查一下记下来')
+    expect(msgs[1]?.reasoning_content).toBe('先想再想')
+  })
+
   it('流中途的 error 抛 LLMStreamError', async () => {
     await expect(feed([{ error: { message: '上游炸了', code: 'server_error' } }])).rejects.toThrow(
       '上游炸了',
@@ -261,6 +304,43 @@ describe('openai-chat / usage 与 Anthropic 的口径差异', () => {
       finish.usage.cacheCreationInputTokens +
       finish.usage.cacheReadInputTokens
     expect(total).toBe(23292)
+  })
+
+  it('网关服务端多轮：usage.aigw.rounds 透传成 serverRounds——此时 token 数是各轮累加', async () => {
+    // 2026-11-14 网关记录的 usage chunk（删了计费明细 tool_charges）：服务端跑了
+    // 5 轮 web_search，307267 是 5 轮 prompt 之和，那次请求的真实上下文约 50k
+    const events = await feed([
+      choice({}, 'tool_calls'),
+      {
+        choices: [],
+        usage: {
+          aigw: { rounds: 5, complete: true },
+          completion_tokens: 6676,
+          completion_tokens_details: { reasoning_tokens: 5228 },
+          prompt_tokens: 307267,
+          prompt_tokens_details: { cached_tokens: 278784 },
+          server_tool_use: { web_search_requests: 6, web_fetch_requests: 0 },
+          total_tokens: 313943,
+        },
+      },
+    ])
+    const finish = events.at(-1)
+    if (finish?.type !== 'finish') throw new Error('最后一个事件应该是 finish')
+    expect(finish.usage.serverRounds).toBe(5)
+    expect(finish.usage.inputTokens + finish.usage.cacheReadInputTokens).toBe(307267)
+  })
+
+  it('单轮不带 serverRounds：rounds=1 和没有 aigw 字段都一样', async () => {
+    for (const extra of [{ aigw: { rounds: 1, complete: true } }, {}]) {
+      const events = await feed([
+        choice({}, 'stop'),
+        { choices: [], usage: { prompt_tokens: 10, completion_tokens: 1, ...extra } },
+      ])
+      const finish = events.at(-1)
+      if (finish?.type !== 'finish') throw new Error('最后一个事件应该是 finish')
+      expect(finish.usage.inputTokens).toBe(10) // 前提：usage chunk 确实被读到了
+      expect('serverRounds' in finish.usage).toBe(false)
+    }
   })
 })
 

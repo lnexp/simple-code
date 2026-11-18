@@ -287,12 +287,21 @@ describe('injectLocalTools：删掉继承来的派任务桥', () => {
     const dir = await mkdtemp(join(tmpdir(), 'sc-inject-'))
     const binDir = await mkdtemp(join(tmpdir(), 'sc-shim-'))
     dirs.push(dir)
-    const keys = ['SIMPLE_CODE_TASK', 'SIMPLE_CODE_TASK_PORT', 'SIMPLE_CODE_TASK_TOKEN'] as const
+    // TASK_SEND/WAKE 2026-11-12 补删：不删则子 sc 能插宿主任务、读写其 wake.json
+    const keys = [
+      'SIMPLE_CODE_TASK',
+      'SIMPLE_CODE_TASK_PORT',
+      'SIMPLE_CODE_TASK_TOKEN',
+      'SIMPLE_CODE_TASK_SEND',
+      'SIMPLE_CODE_WAKE',
+    ] as const
     const saved = keys.map((k) => process.env[k])
     try {
       process.env.SIMPLE_CODE_TASK = '/host/task.js'
       process.env.SIMPLE_CODE_TASK_PORT = '51234'
       process.env.SIMPLE_CODE_TASK_TOKEN = 'tok'
+      process.env.SIMPLE_CODE_TASK_SEND = '/host/task-send.js'
+      process.env.SIMPLE_CODE_WAKE = '/host/wake.js'
       await injectLocalTools(dir, binDir)
       for (const k of keys) expect(process.env[k]).toBeUndefined()
     } finally {

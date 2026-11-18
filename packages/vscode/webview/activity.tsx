@@ -187,14 +187,12 @@ export function ToolRow({
               <code>
                 {approval.always.kind === 'nonpath'
                   ? `${approval.always.lead} 的第 ${approval.always.from} 位参数起不是路径`
-                  : approval.always.kind === 'paths'
-                    ? [
-                        ...approval.always.dirs.map((d) => `${d}/*`),
-                        ...(approval.always.hidden ?? []).map(
-                          (h) => `${h.write ? '写' : '读'} ${h.path}`,
-                        ),
-                      ].join('、')
-                    : `${approval.always.dir}/*`}
+                  : [
+                      ...approval.always.dirs.map((d) => `${d}/*`),
+                      ...(approval.always.hidden ?? []).map(
+                        (h) => `${h.write ? '写' : '读'} ${h.path}`,
+                      ),
+                    ].join('、')}
               </code>
             </div>
           )}

@@ -26,7 +26,12 @@
     "test/branch-approval-badge.test.ts",
     "test/turn-memo.test.ts",
     "test/bottom-area.test.ts",
-    "test/scroll-restore-wiring.test.ts"
+    "test/scroll-restore-wiring.test.ts",
+    "test/current-file-wiring.test.ts",
+    "test/task-history-dup.test.ts",
+    "test/turn-queue-render.test.ts",
+    "test/task-draft-render.test.ts",
+    "test/task-rename.test.ts"
   ],
   "$comment": [
     "排除的这些测试要 DOM 类型（toolrow 还要 JSX），而这个 project 没有 DOM lib、",

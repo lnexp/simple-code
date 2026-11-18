@@ -72,6 +72,7 @@ export {
   computeMemoryStats,
   type LastReflect,
   type LibraryStat,
+  lastReflectAt,
   type MemoryStats,
 } from './session/memory-stats.ts'
 export type { CompactResult, Session, SessionOptions } from './session/session.ts'
@@ -103,6 +104,7 @@ export {
   TASK_RESULT_HEAD,
   type TaskManifest,
   taskResultText,
+  wrapGoalBrief,
   writeTaskManifest,
 } from './session/task.ts'
 export {
@@ -130,6 +132,7 @@ export type { ApprovalCategory, ApprovalVerdict } from './tools/approval.ts'
 export type { BashConfig } from './tools/bash.ts'
 export { createBashTool } from './tools/bash.ts'
 export type { BgProcessInfo } from './tools/bg.ts'
+export { parseStamp } from './tools/decay.ts'
 export { describeError } from './tools/describe.ts'
 export {
   type LessonWriteInput,
@@ -159,6 +162,7 @@ export {
   writeNote,
 } from './tools/note.ts'
 export { listSkills, readSkill, searchSkills } from './tools/skill.ts'
+export { localStamp } from './tools/timestamp.ts'
 export type { ApprovalAsk, RawSink, Tool, ToolContext, ToolOutput } from './tools/types.ts'
 export { createViewImageTool } from './tools/viewimage.ts'
 export type { WebfetchConfig } from './tools/webfetch.ts'

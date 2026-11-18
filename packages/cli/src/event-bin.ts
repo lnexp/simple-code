@@ -4,7 +4,8 @@
  * 活跃战役状态板（.simple-code/events/，front matter + H1 + 进展时间序），
  * 归档=单次归类判断+原子落盘。
  *
- *   "$SIMPLE_CODE_EVENT" list                    # 全量清单（name — description）
+ *   "$SIMPLE_CODE_EVENT" list                    # 清单（默认收起超半年未用）
+ *   "$SIMPLE_CODE_EVENT" list --all             # 全量清单
  *   "$SIMPLE_CODE_EVENT" search <关键词>          # 匹配 name/description
  *   "$SIMPLE_CODE_EVENT" read <name>              # 一条全文
  *   "$SIMPLE_CODE_EVENT" read <name> --desc      # 只看一行描述
@@ -34,7 +35,7 @@ import { findWorkspaceRoot } from '@simple-code/core/src/tools/workspace-root.ts
 import { logSearchText } from './search-log.ts'
 
 const usage = `用法：
-  event list                       全量清单（name — description）
+  event list                       清单（默认收起超半年未用，--all 全量）
   event search <关键词>             按 name/description 匹配（更细的词 read 全文）
   event read <name>                一条全文
   event read <name> --desc        只看一行描述
@@ -52,6 +53,10 @@ export function eventMain(argv: string[], start = process.cwd()): number {
   const [sub, target, flag] = argv
   const all = argv.includes('--all')
   try {
+    if (sub === 'help' || sub === '--help' || sub === '-h') {
+      console.log(usage)
+      return 0
+    }
     if (sub === 'list') {
       console.log(listEvents(cwd, all))
     } else if (sub === 'search' && target) {
@@ -73,7 +78,7 @@ export function eventMain(argv: string[], start = process.cwd()): number {
       console.log(mergeEvents(cwd, target, argv.slice(2)))
     } else {
       console.log(usage)
-      return sub === 'help' || sub === '--help' ? 0 : 1
+      return 1
     }
     return 0
   } catch (e) {

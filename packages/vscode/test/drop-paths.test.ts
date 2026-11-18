@@ -5,6 +5,7 @@ import {
   type DropData,
   hasOsFileDrag,
   isExplorerDrag,
+  osFileDragPaths,
   parseExplorerPaths,
   toDisplayPath,
 } from '../webview/dropPaths.ts'
@@ -204,5 +205,21 @@ describe('composeWithAttachments', () => {
   })
   it('没有附件时原样返回', () => {
     expect(composeWithAttachments('纯文本', [])).toBe('纯文本')
+  })
+})
+
+describe('Finder/OS 拖路径提取（2026-11-09 翻案：Electron File.path）', () => {
+  it('File 带 path 属性的收进路径列表', () => {
+    const files = [
+      { path: '/Users/x/a.md' },
+      { path: '/Users/x/b.png' },
+      {},
+    ]
+    expect(osFileDragPaths(files)).toEqual(['/Users/x/a.md', '/Users/x/b.png'])
+  })
+
+  it('全部没 path（纯浏览器环境）→ 空数组，调用方兜底提示', () => {
+    expect(osFileDragPaths([{}, {}, {}])).toEqual([])
+    expect(osFileDragPaths([])).toEqual([])
   })
 })

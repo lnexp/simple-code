@@ -14,13 +14,15 @@ export type ParsedArgs =
   | { ok: true; cmd: string; file: string; line: number; col: number; colGiven: boolean }
   | { ok: false; error: string }
 
+const USAGE =
+  '用法：<definition|refs|symbols|hover|calls-in|calls-out> <file>[:行[:列]]，如 refs src/run.ts:120:5'
+
 export function parseLspArgs(argv: string[]): ParsedArgs {
   const [cmd, fileArg] = argv
   if (!cmd || !fileArg) {
     return {
       ok: false,
-      error:
-        '用法：<definition|refs|symbols|hover|calls-in|calls-out> <file>[:行[:列]]，如 refs src/run.ts:120:5',
+      error: USAGE,
     }
   }
   const parts = fileArg.split(':')
@@ -42,6 +44,10 @@ export function parseLspArgs(argv: string[]): ParsedArgs {
 }
 
 export async function lspMain(argv: string[]): Promise<number> {
+  if (argv.includes('--help') || argv.includes('-h') || argv[0] === 'help') {
+    process.stdout.write(`${USAGE}\n`)
+    return 0
+  }
   const parsed = parseLspArgs(argv)
   if (!parsed.ok) {
     process.stderr.write(`${parsed.error}\n`)

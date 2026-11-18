@@ -116,6 +116,13 @@ export type Usage = {
   cacheReadInputTokens: number
   /** OpenAI Responses 单独报告；Anthropic 不报，此时为 0 */
   reasoningTokens: number
+  /**
+   * 服务端跑了几轮。网关在服务端替模型执行工具（web_search 等）时，一次请求
+   * 在服务端是好几轮模型调用，上面几项是**各轮累加**的计费量，不是上下文
+   * 大小（2026-11-14 实测 5 轮报 307k，真实上下文约 50k）。只在 >1 时出现；
+   * 目前只有 openai-chat 认网关的 `usage.aigw.rounds`
+   */
+  serverRounds?: number
 }
 
 export type FinishReason = 'stop' | 'tool-calls' | 'length' | 'content-filter' | 'error'

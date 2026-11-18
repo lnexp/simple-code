@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import type { Session, SetTimer } from '@simple-code/core'
+import type { HistoryRow, Session, SetTimer } from '@simple-code/core'
 import { listTaskManifests, MEMORY_RELATIVE, openStore } from '@simple-code/core'
 import { describe, expect, it, vi } from 'vitest'
 import type { BridgeDeps } from '../src/bridge.ts'
@@ -28,10 +28,15 @@ function fakeTaskSession(
 ) {
   const calls: string[] = []
   const sessions: Session[] = []
+  /** 任务视图翻页（task_fetchHistory）的桩数据：用例自己配 */
+  const taskPages: { cursor: number | null; rows: HistoryRow[]; next: number | null }[] = []
+  /** 各任务 session 被调 historyPage 的实参记录（按 session 顺序分桶或平铺） */
+  const pageCalls: { owner: string; cursor: number | null; live: boolean }[] = []
   // 每次新建 session 对象（真实行为：每个任务一个 getSession，config
   // 不共享——分支级开关各自独立的前提），calls 共享供断言。第一个对象
   // 预建：既有用例「先改 session 再 dispatch」改的就是它（make 首次返回它）
   const buildSession = () => {
+    let floor: number | null = null
     // config 是固定对象（真实 loadConfig 的行为）：分支级开关切换往上面
     // 写，TaskState 与装配点读的是同一个
     const config = {
@@ -55,9 +60,22 @@ function fakeTaskSession(
       setMemoryRoot: (dir: string) => {
         ;(session as Record<string, unknown>).memoryRoot = dir
       },
+      setFloor: (f: number | null) => {
+        floor = f
+      },
       messages: () => [],
       historyRows: () => [],
-      historyRowsWindowed: () => [],
+      // 任务视图翻页（task_fetchHistory）的桩：pages 用例自己配
+      historyPage: (cursor: number | null, _limit: number, options?: { live?: boolean }) => {
+        pageCalls.push({
+          owner: String((session as { owner: string }).owner),
+          cursor,
+          live: options?.live ?? false,
+        })
+        const hit = taskPages.find((p) => p.cursor === cursor)
+        return hit ? { rows: hit.rows, next: hit.next } : { rows: [], next: null }
+      },
+      historyRowsWindowed: () => ({ rows: [], floor }),
       lastTurnError: () => null,
       isRunning: () => false,
       takeTaskResults: () => 0,
@@ -103,7 +121,7 @@ function fakeTaskSession(
     used = true
     return first
   }
-  return { make, calls, sessions }
+  return { make, calls, sessions, taskPages, pageCalls }
 }
 
 const neverTimer: SetTimer = () => () => {}
@@ -149,6 +167,8 @@ function taskHarness(options: {
     options.taskHang,
   )
   const built: string[] = []
+  /** 两个 session 工厂各自收到的开轮回调（自动反思挂点，reflect-auto.ts） */
+  const turnHooks: { main?: (turnsSince: (at: number) => number) => void; task?: unknown } = {}
   const choiceStore = {
     stored: new Map<string, unknown>(),
     get: (dir: string) => (choiceStore.stored.get(dir) as never) ?? null,
@@ -176,13 +196,14 @@ function taskHarness(options: {
     post: (m: ToWebview) => {
       posted.push(m)
     },
-    session: async () => {
+    session: async (_requestApproval, onTurnStart) => {
+      turnHooks.main = onTurnStart
       built.push('main')
       const session = {
         root: '/tmp/x',
         messages: () => [],
         historyRows: () => [],
-        historyRowsWindowed: () => [],
+        historyRowsWindowed: () => ({ rows: [], floor: null }),
         lastTurnError: () => null,
         isRunning: () => false,
         takeTaskResults: () => mainTaken(),
@@ -222,7 +243,8 @@ function taskHarness(options: {
       } as unknown as Session
       return session
     },
-    taskSession: async (_manifest, _requestApproval) => {
+    taskSession: async (_manifest, _requestApproval, onTurnStart) => {
+      turnHooks.task = onTurnStart
       built.push('task')
       const err = options.taskSessionErrors?.shift()
       if (err !== undefined) throw err
@@ -257,6 +279,7 @@ function taskHarness(options: {
     posted,
     taskFake,
     built,
+    turnHooks,
     choiceStore,
     summaryStore,
     attendanceStore,
@@ -865,6 +888,124 @@ describe('分身任务接线', () => {
     // 内容来自 mirror（baseItems=historyRows + replay）。假 session 的
     // historyRows 是空数组、fold 已清 replay，所以基线为空——真库才有
     // 内容；这里只验「选中就有基线可拿」，内容正确性归 events.test
+  })
+
+  it('task_fetchHistory → 走任务自己的 session 翻页回 task_historyPage；任务已关闭回空页', async () => {
+    const h = taskHarness({ taskEvents: [{ type: 'text_delta', text: '分支经历' }] })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'task_dispatch', brief: '要翻页的分支' })
+    await settle()
+    await settle()
+    h.posted.length = 0
+
+    // 任务 session 的翻页桩：cursor null → 一页旧事，还有下一页
+    h.taskFake.taskPages.push({
+      cursor: null,
+      rows: [
+        {
+          id: 1,
+          turnId: 5,
+          role: 'user',
+          parts: [{ type: 'text', text: '任务的旧消息' }],
+          meta: null,
+          elapsedMs: null,
+          finishedAt: null,
+        },
+      ],
+      next: 42,
+    })
+    h.bridge.handle({ type: 'task_fetchHistory', task: '要翻页的分支', cursor: null })
+    await settle()
+    let page = h.posted.find(
+      (m): m is Extract<ToWebview, { type: 'task_historyPage' }> => m.type === 'task_historyPage',
+    )
+    expect(page?.name).toBe('要翻页的分支')
+    expect(page?.next).toBe(42)
+    expect(page?.items).toEqual([{ kind: 'user', text: '任务的旧消息' }])
+
+    // 不存在的任务（已关闭）：空页 + next=null，把 webview 的 loading 收掉
+    h.bridge.handle({ type: 'task_fetchHistory', task: '已被关闭的分支', cursor: null })
+    await settle()
+    const pages = h.posted.filter(
+      (m): m is Extract<ToWebview, { type: 'task_historyPage' }> => m.type === 'task_historyPage',
+    )
+    page = pages.at(-1)
+    expect(page).toMatchObject({ name: '已被关闭的分支', items: [], next: null })
+  })
+
+  it('任务视图窗口化翻页：第一页从各任务自己的 floor 往下翻（带 live）；未推 hydrate 时起点不动，推了才动', async () => {
+    let releaseSecond!: () => void
+    let sendCount = 0
+    const h = taskHarness({ taskEvents: [{ type: 'text_delta', text: '答' }] })
+    const s0 = h.taskFake.sessions[0] as unknown as {
+      owner: string
+      setFloor: (f: number | null) => void
+      send: (t: string) => AsyncGenerator<{ type: string; text?: string }>
+    }
+    s0.owner = 'task-a'
+    s0.setFloor(40)
+    s0.send = () => {
+      sendCount++
+      const wait = sendCount === 2
+      return (async function* () {
+        yield { type: 'text_delta', text: '答' }
+        if (wait) await new Promise<void>((r) => (releaseSecond = r))
+      })()
+    }
+
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'task_dispatch', brief: '任务甲' })
+    for (let i = 0; i < 4; i++) await settle()
+
+    // 再开第二个任务，设不同的 floor，验证多任务各自的 floor 互不串
+    h.bridge.handle({ type: 'task_dispatch', brief: '任务乙' })
+    await settle()
+    const s1 = h.taskFake.sessions[1] as unknown as {
+      owner: string
+      setFloor: (f: number | null) => void
+    }
+    s1.owner = 'task-b'
+    s1.setFloor(80)
+    // 刷一次任务乙的第二轮让 floor=80 落进任务乙运行态
+    h.bridge.handle({ type: 'task_send', task: '任务乙', text: '续' })
+    for (let i = 0; i < 4; i++) await settle()
+
+    h.taskFake.pageCalls.length = 0
+    h.bridge.handle({ type: 'task_fetchHistory', task: '任务甲', cursor: null })
+    await settle()
+    h.bridge.handle({ type: 'task_fetchHistory', task: '任务甲', cursor: 7 })
+    await settle()
+    h.bridge.handle({ type: 'task_fetchHistory', task: '任务乙', cursor: null })
+    await settle()
+    expect(h.taskFake.pageCalls).toEqual([
+      { owner: 'task-a', cursor: 40, live: true },
+      { owner: 'task-a', cursor: 7, live: true },
+      { owner: 'task-b', cursor: 80, live: true },
+    ])
+
+    // 面板 detach 期间任务甲在后台跑完第二轮：fold 把 baseFloor 推到 90，
+    // 但 task_hydrate 未投达 webview，postedFloor 保持 40 不动
+    s0.setFloor(90)
+    h.bridge.handle({ type: 'task_send', task: '任务甲', text: '后台一轮' })
+    await settle()
+    h.bridge.detach()
+    releaseSecond()
+    for (let i = 0; i < 4; i++) await settle()
+
+    h.taskFake.pageCalls.length = 0
+    h.bridge.handle({ type: 'task_fetchHistory', task: '任务甲', cursor: null })
+    await settle()
+    expect(h.taskFake.pageCalls).toEqual([{ owner: 'task-a', cursor: 40, live: true }])
+
+    // 重连 attach（rehydrate 推了新 task_hydrate）后，起点同步到 90
+    h.bridge.handle({ type: 'ready' })
+    for (let i = 0; i < 4; i++) await settle()
+    h.taskFake.pageCalls.length = 0
+    h.bridge.handle({ type: 'task_fetchHistory', task: '任务甲', cursor: null })
+    await settle()
+    expect(h.taskFake.pageCalls).toEqual([{ owner: 'task-a', cursor: 90, live: true }])
   })
 
   it('一轮跑完后切走再切回（task_open 重推基线）：底栏的用量与首字/总耗时还在', async () => {
@@ -1516,37 +1657,50 @@ describe('完成回调（task-trunk 规则 12）', () => {
   const sentOf = (h: ReturnType<typeof taskHarness>): string[] =>
     h.taskFake.calls.filter((c) => c.startsWith('send:')).map((c) => c.slice('send:'.length))
 
-  it('只输名称开空任务（规则 13）：idle 不跑，可先切模型；第一条拼框架句只拼一次；用户开的不回调', async () => {
+  it('「+ 任务」第一条消息即开（规则 13，11-14 改）：名字取打的字首行；先选的模型/档位/审批生效；拼框架句只拼一次；回 select_task；用户开的不回调', async () => {
     const h = taskHarness({
       realStore: true,
       taskEvents: [{ type: 'text_delta', text: '空任务答' }],
     })
     h.bridge.handle({ type: 'ready' })
     await settle()
-    h.bridge.handle({ type: 'task_create', name: '空任务' })
+    // text 里附件拼在前面：名字只认 name（用户打的字），不拿 text 首行
+    h.bridge.handle({
+      type: 'task_create',
+      name: '空任务\n细节',
+      text: '📎 a.ts\n\n空任务\n细节',
+      images: [{ mimeType: 'image/png', data: 'AAAA' }],
+      choice: { provider: 'p', model: 'm2', effort: 'max' },
+      attendance: 'off',
+    })
     await settleN()
     const snap = h.posted
       .filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks')
       .at(-1)
-    expect(snap?.tasks.map((t) => [t.name, t.status])).toEqual([['空任务', 'idle']])
-    expect(sentOf(h)).toEqual([]) // 建好不跑
-    expect(manifestOf(h.depsFolder)).toMatchObject({ awaitingFirstMessage: true })
-    expect(manifestOf(h.depsFolder)).not.toHaveProperty('callback')
-    h.bridge.handle({ type: 'setModel', choice: { provider: 'p', model: 'm2' }, task: '空任务' })
-    await settleN()
-    expect(h.taskFake.calls).toContain('setModel:{"provider":"p","model":"m2"}')
-    expect(sentOf(h)).toEqual([])
-    h.bridge.handle({ type: 'task_send', task: '空任务', text: '第一句' })
-    await settleN()
+    expect(snap?.tasks.map((t) => t.name)).toEqual(['空任务'])
+    expect(snap?.tasks[0]?.attendance).toBe('off')
+    expect(h.posted).toContainEqual({ type: 'select_task', task: '空任务' })
+    expect(h.taskFake.calls).toContain('setModel:{"provider":"p","model":"m2","effort":"max"}')
+    expect(h.taskFake.calls).toContain('setEffort:max')
+    // 选择在发第一条之前生效（第一轮就跑在选的模型上）
+    const calls = h.taskFake.calls
+    expect(calls.indexOf('setEffort:max')).toBeLessThan(
+      calls.findIndex((c) => c.startsWith('send:')),
+    )
     const [first] = sentOf(h)
     expect(first?.startsWith('（task-空任务：你是一个独立任务')).toBe(true)
-    expect(first?.endsWith('\n\n第一句')).toBe(true)
+    expect(first?.endsWith('\n\n📎 a.ts\n\n空任务\n细节+1图')).toBe(true)
     expect(manifestOf(h.depsFolder).awaitingFirstMessage).toBeUndefined()
+    expect(manifestOf(h.depsFolder)).not.toHaveProperty('callback')
     expect(mailbox(h.depsFolder)).toEqual([]) // 第一轮结束也不回调
     h.bridge.handle({ type: 'task_send', task: '空任务', text: '第二句' })
     await settleN()
     expect(sentOf(h).at(-1)).toBe('第二句') // 不再拼
     expect(mailbox(h.depsFolder)).toEqual([])
+    // 同名不拒、加序号（同 agent 派任务）：名字由宿主定，webview 靠 select_task 知道
+    h.bridge.handle({ type: 'task_create', name: '空任务', text: '再来' })
+    await settleN()
+    expect(h.posted).toContainEqual({ type: 'select_task', task: '空任务 2' })
   })
 
   it('老的空任务（10-30 前用户开的，manifest 仍 pending + awaitingFirstMessage）被 reload：恢复 idle、不补回调；第一条照样拼框架句', async () => {
@@ -1754,8 +1908,12 @@ describe('任务改名（2026-11-09：显示名，owner 不动）', () => {
     h.bridge.handle({ type: 'task_rename', task: '调研某库', name: '另一个任务' })
     await settle()
     expect(h.posted.some((m) => m.type === 'fatal')).toBe(true)
-    // 拒了不发快照（只有成功才推）；原名未动以磁盘 manifest 为准
-    expect(listTaskManifests(h.depsFolder).map((m) => m.name)).toEqual(['调研某库', '另一个任务'])
+    // 拒了不发快照（只有成功才推）；原名未动以磁盘 manifest 为准（目录枚举按随机 owner 排，先 sort）
+    expect(
+      listTaskManifests(h.depsFolder)
+        .map((m) => m.name)
+        .sort(),
+    ).toEqual(['另一个任务', '调研某库'])
   })
 
   it('空名/没变化：静默不动（不 fatal、不推快照）', async () => {
@@ -1771,5 +1929,44 @@ describe('任务改名（2026-11-09：显示名，owner 不动）', () => {
     await settle()
     expect(h.posted.filter((m) => m.type === 'tasks')).toEqual([])
     expect(h.posted.some((m) => m.type === 'fatal')).toBe(false)
+  })
+})
+
+/** 自动反思（reflect-auto.ts，2026-11-12）：两个 session 工厂拿同一个开轮回调，
+ *  到门槛就派「反思」；按钮派出也记派出时间 */
+describe('自动反思接线', () => {
+  const tasksSnapshot = (h: ReturnType<typeof taskHarness>) =>
+    h.posted.filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks').at(-1)
+  const startFile = (h: ReturnType<typeof taskHarness>) =>
+    join(h.depsFolder, '.simple-code', 'reflect.json')
+
+  it('主任务开轮到门槛 → 派「反思」；任务 session 拿到的是同一个回调', async () => {
+    const h = taskHarness({})
+    h.bridge.handle({ type: 'ready' })
+    h.bridge.handle({ type: 'send', text: '你好' })
+    await settle()
+    const hook = h.turnHooks.main
+    expect(hook).toBeTypeOf('function')
+    // 前提：门槛前没有任何任务，派出来的「反思」不是别处来的
+    expect(tasksSnapshot(h)?.tasks ?? []).toHaveLength(0)
+    hook?.(() => 100)
+    await settle()
+    await settle()
+    expect(tasksSnapshot(h)?.tasks.map((t) => t.name)).toEqual(['反思'])
+    expect(h.built).toContain('task')
+    expect(h.turnHooks.task).toBe(hook)
+    expect(readFileSync(startFile(h), 'utf8')).toMatch(/"lastStart": "\d{4}-\d{2}-\d{2} /)
+  })
+
+  it('反思按钮派出成功也记派出时间', async () => {
+    const h = taskHarness({})
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    expect(() => readFileSync(startFile(h), 'utf8')).toThrow()
+    h.bridge.handle({ type: 'reflect_start' })
+    await settle()
+    await settle()
+    expect(h.posted.some((m) => m.type === 'reflect_result' && m.ok)).toBe(true)
+    expect(readFileSync(startFile(h), 'utf8')).toContain('lastStart')
   })
 })

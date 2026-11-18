@@ -14,6 +14,7 @@ import {
   type TaskManifest,
   taskResultText,
   watchIdle,
+  wrapGoalBrief,
   writeTaskManifest,
 } from '@simple-code/core'
 import {
@@ -76,9 +77,14 @@ export type TaskSummaryStore = {
   set(owner: string, value: boolean): void
 }
 
+/** 基线窗口（2026-11-06 拍板）：底稿只装最近 N 个不同 step（≈ 3-5 屏），
+ *  窗口外的往上翻页取（session.historyRowsWindowed 的 floor），主/任务视图共用 */
+export const FOLD_RECENT_STEPS = 100
+
 type TaskDeps = {
   folder: string
-  post: (msg: ToWebview) => void
+  /** 返回 false 表示未投达 webview（如面板未 ready）：postedFloor 不前移 */
+  post: (msg: ToWebview) => boolean
   /** 分支模型选择的持久化（2026-09-22 拍板：分支持久化）。不传 = 内存态 */
   choiceStore?: TaskChoiceStore
   /** 分支级历史摘要开关的持久化。不传 = 全部跟主任务（联动退回 folder 级） */
@@ -101,6 +107,11 @@ type TaskDeps = {
   /** 有任务回调投给了主任务（task-trunk 规则 12）：bridge 在主任务空闲时取走、
    *  刷新主视图；在跑时 loop 下一个请求前自己取 */
   pokeMain?: () => void
+  /** 一轮结束（runLoop finally 最后）：排队发送据结局决定发下一条还是暂停
+   *  （turn-queue.ts）。主任务那边是 bridge send 的 finally，同一个口径 */
+  turnEnded?: (owner: string, end: TurnEnd['end']) => void
+  /** 任务关闭了（已从 runs 删掉）：它的排队跟着丢 */
+  closed?: (owner: string) => void
 }
 
 type TaskOutcome = { ok: boolean; error?: string }
@@ -125,6 +136,12 @@ type Run = {
   session: Session | null
   idle: ReturnType<typeof watchIdle> | null
   baseItems: ChatItem[]
+  /** baseItems 对应的分页起点（historyRowsWindowed 的 floor），随基线刷新前移 */
+  baseFloor: number | null
+  /** 最近一次真正推 task_hydrate 达 webview 时的 baseFloor（多任务各记一份） */
+  postedFloor: number | null
+  /** 最近一次真正投达 webview 的基线世代号（与 postedFloor 同拍推进） */
+  hydrateEpoch: number
   replay: Array<{ ev: AgentEvent; at: number }>
   /** 进行中轮次的用户文本（插话不在这，在 queuedTexts）。mirror 要把它摆进 items——
    *  用户消息从不进 replay 事件流，没有它 task_hydrate 一替换就把 webview
@@ -274,11 +291,12 @@ export function createTaskCenter(deps: TaskDeps) {
   }
 
   /** task_hydrate：items + 底栏两字段（主 hydrate 同款，见 protocol） */
-  const hydrateMsg = (r: Run): ToWebview => {
+  const hydrateMsg = (r: Run, epoch: number): ToWebview => {
     const view = mirror(r)
     return {
       type: 'task_hydrate',
       name: r.name,
+      epoch,
       items: view.items,
       contextTokens: view.contextTokens,
       ...(view.lastTiming ? { lastTiming: view.lastTiming } : {}),
@@ -286,12 +304,25 @@ export function createTaskCenter(deps: TaskDeps) {
     }
   }
 
+  /** 推基线给 webview；真正投达时同步该任务的 postedFloor 与 hydrateEpoch */
+  const postHydrate = (r: Run): number => {
+    const nextEpoch = r.hydrateEpoch + 1
+    const msg = hydrateMsg(r, nextEpoch)
+    if (deps.post(msg)) {
+      r.postedFloor = r.baseFloor
+      r.hydrateEpoch = nextEpoch
+    }
+    return msg.type === 'task_hydrate' ? msg.items.length : 0
+  }
+
   const fold = (r: Run, session: Session): void => {
-    // 同步版（原图行，hydrateItems 端窄化掉不显示）——bridge 的 fold 同款；
-    // toHydrateRows 是 async（缩略图），跑完的收口不值得为它等一轮微任务
+    // 同步窗口版（同 bridge fold）：底稿只装最近 FOLD_RECENT_STEPS 个 step，
+    // 窗口外的从 floor 往下翻页取（含 live 行）
     const { contextTokens, lastTiming } = mirror(r)
     r.usage = { contextTokens, lastTiming }
-    r.baseItems = hydrateItems(session.historyRows())
+    const { rows, floor } = session.historyRowsWindowed(FOLD_RECENT_STEPS)
+    r.baseItems = hydrateItems(rows)
+    r.baseFloor = floor
     r.replay = []
     r.pendingTexts = []
     r.queuedTexts = []
@@ -312,7 +343,7 @@ export function createTaskCenter(deps: TaskDeps) {
     if (s === null || r.status === 'running' || r.status === 'closing') return
     if (s.takeTaskResults() === 0) return
     fold(r, s)
-    deps.post(hydrateMsg(r))
+    postHydrate(r)
   }
 
   /**
@@ -367,7 +398,7 @@ export function createTaskCenter(deps: TaskDeps) {
     void deliver(
       r.name,
       r.manifest.parent ?? '',
-      taskResultText(r.name, status, over?.reply ?? r.lastText),
+      taskResultText(r.name, status, over?.reply ?? r.lastText, r.manifest.goal === true),
     )
   }
 
@@ -430,9 +461,7 @@ export function createTaskCenter(deps: TaskDeps) {
         session.takeTaskResults()
         fold(r, session)
         foldMs = lap()
-        const msg = hydrateMsg(r)
-        if (msg.type === 'task_hydrate') items = msg.items.length
-        deps.post(msg)
+        items = postHydrate(r)
         postMs = lap()
       }
       // 派出那一轮结束：回调登记者一次（规则 12）；agent 续派触发的轮次
@@ -453,6 +482,8 @@ export function createTaskCenter(deps: TaskDeps) {
         tailMs: lap(),
       })
       // session 故意不关：空闲摘要还在跑。merge/discard/dispose 时关
+      // 放最后：排队的下一条会同步把任务置回 running，收尾要先做完
+      if (r.lastTurn !== undefined) deps.turnEnded?.(r.manifest.owner, r.lastTurn.end)
     }
   }
 
@@ -509,8 +540,10 @@ export function createTaskCenter(deps: TaskDeps) {
         // send 还没开始（runLoop 先 await 这里），用户消息既不在
         // historyRows 也不在 replay——清掉它第一轮全程看不见自己发的
         // 话（2026-09-23 真机；reload 后首条 task_send 同理）
-        r.baseItems = hydrateItems(s.historyRows())
-        deps.post(hydrateMsg(r))
+        const { rows, floor } = s.historyRowsWindowed(FOLD_RECENT_STEPS)
+        r.baseItems = hydrateItems(rows)
+        r.baseFloor = floor
+        postHydrate(r)
         postTasks() // 控件状态从 null 变实——刷新一次
         return s
       }
@@ -533,7 +566,7 @@ export function createTaskCenter(deps: TaskDeps) {
         postTasks()
         // 正看着这个任务的话视图要跟着出错误条（runLoop 对 null 裸
         // return，finally 里的 hydrate 只在有 session 时推）
-        deps.post(hydrateMsg(r))
+        postHydrate(r)
         return null
       })
     }
@@ -555,6 +588,9 @@ export function createTaskCenter(deps: TaskDeps) {
       session: null,
       idle: null,
       baseItems: [],
+      baseFloor: null,
+      postedFloor: null,
+      hydrateEpoch: 0,
       replay: [],
       pendingTexts: [],
       queuedTexts: [],
@@ -604,8 +640,9 @@ export function createTaskCenter(deps: TaskDeps) {
       return `已有同名任务「${clean}」`
     runs.delete(task)
     r.name = clean
+    r.manifest = { ...r.manifest, name: clean }
     runs.set(clean, r)
-    writeTaskManifest(deps.folder, { ...r.manifest, name: clean })
+    writeTaskManifest(deps.folder, r.manifest)
     postTasks()
     return null
   }
@@ -616,13 +653,29 @@ export function createTaskCenter(deps: TaskDeps) {
       ...(parent !== undefined ? { parent } : {}),
     })
 
-  /** 只输名称开空任务（「+ 任务」，规则 13）：建好进任务条、idle，不跑——用户
-   *  先切模型（setModel 照常建会话、按 owner 存选择）再发第一条消息 */
-  const create = async (name: string, parent: string): Promise<string | null> => {
-    const r = await openRun(nameOf(name), { via: 'user', parent, awaitingFirstMessage: true })
-    if (typeof r === 'string') return r
-    postTasks()
-    return null
+  /** 「+ 任务」（规则 13，2026-11-14 改为第一条消息即开）：面板上先选好模型/
+   *  审批、写第一条消息，这里一次建好并发出——不再有「建了没说话」的空任务，
+   *  名字也不用改（改名要动所有按名字认任务的地方）。名字取 name 首行，同名加
+   *  序号（同 dispatchUnique）。仍按空任务建：第一条拼框架句、第一个 step 才
+   *  开段、不回调，都沿用 awaitingFirstMessage 那套。返回实际任务名 */
+  const create = async (
+    first: { name: string; text: string; images?: ImageInput[] },
+    parent: string,
+    pick: { choice?: TaskChoice; attendance?: Attendance },
+  ): Promise<{ name: string } | { error: string }> => {
+    const base = nameOf(first.name)
+    let name = base
+    for (let i = 2; taken(name); i++) name = `${base} ${i}`
+    const r = await openRun(name, {
+      via: 'user',
+      parent,
+      awaitingFirstMessage: true,
+      ...(pick.choice ? { choice: pick.choice } : {}),
+    })
+    if (typeof r === 'string') return { error: r }
+    if (pick.attendance !== undefined) setAttendance(name, pick.attendance)
+    const error = send(name, first.text, first.images)
+    return error === null ? { name } : { error }
   }
 
   /** agent 派任务（规则 11，$SIMPLE_CODE_TASK）：同名不拒、自动编号——agent 一次
@@ -633,6 +686,7 @@ export function createTaskCenter(deps: TaskDeps) {
     parent: string,
     choice?: TaskChoice,
     lean?: boolean,
+    goal?: true,
   ): Promise<{ name: string } | { error: string }> => {
     const base = nameOf(brief)
     let name = base
@@ -642,6 +696,7 @@ export function createTaskCenter(deps: TaskDeps) {
       parent,
       ...(choice ? { choice } : {}),
       ...(lean ? { lean: true } : {}),
+      ...(goal ? { goal: true } : {}),
     })
     return error === null ? { name } : { error }
   }
@@ -659,7 +714,9 @@ export function createTaskCenter(deps: TaskDeps) {
     // 乐观路径——镜像里垫上（原文，不带任务框架句）
     r.pendingTexts = [{ text: brief, pos: r.replay.length }]
     postTasks()
-    void runLoop(r, frameBrief(name, brief))
+    // goal 模式（goal-mode.md）：任务书前置子任务纪律——接单第一屏就是，
+    // 反思同款（纪律是产品的一部分，不靠模型记得）
+    void runLoop(r, frameBrief(name, opts.goal === true ? wrapGoalBrief(brief) : brief))
     return null
   }
 
@@ -671,6 +728,9 @@ export function createTaskCenter(deps: TaskDeps) {
     choice?: TaskChoice
     /** --lean（2026-11-03）：精简上下文——只保常驻+floor+live，压缩=硬切 */
     lean?: true
+    /** --goal --go（goal-mode.md）：目标模式——manifest 持久化 goal，任务书
+     *  拼 GOAL_DISCIPLINE、终止回调附审核提醒（reload 恢复后仍带） */
+    goal?: true
   }
 
   /** 建任务、进 runs（还不跑、不推快照）。字符串 = 拒绝原因 */
@@ -690,6 +750,7 @@ export function createTaskCenter(deps: TaskDeps) {
         createTask(deps.folder, name, {
           ...(register ? { parent } : {}),
           ...(opts.awaitingFirstMessage ? { awaitingFirstMessage: true } : {}),
+          ...(opts.goal ? { goal: true } : {}),
           // 用户开的任务用户自己会看 robot 总览；完成提醒本来面向的就是它
           ...(via === 'user' ? { userTouched: true } : {}),
         }),
@@ -720,6 +781,9 @@ export function createTaskCenter(deps: TaskDeps) {
       session: null,
       idle: null,
       baseItems: [],
+      baseFloor: null,
+      postedFloor: null,
+      hydrateEpoch: 0,
       replay: [],
       pendingTexts: [],
       queuedTexts: [],
@@ -745,6 +809,7 @@ export function createTaskCenter(deps: TaskDeps) {
       ms: Date.now() - t0,
       ...(opts.awaitingFirstMessage ? { awaitingFirstMessage: true } : {}),
       ...(opts.choice ? { model: `${opts.choice.provider}/${opts.choice.model}` } : {}),
+      ...(opts.goal ? { goal: true } : {}),
     })
     return run
   }
@@ -801,7 +866,7 @@ export function createTaskCenter(deps: TaskDeps) {
           const why = error instanceof Error ? error.message : String(error)
           r.notices.push(`插话没送达：「${text.slice(0, 40)}」（${why}）`)
         }
-        deps.post(hydrateMsg(r))
+        postHydrate(r)
       })
       return null
     }
@@ -849,7 +914,7 @@ export function createTaskCenter(deps: TaskDeps) {
   const open = (name: string): void => {
     const r = runs.get(name)
     if (!r) return
-    deps.post(hydrateMsg(r))
+    postHydrate(r)
     // reload 恢复的任务 session 是惰性的：没建之前 baseItems 为空，切进来
     // 一片空白（2026-09-23 实测）。打开即建——ensureSession 建好后 fold 继承
     // 历史 + 自己的经历并再推一次基线。已建/在建时是同一个 Promise，无副作用
@@ -955,6 +1020,7 @@ export function createTaskCenter(deps: TaskDeps) {
       const counts = finalizeTask(deps.folder, r.manifest.owner)
       await closeRun(r)
       runs.delete(name)
+      deps.closed?.(r.manifest.owner)
       postTasks()
       logRun({
         ev: 'task_close',
@@ -998,6 +1064,12 @@ export function createTaskCenter(deps: TaskDeps) {
 
   return {
     anyRunning,
+    /** 这个 owner 的任务在跑（或在关）吗——排队发送「在跑只入队」的判据。
+     *  没有这个任务 = false */
+    busyOf: (owner: string): boolean => {
+      const r = [...runs.values()].find((x) => x.manifest.owner === owner)
+      return r?.status === 'running' || r?.status === 'closing'
+    },
     dispatch,
     dispatchUnique,
     create,
@@ -1008,6 +1080,9 @@ export function createTaskCenter(deps: TaskDeps) {
     send,
     open,
     sessionOf,
+    /** webview 手里该任务底稿的分页起点（postedFloor）与世代号 */
+    floorOf: (name: string): number | null => runs.get(name)?.postedFloor ?? null,
+    epochOf: (name: string): number => runs.get(name)?.hydrateEpoch ?? 0,
     setSummaryInContext,
     compactTarget,
     attendanceOf,
@@ -1046,7 +1121,7 @@ export function createTaskCenter(deps: TaskDeps) {
       if (runs.size === 0) return
       postTasks()
       for (const r of runs.values()) {
-        deps.post(hydrateMsg(r))
+        postHydrate(r)
       }
     },
     /** 扩展停用：关全部分身 session（跑着的轮随 session 关闭而中止） */

@@ -34,7 +34,15 @@ export async function injectLocalTools(
   // 派任务桥只属于 VS Code 宿主里的会话：从宿主 bash 起的 sc 经 envPassthrough
   // 继承了 bin 路径 + 端口 + token，不删的话 sc 的 bash 描述出现【派任务】、
   // 能把任务派进宿主任务条，回调还落到宿主主任务的信箱（task-trunk 复审）
-  for (const key of ['SIMPLE_CODE_TASK', 'SIMPLE_CODE_TASK_PORT', 'SIMPLE_CODE_TASK_TOKEN'])
+  // TASK_SEND/WAKE 同理（2026-11-12 补）：不删则子 sc 能把消息插进宿主
+  // 任务、读写宿主项目的 wake.json——都绕过了「终端 sc 无桥」的边界
+  for (const key of [
+    'SIMPLE_CODE_TASK',
+    'SIMPLE_CODE_TASK_PORT',
+    'SIMPLE_CODE_TASK_TOKEN',
+    'SIMPLE_CODE_TASK_SEND',
+    'SIMPLE_CODE_WAKE',
+  ])
     delete process.env[key]
   const entries: ShimEntry[] = []
   // IMAGEGEN 依赖凭据代理（ensureCredentialProxy）；LSP 依赖 VS Code 桥，终端没有，不注入
@@ -173,9 +181,7 @@ export const createApproval = (sink: Sink): ApprovalShared => {
         const alwaysHint = q.always
           ? q.always.kind === 'nonpath'
             ? `[a]始终允许（${q.always.lead} 的第 ${q.always.from} 位参数起不是路径，今后免审）`
-            : q.always.kind === 'paths'
-              ? `[a]始终允许（这 ${q.always.dirs.length} 个目录今后免审）`
-              : `[a]始终允许（${q.always.dir}/ 今后免审）`
+            : `[a]始终允许（这 ${q.always.dirs.length} 个目录今后免审）`
           : ''
         sink.err(
           `\n[需要审批·${APPROVAL_LABEL[q.category] ?? q.category}] ${q.reason}\n  ${q.command}\n` +
@@ -214,9 +220,7 @@ export const createApproval = (sink: Sink): ApprovalShared => {
 /** 审批类别的中文标签。与 webview 的 APPROVAL_TAG 同源（approval.md §4.2） */
 const APPROVAL_LABEL: Record<string, string> = {
   external_dir: '项目外路径',
-  hidden_path: '隐藏路径',
-  network_cmd: '网络命令',
-  unparseable: '无法静态判定',
+  ask_rule: '自定义规则',
   multi: '多重触发',
 }
 
