@@ -1499,10 +1499,21 @@ function buildStore(
                 memberIds[0] ?? -1,
               )[0]?.owner ?? null)
             : null
+        // 出处：成员全来自同一处才继承（整组是别人的经历）。混了来源的不继承
+        // ——父行盖着本会话自己的经历，标成别人的反而错；出处靠合并文字里的
+        // 〔来源名〕（renderMergeInput / MERGE_SYSTEM）
+        const sources =
+          memberIds.length > 0
+            ? db.all<{ source: string | null }>(
+                `SELECT DISTINCT source FROM summaries WHERE id IN (${memberIds.map(() => '?').join(',')})`,
+                ...memberIds,
+              )
+            : []
+        const inherited = sources.length === 1 ? (sources[0]?.source ?? null) : null
         db.run(
           `INSERT INTO summaries(level, covers_from, covers_to, text, status, in_context,
-                                 superseded_by, head, archive_path, owner)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                 superseded_by, head, archive_path, owner, source)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           row.level,
           row.coversFrom,
           row.coversTo,
@@ -1513,6 +1524,7 @@ function buildStore(
           row.head,
           row.archivePath,
           firstMemberOwner,
+          inherited,
         )
         const parentId = lastRowId(db)
         for (const id of memberIds) {
@@ -2092,6 +2104,7 @@ type SummaryRow = {
   head: string | null
   archive_path: string | null
   name: string | null
+  source: string | null
   turn_from: number | null
   turn_to: number | null
 }
@@ -2106,7 +2119,7 @@ function loadSummaries(db: Db, sumVis: string): Summary[] {
   return db
     .all<SummaryRow>(
       `SELECT id, level, covers_from, covers_to, text, status, in_context, superseded_by,
-              head, archive_path, name, owner,
+              head, archive_path, name, owner, source,
               (SELECT turn_id FROM steps WHERE id = covers_from) AS turn_from,
               (SELECT turn_id FROM steps WHERE id = covers_to) AS turn_to
        FROM summaries WHERE ${sumVis} ORDER BY covers_from, level`,
@@ -2124,6 +2137,7 @@ function loadSummaries(db: Db, sumVis: string): Summary[] {
       text: row.text,
       status: row.status as SummaryStatus,
       owner: row.owner ?? null,
+      ...(row.source !== null ? { source: row.source } : {}),
       // SQLite 没有布尔类型，存的是 0/1
       inContext: row.in_context === 1,
       supersededBy: row.superseded_by,

@@ -283,4 +283,16 @@ export const MIGRATIONS = [
   // 379MB 真库实测 1.4s/次，fold 每轮 turn 结束都跑。建复合索引后 SQLite
   // 改走 messages_live + 索引定位，实测 0.005s（276 倍）
   `CREATE INDEX IF NOT EXISTS messages_restore ON messages(owner, state, step_id)`,
+  // 拉段出处（2026-11-19，任务互串真机：A 拉进还开着的 B 的段，摘要改成 A
+  // 名下又不标来源，A 把 B 的经历当成自己的接着答）。summaries.source =
+  // 拉段复制来的行的出处标签（「任务「名」」/「主任务」），NULL = 自己的经历；
+  // segments.name = 段主人关闭时的任务名，拉段时拼标签用（manifest 关闭即删）
+  `ALTER TABLE summaries ADD COLUMN source TEXT`,
+  `ALTER TABLE segments ADD COLUMN name TEXT`,
+  // 回填：修复前关闭只给当时没合回的段标 closed，早先用满合回的段留着 0——
+  // 会话改成只拉 closed 段后，这些段对还没拉过的会话就永远拉不到了。任务只在
+  // 关闭时才有 closed=1 的段，所以「同 owner 有 closed 段」= 已关，全标上。
+  // 幂等，段表千行级，每次开库跑无感
+  `UPDATE segments SET closed = 1
+   WHERE closed = 0 AND owner <> '' AND owner IN (SELECT owner FROM segments WHERE closed = 1)`,
 ]
