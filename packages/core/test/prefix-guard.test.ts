@@ -25,6 +25,7 @@ import {
 } from '../src/loop/prefix-guard.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
 import type { LoopDeps } from '../src/loop/run.ts'
+import { estimateMessageTokens } from '../src/loop/tokens.ts'
 import { getSession } from '../src/session/session.ts'
 import { MEMORY_RELATIVE } from '../src/session/store.ts'
 
@@ -373,10 +374,17 @@ const open = (dir: string, globalPath: string) =>
     globalPath,
     env: { TEST_KEY: KEY },
     tools: [],
-    stream: (() =>
-      (async function* () {
-        for (const ev of says('答。这段回答也要够长才卸得动'.repeat(8))) yield ev
-      })()) as LoopDeps['stream'],
+    stream: ((request: Request) => {
+      // 真实 usage 跟着请求走（同 summary-e2e 的说明）：固定报 1 的话，
+      // 跨 turn 的预算基线恢复后 currentUsage 永远从 1 起算，卸载不触发
+      const inputTokens = request.messages.reduce((n, m) => n + estimateMessageTokens(m.parts), 0)
+      const events = says('答。这段回答也要够长才卸得动'.repeat(8)).map((ev) =>
+        ev.type === 'finish' ? { ...ev, usage: { ...ev.usage, inputTokens } } : ev,
+      )
+      return (async function* () {
+        for (const ev of events) yield ev
+      })()
+    }) as LoopDeps['stream'],
     fetchImpl: summaryFetch,
     skipLock: true,
   })

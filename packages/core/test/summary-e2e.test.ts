@@ -6,6 +6,7 @@ import type { AgentEvent } from '../src/events.ts'
 import type { Message, Request, Usage } from '../src/llm/types.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
 import type { LoopDeps } from '../src/loop/run.ts'
+import { estimateMessageTokens } from '../src/loop/tokens.ts'
 import { resolveBucketFile } from '../src/session/buckets.ts'
 import { listLeaves } from '../src/session/leaf.ts'
 import { getSession } from '../src/session/session.ts'
@@ -130,8 +131,16 @@ function recordingStream(rounds: StreamEvent[][]) {
   const stream: LoopDeps['stream'] = (request) => {
     const round = rounds[sent.length] ?? rounds[rounds.length - 1] ?? []
     sent.push(structuredClone(request))
+    // **真实 usage 要跟着请求走**（2026-11-20）：原来固定报 1，跨 turn 的
+    // 预算基线（usage_baseline）恢复后 currentUsage 从 1 起算，历史再长也
+    // 不触发卸载——测试就不再走「真实 usage + 新增估算」那条路。按请求
+    // 估算报数，等价于真 API 报的输入量
+    const inputTokens = request.messages.reduce((n, m) => n + estimateMessageTokens(m.parts), 0)
+    const events = round.map((ev) =>
+      ev.type === 'finish' ? { ...ev, usage: { ...ev.usage, inputTokens } } : ev,
+    )
     return (async function* () {
-      for (const ev of round) yield ev
+      for (const ev of events) yield ev
     })()
   }
   return { stream, sent }

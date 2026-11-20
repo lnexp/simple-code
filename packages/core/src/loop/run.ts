@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { readdirSync } from 'node:fs'
 import type { AgentEvent } from '../events.ts'
 import { LLMStreamError } from '../llm/protocol.ts'
@@ -99,6 +100,12 @@ export type LoopDeps = {
    * 规则：**发出去的必须先在库里**。不传 = 不落（单测、ephemeral）
    */
   checkpoint?: (messages: Message[]) => void
+  /**
+   * 把上一次响应的真实 usage 与它覆盖的末尾消息锚点落盘（session 的
+   * usage_baseline）。loop 不落盘——那是 store 的事；不传 = 不存
+   * （单测、ephemeral）。跨 turn 恢复见 LoopContext.usageAnchor 的注释
+   */
+  saveUsageBaseline?: (usage: Usage, anchor: string) => void
   caps: Capabilities
   /** buildRequest 需要、但 loop 不解释的部分 */
   request: Omit<Request, 'messages'>
@@ -352,6 +359,22 @@ export type LoopContext = {
    * 扣除，不改 step_finish 携带的真实 usage；下一次没有临时提示的成功请求会清零。
    */
   lastUsageExcludedInputTokens?: number
+  /**
+   * `lastUsage` 覆盖到的**末尾消息指纹**（usage_baseline 表）。跨 turn 从
+   * 库里恢复：ctx 每轮重建，只有 `lastUsage` 的内存态活不过 turn 边界，
+   * 新轮首请求会退化成全量估算——6.2-sol 实测真实 276,598 被估成 455,243
+   * （1.65 倍），轮末第一句话就误触发 budget 压缩（2026-11-20 真机）。
+   *
+   * 存指纹而不是下标：装配数组随摘要顶替/卸载变化，下标跨轮不可靠；
+   * 找不到指纹就退回全量估算（和没有基线时一样，安全方向）
+   */
+  usageAnchor?: string | undefined
+  /**
+   * 本次请求发出那份的末尾消息锚点（streamWithOverflowRecovery 在发请求时
+   * 记下，runStep 收到响应后用来落基线）。和 usageAnchor 的区别：这个是
+   * 「刚发出去的」，那个是「上次响应的基线」，两者在收到响应后对齐
+   */
+  lastRequestAnchor?: string | undefined
   /**
    * 最近一次真正发出去的那份请求的**估算**总量（与面板/regions.jsonl 同一把
    * 尺子：regionSizes 各区之和）。只给 llm_usage 日志用——和响应里的真实
@@ -739,6 +762,13 @@ async function* runStep(ctx: LoopContext): AsyncIterable<AgentEvent> {
   // 就 409（2026-11-14 网关多轮事故）。不当基线＝下一轮全量
   // 估算，和第一轮一样
   ctx.lastUsage = acc.usage.serverRounds ? undefined : acc.usage
+  // 锚点跟着**这次真正发出去的那份**末尾走，并落库给下一个 turn 用。
+  // 服务端多轮 / 空请求：锚点一并清掉，别让旧锚点配上新 usage
+  const requestAnchor = acc.usage.serverRounds ? undefined : ctx.lastRequestAnchor
+  ctx.usageAnchor = requestAnchor
+  if (!acc.usage.serverRounds && requestAnchor !== undefined) {
+    ctx.deps.saveUsageBaseline?.(acc.usage, requestAnchor)
+  }
   // 同一次请求：真实 usage（API 计数，底栏打底用的就是它）× 估算（面板用的
   // 字符密度估法）。usage 全 0 = 渠道没报（网关常见），照记——那本身就是信息
   logRun({
@@ -802,6 +832,13 @@ async function* streamWithOverflowRecovery(
     // usage 基线使用不含临时恢复提示的逻辑历史坐标；提示已经包含在上一次
     // 请求的真实 usage 中，但不在 ctx.messages 里，不能占掉后续 assistant 的新增位置。
     ctx.usageCoversUpTo = guardRequest.messages.length
+    // 锚点同样取逻辑历史（guardRequest）末尾，不取 request 末尾：重复恢复提示
+    // 只属于本次发送，下一次请求不会再有，拿它当锚点会永远匹配不上。
+    // 落库时机在收到响应后（runStep），这里只记「这次发出去的那份」
+    ctx.lastRequestAnchor =
+      guardRequest.messages.length === 0
+        ? undefined
+        : anchorOf(guardRequest.messages[guardRequest.messages.length - 1]!)
     // 先落盘再发（见 LoopDeps.checkpoint）。在守卫之前：守卫拦下也无妨，
     // 落的是合法的 live 历史
     ctx.deps.checkpoint?.(ctx.messages)
@@ -1645,12 +1682,44 @@ const estimateAll = (messages: Message[]): number =>
  * 缓解成「攒够摘要就触发一次」，看着像修好了。**两处必须同一个坐标系**：
  * 下面 `sinceIndex` 传的是拼装后数组的长度，见 `usageCoversUpTo` 的注释。
  */
+/** 消息指纹用的投影：图片内容会因发送时缩放而变化（库里存原图），
+ *  不归一化的话含图会话跨 turn 永远匹配不上锚点，等于没有基线。
+ *  resize 不改图片数量与消息结构，所以只抹掉内容、保留形态 */
+function anchorView(part: Part): unknown {
+  if (part.type === 'image') return { type: 'image' }
+  if (part.type === 'tool_result' && part.images?.length) {
+    return { ...part, images: part.images.map(() => ({ type: 'image' })) }
+  }
+  return part
+}
+
+/** 消息指纹：预算基线的锚点。内容不变就同值，跨 turn 稳定。测试也用它造锚点 */
+export function anchorOf(message: Message): string {
+  return createHash('sha256')
+    .update(JSON.stringify({ role: message.role, parts: message.parts.map(anchorView) }))
+    .digest('hex')
+    .slice(0, 32)
+}
+
+/** 锚点在装配数组里的位置（其后算新增）。找不到返回 0 = 没有可用基线 */
+function indexAfterAnchor(messages: Message[], anchor: string): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (anchorOf(messages[i]!) === anchor) return i + 1
+  }
+  return 0
+}
+
 const currentUsage = (ctx: LoopContext): number => {
-  const usage = contextUsage(
-    assembleForRequest(ctx),
-    ctx.lastUsage ?? null,
-    ctx.usageCoversUpTo ?? 0,
-  )
+  const assembled = assembleForRequest(ctx)
+  // 基线覆盖到哪：优先按锚点定位（跨 turn 恢复的基线只有锚点，没有可信
+  // 下标——装配数组会随摘要顶替/卸载变化）。锚点找不到 = 这段历史已被
+  // 改写，退回全量估算；再不行用同一 turn 里记下的精确下标
+  let covers = ctx.usageCoversUpTo ?? 0
+  if (ctx.usageAnchor !== undefined) {
+    const found = indexAfterAnchor(assembled, ctx.usageAnchor)
+    if (found > 0) covers = found
+  }
+  const usage = contextUsage(assembled, ctx.lastUsage ?? null, covers)
   if (ctx.lastUsage === undefined) return usage
   return Math.max(0, usage - (ctx.lastUsageExcludedInputTokens ?? 0))
 }

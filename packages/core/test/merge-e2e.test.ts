@@ -7,6 +7,7 @@ import type { AgentEvent } from '../src/events.ts'
 import type { Message, Request, Usage } from '../src/llm/types.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
 import type { LoopDeps } from '../src/loop/run.ts'
+import { estimateMessageTokens } from '../src/loop/tokens.ts'
 import { getSession } from '../src/session/session.ts'
 import { openStore } from '../src/session/store.ts'
 
@@ -154,13 +155,27 @@ const smartFetch = (l0Text: string, mergeText: string) =>
     )
   }) as unknown as typeof fetch
 
-function recordingStream(rounds: StreamEvent[][]) {
+/**
+ * `usageMode`：'estimate'（默认，按请求估算报数，等价真 API）/ 固定数字。
+ *
+ * 原来一律固定报 1，跨 turn 的预算基线（usage_baseline）恢复后 currentUsage
+ * 永远从 1 起算，历史再长也不触发卸载。需要**故意**报一个异常值的用例
+ * （「真实 usage 是估算的 2 倍」「usage 报 0」）显式传数字
+ */
+function recordingStream(rounds: StreamEvent[][], usageMode: 'estimate' | number = 'estimate') {
   const sent: Request[] = []
   const stream: LoopDeps['stream'] = (request) => {
     const round = rounds[sent.length] ?? rounds[rounds.length - 1] ?? []
     sent.push(structuredClone(request))
+    const inputTokens =
+      usageMode === 'estimate'
+        ? request.messages.reduce((n, m) => n + estimateMessageTokens(m.parts), 0)
+        : usageMode
+    const events = round.map((ev) =>
+      ev.type === 'finish' ? { ...ev, usage: { ...ev.usage, inputTokens } } : ev,
+    )
     return (async function* () {
-      for (const ev of round) yield ev
+      for (const ev of events) yield ev
     })()
   }
   return { stream, sent }
@@ -434,7 +449,7 @@ describe('合并端到端', () => {
    */
   const sixTurnsThen = async (
     indexRatio: number,
-    inputTokens = 1,
+    usageMode: 'estimate' | number = 'estimate',
     seedRegions?: object,
     emptyMerge = false,
   ) => {
@@ -455,7 +470,8 @@ describe('合并端到端', () => {
       await writeFile(join(mem, 'regions.jsonl'), `${JSON.stringify(seedRegions)}\n`, 'utf8')
     }
     const rec = recordingStream(
-      Array.from({ length: 7 }, (_, i) => says(bigReply(String(i)), inputTokens)),
+      Array.from({ length: 7 }, (_, i) => says(bigReply(String(i)))),
+      usageMode,
     )
     const session = await getSession(dir, {
       globalPath,
