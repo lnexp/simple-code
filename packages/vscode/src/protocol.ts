@@ -162,6 +162,9 @@ export type ToHost =
   | { type: 'task_open'; task: string }
   /** 关闭任务（task-v3：唯一的生命周期操作。在跑会先停，摘要排空后收尾） */
   | { type: 'task_close'; name: string }
+  /** 改任务名（显示用）：owner 不动——行/段/摘要都是 owner 域的，名字只是
+   *  manifest 的字段和内存键。撞名由宿主拒，回 fatal 提示 */
+  | { type: 'task_rename'; task: string; name: string }
   /** 中断任务正在跑的轮（与对话的停止同一语义，通用控件） */
   | { type: 'task_stop'; name: string }
   /** 面板正显示哪个任务（null = 主任务）。桌面机器人据此判「这条你看得到」，

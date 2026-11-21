@@ -1175,6 +1175,14 @@ code a[data-open-path]:hover {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 14em;
 }
 .branch-open:hover { text-decoration: underline; }
+/* 双击任务名改名的行内编辑框：字号随 tab（11px），宽度足够 20 个汉字 */
+.branch-rename {
+  flex: none; font-size: 11px; padding: 0 4px; min-width: 9em;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-focusBorder);
+  border-radius: 3px; outline: none;
+}
 .branch-add {
   flex: none; border: none; background: none; cursor: pointer; padding: 2px 8px;
   color: var(--vscode-descriptionForeground); font-size: 11px;

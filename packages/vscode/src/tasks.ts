@@ -13,8 +13,8 @@ import {
   type SetTimer,
   type TaskManifest,
   taskResultText,
-  wrapGoalBrief,
   watchIdle,
+  wrapGoalBrief,
   writeTaskManifest,
 } from '@simple-code/core'
 import {
@@ -628,6 +628,25 @@ export function createTaskCenter(deps: TaskDeps) {
   const nameOf = (brief: string): string => brief.split('\n', 1)[0]?.slice(0, 20).trim() || '任务'
   const taken = (name: string): boolean => runs.has(name) || forking.has(name)
 
+  /** 改任务名（显示用，2026-11-09）：runs 以名为键，迁键 + manifest 落盘 +
+   *  推快照，webview 的快照守卫按「旧名消失」迁移选中态。owner/行/段不动。
+   *  失败回文案给 fatal；任务已不在（竞态关掉了）返回 null 静默——快照守卫收尾 */
+  const rename = (task: string, name: string): string | null => {
+    const r = runs.get(task)
+    if (r === undefined) return null
+    const clean = name.trim().slice(0, 20)
+    if (clean === '' || clean === task) return null
+    if ((runs.has(clean) && runs.get(clean) !== r) || forking.has(clean))
+      return `已有同名任务「${clean}」`
+    runs.delete(task)
+    r.name = clean
+    r.manifest = { ...r.manifest, name: clean }
+    runs.set(clean, r)
+    writeTaskManifest(deps.folder, r.manifest)
+    postTasks()
+    return null
+  }
+
   const dispatch = (brief: string, parent?: string): Promise<string | null> =>
     dispatchNamed(nameOf(brief), brief, {
       via: 'user',
@@ -1082,6 +1101,7 @@ export function createTaskCenter(deps: TaskDeps) {
         })),
     close,
     stop,
+    rename,
     states,
     /** 桌面机器人的现状（关闭中的不算——马上就没了） */
     robotViews: (): RobotTaskView[] =>

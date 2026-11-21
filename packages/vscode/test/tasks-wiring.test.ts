@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { HistoryRow, Session, SetTimer } from '@simple-code/core'
-import { MEMORY_RELATIVE, openStore } from '@simple-code/core'
+import { listTaskManifests, MEMORY_RELATIVE, openStore } from '@simple-code/core'
 import { describe, expect, it, vi } from 'vitest'
 import type { BridgeDeps } from '../src/bridge.ts'
 import { createBridge } from '../src/bridge.ts'
@@ -1862,6 +1862,73 @@ describe('forkTurn（v3 遗产）框架句的角色边界（2026-11-06 真项目
     const text = frameBrief('调研某库', '去查 x 库的用法')
     expect(text).toContain('只有已合回的历史摘要')
     expect(text).toContain('按任务书干活')
+  })
+})
+
+describe('任务改名（2026-11-09：显示名，owner 不动）', () => {
+  it('改名：trim 后迁键 + manifest 落盘，reload 恢复用新名', async () => {
+    const h = taskHarness({})
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'task_dispatch', brief: '调研某库\n细节' })
+    await settle()
+    await settle()
+    h.posted.length = 0
+    h.bridge.handle({ type: 'task_rename', task: '调研某库', name: '  新调研  ' })
+    await settle()
+    const snap = h.posted
+      .filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks')
+      .at(-1)
+    expect(snap?.tasks.map((t) => t.name)).toEqual(['新调研'])
+    // manifest 是 reload 的真相：名字落了盘
+    expect(listTaskManifests(h.depsFolder).map((m) => m.name)).toEqual(['新调研'])
+    // reload 恢复：重建 bridge 扫同一目录，新名回条上
+    const h2 = taskHarness({ folder: h.depsFolder })
+    h2.bridge.handle({ type: 'ready' })
+    for (let i = 0; i < 3; i++) await settle()
+    const snap2 = h2.posted.find(
+      (m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks',
+    )
+    expect(snap2?.tasks[0]?.name).toBe('新调研')
+  })
+
+  it('撞名：回 fatal 提示，两个任务原名原样', async () => {
+    const h = taskHarness({})
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'task_dispatch', brief: '调研某库\n细节' })
+    await settle()
+    await settle()
+    // 注意：webview 的 dispatch 撞名是直接拒的（自动编号只有 agent 派的
+    // dispatchUnique 有），所以用不同首行建第二个任务
+    h.bridge.handle({ type: 'task_dispatch', brief: '另一个任务\n细节' })
+    await settle()
+    await settle()
+    h.posted.length = 0
+    h.bridge.handle({ type: 'task_rename', task: '调研某库', name: '另一个任务' })
+    await settle()
+    expect(h.posted.some((m) => m.type === 'fatal')).toBe(true)
+    // 拒了不发快照（只有成功才推）；原名未动以磁盘 manifest 为准（目录枚举按随机 owner 排，先 sort）
+    expect(
+      listTaskManifests(h.depsFolder)
+        .map((m) => m.name)
+        .sort(),
+    ).toEqual(['另一个任务', '调研某库'])
+  })
+
+  it('空名/没变化：静默不动（不 fatal、不推快照）', async () => {
+    const h = taskHarness({})
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'task_dispatch', brief: '调研某库\n细节' })
+    await settle()
+    await settle()
+    h.posted.length = 0
+    h.bridge.handle({ type: 'task_rename', task: '调研某库', name: '   ' })
+    h.bridge.handle({ type: 'task_rename', task: '调研某库', name: '调研某库' })
+    await settle()
+    expect(h.posted.filter((m) => m.type === 'tasks')).toEqual([])
+    expect(h.posted.some((m) => m.type === 'fatal')).toBe(false)
   })
 })
 

@@ -528,7 +528,10 @@ export function renderMergeInput(members: Summary[]): string {
   return members
     .map((s) => {
       const where = s.archivePath ? `\n详情：${s.archivePath}` : ''
-      return `[step ${s.coversFrom}-${s.coversTo}]${where}\n${s.text}`
+      // 出处跟着进合并输入：成员来源不一时父行不继承 source（recordMerge），
+      // 只能靠合出来的文字自己标——MERGE_SYSTEM 要求保留
+      const from = s.source ? `\n来源：${s.source}` : ''
+      return `[step ${s.coversFrom}-${s.coversTo}]${from}${where}\n${s.text}`
     })
     .join('\n\n')
 }
@@ -561,6 +564,7 @@ const MERGE_SYSTEM =
   '信息必须比输入少——主题相近的并成一行，次要的关键词删掉，不要逐条照抄输入。\n' +
   '关键词优先用文件名、命令、专有名词——那是能被搜到的东西。\n' +
   '后来被推翻的结论也留一个词并标「(已推翻)」，那是后面最需要知道的。\n' +
+  '输入里带「来源：」的条目是别的会话的经历，对应主题行开头标〔来源名〕，不许丢。\n' +
   '不要完整句子，不要「本段历史进行了……」这类开场，不要引号。'
 
 /** 组装合并请求。跟 L0 一样：不带工具、关 thinking */

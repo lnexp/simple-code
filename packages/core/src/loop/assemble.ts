@@ -53,6 +53,12 @@ export type Summary = {
    * owner 的连续段，进场（flipSummary）只翻自己 owner 的行
    */
   owner: string | null
+  /**
+   * 拉段复制来的行的出处标签（「任务「名」」/「主任务」），null/缺省 = 本会话
+   * 自己的经历。渲染成「来源：」行——不标的话别的会话的经历跟自己的一模一样，
+   * 模型会接着别人的上下文作答（2026-11-19 任务互串真机）
+   */
+  source?: string | null
 }
 
 /**
@@ -311,6 +317,8 @@ export function renderSummary(summary: Summary, body?: string): string {
       ? '?'
       : `${summary.turnFrom}-${summary.turnTo}`
   const lines = [`${SUMMARY_TAG} turn=${turns}>`]
+  // 老行 source 是 NULL，渲染字节不变：前缀守卫不拦、缓存接得上
+  if (summary.source) lines.push(`来源：${summary.source}（别的会话的经历，不是本会话做的）`)
   if (summary.head) lines.push(`开头：${summary.head}`)
   // **标题和描述同一行**，不是两行。分两行的话每条摘要多一个 `摘要：`/
   // `标题：` 的标签开销，而温区一共才 70 来 token，标签就吃掉 5%

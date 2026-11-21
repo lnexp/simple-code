@@ -231,8 +231,8 @@ export function createTask(
     db.transaction(() => {
       db.run(
         `INSERT INTO summaries(level, covers_from, covers_to, text, status, in_context,
-                               superseded_by, head, archive_path, name, owner)
-         SELECT level, covers_from, covers_to, text, 'ready', 1, NULL, head, archive_path, name, ?
+                               superseded_by, head, archive_path, name, owner, source)
+         SELECT level, covers_from, covers_to, text, 'ready', 1, NULL, head, archive_path, name, ?, source
          FROM summaries WHERE owner = ? AND in_context = 1 AND status = 'ready'
          ORDER BY covers_from, level`,
         m.owner,
@@ -321,7 +321,8 @@ export function finalizeTask(root: string, owner: string): FinalizeCounts {
     db.all<{ c: number }>(`SELECT COUNT(*) AS c ${sql}`, ...p)[0]?.c ?? 0
   const counts: FinalizeCounts = { sumDeleted: 0, msgDeleted: 0, segments: 0 }
   try {
-    const legacy = scopeOf(readTaskManifest(root, owner))
+    const manifest = readTaskManifest(root, owner)
+    const legacy = scopeOf(manifest)
     db.transaction(() => {
       if (legacy.forkTurn > 0) {
         const ceil = legacy.inheritCeil
@@ -366,7 +367,7 @@ export function finalizeTask(root: string, owner: string): FinalizeCounts {
       counts.sumDeleted += count(`FROM summaries WHERE id IN (${outside})`, owner)
       db.run(`DELETE FROM summaries WHERE id IN (${outside})`, owner)
       counts.segments = count(`FROM segments WHERE owner = ? AND state <> 'merged'`, owner)
-      closeSegments(db, owner, root)
+      closeSegments(db, owner, root, manifest.name)
       // 关了不再拉段。开场从主干复制的拉段记录 ≈ 已合回段数、每任务一份，不删
       // 就随天数平方涨（一天 100 任务一年约 13 亿行、98GB）
       db.run(`DELETE FROM segment_pulls WHERE owner = ?`, owner)

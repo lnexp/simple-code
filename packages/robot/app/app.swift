@@ -184,7 +184,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 有事才出现（D3+D5，用户定 2026-10-31）：没事时只留菜单栏图标；开了「常驻桌面」就一直在（2026-11-09 加）
     let visible = pinned || !items.isEmpty
     if visible { panel.orderFrontRegardless() } else { panel.orderOut(nil) }
-    if visible && !fresh.isEmpty { bounce() }
+    if visible && !fresh.isEmpty { pulse() }
     if let img = skin[st]?.image.copy() as? NSImage {
       img.size = NSSize(width: 18, height: 18)
       statusItem.button?.image = img
@@ -228,16 +228,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     panel.setFrame(NSRect(x: anchor.x - w, y: anchor.y, width: w, height: h), display: true)
   }
 
-  func bounce() {
-    let o = robot.frame.origin
-    NSAnimationContext.runAnimationGroup({ ctx in
-      ctx.duration = 0.12
-      robot.animator().setFrameOrigin(NSPoint(x: o.x, y: o.y + 10))
-    }, completionHandler: {
-      NSAnimationContext.runAnimationGroup { ctx in
-        ctx.duration = 0.18
-        self.robot.animator().setFrameOrigin(o)
-      }
-    })
+  /// 有新条目时原地脉冲两下（旧版上下弹跳，2026-11-09 用户反馈晃眼，不挪位置）
+  func pulse() {
+    guard let l = robotImg.layer else { return }
+    let a = CAKeyframeAnimation(keyPath: "transform.scale")
+    a.values = [1, 1.2, 1, 1.15, 1]
+    a.keyTimes = [0, 0.2, 0.45, 0.65, 1]
+    a.duration = 0.5
+    l.add(a, forKey: "pulse")
   }
 }

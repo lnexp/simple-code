@@ -1266,6 +1266,12 @@ export function createBridge(deps: BridgeDeps): Bridge {
         case 'task_close':
           void doCloseTask(msg.name)
           return
+        case 'task_rename': {
+          const error = tasks.rename(msg.task, msg.name)
+          if (error !== null) post({ type: 'fatal', message: error })
+          else postTurnQueue()
+          return
+        }
         case 'task_stop':
           tasks.stop(msg.name)
           return

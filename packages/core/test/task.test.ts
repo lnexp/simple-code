@@ -16,8 +16,8 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Message } from '../src/llm/types.ts'
-import type { Summary } from '../src/loop/assemble.ts'
-import { pickMergeGroup } from '../src/loop/summarize.ts'
+import { renderSummary, type Summary } from '../src/loop/assemble.ts'
+import { pickMergeGroup, renderMergeInput } from '../src/loop/summarize.ts'
 import { SEGMENT_FULL_STEPS, SEGMENT_WIDTH, TRUNK } from '../src/session/segments.ts'
 import { MEMORY_RELATIVE, openStore, type Store } from '../src/session/store.ts'
 import {
@@ -346,6 +346,138 @@ describe('拉摘要（规则 5）', () => {
       main.summaries().find((s) => s.text.startsWith('A'))?.coversTo ?? Infinity,
     )
     main.close()
+  })
+})
+
+describe('开着的任务互不拉段、拉进来的标出处（2026-11-19 任务互串）', () => {
+  /** A、B 都开着；B 第一段摘完、用满合回（closed 仍 0）；A 切到 B 之上的新段 */
+  async function twoOpenTasks(dir: string) {
+    const a = createTask(dir, 'A')
+    const b = createTask(dir, 'B')
+    const as = openStore(dir, { task: scopeOf(a) })
+    const al: Message[] = []
+    runTurn(as, al, 'A 问一', 'A 答一')
+    summarizeAll(as, stepsOf(dir, a.owner), 'A')
+    const bs = openStore(dir, { task: scopeOf(b) })
+    const bl: Message[] = []
+    runTurn(bs, bl, 'B 问一', 'B 答一')
+    summarizeAll(bs, stepsOf(dir, b.owner), 'B')
+    fillSegment(bs)
+    runTurn(bs, bl, 'B 问二', 'B 答二') // B 第一段 full，开第二段
+    as.mergeSegments() // B 第一段合回（主干拉走）
+    fillSegment(as)
+    runTurn(as, al, 'A 问二', 'A 答二') // A 新段在 B 两段之上
+    const bSeg = segs(dir).find((s) => s.owner === b.owner)
+    return { a, b, as, bs, al, bSeg }
+  }
+
+  it('B 用满合回的段只进主干，开着的 A 拉不到；B 关闭后 A 才拉', async () => {
+    const dir = await workspace()
+    const { b, as, bs, bSeg } = await twoOpenTasks(dir)
+    expect(bSeg).toMatchObject({ state: 'merged', closed: 0 })
+    // 修复前：A 在压缩点就把 B 还在进行的经历拉进来
+    expect(as.pullPending()).toBe(false)
+    expect(as.pullSegments()).toBe(0)
+    expect(
+      query(
+        dir,
+        `SELECT 1 FROM segment_pulls WHERE owner = ? AND segment_id = ?`,
+        TRUNK,
+        bSeg?.id ?? 0,
+      ),
+    ).toHaveLength(1) // 主干照收
+    // B 关闭：早先已合回的段也补标 closed，任务名记进段
+    summarizeAll(bs, stepsOf(dir, b.owner).slice(2), 'B后')
+    bs.close()
+    flipTaskLive(dir, b.owner)
+    finalizeTask(dir, b.owner)
+    expect(
+      segs(dir)
+        .filter((s) => s.owner === b.owner)
+        .every((s) => s.closed === 1),
+    ).toBe(true)
+    expect(as.pullPending()).toBe(true)
+    expect(as.pullSegments()).toBe(4)
+    as.close()
+  })
+
+  it('拉进来的行带 source，渲染出「来源：」行；自己的行不带（老行渲染字节不变）', async () => {
+    const dir = await workspace()
+    const { b, as, bs } = await twoOpenTasks(dir)
+    bs.close()
+    finalizeTask(dir, b.owner)
+    as.pullSegments()
+    const rows = as.summaries().filter((s) => s.inContext)
+    const pulled = rows.filter((s) => s.text.startsWith('B'))
+    const own = rows.filter((s) => s.text.startsWith('A'))
+    expect(pulled.length).toBeGreaterThan(0)
+    expect(pulled.every((s) => s.source === '任务「B」')).toBe(true)
+    expect(renderSummary(pulled[0] as Summary)).toContain('来源：任务「B」（别的会话的经历')
+    expect(own.every((s) => s.source === undefined)).toBe(true)
+    expect(renderSummary(own[0] as Summary)).not.toContain('来源：')
+    expect(renderMergeInput(pulled)).toContain('来源：任务「B」')
+    as.close()
+  })
+
+  it('开着的 B 被主干收段：出处标签读 manifest 拿任务名，不露 owner id', async () => {
+    const dir = await workspace()
+    const { as, bs, bSeg } = await twoOpenTasks(dir)
+    const trunkRows = query<{ source: string | null }>(
+      dir,
+      `SELECT source FROM summaries WHERE owner = ? AND text LIKE 'B%'`,
+      TRUNK,
+    )
+    expect(bSeg?.closed).toBe(0)
+    expect(trunkRows.length).toBeGreaterThan(0)
+    expect(trunkRows.every((r) => r.source === '任务「B」')).toBe(true)
+    as.close()
+    bs.close()
+  })
+
+  it('回填迁移：修复前关闭的任务早先合回的段 closed=0，开库补成 1、可拉', async () => {
+    const dir = await workspace()
+    const { b, as, bs, bSeg } = await twoOpenTasks(dir)
+    bs.close()
+    finalizeTask(dir, b.owner)
+    as.close()
+    // 模拟修复前的关闭：只有关闭时没合回的段是 closed
+    query(dir, `UPDATE segments SET closed = 0 WHERE id = ?`, bSeg?.id ?? 0)
+    openStore(dir).close() // 开库即跑 MIGRATIONS
+    expect(segs(dir).find((s) => s.id === bSeg?.id)?.closed).toBe(1)
+  })
+
+  it('合并：成员同出处父行继承 source，混了自己的行不继承', async () => {
+    const dir = await workspace()
+    const { a, b, as, bs } = await twoOpenTasks(dir)
+    bs.close()
+    finalizeTask(dir, b.owner)
+    as.pullSegments()
+    const rows = as.summaries().filter((s) => s.inContext)
+    const pulled = rows.filter((s) => s.text.startsWith('B'))
+    const own = rows.filter((s) => s.text.startsWith('A'))
+    const parent = (members: Summary[]) =>
+      as.recordMerge(
+        {
+          level: 1,
+          coversFrom: Math.min(...members.map((s) => s.coversFrom)),
+          coversTo: Math.max(...members.map((s) => s.coversTo)),
+          name: '',
+          text: '合',
+          status: 'ready',
+          inContext: false,
+          supersededBy: null,
+          head: null,
+          archivePath: null,
+        },
+        members.map((s) => s.id),
+      )
+    const sourceOf = (id: number) =>
+      query<{ source: string | null }>(dir, `SELECT source FROM summaries WHERE id = ?`, id)[0]
+        ?.source
+    expect(sourceOf(parent(pulled.slice(0, 2)))).toBe('任务「B」')
+    expect(sourceOf(parent([...own.slice(0, 1), ...pulled.slice(2, 3)]))).toBeNull()
+    expect(a.owner).not.toBe(b.owner)
+    as.close()
   })
 })
 
