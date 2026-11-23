@@ -10,6 +10,7 @@ import type { Summary } from '../src/loop/assemble.ts'
 import { PrefixBrokenError } from '../src/loop/prefix-guard.ts'
 import type { RegionSizes } from '../src/loop/regions.ts'
 import { relayHit, relaySave } from '../src/loop/relay-cache.ts'
+import { REPETITION_RECOVERY_PROMPT } from '../src/loop/repetition.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
 import { type LoopContext, type LoopDeps, run } from '../src/loop/run.ts'
 import { estimateMessageTokens } from '../src/loop/tokens.ts'
@@ -80,6 +81,8 @@ async function drive(options: {
   kickSummary?: LoopDeps['kickSummary']
   /** 注入 deps.prefixGuard：观测守卫违规走哪个分支 */
   prefixGuard?: LoopDeps['prefixGuard']
+  /** 记录发请求前的历史快照 */
+  checkpoint?: LoopDeps['checkpoint']
 }): Promise<Harness> {
   const scripted = scriptedStream(options.rounds ?? [])
   const tools = options.tools ?? [fakeTool('bash')]
@@ -103,6 +106,7 @@ async function drive(options: {
     ...(options.kickSummary ? { kickSummary: options.kickSummary } : {}),
     ...(options.memory ? { memory: options.memory } : {}),
     ...(options.prefixGuard ? { prefixGuard: options.prefixGuard } : {}),
+    ...(options.checkpoint ? { checkpoint: options.checkpoint } : {}),
   }
   const ctx: LoopContext = {
     messages: options.messages ?? [{ role: 'user', parts: [{ type: 'text', text: '跑一下' }] }],
@@ -767,6 +771,158 @@ describe('健壮性', () => {
 
     expect(kinds(h.events)).toContain('restart')
     expect(h.ctx.messages.at(-1)?.parts).toEqual([{ type: 'text', text: '完整回答' }])
+  })
+
+  it('正文重复时及时止损，注入提示后自动重试两次以内', async () => {
+    const unit = Array.from({ length: 24 }, (_, i) => `第${i}段：不同的内容 ${i * 17 + 3}。`).join(
+      '',
+    )
+    const repeated = unit.repeat(4)
+    const first: StreamEvent[] = [
+      { type: 'text_start' },
+      ...Array.from({ length: Math.ceil(repeated.length / 37) }, (_, i) => ({
+        type: 'text_delta' as const,
+        text: repeated.slice(i * 37, (i + 1) * 37),
+      })),
+      { type: 'text_end' },
+      { type: 'finish', reason: 'stop', usage: usage() },
+    ]
+    const checkpoints: Message[][] = []
+    const h = await drive({
+      rounds: [first, says('恢复成功')],
+      checkpoint: (messages) =>
+        checkpoints.push(messages.map((message) => structuredClone(message))),
+    })
+
+    expect(h.requests()).toBe(2)
+    expect(kinds(h.events)).toContain('restart')
+    expect(h.events.some((e) => e.type === 'error')).toBe(false)
+    expect(JSON.stringify(h.sent[1]?.messages)).toContain('SC 检测到上一轮响应出现重复输出')
+    expect(JSON.stringify(h.ctx.messages)).not.toContain('SC 检测到上一轮响应出现重复输出')
+    expect(checkpoints.every((messages) => !JSON.stringify(messages).includes('SC 检测到'))).toBe(
+      true,
+    )
+    expect(h.ctx.messages.filter((message) => message.role === 'assistant')).toEqual([
+      { role: 'assistant', parts: [{ type: 'text', text: '恢复成功' }] },
+    ])
+  })
+
+  it('第二次自动重试仍重复时停止，不发第三次请求', async () => {
+    const unit = Array.from({ length: 24 }, (_, i) => `第${i}段：不同的内容 ${i * 17 + 3}。`).join(
+      '',
+    )
+    const repeated = (): StreamEvent[] => [
+      { type: 'text_start' },
+      { type: 'text_delta', text: unit.repeat(4) },
+      { type: 'text_end' },
+      { type: 'finish', reason: 'stop', usage: usage() },
+    ]
+    const h = await drive({ rounds: [repeated(), repeated(), repeated(), says('不该到')] })
+
+    expect(h.requests()).toBe(3)
+    expect(h.events.at(-1)).toMatchObject({ type: 'error', kind: 'doom_loop' })
+    expect((h.events.at(-1) as { message: string }).message).toContain('自动重试 2 次')
+  })
+
+  it('重复正文之前已经开始工具输入时只停止，不自动重试', async () => {
+    const unit = Array.from({ length: 24 }, (_, i) => `第${i}段：不同的内容 ${i * 17 + 3}。`).join(
+      '',
+    )
+    const h = await drive({
+      rounds: [
+        [
+          { type: 'tool_input_start', id: 't1', name: 'bash' },
+          { type: 'text_start' },
+          { type: 'text_delta', text: unit.repeat(4) },
+        ],
+      ],
+    })
+
+    expect(h.requests()).toBe(1)
+    expect(
+      h.sent[0]?.messages.some((message) =>
+        message.parts.some((part) => part.type === 'text' && part.text.includes('SC 检测到')),
+      ),
+    ).toBe(false)
+    expect(h.events.at(-1)).toMatchObject({ type: 'error', kind: 'doom_loop' })
+  })
+
+  it('检测到重复时会 abort 当前上游流', async () => {
+    const unit = Array.from({ length: 24 }, (_, i) => `第${i}段：不同的内容 ${i * 17 + 3}。`).join(
+      '',
+    )
+    let requests = 0
+    let upstreamAborted = false
+    const h = await drive({
+      stream: (_request, signal) =>
+        (async function* () {
+          requests++
+          try {
+            yield { type: 'text_start' as const }
+            yield { type: 'text_delta' as const, text: unit.repeat(4) }
+          } finally {
+            upstreamAborted = signal.aborted
+          }
+        })(),
+    })
+
+    expect(upstreamAborted).toBe(true)
+    expect(requests).toBe(3)
+  })
+
+  it('重启丢弃工具片段后，重复正文仍可自动恢复', async () => {
+    const unit = Array.from({ length: 24 }, (_, i) => `第${i}段：不同的内容 ${i * 17 + 3}。`).join(
+      '',
+    )
+    const h = await drive({
+      rounds: [
+        [
+          { type: 'tool_input_start', id: 'discarded', name: 'bash' },
+          { type: 'restart' },
+          { type: 'text_start' },
+          { type: 'text_delta', text: unit.repeat(4) },
+        ],
+        says('恢复成功'),
+      ],
+    })
+
+    expect(h.requests()).toBe(2)
+    expect(h.events.at(-1)).toMatchObject({ type: 'step_finish' })
+    expect(h.events.some((event) => event.type === 'error')).toBe(false)
+  })
+
+  it('临时恢复提示不计入下一步上下文预算', async () => {
+    const unit = Array.from({ length: 24 }, (_, i) => `第${i}段：不同的内容 ${i * 17 + 3}。`).join(
+      '',
+    )
+    const repeated: StreamEvent[] = [
+      { type: 'text_start' },
+      { type: 'text_delta', text: unit.repeat(4) },
+    ]
+    const recovered = calls('after-recovery').map((event) =>
+      event.type === 'finish' ? { ...event, usage: { ...usage(), inputTokens: 500 } } : event,
+    )
+    const h = await drive({ rounds: [repeated, recovered, says('完成')] })
+
+    const finishes = h.events.filter(
+      (event): event is Extract<AgentEvent, { type: 'step_finish' }> =>
+        event.type === 'step_finish',
+    )
+    const finish = finishes[0]
+    if (!finish) throw new Error('恢复请求没有完成')
+    const assistant = h.ctx.messages.find(
+      (message) =>
+        message.role === 'assistant' && message.parts.some((part) => part.type === 'tool_call'),
+    )
+    if (!assistant) throw new Error('恢复请求没有产生工具调用')
+    const promptTokens = estimateMessageTokens([{ type: 'text', text: REPETITION_RECOVERY_PROMPT }])
+    const assistantTokens = estimateMessageTokens(assistant.parts)
+
+    expect(finish.contextTokens).toBe(500 - promptTokens + assistantTokens)
+    expect(finishes).toHaveLength(2)
+    const final = h.ctx.messages.at(-1)
+    if (final?.role !== 'assistant') throw new Error('普通请求没有完成')
+    expect(finishes[1]?.contextTokens).toBe(1 + estimateMessageTokens(final.parts))
   })
 })
 

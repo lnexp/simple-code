@@ -18,6 +18,8 @@ export function ContextPanel({
   compact,
   summaryInContext,
   onToggleSummary,
+  pullSegments,
+  onTogglePull,
   onCompact,
   onClose,
 }: {
@@ -32,6 +34,10 @@ export function ContextPanel({
    *  的标准装配。协议字段沿旧名，UI 语义按「精简」正着显示） */
   summaryInContext: boolean
   onToggleSummary: (value: boolean) => void
+  /** 拉段开关（任务视图才有；null = 主任务，恒开不显示，2026-11-21 用户定：
+   *  开 = 压缩点拉别的会话的段（带出处标签），关 = 完全独立） */
+  pullSegments: boolean | null
+  onTogglePull: (value: boolean) => void
   onCompact: () => void
   onClose: () => void
 }) {
@@ -93,21 +99,11 @@ export function ContextPanel({
             藏在数据非空分支里，空态只剩一句提示（记忆面板 V2 同款的结构
             退化，这次一起修掉） */}
         <div className="ctx-head">
-          {/* 标题行右侧的小按钮：说明进 title，面板里只留结果 / 运行中提示 */}
+          {/* 标题行只留动作按钮（立即压缩）；状态开关是「一行一个」的
+              toggle 行（设置页同款），不再挤在标题旁——窄面板里三个
+              文字按钮一行放不下（2026-11-23 用户反馈丑） */}
           <div className="ctx-title-row">
             <div className="ctx-title">上下文分析</div>
-            <button
-              type="button"
-              className="ctx-compact"
-              onClick={() => onToggleSummary(!summaryInContext)}
-              title={
-                summaryInContext
-                  ? '标准装配（摘要在场）。开启精简后只保常驻区 + 保底区 + 当前轮：摘要、存根都不进上下文，压缩=硬切（库与 recall 不变）；下一轮生效'
-                  : '精简中：只保常驻区 + 保底区 + 当前轮。关闭回到标准装配（摘要索引区 + 存根区进场）；下一轮生效'
-              }
-            >
-              精简上下文：{summaryInContext ? '关' : '开'}
-            </button>
             <button
               type="button"
               className="ctx-compact"
@@ -121,6 +117,36 @@ export function ContextPanel({
             >
               {compact.busy ? '压缩中…' : '立即压缩'}
             </button>
+          </div>
+          <div className="ctx-switches">
+            <button
+              type="button"
+              className="ctx-compact"
+              aria-pressed={!summaryInContext}
+              onClick={() => onToggleSummary(!summaryInContext)}
+              title={
+                summaryInContext
+                  ? '标准装配（摘要在场）。开启精简后只保常驻区 + 保底区 + 当前轮：摘要、存根都不进上下文，压缩=硬切（库与 recall 不变）；下一轮生效'
+                  : '精简中：只保常驻区 + 保底区 + 当前轮。关闭回到标准装配（摘要索引区 + 存根区进场）；下一轮生效'
+              }
+            >
+              精简上下文：{summaryInContext ? '关' : '开'}
+            </button>
+            {pullSegments !== null && (
+              <button
+                type="button"
+                className="ctx-compact"
+                aria-pressed={pullSegments}
+                onClick={() => onTogglePull(!pullSegments)}
+                title={
+                  pullSegments
+                    ? '开着：压缩点拉别的会话已合回的段，带「来源」标签。关掉即完全独立——不看任何别的会话的经历'
+                    : '独立中：不拉任何别的会话的段。开启后在压缩点拉别的会话已合回的段（带出处标签），下一轮生效'
+                }
+              >
+                合并任务摘要：{pullSegments ? '开' : '关'}
+              </button>
+            )}
           </div>
         </div>
         {body}

@@ -10,10 +10,17 @@
 
 import { createHash } from 'node:crypto'
 import { copyFile, readdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { build } from 'esbuild'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
+// jsonc-parser 装在 packages/core 下（pnpm 严格布局），仓库根解析不到；
+// alias 的替换值要绝对路径，从 core 那边 resolve 出来
+const JSONC_ESM = createRequire(join(root, 'packages/core', 'package.json')).resolve(
+  'jsonc-parser/lib/esm/main.js',
+)
 
 // esm bundle 里 CJS 依赖的 require('child_process')（core 经 MCP SDK →
 // cross-spawn 引入）没有 require 可用——垫一个 createRequire，esbuild 的
@@ -107,6 +114,15 @@ const TARGETS = [
     name: 'wake-bin',
     entry: 'packages/cli/src/wake.ts',
     outfile: 'packages/cli/dist/wake.js',
+    options: { platform: 'node', format: 'esm', target: 'node22' },
+  },
+  {
+    // 通讯网关进程（im-gateway.md §5.2）：独立 node 进程监听 gateway.sock，
+    // 由 SC 拉起（ELECTRON_RUN_AS_NODE 的宿主内置 Node）。esm+node22 同
+    // cli bins——统一 banner 垫 require（见下）
+    name: 'gateway',
+    entry: 'packages/vscode/src/gateway-main.ts',
+    outfile: 'packages/vscode/dist/gateway.js',
     options: { platform: 'node', format: 'esm', target: 'node22' },
   },
   {
@@ -230,6 +246,14 @@ for (const target of TARGETS) {
     ...(target.options.format === 'esm' && target.options.platform === 'node'
       ? { banner: ESM_REQUIRE_BANNER }
       : {}),
+    // jsonc-parser 的 main 是 UMD：require 以参数传进工厂函数，esbuild
+    // 分析不了那些相对 require，打进单文件后运行时报
+    // "Cannot find module './impl/format'"（sc/gateway/extension 实测）。
+    // 钉到 ESM 构建（真 import 语句，可分析）。注意 ESM 构建的 import
+    // 不带 .js 扩展名，只有打包器认——源码 import 仍写包名，Node 直跑
+    // 走 main 的 UMD，正常。extension/companion 自己有 alias
+    // （web-tree-sitter），合进来而不是顶掉
+    alias: { 'jsonc-parser': JSONC_ESM, ...(target.options.alias ?? {}) },
   })
   console.log(`built ${target.outfile}`)
 }

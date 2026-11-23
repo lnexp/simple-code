@@ -27,10 +27,17 @@ function buildRequest(req: Request, ctx: ProviderContext) {
   const body = {
     model: req.model,
     stream: true,
-    // instructions 必传：不传时至少有一个网关会注入它自己的默认提示词
-    // （实测有网关注入约 21k 字符的默认提示词），行为完全不可控
-    instructions: req.system,
-    input: req.messages.flatMap(toWireItems),
+    // instructions 传空串、system 挪到 input[0] 的 developer 消息：
+    // ① GPT-6.2 起顶层 instructions 不进缓存（opencode 2026-11-18 实测
+    //    每步全价重付，v2.3.2 同款改法）；② 字段不能整个删掉——不传时有
+    //    网关注入自家默认提示词（2026-08 实测约 21k 字符），空串即占位
+    instructions: '',
+    input: [
+      ...(req.system
+        ? [{ role: 'developer', content: [{ type: 'input_text', text: req.system }] }]
+        : []),
+      ...req.messages.flatMap(toWireItems),
+    ],
     tools: req.tools.map((t) => ({
       type: 'function',
       name: t.name,

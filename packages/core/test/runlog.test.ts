@@ -80,4 +80,28 @@ describe('runlog', () => {
     expect(() => log({ ev: 'llm' })).not.toThrow()
     await tick()
   })
+
+  it('recall 选择器原文另存 ~/.simple-code/logs/recall-unparsed.jsonl：一行一个 JSON、追加、带 at', async () => {
+    // test-setup 把它 mock 掉了（挡真写盘），这里取真身、HOME 指到临时目录
+    const { logRecallUnparsed } =
+      await vi.importActual<typeof import('../src/runlog.ts')>('../src/runlog.ts')
+    const home = await mkdtemp(join(tmpdir(), 'runlog-home-'))
+    vi.stubEnv('HOME', home)
+    try {
+      logRecallUnparsed({ folder: '/w', turn: 1, raw: '甲' })
+      logRecallUnparsed({ folder: '/w', turn: 2, raw: '乙' })
+    } finally {
+      vi.unstubAllEnvs()
+    }
+    const file = join(home, '.simple-code', 'logs', 'recall-unparsed.jsonl')
+    const lines = (await readFile(file, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l))
+    expect(lines).toMatchObject([
+      { folder: '/w', turn: 1, raw: '甲' },
+      { folder: '/w', turn: 2, raw: '乙' },
+    ])
+    expect(typeof lines[0].at).toBe('string')
+  })
 })

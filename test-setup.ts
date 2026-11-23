@@ -15,5 +15,5 @@ delete process.env.SIMPLE_CODE_MEMORY_DIR
  */
 vi.mock(import('./packages/core/src/runlog.ts'), async (importOriginal) => {
   const actual = await importOriginal<typeof import('./packages/core/src/runlog.ts')>()
-  return { ...actual, logRun: vi.fn(), logRunTo: actual.logRunTo }
+  return { ...actual, logRun: vi.fn(), logRunTo: actual.logRunTo, logRecallUnparsed: vi.fn() }
 })

@@ -45,7 +45,7 @@ import {
   type SummaryOutput,
 } from '../loop/summarize.ts'
 import { estimateMessageTokens, estimateTextTokens, inputBudget } from '../loop/tokens.ts'
-import { logRun } from '../runlog.ts'
+import { logRecallUnparsed, logRun } from '../runlog.ts'
 import { probeSync } from '../sync-probe.ts'
 import { createBashTool } from '../tools/bash.ts'
 import { type BgProcessInfo, BgRegistry } from '../tools/bg.ts'
@@ -901,12 +901,11 @@ export async function getSession(
    *  失败都只留 runlog，不打断 send；结果没到 = 本轮没有提醒，不重试。
    *  只在 mode=on 时发（选择 + 关键词撞摘要同一次请求）：shadow 是 recall
    *  的**默认值**，shadow 下零请求；没配 summaryModel 的用户 on 模式花的是
-   *  主模型的钱 */
+   *  主模型的钱。任务会话同样发（不管人开还是 agent 派），注入按 owner 落库 */
   const startSelector = (text: string): void => {
     selection = null
     const recall = config.config.recall
-    if (recall.mode !== 'on' || store === null || activeTurn === null || options.task !== undefined)
-      return
+    if (recall.mode !== 'on' || store === null || activeTurn === null) return
     const pending = {
       turn: activeTurn,
       picked: null as SelectorCandidate[] | null,
@@ -947,11 +946,19 @@ export async function getSession(
         topK: recall.topK,
         excludeNames: exclude,
       })
-      // 不记原文（runlog 只记元数据）；unparsed = 回了东西却一个名字都没认出
-      // 来——格式不听话的信号，与正常的「无」分开。判 body 不判 raw：经验库
+      // runlog 只记元数据；unparsed = 回了东西却一个名字都没认出来——格式
+      // 不听话的信号，与正常的「无」分开，原文另存 recall-unparsed.jsonl
+      // 供查格式（runlog.ts logRecallUnparsed）。判 body 不判 raw：经验库
       // 没相关的时模型只回关键词行（没写「无」），raw 非空会把它误报成
       // unparsed（2026-10-14 实测上线后 5/35 全是这种假阳性）
       const unparsed = pending.picked.length === 0 && body.trim() !== '' && body.trim() !== '无'
+      if (unparsed)
+        logRecallUnparsed({
+          folder: folderPath,
+          turn: pending.turn,
+          model: config.summary.name,
+          raw,
+        })
       logRun({
         ...log,
         ms: Date.now() - startedAt,
@@ -1027,12 +1034,12 @@ export async function getSession(
 
   /**
    * 动作联想（touch-cue.ts）：刚执行完的命令碰到 description 点名的文件/程序，
-   * 每个工具步都可以提。同选择器：只主任务、只 recall.mode=on；仓库文件表与
+   * 每个工具步都可以提。同选择器：任务也提、只 recall.mode=on；仓库文件表与
    * 条目每轮建一次
    */
   let touchContext: { turn: number; ctx: ReturnType<typeof loadTouchContext> } | null = null
   function offerTouch(store: Store, anchor: CueAnchor, seen: ReadonlySet<string>): void {
-    if (config.config.recall.mode !== 'on' || options.task !== undefined) return
+    if (config.config.recall.mode !== 'on') return
     const commands = stepCommands(messages)
     if (commands.length === 0) return
     if (touchContext?.turn !== anchor.turnId)
@@ -1376,9 +1383,10 @@ export async function getSession(
       // 崩溃重启后模型的回答在历史里成了没有来由的一段话
       store?.save(messages)
       // recall（选择器 + 关键词撞摘要，selector.ts/cue.ts）：send 入口与主
-      // 请求并行，结果经 offerAsyncCue 异步注入。任务会话不算（v1）：任务
-      // 短命、上下文有继承语义；排队插话的轮也拿不到——beginTurn 在 loop
-      // 里，那是第二处接线点，痛了再接
+      // 请求并行，结果经 offerAsyncCue 异步注入。任务会话也算：v1 不算的
+      // 理由「任务短命」已不成立——执行放任务里跑、一开几十轮（2026-11-20
+      // 实测真项目两周 714 个任务轮零 recall，用户拍板任务一律跑）。排队
+      // 插话的轮拿不到——beginTurn 在 loop 里，那是第二处接线点，痛了再接
       //
       // 续接轮不算。async_cues 一轮一条，原轮注入过的话再选
       // 会被 DO NOTHING 吞掉、日志却记成注入了
@@ -2287,7 +2295,7 @@ const systemPrompt = (
       : visionRelay
         ? '不支持图片：view_image 返回视觉副模型的文字转述，原图只存档。\n'
         : '不支持图片：view_image 只返回图片的格式与字节数。\n') +
-    `需要了解或修改项目时，用 bash 工具执行命令。${contextRules(env)}${growthRules(lessons, env)}${toolRules(env)}${modelRules(env)}`
+    `需要了解或修改项目时，用 bash 工具执行命令。\n\n## 过程汇报\n${PROGRESS_RULES}${contextRules(env)}${growthRules(lessons, env)}${toolRules(env)}${modelRules(env)}`
   // 用户级在前、项目级在后，冲突以项目级为准（2026-09-29 拍板，三家同款
   // 叠放）。notes 段独立于 AGENTS.md——没有约定文件的项目照样可以记笔记
   const withUser =
@@ -2360,6 +2368,15 @@ const toolRules = (env: NodeJS.ProcessEnv): string => {
  * one session / 摘要 / 卸载 / 落盘不丢是 core 行为，任何环境都成立，无条件；
  * 检索句条件拼，理由同 toolRules：没注入 bin 的环境说了就是误导。
  */
+
+// 过程汇报（2026-11-18 用户拍板加，措辞过目）：三家对照里 CX/CC 都有、
+// SC 缺——50 次工具调用不吭声、到收尾才汇报。两家都用「关键节点」软节奏
+// 而非硬次数（硬次数会被「继续处理中」占位句机械满足）；模型行为规则与
+// bin 注入无关，无条件。webview 本就展示工具调用，所以点明差异化价值是
+// 「线索、判断和去向」，堵住复述命令输出的凑数路径。
+const PROGRESS_RULES =
+  '动手前一句话说要做什么；连续埋头调用工具时按关键节点插话——发现关键事实（根因、反常数据）、调整方向、或隔了多步没说话，就用一两句讲「已确认什么、接下来干什么」，不要一路沉默到收尾。简短说人话，不凑数：工具命令和输出用户在界面看得到，要报的是线索、判断和去向；这不替代收尾的完整汇报。'
+
 const contextRules = (env: NodeJS.ProcessEnv): string => {
   const retrieval =
     env.SIMPLE_CODE_MEMORY !== undefined
@@ -2444,7 +2461,7 @@ const growthRules = (lessons: string | null, env: NodeJS.ProcessEnv): string =>
   '用户 `~/.simple-code/skills/<name>/SKILL.md`（同名时用户级覆盖项目级），' +
   '目录名即名字，按 SKILL.md 内容执行；改项目级 SKILL.md 走 "$SIMPLE_CODE_APPLY_PATCH"，用户级写走 bash 审批。\n' +
   '③note：general 记录结论，lesson 记教训，principle 记有依据的判断，goal 记当前事与目标，wiki 是反思维护的机制词条（读到与代码不符的当场订正）。' +
-        '主 agent 在目标/授权内自主管理 goal：先检查当前项目是否有 current: true 的 goal；如果没有，而当前请求明确会跨多个请求继续推进一件事，主动用 NOTE write --type goal 建立项目目标，填写事、目标、当前范围与边界、怎样算达到目标。注意：用户说「开启一个 goal 任务」指的是派任务的 goal 模式（$SIMPLE_CODE_TASK --goal，见 bash 工具描述），不是写本类型的 note。' +
+  '主 agent 在目标/授权内自主管理 goal：先检查当前项目是否有 current: true 的 goal；如果没有，而当前请求明确会跨多个请求继续推进一件事，主动用 NOTE write --type goal 建立项目目标，填写事、目标、当前范围与边界、怎样算达到目标。注意：用户说「开启一个 goal 任务」指的是派任务的 goal 模式（$SIMPLE_CODE_TASK --goal，见 bash 工具描述），不是写本类型的 note。' +
   '一次性任务或目标不清楚时不要创建；不把设想当定案、不擅改目标或降低验收。' +
   '目标用 current: true 指定，其他目标取消 current；暂停/完成改 status: paused/completed。客观验收可自主完成，主观效果须用户确认。' +
   '出现可复用的判断时，先核对原话或其他依据；有依据才主动用 NOTE write --type principle 写 candidate，并记录判断、适用边界与依据。' +

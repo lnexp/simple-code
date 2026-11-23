@@ -71,6 +71,12 @@ export type Router = {
   showing: () => { folder: string; task: string | null }
   /** 机器人上点「允许」：找到卡所在的 bridge 放行。没有这张卡 = false */
   allow: (toolCallId: string) => boolean
+  /** 手机上回「拒」（im-gateway.md §6）。没有这张卡 = false */
+  deny: (toolCallId: string, reason?: string) => boolean
+  /** 网关送话（im-gateway.md §5.4 send）：folder 定 bridge，owner 定主任务/任务 */
+  gatewaySend: (folder: string, owner: string, text: string) => string | null
+  /** 网关急停（§5.4 stop） */
+  gatewayStop: (folder: string, owner: string) => boolean
   /** 机器人上点某条：切到目录，再让 webview 选中任务。webview 还没就绪
    *  （面板刚被 focus 命令拉起）就等 ready 后再做 */
   focus: (folder: string, task: string | null) => void
@@ -185,7 +191,11 @@ export function createRouter(deps: RouterDeps): Router {
           // seed 已设过 active（上次选择）就不动它——「没 spawn」不是重置
           // active 的理由，否则 seed 被 [0] 顶掉，出现先连 [0] 再跳的闪换
           if (active === '') active = pick()
-          if (active && !bridges.has(active)) spawn(active)
+          // 所有目录都建 bridge（2026-11-18 用户拍板：手机 /列表 要看得到
+          // 全部目录的任务，不再只显示访问过的）。bridge 构造无 I/O、session
+          // 惰性不占锁，代价只是每个目录读一遍任务 manifest；只有 active
+          // 才 attach——后台目录不该往 webview 推基线
+          for (const f of deps.folders()) if (!bridges.has(f)) spawn(f)
           bridges.get(active)?.attach()
           postFolders()
           if (pendingFocus !== null) {
@@ -224,6 +234,8 @@ export function createRouter(deps: RouterDeps): Router {
         b.dispose()
         bridges.delete(folder)
       }
+      // 新增目录同样直接建（同 ready 的口径）：/列表 覆盖全部目录
+      for (const f of list) if (!bridges.has(f)) spawn(f)
       if (active !== '' && !list.includes(active)) {
         active = pick()
         if (active) spawn(active).attach()
@@ -270,6 +282,22 @@ export function createRouter(deps: RouterDeps): Router {
     allow: (toolCallId) => {
       for (const b of bridges.values()) if (b.allowToolCall(toolCallId)) return true
       return false
+    },
+
+    deny: (toolCallId, reason) => {
+      for (const b of bridges.values()) if (b.denyToolCall(toolCallId, reason)) return true
+      return false
+    },
+
+    gatewaySend: (folder, owner, text) => {
+      const b = bridges.get(folder)
+      if (!b) return `这个窗口没有打开「${folder}」的 SC 会话`
+      return b.gatewaySend(owner, text)
+    },
+
+    gatewayStop: (folder, owner) => {
+      const b = bridges.get(folder)
+      return b !== undefined && b.stopOwner(owner)
     },
 
     focus: (folder, task) => {

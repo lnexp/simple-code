@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { logRun } from '@simple-code/core'
@@ -89,12 +90,12 @@ export function startRobot(
     )
   }
 
-  panel.onRobotChange = refresh
+  const unsub = panel.onRobotChange(refresh)
   const sub = vscode.window.onDidChangeWindowState(refresh)
   refresh()
   return {
     dispose: () => {
-      panel.onRobotChange = undefined
+      unsub()
       sub.dispose()
       client.dispose()
     },
@@ -114,4 +115,33 @@ export async function installRobot(): Promise<void> {
       `安装桌面机器人失败：${e instanceof Error ? e.message : String(e)}。也可以在扩展面板搜索 ${ROBOT_EXTENSION_ID}，或用「从 VSIX 安装」装下载好的包。`,
     )
   }
+}
+
+/** 机器人开关配置（desktop-robot.md §7）：机器人与机器人插件共写，SC 只读。
+ *  不跨包 import packages/robot——那是独立发布的插件，SC 侧保持同语义的小抄 */
+const robotConfigPath = (): string => join(homedir(), '.simple-code/robot/config.json')
+
+/** enabled 的读：文件不存在/写坏了/没有这一项都算开（默认开，用户定
+ *  2026-10-31）——与机器人插件 control.ts readEnabled 同语义 */
+export function readRobotEnabled(): boolean {
+  try {
+    const v = JSON.parse(readFileSync(robotConfigPath(), 'utf8')) as unknown
+    return !(typeof v === 'object' && v !== null && (v as { enabled?: unknown }).enabled === false)
+  } catch {
+    return true
+  }
+}
+
+/** 机器人插件装没装（设置页「桌面机器人」分区的前提） */
+export function robotInstalled(): boolean {
+  return vscode.extensions.getExtension(ROBOT_EXTENSION_ID) !== undefined
+}
+
+/** 设置页开关的转发：enable/disable 命令带静默参数（拉起/退出逻辑只在
+ *  机器人插件一处维护）。命令完成（disable 最多等 app 3s 退出）后由调用方回读 */
+export async function toggleRobot(on: boolean): Promise<void> {
+  await vscode.commands.executeCommand(
+    on ? 'simpleCodeRobot.enable' : 'simpleCodeRobot.disable',
+    true,
+  )
 }

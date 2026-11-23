@@ -7,6 +7,7 @@ import {
   startCredentialProxy,
 } from '@simple-code/core'
 import * as vscode from 'vscode'
+import { startGateway } from './gateway.ts'
 import { watchLoopLag } from './loop-lag.ts'
 import { startLspBridge } from './lsp-bridge.ts'
 import { ChatPanel } from './panel.ts'
@@ -115,6 +116,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     sendList: (req) => Promise.resolve(panel.taskSendList(req)),
     wake: (req) => panel.wake(req),
   })
+  // 通讯网关（im-gateway.md §5.3）：手机飞书遥控。enabled 默认关——启用 =
+  // 用户手改 ~/.simple-code/gateway/config.json。先 await 再进 subscriptions
+  // （replace 旧版时最多等 1 秒，避免参数列表里的 await 挡住后面的注册）
+  const gateway = await startGateway(panel, {
+    version: context.extension.packageJSON.version,
+    extensionPath: context.extensionPath,
+  })
   context.subscriptions.push(
     // 桥跟着扩展走：停用即关，端口随 env 消失，bin 侧明确报不可达
     { dispose: () => lspServer.close() },
@@ -135,6 +143,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       focusCommand: `${noSecondarySidebar ? 'simpleCode.chat.cursor' : 'simpleCode.chat'}.focus`,
     }),
     vscode.commands.registerCommand('simpleCode.installRobot', installRobot),
+    gateway,
     // 多根工作区：文件夹增删时路由层要清失效 bridge / 回落 active（design.md §7）
     vscode.workspace.onDidChangeWorkspaceFolders(() => panel.setFolders()),
     // 底栏「当前文件」按钮：切编辑器、拖选时推给面板。拖选一路连发，防抖 200ms
@@ -153,7 +162,9 @@ function watchActiveEditor(push: () => void): vscode.Disposable[] {
     vscode.window.onDidChangeActiveTextEditor(later),
     vscode.window.onDidChangeTextEditorSelection(later),
     // 切到图片/PDF/notebook 标签不一定有上面两个事件（activeTextEditor 已经
-    // 是空的时候不会再变）；换组时活动标签也跟着变
+    // 是空的时候不会再变）；换组时活动标签也跟着变。已知边界：图片 tab 切
+    // 图片 tab 不触发这三个事件（切换活动标签不改集合，onDidChangeActiveTab
+    // 在 @types/vscode ~1.106 还没有，升类型版本再补）
     vscode.window.tabGroups.onDidChangeTabs(later),
     vscode.window.tabGroups.onDidChangeTabGroups(later),
     { dispose: () => clearTimeout(timer) },

@@ -237,14 +237,15 @@ describe('上下文面板 V2 版式', () => {
     })
     app.clickTab('调研')
     app.send({ type: 'task_hydrate', folder: '/tmp/x', name: '调研', items: [] })
-    // 任务面板：显示「精简上下文：开」（任务精简中）
+    // 任务面板：精简开着（任务精简中）——2026-11-23 起开关是 toggle 行，
+    // 状态看 aria-pressed / ctx-toggle.on，不再是文字「：开/关」
     app.clickCtx()
     const html = app.html()
     // 后台主任务推 state（主任务自己的标准装配）：任务面板不被冲掉
     app.send(state)
-    expect(app.html()).toContain('精简上下文：开')
-    // 切回主任务：恢复主任务的档位（标准装配 → 显示「关」）
+    expect(app.html()).toContain('aria-pressed="true"')
+    // 切回主任务：恢复主任务的档位（标准装配 → toggle 熄灭）
     app.clickTab('主任务')
-    expect(app.html()).toContain('精简上下文：关')
+    expect(app.html()).toContain('aria-pressed="false"')
   })
 })

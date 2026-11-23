@@ -424,7 +424,8 @@ describe('合并端到端', () => {
    * 340 token，两条 680，在这个 500 的预算里怎么调比例都装不下，两组分不开。
    * 撑破预算的活交给 assistant 回复，那也更像真实会话。
    */
-  const bigReply = (l: string) => `${l}${'。这段回答很长必须够长才卸得动'.repeat(40)}`
+  const bigReply = (l: string) =>
+    `${l}${Array.from({ length: 40 }, (_, i) => `。这段回答很长必须够长才卸得动（第${i}段）`).join('')}`
 
   /**
    * inputTokens = 假响应报的真实输入：默认 1（系数夹到 0.5）；给大值时系数夹到 2；

@@ -56,7 +56,8 @@ export function Menu<T>({
   options,
   onPick,
 }: {
-  icon: string
+  /** 触发器前的 codicon 名。设置页的下拉不带（settings-dropdown.tsx） */
+  icon?: string
   /** 挂在触发器上的类名（model-picker / effort-picker），测试和截断宽度都靠它 */
   cls: string
   label: string
@@ -160,7 +161,7 @@ export function Menu<T>({
         disabled={disabled}
         onClick={() => setOpen((o) => !o)}
       >
-        <i className={`codicon codicon-${icon}`} aria-hidden />
+        {icon !== undefined && <i className={`codicon codicon-${icon}`} aria-hidden />}
         <span className="trigger-label">{label}</span>
         <i className={`codicon codicon-chevron-${open ? 'up' : 'down'}`} aria-hidden />
       </button>

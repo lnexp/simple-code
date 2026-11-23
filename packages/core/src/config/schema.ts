@@ -193,12 +193,15 @@ const webfetchConfig = strictObject({
  * =none，而它只对部分端点安全（2026-09-30 实测某端点会 400、另一端点
  * 推理漏进正文），所以不做成默认映射，由用户按端点显式配
  */
+export const SIDE_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+export type SideEffort = (typeof SIDE_EFFORTS)[number]
+
 const sideModelRef = z.union([
   z.string(),
   strictObject({
     provider: z.string(),
     model: z.string(),
-    effort: z.enum(['none', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
+    effort: z.enum(SIDE_EFFORTS).optional(),
   }),
 ])
 

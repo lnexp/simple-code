@@ -936,6 +936,13 @@ ${WRAP_INDENT}
   background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
 }
 .ctx-compact:disabled { opacity: 0.5; cursor: default; }
+/* 状态开关行（2026-11-23）：两个文字按钮（ctx-compact，原来的样式）
+   两端对齐分布，不挤在标题行（三个挤一行放不下）。用户三改定稿：
+   布局 = 标题行留动作按钮 + 本行两端各一个开关 */
+.ctx-switches {
+  display: flex; justify-content: space-between;
+  margin: 6px 0 8px;
+}
 /* 记忆面板（memory-panel.tsx）：双选项并排 + 四元组数字弱化 */
 .mem-choice { display: flex; gap: 6px; }
 /* 结果 / 运行中提示：只在有话说时出现，可多行（结果 + AGENTS 超限提示） */
@@ -1175,6 +1182,14 @@ code a[data-open-path]:hover {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 14em;
 }
 .branch-open:hover { text-decoration: underline; }
+/* 双击任务名改名的行内编辑框：字号随 tab（11px），宽度足够 20 个汉字 */
+.branch-rename {
+  flex: none; font-size: 11px; padding: 0 4px; min-width: 9em;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-focusBorder);
+  border-radius: 3px; outline: none;
+}
 .branch-add {
   flex: none; border: none; background: none; cursor: pointer; padding: 2px 8px;
   color: var(--vscode-descriptionForeground); font-size: 11px;
@@ -1231,8 +1246,8 @@ code a[data-open-path]:hover {
 .task-close:hover { color: var(--vscode-errorForeground, #f48771); }
 .branch-tab[data-status='closing'] { opacity: 0.55; }
 
-/* 多根工作区的对话头（design.md §7）：消息列表顶上、fatal 条之下。
-   单根不渲染，不占空间 */
+/* 对话头（design.md §7）：消息列表顶上、fatal 条之下。多根平铺 tab；
+   单根也渲染（2026-11-17）——最右侧齿轮是设置页入口 */
 .folder-head {
   display: flex; align-items: stretch; flex: none;
   padding: 0 4px 0 6px; border-bottom: 1px solid var(--vscode-editorGroup-border);
@@ -1240,9 +1255,15 @@ code a[data-open-path]:hover {
 /* 平铺文件夹 tab（原 FolderPicker 下拉换掉，用户拍板 tab 化）。
    align-items:stretch + 垂直 padding 归零：tab 要撑满行高，自己的
    border-bottom 压住 head 的底线做选中高亮（margin-bottom:-1px 重叠）。
-   overflow hidden 防 measure 收敛前一帧闪溢出 */
-.folder-tabs { display: flex; align-items: stretch; flex: 1; min-width: 0; overflow: hidden;
+   .folder-tabs 是测量容器（宽度含「»」）兼「»」弹层的定位锚点；裁剪只在
+   里层 .folder-tabs-clip（overflow hidden 防 measure 收敛前一帧闪溢出）。
+   「»」不能放进裁剪层：弹层被裁掉，Menu 的 scrollIntoView 还会把裁剪层
+   滚走（实测 scrollTop 43 / scrollLeft 152，tab 整排消失）——11-18 用户报
+   窄宽度下拉目录看不到、滑不动 */
+.folder-tabs { display: flex; align-items: stretch; flex: 1; min-width: 0; position: relative; }
+.folder-tabs-clip { display: flex; align-items: stretch; flex: 1; min-width: 0; overflow: hidden;
   position: relative; /* 影子测量层的定位/裁剪锚点 */ }
+.folder-tabs > .picker { position: static; } /* 弹层改锚到 .folder-tabs */
 .folder-tab {
   flex: none; display: inline-flex; align-items: center; gap: 5px;
   max-width: 11em; min-width: 0;
@@ -1280,18 +1301,171 @@ code a[data-open-path]:hover {
 .folder-overflow { flex: none; }
 .folder-overflow .trigger { height: auto; padding: 7px 8px; }
 .folder-overflow .trigger-label { max-width: none; }
-/* 弹层左对齐触发器 + 按内容撑宽。**根因**：.menu 通用规则是 right:0——右缘
-   对齐触发器右缘，而 folder 弹层（8 项最长的 basename 撑到 ~230px）比触发器
-   （一个 basename 宽）宽得多，右对齐会把弹层左缘推出视口（实测 left=-61px），
-   每项从左被视口裁掉几个字符、只露尾巴（"sample-web-app" → "le-web-app"）。
-   folder 在面板左上角，向右展开（left:0）永远在视口内；底栏的 model/effort
-   靠右、继续用 right:0 向左展开。无头 Chrome 复刻页验证：-61px → +11px */
-.menu.folder-overflow { left: 0; right: auto; width: max-content; max-width: none; }
-.menu.folder-overflow .menu-label { overflow: visible; text-overflow: clip; }
+/* 弹层右缘对齐 .folder-tabs 右缘（「»」就在那儿，齿轮左边）、按内容撑宽，
+   宽度封顶 .folder-tabs——两侧都不出视口。旧做法左缘对齐触发器向右展开：
+   「»」在窄面板靠右时弹层右缘出视口（11-18 实测 380 宽右缘 505）；更早的
+   right:0 锚在触发器上则左缘出视口（实测 left=-61px）。名字放不下才省略号 */
+.menu.folder-overflow { width: max-content; max-width: 100%; min-width: min(220px, 100%); }
 /* 后台文件夹审批卡的来源标注 */
 .approval-folder {
   font-size: 0.85em; color: var(--vscode-descriptionForeground);
   margin-bottom: 2px;
 }
+
+/* ── 设置页（2026-11-17，.simple-code/tmp/settings-page-proto/ 原型）── */
+/* 目录栏最右的齿轮：folder-tab 同款尺寸，flex none 不参与溢出测量 */
+.folder-gear { flex: none; padding: 7px 8px; margin-bottom: -1px; }
+.folder-gear .codicon { font-size: 14px; }
+.page { flex: 1; min-height: 0; overflow: auto; padding: 0 16px 24px;
+  /* 行高只在设置页设 1.45（原型 body 的 font: 13px/1.45）：全局 body 不设
+     line-height（computed = normal），这里不补的话每行少约 3px——真机看着
+     比 380 原型挤（2026-11-17 用户实测「太拥挤」）。只设 .page 范围，
+     不碰对话区 */
+  line-height: 1.45; }
+/* 宽面板限宽居中（2026-11-17 用户：靠左 640「没有自适应宽度，或者居中」，
+   参照 OpenChamber SettingsPageLayout：mx-auto max-w-[840px]、窄 24px /
+   宽 48px 留白；本页窄屏用 16px，380 侧栏放不下 24）。居中做在 .page 的左右 padding 上而不是子元素 margin:auto
+   ——.sec/.field 等的 margin 简写会把 auto 盖回 0；滚动条仍在面板右缘 */
+@media (min-width: 720px) {
+  .page { padding: 0 max(48px, calc((100% - 840px) / 2)) 32px; } }
+.page-head { position: sticky; top: 0; z-index: 2; display: flex; align-items: center;
+  gap: 6px; padding: 16px 0 6px; background: var(--vscode-sideBar-background); }
+.page-head .title { flex: 1; font-size: 15px; font-weight: 600; }
+.page-sub { margin: 0 0 8px; font-size: 11.5px; color: var(--vscode-descriptionForeground); }
+.icon-btn { display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+  padding: 2px 4px; border: none; border-radius: 4px; background: transparent;
+  color: var(--vscode-foreground); font: inherit; font-size: 12px; cursor: pointer; }
+.icon-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
+.icon-btn.muted { color: var(--vscode-descriptionForeground); }
+.icon-btn .codicon { font-size: 14px; }
+/* 分节标题照 OpenChamber：正文色粗体、节间 28px（原 11px 灰字 + 14px 节距，用户「上下太紧凑」） */
+.sec { margin: 28px 0 10px; font-size: 13px; font-weight: 600; color: var(--vscode-foreground); }
+.card { border: 1px solid color-mix(in srgb, var(--vscode-foreground) 14%, transparent);
+  border-radius: 8px; background: var(--vscode-editor-background); }
+.prov-head { display: flex; align-items: center; gap: 6px; padding: 10px 10px 4px 14px; }
+.prov-head .name { font-weight: 600; }
+.prov-head .meta { flex: 1; min-width: 0; font-size: 11.5px;
+  color: var(--vscode-descriptionForeground);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prov-key { padding: 0 14px 10px; font-size: 11.5px; color: var(--vscode-descriptionForeground); }
+.row { display: flex; align-items: center; gap: 6px; width: 100%; padding: 8px 10px 8px 14px;
+  border: none; border-top: 1px solid color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+  background: none; color: var(--vscode-foreground); font: inherit; text-align: left; cursor: pointer; }
+.row:hover { background: color-mix(in srgb, var(--vscode-foreground) 5%, transparent); }
+.row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .num { font-size: 11.5px; color: var(--vscode-descriptionForeground);
+  font-variant-numeric: tabular-nums; }
+.row .codicon { font-size: 13px; color: var(--vscode-descriptionForeground); }
+.row .codicon-edit { visibility: hidden; }
+.row:hover .codicon-edit { visibility: visible; }
+.badge { padding: 0 5px; border: 1px solid var(--vscode-textLink-foreground);
+  border-radius: 8px; font-size: 10.5px; line-height: 15px;
+  color: var(--vscode-textLink-foreground); }
+.add-row { display: flex; align-items: center; gap: 4px; margin-top: 12px; }
+.field { margin: 0 0 16px; }
+.field > label, .field > .lab { display: block; margin-bottom: 3px; font-size: 12px; }
+.field .hint { margin-top: 3px; font-size: 11.5px; color: var(--vscode-descriptionForeground); }
+.field .err { margin-top: 3px; font-size: 11.5px; color: var(--vscode-errorForeground); }
+.page input[type=text], .page input[type=number],
+.page input[type=password] {
+  box-sizing: border-box; width: 100%; height: 26px; padding: 2px 6px;
+  border: 1px solid var(--vscode-input-border); border-radius: 4px;
+  background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+  font: inherit; font-size: 12.5px; outline: none;
+}
+.page input:focus { border-color: var(--vscode-focusBorder); }
+.page input.bad { border-color: var(--vscode-errorForeground); }
+/* 设置页下拉（settings-dropdown.tsx）：底栏同款自绘 Menu，触发器画成上面
+   输入框的样子。原生 select 的弹出列表 macOS 上由系统画、不读主题色，深色
+   主题里是白底（2026-11-17 用户截图）。外层 .ctl-group 是底栏的扁平样式，
+   这里改成占满一行、不要悬停灰底；弹层向下、与触发器同宽 */
+.page .ctl-group.picker { display: flex; width: 100%; padding: 0; color: inherit; }
+.page .ctl-group.picker:hover:not(:has(:disabled)) { background: none; color: inherit; }
+.ctl.trigger.set-dd { box-sizing: border-box; width: 100%; height: 26px; padding: 2px 6px;
+  border: 1px solid var(--vscode-input-border); border-radius: 4px;
+  background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+  font-size: 12.5px; }
+.ctl.trigger.set-dd .trigger-label { flex: 1; text-align: left; }
+.ctl.trigger.set-dd[aria-expanded='true'], .ctl.trigger.set-dd:focus-visible {
+  border-color: var(--vscode-focusBorder); outline: none; }
+.ctl.trigger.set-dd.bad { border-color: var(--vscode-errorForeground); }
+.ctl.trigger.set-dd:disabled { opacity: 0.6; }
+.menu.set-dd { left: 0; right: 0; min-width: 0; max-width: none; }
+.pw { position: relative; }
+.pw input { padding-right: 28px; }
+.pw .icon-btn { position: absolute; right: 2px; top: 2px; }
+.check { display: flex; align-items: flex-start; gap: 6px; margin: 0 0 8px;
+  font-size: 12px; cursor: pointer; }
+.check input { margin: 2px 0 0; }
+.check .hint { display: block; font-size: 11.5px; color: var(--vscode-descriptionForeground); }
+.readonly { padding: 6px 8px; border-radius: 4px;
+  background: color-mix(in srgb, var(--vscode-foreground) 6%, transparent);
+  font-size: 11.5px; color: var(--vscode-descriptionForeground); }
+.readonly b { color: var(--vscode-foreground); font-weight: 500; }
+.adv { margin: 0 0 10px; padding: 6px 8px; border-radius: 4px; font-size: 11.5px;
+  color: var(--vscode-descriptionForeground);
+  background: color-mix(in srgb, var(--vscode-foreground) 6%, transparent); }
+.btns { display: flex; align-items: center; gap: 8px; margin-top: 20px; }
+.btn { padding: 4px 12px; border: none; border-radius: 4px; font: inherit; font-size: 12.5px;
+  cursor: pointer; background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground); display: inline-flex; align-items: center; gap: 4px; }
+.btn:hover { background: var(--vscode-button-hoverBackground); }
+.btn:disabled { opacity: 0.6; cursor: default; }
+.btn.secondary { background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground); }
+.btn.danger { margin-left: auto; background: transparent;
+  color: var(--vscode-errorForeground); padding: 4px 6px; }
+.toggle-row { display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px; }
+.toggle-row .txt { flex: 1; min-width: 0; }
+.toggle-row .txt .hint { font-size: 11.5px; color: var(--vscode-descriptionForeground); }
+.switch { flex: none; position: relative; width: 30px; height: 16px; margin-top: 2px;
+  border-radius: 8px; background: color-mix(in srgb, var(--vscode-foreground) 25%, transparent);
+  cursor: pointer; border: none; padding: 0; }
+.switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px;
+  border-radius: 50%; background: #fff; transition: left 0.12s; }
+.switch[aria-checked='true'] { background: var(--vscode-button-background); }
+.switch[aria-checked='true']::after { left: 16px; }
+.switch:disabled { opacity: 0.6; }
+.side-row { padding: 12px 14px; }
+.side-row + .side-row {
+  border-top: 1px solid color-mix(in srgb, var(--vscode-foreground) 8%, transparent); }
+.side-row .hint { margin-top: 3px; font-size: 11.5px;
+  color: var(--vscode-descriptionForeground); }
+.side-lab { margin-bottom: 3px; font-size: 12px; }
+.foot { margin-top: 28px; font-size: 11.5px; color: var(--vscode-descriptionForeground); }
+.foot p { margin: 0 0 4px; }
+/* 列表形态左右两栏（2026-11-17 用户：「左侧是可点击的列表」「不管宽窄一律左右
+   两栏」，参照 OpenChamber SettingsSidebarItem 的圆角选中底色）。.page 在这里不
+   整页滚：头部固定，左栏列表与右栏内容各自滚——模型清单长时左栏不跟着滚走。
+   .page.split-page 两个类压过上面 @media 里 .page 的居中 padding，居中改做在
+   右栏内层 .sbody-in（max-width + margin auto）：不能照搬 .page 的百分比
+   padding——.sbody 的 padding 百分比按父级 .split 整宽算，右栏会被多扣掉左栏
+   那么宽（1024 实测卡片只剩 592）。窄侧栏（380）左栏收到 88px，刚好放下
+   四个字的「看图模型」 */
+.page.split-page { display: flex; flex-direction: column; overflow: hidden; padding: 0; }
+.split-page > .page-head { position: static; padding: 12px 16px 2px; }
+.split-page > .page-sub { padding: 0 16px; }
+.split { flex: 1; min-height: 0; display: flex;
+  border-top: 1px solid color-mix(in srgb, var(--vscode-foreground) 8%, transparent); }
+.snav { flex: none; width: 88px; overflow: auto; padding: 10px 6px;
+  border-right: 1px solid color-mix(in srgb, var(--vscode-foreground) 8%, transparent); }
+.snav-item { display: block; width: 100%; margin-bottom: 2px; padding: 6px 10px;
+  border: none; border-radius: 6px; background: none; color: var(--vscode-foreground);
+  font: inherit; text-align: left; cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.snav-item:hover { background: color-mix(in srgb, var(--vscode-foreground) 6%, transparent); }
+.snav-item[aria-current='page'] { font-weight: 600;
+  background: color-mix(in srgb, var(--vscode-foreground) 12%, transparent); }
+.sbody { flex: 1; min-width: 0; overflow: auto; padding: 14px 12px 24px; }
+.sbody-in { max-width: 760px; margin: 0 auto; }
+.sbody-in > .sec:first-child { margin-top: 0; }
+@media (min-width: 720px) {
+  .snav { width: 168px; padding: 14px 10px; }
+  .sbody { padding: 18px 40px 32px; } }
+.welcome { margin: 4px 0 12px; padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 18%, transparent);
+  border-radius: 8px; }
+.welcome .t { font-weight: 600; margin-bottom: 3px; }
+.welcome .s { font-size: 12px; color: var(--vscode-descriptionForeground); }
 
 `

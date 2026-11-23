@@ -1776,3 +1776,43 @@ describe('regions.jsonl：四个区的诊断记录（提案 §13）', () => {
     task.close()
   })
 })
+
+describe('owner 回填一次性迁移（2026-11-18 切目录卡顿修复）', () => {
+  const raw = (dir: string) => new DatabaseSync(join(dir, MEMORY_RELATIVE, 'state.db'))
+  const MARK = 'messages-owner-backfill'
+
+  it('标记不在：回填轮归任务的行并落标记；标记在：行再变脏也不重扫', async () => {
+    const dir = await workspace()
+    openStore(dir).close()
+    // 模拟升级前的老库：轮已归任务、消息行 owner 还没回填
+    const db = raw(dir)
+    db.exec(`DELETE FROM migrations WHERE name = '${MARK}'`)
+    db.exec(
+      `INSERT INTO turns(id, started_at, owner) VALUES (5, '2026-01-01T00:00:00Z', 'task-old')`,
+    )
+    db.exec(`INSERT INTO steps(id, turn_id, started_at) VALUES (9, 5, '2026-01-01T00:00:00Z')`)
+    db.exec(
+      `INSERT INTO messages(turn_id, role, content_json, step_id, owner)
+       VALUES (5, 'user', '{"role":"user","parts":[]}', 9, NULL)`,
+    )
+    db.close()
+    openStore(dir).close()
+    // 回填生效 + 标记已落
+    const after = raw(dir)
+    expect(after.prepare(`SELECT owner FROM messages WHERE turn_id = 5`).get()).toEqual({
+      owner: 'task-old',
+    })
+    expect(after.prepare(`SELECT 1 AS x FROM migrations WHERE name = ?`).get(MARK)).toEqual({
+      x: 1,
+    })
+    // 标记挡住第二次：把行再弄脏，重开不再回填——一次性，不每次开库全扫
+    after.prepare(`UPDATE messages SET owner = NULL WHERE turn_id = 5`).run()
+    after.close()
+    openStore(dir).close()
+    const again = raw(dir)
+    expect(again.prepare(`SELECT owner FROM messages WHERE turn_id = 5`).get()).toEqual({
+      owner: null,
+    })
+    again.close()
+  })
+})

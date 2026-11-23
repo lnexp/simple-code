@@ -7,8 +7,9 @@
  * step，`chainable` 第③条让它一直合不了（规则 1）。
  *
  * 段的一生：open（在写）→ full（主人切走，等摘要把段内 step 全覆盖）→ merged
- * （合回主干：主干拷它的摘要，别的会话在自己的压缩点拉它，`pullable`）。关闭
- * 任务 = 它的段立即 merged + closed；closed 的段比别人当前段号高时，别人下一轮
+ * （合回主干：主干拷它的摘要）→ closed（主人关闭后，别的会话才在自己的压缩点
+ * 拉它，`pullable`；2026-11-19 前 merged 即可拉，开着的任务互串）。关闭
+ * 任务 = 它的段全部 merged + closed；closed 的段比别人当前段号高时，别人下一轮
  * 开始就切段（`segmentForTurn`），让它落到自己当前段之下、变成可拉；真正拉进来
  * 等自己下一个压缩点（run.ts unloadIfNeeded，d75b463：拉段不单独触发压缩）。
  * 只对 closed 提前切：普通段满合回若也触发切段，两个会话会互相切出新段、来回拉。
@@ -38,9 +39,11 @@ export type SegmentRow = {
   ceil: number
   state: 'open' | 'full' | 'merged'
   closed: number
+  /** 段主人关闭时记下的任务名（拉段出处标签用）；没关的、主任务的是 null */
+  name: string | null
 }
 
-const COLS = `id, owner, step_floor AS floor, step_ceil AS ceil, state, closed`
+const COLS = `id, owner, step_floor AS floor, step_ceil AS ceil, state, closed, name`
 
 /** owner 键 → summaries/messages 的 owner 列值（主任务是 NULL） */
 const rowOwner = (key: string): string | null => (key === '' ? null : key)
@@ -85,7 +88,15 @@ export function openSegment(db: Db, key: string, folder: string): SegmentRow {
     floor: top,
     ceil: top + SEGMENT_WIDTH,
   })
-  return { id, owner: key, floor: top, ceil: top + SEGMENT_WIDTH, state: 'open', closed: 0 }
+  return {
+    id,
+    owner: key,
+    floor: top,
+    ceil: top + SEGMENT_WIDTH,
+    state: 'open',
+    closed: 0,
+    name: null,
+  }
 }
 
 /** 有没有已关闭、已合回、号比 seg 高、key 还没拉过的段——有就该提前切段去拉 */
@@ -179,8 +190,14 @@ export function mergeReadySegments(db: Db, folder: string): SegmentRow[] {
   return out
 }
 
-/** 关闭任务：它的段全部即刻合回并标 closed（摘要已由关闭流程排空，欠账照样收尾） */
-export function closeSegments(db: Db, key: string, folder: string): void {
+/**
+ * 关闭任务：它的段全部即刻合回并标 closed（摘要已由关闭流程排空，欠账照样收尾）。
+ *
+ * 早先用满合回的段（state 已是 merged、closed 还是 0）也要补标 closed：别的
+ * 会话只拉 closed 的段（pullableSegments），不补的话它们关了也永远拉不到。
+ * `name` 记进段里，拉段时拼出处标签（manifest 关闭即删，之后无处可查）
+ */
+export function closeSegments(db: Db, key: string, folder: string, name?: string): void {
   for (const seg of db.all<SegmentRow>(
     `SELECT ${COLS} FROM segments WHERE owner = ? AND state <> 'merged'`,
     key,
@@ -202,23 +219,57 @@ export function closeSegments(db: Db, key: string, folder: string): void {
       uncovered: left,
     })
   }
+  db.run(
+    `UPDATE segments SET closed = 1, name = COALESCE(?, name) WHERE owner = ?`,
+    name ?? null,
+    key,
+  )
 }
 
 /**
  * key 可以拉的段：已合回、不是自己的、还没拉过、号比 `below` 低（规则 5：
  * 拉进号更高的段，自己之后的新消息会排到它前面，每个请求都在中间插入）。
- * 主干传 Infinity（没有请求前缀要保护）
+ * 主干传 Infinity（没有请求前缀要保护）。
+ *
+ * **会话只拉已关闭的段**（2026-11-19 用户定）：开着的任务用满合回的段只进
+ * 主干，不进别的开着的会话——否则 A 在压缩点拉进 B 还在进行的经历，B 的
+ * 摘要又新又多，A 顺着 B 的上下文作答（真机互串）。主任务从不关闭，它的段
+ * 也就不再流进开着的任务；任务开场仍从主干复制（带出处标签）
  */
-export function pullableSegments(db: Db, key: string, below: number): SegmentRow[] {
+/** merged = true 跳过 closed 检查（拉段开关开的任务，行为回到 2026-11-19
+ *  之前：merged 即拉）。见 manifestPullSegments */
+export function pullableSegments(
+  db: Db,
+  key: string,
+  below: number,
+  merged = false,
+): SegmentRow[] {
   return db.all<SegmentRow>(
     `SELECT ${COLS} FROM segments g
      WHERE g.state = 'merged' AND g.owner <> ? AND g.step_ceil <= ?
+       AND (g.closed = 1 OR ? = '${TRUNK}' OR ?)
        AND NOT EXISTS (SELECT 1 FROM segment_pulls p WHERE p.owner = ? AND p.segment_id = g.id)
      ORDER BY g.step_floor`,
     key,
     below,
     key,
+    merged ? 1 : 0,
+    key,
   )
+}
+
+/** 任务拉段开关（2026-11-21 用户定）：manifest 没写或 false = 完全独立。
+ *  主任务不走这里（无 manifest，恒开）。不 import task.ts（循环依赖，
+ *  同 manifestName） */
+export function manifestPullSegments(root: string, owner: string): boolean {
+  try {
+    const m = JSON.parse(
+      readFileSync(join(root, '.simple-code', 'tasks', `${owner}.json`), 'utf8'),
+    ) as { pullSegments?: unknown }
+    return m.pullSegments === true
+  } catch {
+    return false
+  }
 }
 
 /** 段里每条摘要行原样写进来要补的头部与路径（store.ts headOfStep） */
@@ -234,6 +285,26 @@ type SumRow = {
   head: string | null
   archive_path: string | null
   name: string | null
+  source: string | null
+}
+
+/** 拉段出处标签：渲染进 `<历史摘要>` 的「来源：」行（assemble.ts renderSummary） */
+export function segmentSourceLabel(seg: Pick<SegmentRow, 'owner' | 'name'>, root?: string): string {
+  if (seg.owner === '') return '主任务'
+  return `任务「${seg.name ?? (root === undefined ? null : manifestName(root, seg.owner)) ?? seg.owner}」`
+}
+
+/** 开着的任务的名字：段名关闭时才写，主干收它用满的段时只能现读 manifest。
+ *  不 import task.ts（它依赖 store.ts，store.ts 又依赖这里），同 legacyTaskRanges */
+function manifestName(root: string, owner: string): string | null {
+  try {
+    const m = JSON.parse(
+      readFileSync(join(root, '.simple-code', 'tasks', `${owner}.json`), 'utf8'),
+    ) as { name?: unknown }
+    return typeof m.name === 'string' && m.name !== '' ? m.name : null
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -243,7 +314,10 @@ type SumRow = {
  * 没被收编、或被跨段父行收编（父行不在段内，不拷）的行。只拷链根：它们已是
  * 这段最压缩的表述，下层成员只是历史结构；拷全量每段多几百行、对上下文无用。
  * 链根一律 in_context=1——拉段只发生在压缩点（前缀可改写），主干没有请求。
- * 源行可能还没进过场（段尾几轮在主人上下文里仍是原文），head/路径为空的现补
+ * 源行可能还没进过场（段尾几轮在主人上下文里仍是原文），head/路径为空的现补。
+ *
+ * 复制行的 owner 改成 target（进 target 的窗口账本），**出处记在 source**：
+ * 不记的话渲染出来跟 target 自己的经历一模一样，模型分不清哪些是别人做的
  */
 export function copySegmentRoots(
   db: Db,
@@ -253,7 +327,7 @@ export function copySegmentRoots(
   folder: string,
 ): number {
   const rows = db.all<SumRow>(
-    `SELECT id, level, covers_from, covers_to, text, superseded_by, head, archive_path, name FROM summaries
+    `SELECT id, level, covers_from, covers_to, text, superseded_by, head, archive_path, name, source FROM summaries
      WHERE owner IS ? AND status = 'ready' AND covers_from > ? AND covers_to <= ?
      ORDER BY covers_from, level`,
     rowOwner(seg.owner),
@@ -262,12 +336,13 @@ export function copySegmentRoots(
   )
   const ids = new Set(rows.map((r) => r.id))
   const roots = rows.filter((r) => r.superseded_by === null || !ids.has(r.superseded_by))
+  const label = segmentSourceLabel(seg, folder)
   for (const r of roots) {
     const head = r.head === null || r.archive_path === null ? headOf(r.covers_from) : null
     db.run(
       `INSERT INTO summaries(level, covers_from, covers_to, text, status, in_context,
-                             superseded_by, head, archive_path, name, owner)
-       VALUES(?, ?, ?, ?, 'ready', 1, NULL, ?, ?, ?, ?)`,
+                             superseded_by, head, archive_path, name, owner, source)
+       VALUES(?, ?, ?, ?, 'ready', 1, NULL, ?, ?, ?, ?, ?)`,
       r.level,
       r.covers_from,
       r.covers_to,
@@ -276,6 +351,7 @@ export function copySegmentRoots(
       r.archive_path ?? head?.archivePath ?? null,
       r.name,
       rowOwner(target),
+      r.source ?? label,
     )
   }
   markPulled(db, target, seg.id)

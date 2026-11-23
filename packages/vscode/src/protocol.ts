@@ -7,6 +7,8 @@ import type {
   ImageInput,
   MemoryStats,
   ModelRef,
+  SettingsEdit,
+  SettingsView,
 } from '@simple-code/core'
 // 只取类型（import type，编译后消失）：ChatItem 定义在 webview 侧的事件层，
 // 但 hydrate/historyPage 的载荷就是它。复制一份类型的话，改一边忘另一边
@@ -162,6 +164,12 @@ export type ToHost =
   | { type: 'task_open'; task: string }
   /** 关闭任务（task-v3：唯一的生命周期操作。在跑会先停，摘要排空后收尾） */
   | { type: 'task_close'; name: string }
+  /** 改任务名（显示用）：owner 不动——行/段/摘要都是 owner 域的，名字只是
+   *  manifest 的字段和内存键。撞名由宿主拒，回 fatal 提示 */
+  | { type: 'task_rename'; task: string; name: string }
+  /** 任务拉段开关（2026-11-21 用户定）：on = 压缩点拉别的会话的 merged
+   *  段（带出处标签）；off = 完全独立。写 manifest，跑着的任务下一轮生效 */
+  | { type: 'task_pull_set'; task: string; on: boolean }
   /** 中断任务正在跑的轮（与对话的停止同一语义，通用控件） */
   | { type: 'task_stop'; name: string }
   /** 面板正显示哪个任务（null = 主任务）。桌面机器人据此判「这条你看得到」，
@@ -172,6 +180,28 @@ export type ToHost =
   | { type: 'turnQueueAdd'; text: string; images?: ImageInput[]; task?: string }
   /** 取消一条排队（按 id：队首可能恰在此刻发出，按序号会删错条） */
   | { type: 'turnQueueCancel'; id: number }
+  /** 设置页（2026-11-17 原型放行）：要一份设置视图（齿轮点开、webview
+   *  重挂载时）。响应是 settings_view */
+  | { type: 'settings_get' }
+  /** 设置页右上角「settings.json」：在编辑器里打开实际生效的那个文件 */
+  | { type: 'settings_openFile' }
+  /** 设置页的一个写操作。宿主逐条校验后写回（webview 是不可信面），
+   *  响应是 settings_result */
+  | { type: 'settings_write'; edit: SettingsEdit }
+  /** 设置页「飞书推送」开关（2026-11-17 用户：推送开关「配置页面上也要有」）。
+   *  写 ~/.simple-code/gateway/state.json 的 push 键——网关每次推送前读，
+   *  不用重启；手机上 /推送 开|关 改的是同一个值。响应是 gateway_push */
+  | { type: 'gateway_push_set'; on: boolean }
+  /** 设置页「飞书推送」分区里的检测按钮（2026-11-18 用户：lark-cli 坏了
+   *  静默失效，要能从界面看出装没装、登录没登录）。响应 gateway_check_result */
+  | { type: 'gateway_check' }
+  /** 设置页「桌面机器人」开关（2026-11-18 用户拍板）：转发机器人插件的
+   *  enable/disable 命令（带静默参数）——拉起/退出逻辑只在插件一处维护，
+   *  SC 不抄进程操作。完成后回 robot_state */
+  | { type: 'robot_toggle'; on: boolean }
+  /** 设置页「桌面机器人」分区未装时的安装按钮：走 installRobot 同款
+   *  installExtension。完成后回 robot_state */
+  | { type: 'robot_install' }
 
 export type ToWebview =
   /** core 的事件**原样透传**，不在宿主侧翻译。翻译是 webview 的事 */
@@ -305,6 +335,21 @@ export type ToWebview =
       from?: number | null
     }
   | { type: 'fatal'; message: string }
+  /** 设置页数据（settings_get 的响应 / 首开推送）。missing = 文件不存在，
+   *  webview 据此显示首开表单代替对话 */
+  | { type: 'settings_view'; view: SettingsView }
+  /** settings_write 的结果。ok 时带新视图；不 ok 只带 error（表单底部展示） */
+  | { type: 'settings_result'; ok: boolean; error?: string; view?: SettingsView }
+  /** 飞书推送开关的当前值（随 settings_view 一起推，gateway_push_set 后再推）。
+   *  null = 飞书网关没启用（gateway/config.json 没有或 enabled 不是 true），
+   *  设置页不显示这一项 */
+  | { type: 'gateway_push'; on: boolean | null; larkCli?: string | null }
+  /** gateway_check 的结果。installed=false 时 version/auth 缺省 */
+  | { type: 'gateway_check_result'; result: GatewayCheck }
+  /** 桌面机器人的开关状态（随 settings_view 一起推，robot_toggle/robot_install
+   *  后再推）。mac=false（SC 主插件判不了机器人）整个分区不显示；mac=true
+   *  且 installed=false 显示安装按钮而不是开关 */
+  | { type: 'robot_state'; mac: boolean; installed: boolean; on: boolean }
   /**
    * 上下文分区快照（regions.jsonl 尾行 + 窗口/输出预留拼成）。null =
    * 还没有任何记录（新装/从未跑过一轮）
@@ -381,6 +426,9 @@ export type TaskState = {
   attendance: Attendance
   /** 历史摘要开关（folder 级，主任务与分支同值——见 protocol 上面那条） */
   summaryInContext: boolean
+  /** 拉段开关（manifest.pullSegments）：true = 拉别的会话的段；任务默认
+   *  false（独立）。主任务无此字段（恒开） */
+  pullSegments: boolean
 }
 
 /** 单个文件夹的显示状态：路径 + 它的轮是否在跑（后台轮的 ● 标记） */
@@ -429,3 +477,16 @@ export type RegionsInfo = {
 
 /** 审批请求（approval_request 的命名类型，给 webview 和 bridge 引用） */
 export type ApprovalRequest = Extract<ToWebview, { type: 'approval_request' }>
+
+/** lark-cli 检测结果（设置页「飞书推送」分区，gateway_check 的响应）。auth
+ *  取 `auth status` 输出里的 identities.bot.status：'ready' = 登录正常；
+ *  null = 已装但读不到 */
+export type GatewayCheck = {
+  larkCli: string
+  installed: boolean
+  /** `--version` 的原始输出（如 "lark-cli version 1.0.97"） */
+  version?: string
+  auth?: string | null
+  /** 不可用时的原因（spawn 报错 / 超时 / 退出码非 0 的 stderr 尾巴） */
+  error?: string
+}

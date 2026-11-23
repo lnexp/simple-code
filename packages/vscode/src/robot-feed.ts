@@ -46,6 +46,9 @@ export function turnTracker() {
 /** 一个任务的现状。task=null 是主任务 */
 export type RobotTaskView = {
   task: string | null
+  /** 任务的 owner（'' = 主任务）。网关按它定向（lesson
+   *  cross-boundary-identity-not-name：任务名可复用，owner 不可） */
+  owner: string
   running: boolean
   /** 本轮开始的墙钟（running 时有意义），总览显示「在跑 N 分钟」 */
   startedAt: number | null
@@ -83,15 +86,23 @@ export type RobotItem =
       key: string
       folder: string
       task: string | null
+      /** '' = 主任务；task-xxx = 任务的 owner。网关记「这张卡属于哪个任务」，
+       *  长按回复送回原任务用（2026-11-18）；robot 不用 */
+      owner?: string
       headline: string
       /** 悬停显示的前 200 字 */
       detail: string
+      /** 最后一段回答原文（前 N 字，N 由消费方定——robot 不传不收，
+       *  网关要前 4000 字，im-gateway.md §5.4） */
+      text?: string
       seen: boolean
     }
 
 export type RobotTask = {
   folder: string
   task: string | null
+  /** '' = 主任务；task-xxx = 任务的 owner（im-gateway.md §5.4） */
+  owner?: string
   state: 'running' | 'waiting' | 'idle' | 'done' | 'error'
   since: string | null
 }
@@ -129,7 +140,14 @@ const taskState = (t: RobotTaskView, waiting: boolean): RobotTask['state'] => {
   return t.lastTurn.end
 }
 
-export function createRobotFeed() {
+export function createRobotFeed(opts?: {
+  doneTextChars?: number
+  /** 结束时正看着的完成/出错也报这一次（seen: true），之后照样算处理过。
+   *  网关那份开（im-gateway.md §5.6，2026-11-17 推送开关「不看窗口在不在前台」）：
+   *  不报的话网关根本收不到这条，开关开着也推不出去。代价：只报一次，那一刻
+   *  网关没连着（重启中）就丢了。robot 不开——它只显示此刻看不到的 */
+  reportSeenOnce?: boolean
+}) {
   /** 看过（seen 过一次）或在机器人上关掉的完成/出错。key 带结束时刻，
    *  同一任务下一轮结束是新 key */
   const consumed = new Set<string>()
@@ -159,16 +177,21 @@ export function createRobotFeed() {
     // 用户正看着这个任务时结束的、或之后回来看到了：算处理过，以后也不再提醒
     if (seen) {
       consumed.add(key)
-      return null
+      if (opts?.reportSeenOnce !== true) return null
     }
     return {
       kind: last.end,
       key,
       folder: f,
       task: t.task,
+      owner: t.owner,
       headline: headline(last.text),
       detail: last.text.slice(0, 200),
-      seen: false,
+      // 网关要推全文（前 4000 字）到手机；robot 用不到，不传就不带
+      ...(opts?.doneTextChars !== undefined
+        ? { text: last.text.slice(0, opts.doneTextChars) }
+        : {}),
+      seen,
     }
   }
 
@@ -186,7 +209,13 @@ export function createRobotFeed() {
         const state = taskState(t, waiting)
         const since =
           state === 'running' ? t.startedAt : state === 'idle' ? null : (t.lastTurn?.at ?? null)
-        tasks.push({ folder: f, task: t.task, state, since: since === null ? null : iso(since) })
+        tasks.push({
+          folder: f,
+          task: t.task,
+          owner: t.owner,
+          state,
+          since: since === null ? null : iso(since),
+        })
       }
     }
     return { type: 'status', items, tasks }

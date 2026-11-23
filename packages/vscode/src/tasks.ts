@@ -1,4 +1,5 @@
 import type { Effort, ImageInput, ModelRef } from '@simple-code/core'
+import { existsSync } from 'node:fs'
 import {
   type AgentEvent,
   type ApprovalAsk,
@@ -8,13 +9,14 @@ import {
   lastTaskReply,
   listTaskManifests,
   logRun,
+  manifestPath,
   postTaskResult,
   type Session,
   type SetTimer,
   type TaskManifest,
   taskResultText,
-  wrapGoalBrief,
   watchIdle,
+  wrapGoalBrief,
   writeTaskManifest,
 } from '@simple-code/core'
 import {
@@ -249,6 +251,9 @@ export function createTaskCenter(deps: TaskDeps) {
           r.session?.config.config.memory.summaryInContext ??
           deps.summaryStore?.get(r.manifest.owner) ??
           deps.defaultSummaryInContext(),
+        // 拉段开关（2026-11-21）：读内存 manifest（pullSet 同步改）——
+        // 不读文件：关闭流程会删 manifest，快照链在 close 里跑会 ENOENT
+        pullSegments: r.manifest.pullSegments === true,
       }
     })
 
@@ -628,6 +633,25 @@ export function createTaskCenter(deps: TaskDeps) {
   const nameOf = (brief: string): string => brief.split('\n', 1)[0]?.slice(0, 20).trim() || '任务'
   const taken = (name: string): boolean => runs.has(name) || forking.has(name)
 
+  /** 改任务名（显示用，2026-11-09）：runs 以名为键，迁键 + manifest 落盘 +
+   *  推快照，webview 的快照守卫按「旧名消失」迁移选中态。owner/行/段不动。
+   *  失败回文案给 fatal；任务已不在（竞态关掉了）返回 null 静默——快照守卫收尾 */
+  const rename = (task: string, name: string): string | null => {
+    const r = runs.get(task)
+    if (r === undefined) return null
+    const clean = name.trim().slice(0, 20)
+    if (clean === '' || clean === task) return null
+    if ((runs.has(clean) && runs.get(clean) !== r) || forking.has(clean))
+      return `已有同名任务「${clean}」`
+    runs.delete(task)
+    r.name = clean
+    r.manifest = { ...r.manifest, name: clean }
+    runs.set(clean, r)
+    writeTaskManifest(deps.folder, r.manifest)
+    postTasks()
+    return null
+  }
+
   const dispatch = (brief: string, parent?: string): Promise<string | null> =>
     dispatchNamed(nameOf(brief), brief, {
       via: 'user',
@@ -933,6 +957,16 @@ export function createTaskCenter(deps: TaskDeps) {
     postTasks()
   }
 
+  /** 拉段开关（2026-11-21 用户定）：写 manifest 即可——store 的 pullEnabled
+   *  每次现读，跑着的任务下一轮生效；不用碰 session */
+  const pullSet = (name: string, on: boolean): void => {
+    const r = runs.get(name)
+    if (!r) return
+    r.manifest = { ...r.manifest, pullSegments: on }
+    writeTaskManifest(deps.folder, r.manifest)
+    postTasks()
+  }
+
   /** 手动压缩的目标。返回字符串 = 拒绝原因。关闭中的不压：关闭流程自己在
    *  排空摘要、owner 还俗，两边同时改这个任务的上下文 */
   const compactTarget = async (name: string): Promise<Session | string> => {
@@ -967,6 +1001,16 @@ export function createTaskCenter(deps: TaskDeps) {
     if (!r) return { ok: false, error: `没有任务「${name}」` }
     // 幂等：已经在关了就无事可做（双击是正常输入，不是错误）
     if (r.status === 'closing') return { ok: true }
+    // manifest 已不在 = 任务实际已收尾（数据已合回、manifest 已删——
+    // 外部 finalize 过，如测试脚本或异常路径）。别把「读不到 manifest」
+    // 当关闭失败卡在条上：停掉 session、从条上清掉，UI 对齐现实
+    if (!existsSync(manifestPath(deps.folder, r.manifest.owner))) {
+      await closeRun(r)
+      runs.delete(name)
+      deps.closed?.(r.manifest.owner)
+      postTasks()
+      return { ok: true }
+    }
     r.status = 'closing'
     postTasks()
     const t0 = Date.now()
@@ -1082,6 +1126,8 @@ export function createTaskCenter(deps: TaskDeps) {
         })),
     close,
     stop,
+    rename,
+    pullSet,
     states,
     /** 桌面机器人的现状（关闭中的不算——马上就没了） */
     robotViews: (): RobotTaskView[] =>
@@ -1089,6 +1135,7 @@ export function createTaskCenter(deps: TaskDeps) {
         .filter((r) => r.status !== 'closing')
         .map((r) => ({
           task: r.name,
+          owner: r.manifest.owner,
           running: r.status === 'running',
           startedAt: r.startedAt ?? null,
           lastTurn: r.lastTurn ?? null,

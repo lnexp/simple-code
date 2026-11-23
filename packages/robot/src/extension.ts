@@ -51,16 +51,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   context.subscriptions.push(
+    // silent：设置页转发时传 true 跳过提示（2026-11-18 用户拍板加——开关就在
+    // 手边，再弹「用命令面板开」是错位）。enable 无提示可跳，只有 disable 带；
+    // 命令面板调用无参数，照常提示
     vscode.commands.registerCommand('simpleCodeRobot.enable', async () => {
       writeEnabled(paths.config, true)
       await ensure()
     }),
-    vscode.commands.registerCommand('simpleCodeRobot.disable', async () => {
+    vscode.commands.registerCommand('simpleCodeRobot.disable', async (silent?: boolean) => {
       writeEnabled(paths.config, false)
       await stop(paths.pid)
-      void vscode.window.showInformationMessage(
-        '桌面机器人已关闭。要再打开：命令面板「SimpleCode Robot: 开启桌面机器人」',
-      )
+      if (silent !== true)
+        void vscode.window.showInformationMessage(
+          '桌面机器人已关闭。要再打开：命令面板「SimpleCode Robot: 开启桌面机器人」',
+        )
     }),
   )
   await ensure()

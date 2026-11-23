@@ -29,6 +29,8 @@ function makeFakeBridgeDeps() {
     /** 挂着的卡的 toolCallId（allowToolCall 用）；放行的记进 _allowed */
     _cards: string[]
     _allowed: string[]
+    /** 手机拒掉的卡（denyToolCall 用）；带理由的记进 _denied */
+    _denied: Array<string | `deny:${string}`>
   }
   const made = new Map<string, Fake>()
   const deps: RouterDeps = {
@@ -43,6 +45,7 @@ function makeFakeBridgeDeps() {
         _pending: 0,
         _cards: [] as string[],
         _allowed: [] as string[],
+        _denied: [] as Array<string | `deny:${string}`>,
         attach: () => calls.push({ folder, method: 'attach' }),
         isRunning: () => made.get(folder)?._running ?? false,
         anyRunning: () => false,
@@ -53,6 +56,14 @@ function makeFakeBridgeDeps() {
           f._allowed.push(id)
           return true
         },
+        denyToolCall: (id: string, reason?: string) => {
+          const f = made.get(folder)
+          if (!f?._cards.includes(id)) return false
+          f._denied.push(reason === undefined ? id : `deny:${reason}`)
+          return true
+        },
+        gatewaySend: (owner: string) => (made.has(folder) ? owner : '没有会话'),
+        stopOwner: () => made.has(folder) && (made.get(folder)?._running ?? false),
         pendingApprovals: () => made.get(folder)?._pending ?? 0,
         rehydrateTasks: () => calls.push({ folder, method: 'rehydrateTasks' }),
         handle: () => {},
@@ -132,6 +143,34 @@ describe('多根路由（router）', () => {
     r.handle({ type: 'ready' })
     expect(sent.some((m) => m.type === 'folders' && m.active === '/w/a')).toBe(true)
     expect(sent.filter((m) => m.type === 'folders').length).toBe(1)
+  })
+
+  it('ready：所有目录都建 bridge（手机 /列表 覆盖全部），只有 active attach', () => {
+    // 2026-11-18 用户拍板：reload 后没访问过的目录任务在 /列表 里消失——
+    // ready 即全建（bridge 构造无 I/O、session 惰性），后台目录不 attach
+    const { deps, made, calls } = makeFakeBridgeDeps()
+    const r = createRouter(deps)
+    r.handle({ type: 'ready' })
+    expect([...made.keys()].sort()).toEqual(['/w/a', '/w/b'])
+    expect(calls.filter((c) => c.method === 'attach')).toEqual([
+      { folder: '/w/a', method: 'attach' },
+    ])
+    // robotFolders 覆盖全部目录——网关 /列表 的数据源
+    expect(
+      r
+        .robotFolders()
+        .map((f) => f.folder)
+        .sort(),
+    ).toEqual(['/w/a', '/w/b'])
+  })
+
+  it('setFolders：新增目录也直接建 bridge', () => {
+    const { deps, made, setFolders } = makeFakeBridgeDeps()
+    const r = createRouter(deps)
+    r.handle({ type: 'ready' })
+    setFolders(['/w/a', '/w/b', '/w/c'])
+    r.setFolders()
+    expect([...made.keys()].sort()).toEqual(['/w/a', '/w/b', '/w/c'])
   })
 
   it('seed：上次选择在列表里则第一个 spawn 的就是它', () => {
@@ -387,11 +426,13 @@ describe('桌面机器人接口（desktop-robot.md §5.2、§5.5）', () => {
     expect(changes).toBe(afterReady + 1)
   })
 
-  it('robotFolders 只含建过 bridge 的目录，按工作区顺序', () => {
+  it('robotFolders 覆盖全部目录（ready 即全建），按工作区顺序', () => {
     const { deps } = makeFakeBridgeDeps()
     const r = createRouter(deps)
     r.handle({ type: 'ready' })
-    expect(r.robotFolders().map((f) => f.folder)).toEqual(['/w/a'])
+    // 2026-11-18 起 ready 给所有目录建 bridge（手机 /列表 全量），
+    // 不再是「只含访问过的」
+    expect(r.robotFolders().map((f) => f.folder)).toEqual(['/w/a', '/w/b'])
     r.handle({ type: 'switchFolder', folder: '/w/b' })
     expect(r.robotFolders().map((f) => f.folder)).toEqual(['/w/a', '/w/b'])
   })

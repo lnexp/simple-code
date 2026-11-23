@@ -31,6 +31,7 @@ const idle = (
   userTouched = true,
 ): RobotTaskView => ({
   task,
+  owner: '',
   running: false,
   startedAt: null,
   lastTurn,
@@ -123,6 +124,21 @@ describe('完成/出错提醒（§5.3）', () => {
     ])
   })
 
+  it('网关那份（reportSeenOnce）：结束时正看着也报一次 seen:true，之后不再出现', () => {
+    const feed = createRobotFeed({ reportSeenOnce: true })
+    const f = (t: RobotTaskView): RobotFolderView[] => [{ folder: SC, tasks: [t], approvals: [] }]
+    expect(feed.build(f(idle(null, done)), looking(SC, null)).items).toEqual([
+      expect.objectContaining({ kind: 'done', key: `${SC}##1000`, seen: true }),
+    ])
+    expect(feed.build(f(idle(null, done)), looking(SC, null)).items).toEqual([])
+    expect(feed.build(f(idle(null, done)), away).items).toEqual([])
+    // 不在看的照旧 seen:false
+    const next = { at: 2000, end: 'done' as const, text: '又完成了' }
+    expect(feed.build(f(idle(null, next)), away).items).toEqual([
+      expect.objectContaining({ key: `${SC}##2000`, seen: false }),
+    ])
+  })
+
   it('被停止的不提醒；开始新一轮（running）时旧提醒收起', () => {
     const feed = createRobotFeed()
     const stopped = feed.build(
@@ -154,6 +170,7 @@ describe('总览的任务状态', () => {
           tasks: [
             {
               task: null,
+              owner: '',
               running: true,
               startedAt: Date.parse('2026-10-31T10:00:00Z'),
               lastTurn: null,

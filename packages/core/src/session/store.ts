@@ -30,6 +30,7 @@ import { syncSearchIndex } from './search-index.ts'
 import {
   copySegmentRoots,
   currentSegment,
+  manifestPullSegments,
   mergeReadySegments,
   openSegment,
   pullableSegments,
@@ -381,13 +382,16 @@ export type Store = {
   ): void
   /** 动作联想（touch-cue.ts）：一步至多一条，同样 DO NOTHING、注入后不变 */
   saveTouchCue(cue: { stepId: number; after: number; lines: string[]; names: string[] }): void
-  /** 全部轮内注入（stepId → 锚点与成品行），选择器与动作联想合并。同 cues()：任务视角继承对话行 */
+  /** 轮内注入（stepId → 锚点与成品行），选择器与动作联想合并。读自己的 + 主任务的：
+   *  老任务（v3 fork）继承了主任务原文行，行上的注入照旧渲染；新任务视图里没有
+   *  主任务的 step（号段互不重叠），主任务的锚点落不进来 */
   asyncCues(): Map<number, AsyncCue>
   /** 在场原文最早的 step（可见 live 消息的 MIN(step_id)），无则 null——recall 去重：
    *  覆盖/锚在它之后的东西，原文还在上下文里。存根也算（step 已 unloaded、
    *  工具输出换成了存根，对话文字仍在场）；卸载从最老的来，在场段是连续尾巴 */
   liveStepFloor(): number | null
-  /** 锚点 step ≥ fromStep 的轮内注入用过的名字（kind:name），两种注入都算 */
+  /** 锚点 step ≥ fromStep 的轮内注入用过的名字（kind:name），两种注入都算。只算
+   *  自己的：主任务在任务开出之后注入的不在任务上下文里，算进来会把任务该提的滤掉 */
   asyncCuedNamesSince(fromStep: number): Set<string>
   /** 缝 (from, to) 开区间里有没有内容痕迹（可见消息/外主 steps）——跨缝合的第②③道保险 */
   gapHasContent(from: number, to: number): boolean
@@ -503,6 +507,7 @@ export function openStore(folderPath: string, opts: { task?: TaskScope } = {}): 
   const db = openDb(join(dir, 'state.db'))
   db.exec(SCHEMA)
   migrate(db)
+  backfillMessageOwner(db)
   // 平铺老归档挪进桶（幂等，见 buckets.ts）。挪了文件才要重写 db 里
   // summaries.archive_path 的老平铺指路牌——那是模型点名读的路径，
   // 留着死链等于迁移自己制造「No such file」
@@ -578,6 +583,13 @@ function buildStore(
     segKey === TRUNK
       ? Number.POSITIVE_INFINITY
       : (currentSegment(db, segKey)?.floor ?? Number.POSITIVE_INFINITY)
+  /** 拉段开关（2026-11-21 用户定）：主任务（''，无 manifest）恒开＝merged 即拉
+   *  （2026-11-19 之前的完整行为）；任务看 manifest，缺省＝完全独立一段不拉；
+   *  主干视图（'trunk'）不走 pullSegments（mergeSegments 直连），保险起见恒开。
+   *  每次现读（UI 开关改 manifest 后跑着的任务下一轮就生效）——任务 manifest
+   *  几 KB，轮级频率无感 */
+  const pullEnabled = (): boolean =>
+    segKey === '' || segKey === TRUNK || manifestPullSegments(folderPath, segKey)
   // turns 表的可见条件（带别名 turns.，查询里 turns 无别名时替换掉前缀）
   // 对话侧要排除 reserved 锚（fork 占段头的行，owner=NULL 但没有内容）——
   // 不排的话 lastTurnId 会把它当「当前轮」
@@ -1102,8 +1114,9 @@ function buildStore(
 
     saveAsyncCue: (turnId, cue) => {
       db.run(
-        `INSERT INTO async_cues(owner, turn_id, step_id, after, lines, names, created_at) VALUES('', ?, ?, ?, ?, ?, ?)
+        `INSERT INTO async_cues(owner, turn_id, step_id, after, lines, names, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(owner, turn_id) DO NOTHING`,
+        scope?.owner ?? '',
         turnId,
         cue.stepId,
         cue.after,
@@ -1115,8 +1128,9 @@ function buildStore(
 
     saveTouchCue: (cue) => {
       db.run(
-        `INSERT INTO touch_cues(owner, step_id, after, lines, names, created_at) VALUES('', ?, ?, ?, ?, ?)
+        `INSERT INTO touch_cues(owner, step_id, after, lines, names, created_at) VALUES(?, ?, ?, ?, ?, ?)
          ON CONFLICT(owner, step_id) DO NOTHING`,
+        scope?.owner ?? '',
         cue.stepId,
         cue.after,
         JSON.stringify(cue.lines),
@@ -1128,12 +1142,14 @@ function buildStore(
     asyncCues: () => {
       const out = new Map<number, AsyncCue>()
       for (const r of db.all<{ step_id: number; after: number; lines: string }>(
-        `SELECT step_id, after, lines FROM async_cues WHERE owner = ''`,
+        `SELECT step_id, after, lines FROM async_cues WHERE owner IN ('', ?)`,
+        scope?.owner ?? '',
       ))
         out.set(r.step_id, { after: r.after, lines: JSON.parse(r.lines) as string[] })
       // 同一步两边都有：锚点同源（offerAsyncCue 一次算出），行拼在选择器之后
       for (const r of db.all<{ step_id: number; after: number; lines: string }>(
-        `SELECT step_id, after, lines FROM touch_cues WHERE owner = ''`,
+        `SELECT step_id, after, lines FROM touch_cues WHERE owner IN ('', ?)`,
+        scope?.owner ?? '',
       )) {
         const lines = JSON.parse(r.lines) as string[]
         const prev = out.get(r.step_id)
@@ -1156,7 +1172,8 @@ function buildStore(
       const names = new Set<string>()
       for (const table of ['async_cues', 'touch_cues'])
         for (const r of db.all<{ names: string }>(
-          `SELECT names FROM ${table} WHERE owner = '' AND step_id >= ?`,
+          `SELECT names FROM ${table} WHERE owner = ? AND step_id >= ?`,
+          scope?.owner ?? '',
           fromStep,
         ))
           for (const n of JSON.parse(r.names) as string[]) names.add(n)
@@ -1499,10 +1516,21 @@ function buildStore(
                 memberIds[0] ?? -1,
               )[0]?.owner ?? null)
             : null
+        // 出处：成员全来自同一处才继承（整组是别人的经历）。混了来源的不继承
+        // ——父行盖着本会话自己的经历，标成别人的反而错；出处靠合并文字里的
+        // 〔来源名〕（renderMergeInput / MERGE_SYSTEM）
+        const sources =
+          memberIds.length > 0
+            ? db.all<{ source: string | null }>(
+                `SELECT DISTINCT source FROM summaries WHERE id IN (${memberIds.map(() => '?').join(',')})`,
+                ...memberIds,
+              )
+            : []
+        const inherited = sources.length === 1 ? (sources[0]?.source ?? null) : null
         db.run(
           `INSERT INTO summaries(level, covers_from, covers_to, text, status, in_context,
-                                 superseded_by, head, archive_path, owner)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                 superseded_by, head, archive_path, owner, source)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           row.level,
           row.coversFrom,
           row.coversTo,
@@ -1513,6 +1541,7 @@ function buildStore(
           row.head,
           row.archivePath,
           firstMemberOwner,
+          inherited,
         )
         const parentId = lastRowId(db)
         for (const id of memberIds) {
@@ -1599,12 +1628,13 @@ function buildStore(
 
     trunk: () => (trunkView ??= buildStore(db, folderPath, dir, turnsDir, TRUNK_SCOPE, () => {})),
 
-    pullPending: () => pullableSegments(db, segKey, pullBelow()).length > 0,
+    pullPending: () => pullEnabled() && pullableSegments(db, segKey, pullBelow(), true).length > 0,
 
     pullSegments: () => {
       let rows = 0
+      if (!pullEnabled()) return rows
       db.transaction(() => {
-        for (const seg of pullableSegments(db, segKey, pullBelow()))
+        for (const seg of pullableSegments(db, segKey, pullBelow(), true))
           rows += copySegmentRoots(db, seg, segKey, (id) => headOfStep(db, id), folderPath)
       })
       return rows
@@ -1681,6 +1711,19 @@ function migrate(db: Db): void {
     db.run(`DROP TABLE prompt_snapshot`)
     db.run(`ALTER TABLE prompt_snapshot_new RENAME TO prompt_snapshot`)
   }
+}
+
+/** 老库一次性：消息行 owner 回填（原在 MIGRATIONS 每开必跑，见
+ *  schema.sql.ts 那段的说明——大库上它是切目录卡顿的主源头）。
+ *  标记通道同 cleanup.ts 的范式：跑一次，之后开库只查一行标记 */
+function backfillMessageOwner(db: Db): void {
+  const MARK = 'messages-owner-backfill'
+  if (db.all(`SELECT 1 AS x FROM migrations WHERE name = ?`, MARK).length > 0) return
+  db.transaction(() => {
+    db.run(`UPDATE messages SET owner = (SELECT t.owner FROM turns t WHERE t.id = messages.turn_id)
+            WHERE owner IS NULL AND turn_id IN (SELECT id FROM turns WHERE owner IS NOT NULL)`)
+    db.run(`INSERT INTO migrations(name, ran_at) VALUES(?, datetime('now'))`, MARK)
+  })
 }
 
 /**
@@ -2092,6 +2135,7 @@ type SummaryRow = {
   head: string | null
   archive_path: string | null
   name: string | null
+  source: string | null
   turn_from: number | null
   turn_to: number | null
 }
@@ -2106,7 +2150,7 @@ function loadSummaries(db: Db, sumVis: string): Summary[] {
   return db
     .all<SummaryRow>(
       `SELECT id, level, covers_from, covers_to, text, status, in_context, superseded_by,
-              head, archive_path, name, owner,
+              head, archive_path, name, owner, source,
               (SELECT turn_id FROM steps WHERE id = covers_from) AS turn_from,
               (SELECT turn_id FROM steps WHERE id = covers_to) AS turn_to
        FROM summaries WHERE ${sumVis} ORDER BY covers_from, level`,
@@ -2124,6 +2168,7 @@ function loadSummaries(db: Db, sumVis: string): Summary[] {
       text: row.text,
       status: row.status as SummaryStatus,
       owner: row.owner ?? null,
+      ...(row.source !== null ? { source: row.source } : {}),
       // SQLite 没有布尔类型，存的是 0/1
       inContext: row.in_context === 1,
       supersededBy: row.superseded_by,
