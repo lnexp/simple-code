@@ -5,6 +5,7 @@ export {
   GLOBAL_CONFIG_PATH,
   listModels,
   loadConfig,
+  MissingConfigError,
   selectModel,
   WORKSPACE_CONFIG_RELATIVE,
   writeWorkspaceSummaryInContext,
@@ -17,6 +18,16 @@ export type {
   RequestPreferences,
 } from './config/schema.ts'
 export { configSchema } from './config/schema.ts'
+export type {
+  SettingsApiKey,
+  SettingsEdit,
+  SettingsModelView,
+  SettingsProviderView,
+  SettingsView,
+  SideModelView,
+} from './config/settings-edit.ts'
+export { readSettingsView } from './config/settings-edit.ts'
+export { applyEdit, applySettingsEdit } from './config/settings-write.ts'
 export type { AgentEvent } from './events.ts'
 export type { SendOptions } from './llm/client.ts'
 export { sendRequest } from './llm/client.ts'
@@ -62,7 +73,7 @@ export {
 export { unloadMessage } from './loop/unload.ts'
 export { startCredentialProxy } from './proxy/credential-proxy.ts'
 export { forwardBlock, forwardLine, LLM_PROXY_PORT } from './remote.ts'
-export { logRun, runLogPath } from './runlog.ts'
+export { logRun, logRunTo, runLogPath, syncLogRunTo } from './runlog.ts'
 export { openDbReadOnly } from './session/db.ts'
 export type { SetTimer } from './session/idle.ts'
 export { watchIdle } from './session/idle.ts'
@@ -96,6 +107,7 @@ export {
   createTask,
   finalizeTask,
   flipTaskLive,
+  manifestPath,
   lastTaskReply,
   listTaskManifests,
   postTaskResult,

@@ -60,6 +60,10 @@ export type TaskManifest = {
   /** goal 模式（goal-mode.md，2026-11-09）：任务书拼 GOAL_DISCIPLINE、终止
    *  回调附审核提醒。老 manifest 没有 = 普通任务 */
   goal?: true
+  /** 拉别的会话的段（2026-11-21 用户定）：true = 压缩点拉 merged 段（含
+   *  还开着的任务，带 source 出处标签）；缺省 = 完全独立，一段不拉。
+   *  主任务无 manifest，恒开（merged 即拉） */
+  pullSegments?: boolean
   /**
    * 继承上界（owner IS NULL 且 id ≤ forkTurn 的轮对它可见），stepFloor = 继承段
    * 的 step 上界。只剩 v3 遗产来源（升级时还开着的老任务）——--fork 功能
@@ -92,7 +96,8 @@ const newOwnerId = (taken: (id: string) => boolean): string => {
 }
 
 const tasksDir = (root: string): string => join(root, '.simple-code', 'tasks')
-const manifestPath = (root: string, owner: string): string => join(tasksDir(root), `${owner}.json`)
+export const manifestPath = (root: string, owner: string): string =>
+  join(tasksDir(root), `${owner}.json`)
 
 export function readTaskManifest(root: string, owner: string): TaskManifest {
   return JSON.parse(readFileSync(manifestPath(root, owner), 'utf8')) as TaskManifest

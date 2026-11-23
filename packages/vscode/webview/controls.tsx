@@ -301,25 +301,49 @@ export function FolderTabs({ folders, active }: { folders: FolderState[]; active
   }
   return (
     <div className="folder-tabs" ref={rowRef}>
-      {shown.map((f, i) => (
-        <button
-          key={f.path}
-          ref={(el) => {
-            tabRefs.current[i] = el
-          }}
-          className={'folder-tab' + (f.path === active ? ' active' : '')}
-          title={`${f.path}\n切换只换记忆和显示，不拦 agent 访问别的文件夹`}
-          onClick={() => post({ type: 'switchFolder', folder: f.path })}
-        >
-          {f.running && <span className="tab-dot" aria-label="跑着" />}
-          <span className="tab-label">{base(f.path)}</span>
-          {f.pendingApprovals > 0 && (
-            <span className="tab-badge" aria-label={`${f.pendingApprovals} 个待审批`}>
-              {f.pendingApprovals}
-            </span>
-          )}
-        </button>
-      ))}
+      <div className="folder-tabs-clip">
+        {shown.map((f, i) => (
+          <button
+            key={f.path}
+            ref={(el) => {
+              tabRefs.current[i] = el
+            }}
+            className={'folder-tab' + (f.path === active ? ' active' : '')}
+            title={`${f.path}\n切换只换记忆和显示，不拦 agent 访问别的文件夹`}
+            onClick={() => post({ type: 'switchFolder', folder: f.path })}
+          >
+            {f.running && <span className="tab-dot" aria-label="跑着" />}
+            <span className="tab-label">{base(f.path)}</span>
+            {f.pendingApprovals > 0 && (
+              <span className="tab-badge" aria-label={`${f.pendingApprovals} 个待审批`}>
+                {f.pendingApprovals}
+              </span>
+            )}
+          </button>
+        ))}
+        {/* 影子测量层：溢出 tab 的影子副本。absolute + visibility:hidden
+          不占 flex 布局但保留 shrink-to-fit 宽度——fits() 在已折叠状态
+          下也能测到全量宽度。没有它，溢出 tab 卸载后 tabRefs 后面全是
+          null，拖宽窗口也永远收不回来（死锁）。ref 索引接在 shown 之后，
+          不是 visible 之后——active 提升会改写两个分区的实际长度 */}
+        {overflow.map((f, i) => (
+          <button
+            key={f.path}
+            ref={(el) => {
+              tabRefs.current[shown.length + i] = el
+            }}
+            className="folder-tab tab-shadow"
+            aria-hidden
+            tabIndex={-1}
+          >
+            {f.running && <span className="tab-dot" aria-hidden />}
+            <span className="tab-label">{base(f.path)}</span>
+            {f.pendingApprovals > 0 && <span className="tab-badge">{f.pendingApprovals}</span>}
+          </button>
+        ))}
+      </div>
+      {/* 「»」在裁剪层外（见 style.ts .folder-tabs）：放里面弹层被裁、
+          scrollIntoView 会把整排 tab 滚走 */}
       {overflow.length > 0 && (
         <Menu
           icon="codicon-folder"
@@ -344,26 +368,6 @@ export function FolderTabs({ folders, active }: { folders: FolderState[]; active
           onPick={(folder) => post({ type: 'switchFolder', folder })}
         />
       )}
-      {/* 影子测量层：溢出 tab 的影子副本。absolute + visibility:hidden
-          不占 flex 布局但保留 shrink-to-fit 宽度——fits() 在已折叠状态
-          下也能测到全量宽度。没有它，溢出 tab 卸载后 tabRefs 后面全是
-          null，拖宽窗口也永远收不回来（死锁）。ref 索引接在 shown 之后，
-          不是 visible 之后——active 提升会改写两个分区的实际长度 */}
-      {overflow.map((f, i) => (
-        <button
-          key={f.path}
-          ref={(el) => {
-            tabRefs.current[shown.length + i] = el
-          }}
-          className="folder-tab tab-shadow"
-          aria-hidden
-          tabIndex={-1}
-        >
-          {f.running && <span className="tab-dot" aria-hidden />}
-          <span className="tab-label">{base(f.path)}</span>
-          {f.pendingApprovals > 0 && <span className="tab-badge">{f.pendingApprovals}</span>}
-        </button>
-      ))}
     </div>
   )
 }

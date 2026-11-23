@@ -66,6 +66,36 @@ describe('resizeImageParts', () => {
     expect(out[0]).toBe(textMsg)
     expect(out[1]?.parts[0]?.type).toBe('text') // 占位符，不是图片
   })
+
+  it('同一张图第二次请求走缓存，不再解码（每次请求重压曾卡宿主 6–13s）', async () => {
+    const photon = (await import('@silvia-odwyer/photon-node')) as unknown as Photon
+    const decode = vi.spyOn(photon.PhotonImage, 'new_from_byteslice')
+    try {
+      const big = makePng(2100, 300, mulberry32(21)).toString('base64')
+      const first = await firstPart([{ ...image(big), detail: 'high' }])
+      expect(decode).toHaveBeenCalledTimes(1)
+      // 每轮从库重新组装：内容相同、对象是新的
+      const second = await firstPart([{ ...image(big), detail: 'low' }])
+      expect(decode).toHaveBeenCalledTimes(1)
+      if (first.type !== 'image' || second.type !== 'image') throw new Error('应为图片')
+      expect(second.data).toBe(first.data)
+      expect(second.mimeType).toBe('image/jpeg')
+      expect(second.detail).toBe('low') // 非 data 字段跟本次的 part 走
+    } finally {
+      decode.mockRestore()
+    }
+  })
+
+  it('原样放行命中缓存时还本次的 part——保住 result === part 的「没改」语义', async () => {
+    const data = makePng(64, 48, mulberry32(22)).toString('base64')
+    const a = image(data)
+    expect(await firstPart([a])).toBe(a)
+    const b = image(data) // 同内容的新对象（下一轮组装）
+    const msg = { role: 'user' as const, parts: [b] }
+    const [out] = await resizeImageParts([msg])
+    expect(out?.parts[0]).toBe(b)
+    expect(out).toBe(msg) // 消息引用不换（regions 按引用圈保底区）
+  })
 })
 
 describe('thumbnailDataUrl', () => {

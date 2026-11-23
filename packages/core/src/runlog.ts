@@ -12,6 +12,7 @@
  * 就本末倒置了。代价是路径坏了只有静默——但这类问题「日志文件没出现」
  * 本身就是信号。
  */
+import { appendFileSync, mkdirSync } from 'node:fs'
 import { appendFile, mkdir, readdir, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -72,6 +73,34 @@ export function logRunTo(dir: string): (ev: Record<string, unknown>) => void {
 /** 默认实例：~/.simple-code/logs/。模块加载时不建目录（见上） */
 export const logRun = logRunTo(join(homedir(), '.simple-code', 'logs'))
 
+/**
+ * 同步版（格式与 logRunTo 一致）：给「写完就要 process.exit」的路径用——
+ * 异步链没冲完就退出，最后几条日志无声丢（网关 2026-11-17 两次死因排查
+ * 被它拖累：idle_exit/exit 都没落盘）。频率低的进程（网关、一次性脚本）
+ * 整个换它也没感知；高频路径别用，同步 IO 会阻塞事件循环
+ */
+export function syncLogRunTo(dir: string): (ev: Record<string, unknown>) => void {
+  let purged = false
+  return (ev: Record<string, unknown>): void => {
+    const now = new Date()
+    const line =
+      JSON.stringify({
+        at: now.toISOString(),
+        pid: process.pid,
+        ...ev,
+      }) + '\n'
+    try {
+      if (!purged) {
+        purged = true
+        mkdirSync(dir, { recursive: true })
+      }
+      appendFileSync(join(dir, fileName(now)), line, 'utf8')
+    } catch {
+      // 日志失败不影响主流程（同 logRunTo 的约定）
+    }
+  }
+}
+
 async function purgeOld(dir: string): Promise<void> {
   const cutoff = Date.now() - RETAIN_DAYS * 24 * 3600_000
   for (const name of await readdir(dir).catch(() => [] as string[])) {
@@ -84,3 +113,21 @@ async function purgeOld(dir: string): Promise<void> {
 
 /** 测试与探测用：算出来会写哪个文件（不写盘） */
 export const runLogPath = (): string => join(homedir(), '.simple-code', 'logs', fileName())
+
+/**
+ * recall 选择器「回了东西却一个名字都没认出来」时的原文（session.ts 的
+ * unparsed）。文件头「只记元数据」管的是按天的运行日志；这是单独一个文件，
+ * 只为查格式问题——2026-11-20 近两周 5–7% 的 recall_select 是 unparsed，
+ * 原文没记、看不出原因。同 approval-unparsed.jsonl：不按天切、不清理（一次
+ * 一行、量小），同步写（频率低）。路径每次现算，测试换 HOME 即可
+ */
+export function logRecallUnparsed(ev: Record<string, unknown>): void {
+  try {
+    const dir = join(homedir(), '.simple-code', 'logs')
+    mkdirSync(dir, { recursive: true })
+    const line = `${JSON.stringify({ at: new Date().toISOString(), ...ev })}\n`
+    appendFileSync(join(dir, 'recall-unparsed.jsonl'), line, 'utf8')
+  } catch {
+    // 日志失败不影响主流程（同 logRunTo 的约定）
+  }
+}

@@ -23,7 +23,9 @@ const body = (over: Partial<Request> = {}) =>
   openaiResponses.buildRequest(baseRequest(over), { baseUrl: 'https://x.test', apiKey: 'k' })
     .body as Record<string, unknown>
 
-const wireInput = (messages: Message[]) => body({ messages }).input as Record<string, unknown>[]
+// 消息 → item 的纯映射：固定 system 空，不让 developer 头混进断言
+const wireInput = (messages: Message[]) =>
+  body({ system: '', messages }).input as Record<string, unknown>[]
 
 async function feed(events: [string, Record<string, unknown>][]): Promise<LLMEvent[]> {
   const sse = events
@@ -231,8 +233,24 @@ describe('openai-responses / usage', () => {
 })
 
 describe('openai-responses / buildRequest', () => {
-  it('system 走顶层 instructions', () => {
-    expect(body().instructions).toBe('S')
+  it('system 走 input[0] 的 developer 消息，instructions 只传空串', () => {
+    // GPT-6.2 起顶层 instructions 不进缓存（opencode 2026-11-18 实测每步
+    // 全价重付），system 必须挪进 input 才吃到前缀缓存。instructions 不能
+    // 整个删掉：不传时有网关注入自家默认提示词（2026-08 实测约 21k 字符）
+    expect(body().instructions).toBe('')
+    const [head, ...rest] = body({
+      messages: [{ role: 'user', parts: [{ type: 'text', text: 'hi' }] }],
+    }).input as Record<string, unknown>[]
+    expect(head).toEqual({ role: 'developer', content: [{ type: 'input_text', text: 'S' }] })
+    expect(rest).toEqual([{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }])
+  })
+
+  it('system 为空时不发 developer 消息，input 从第一条真实消息开始', () => {
+    const items = body({
+      system: '',
+      messages: [{ role: 'user', parts: [{ type: 'text', text: 'hi' }] }],
+    }).input as Record<string, unknown>[]
+    expect(items).toEqual([{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }])
   })
 
   it('带 cacheKey 时发 prompt_cache_key，没有则整个字段不发', () => {

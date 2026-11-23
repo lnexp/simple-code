@@ -30,6 +30,7 @@ import {
   scopeOf,
   type TaskManifest,
   taskResultText,
+  writeTaskManifest,
   wrapGoalBrief,
 } from '../src/session/task.ts'
 
@@ -349,6 +350,14 @@ describe('拉摘要（规则 5）', () => {
   })
 })
 
+/** 打开拉段开关（2026-11-21 用户定：任务默认关＝完全独立，manifest 显式
+ *  开才拉 merged 段）。模拟 UI 开关改 manifest */
+const pullOn = (dir: string, owner: string): void => {
+  const m = readTaskManifest(dir, owner)
+  if (m === null) return
+  writeTaskManifest(dir, { ...m, pullSegments: true })
+}
+
 describe('开着的任务互不拉段、拉进来的标出处（2026-11-19 任务互串）', () => {
   /** A、B 都开着；B 第一段摘完、用满合回（closed 仍 0）；A 切到 B 之上的新段 */
   async function twoOpenTasks(dir: string) {
@@ -371,11 +380,11 @@ describe('开着的任务互不拉段、拉进来的标出处（2026-11-19 任�
     return { a, b, as, bs, al, bSeg }
   }
 
-  it('B 用满合回的段只进主干，开着的 A 拉不到；B 关闭后 A 才拉', async () => {
+  it('A 默认独立：B 合回的段进主干，A 一段不拉；开了开关 merged 即拉', async () => {
     const dir = await workspace()
-    const { b, as, bs, bSeg } = await twoOpenTasks(dir)
+    const { a, b, as, bs, bSeg } = await twoOpenTasks(dir)
     expect(bSeg).toMatchObject({ state: 'merged', closed: 0 })
-    // 修复前：A 在压缩点就把 B 还在进行的经历拉进来
+    // 默认关：B 还开着不拉，B 关了也不拉——任务上下文完全独立（2026-11-21）
     expect(as.pullPending()).toBe(false)
     expect(as.pullSegments()).toBe(0)
     expect(
@@ -396,16 +405,25 @@ describe('开着的任务互不拉段、拉进来的标出处（2026-11-19 任�
         .filter((s) => s.owner === b.owner)
         .every((s) => s.closed === 1),
     ).toBe(true)
+    expect(as.pullPending()).toBe(false)
+    expect(as.pullSegments()).toBe(0)
+    // 开了开关：merged 即拉（B 关不关无所谓），拉进来的行带出处
+    pullOn(dir, a.owner)
     expect(as.pullPending()).toBe(true)
     expect(as.pullSegments()).toBe(4)
+    expect(
+      as
+        .summaries()
+        .filter((s) => s.text.startsWith('B'))
+        .every((s) => s.source === '任务「B」'),
+    ).toBe(true)
     as.close()
   })
 
-  it('拉进来的行带 source，渲染出「来源：」行；自己的行不带（老行渲染字节不变）', async () => {
+  it('开关开的任务拉 B 还开着的 merged 段，行带 source；自己的行不带（老行渲染字节不变）', async () => {
     const dir = await workspace()
-    const { b, as, bs } = await twoOpenTasks(dir)
-    bs.close()
-    finalizeTask(dir, b.owner)
+    const { a, as } = await twoOpenTasks(dir)
+    pullOn(dir, a.owner)
     as.pullSegments()
     const rows = as.summaries().filter((s) => s.inContext)
     const pulled = rows.filter((s) => s.text.startsWith('B'))
@@ -448,9 +466,8 @@ describe('开着的任务互不拉段、拉进来的标出处（2026-11-19 任�
 
   it('合并：成员同出处父行继承 source，混了自己的行不继承', async () => {
     const dir = await workspace()
-    const { a, b, as, bs } = await twoOpenTasks(dir)
-    bs.close()
-    finalizeTask(dir, b.owner)
+    const { a, b, as } = await twoOpenTasks(dir)
+    pullOn(dir, a.owner)
     as.pullSegments()
     const rows = as.summaries().filter((s) => s.inContext)
     const pulled = rows.filter((s) => s.text.startsWith('B'))
@@ -746,6 +763,8 @@ describe('真 session：前缀与主干（规则 5、10）', () => {
     const globalPath = await settings(dir)
     seen.length = 0
     const b = createTask(dir, 'B', { awaitingFirstMessage: true })
+    // 空任务也要开了开关才拉别人的段（2026-11-21 默认独立）
+    pullOn(dir, b.owner)
     // 空任务零段：不留「open 却零 step」的段给别人的合并链跨过
     expect(segs(dir).filter((s) => s.owner === b.owner)).toEqual([])
     // B 建好、还没发第一条消息时：A 开、跑、摘、关——A 的段合回

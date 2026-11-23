@@ -1,4 +1,4 @@
-import type { BgProcessInfo, Effort, MemoryStats, ModelRef } from '@simple-code/core'
+import type { BgProcessInfo, Effort, MemoryStats, ModelRef, SettingsView } from '@simple-code/core'
 import {
   memo,
   type MouseEvent as ReactMouseEvent,
@@ -14,6 +14,7 @@ import type {
   ApprovalRequest,
   Attendance,
   FolderState,
+  GatewayCheck,
   RegionsInfo,
   TaskDraftDefaults,
   TaskState,
@@ -52,6 +53,8 @@ import { renderMarkdown, splitOpenFence } from './markdown.ts'
 import { MemoryPanel } from './memory-panel.tsx'
 import { Menu } from './menu.tsx'
 import { findPathTokens } from './pathlink.ts'
+import { SettingsPage } from './settings.tsx'
+import type { RobotState } from './settings-shared.tsx'
 import { groupTurns } from './steps.ts'
 import { draftChoice, draftControls, NEW_DRAFT, pickModel, type TaskDraft } from './task-draft.ts'
 import { useThrottledText } from './throttle.ts'
@@ -145,6 +148,65 @@ export function App() {
   /** 挂起中的审批（approval_request 到、approval_closed 消）多问并发时
    * 会有多条——每条一个 id，答复按钮各自对应 */
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([])
+  /** 设置页（2026-11-17）：齿轮开/关。缺配置时的首开表单不算「开」——
+   *  它是面板的主内容，不是从齿轮进来的页面 */
+  const [settingsPage, setSettingsPage] = useState(false)
+  /** 设置页数据（settings_view 推来）。null = 还没到（齿轮点了在拉） */
+  const [settings, setSettings] = useState<SettingsView | null>(null)
+  /** 飞书推送开关（gateway_push 推来，随 settings_view 到）。null = 网关没启用 */
+  const [gatewayPush, setGatewayPush] = useState<boolean | null>(null)
+  /** lark-cli 检测（飞书推送分区）：路径随 gateway_push 到，结果等检测按钮 */
+  const [larkCli, setLarkCli] = useState<string | null>(null)
+  const [larkCheck, setLarkCheck] = useState<GatewayCheck | null>(null)
+  const [larkBusy, setLarkBusy] = useState(false)
+  /** 桌面机器人开关（robot_state 推来）。null = 非 mac，分区不显示 */
+  const [robot, setRobot] = useState<RobotState>(null)
+  // 消息 handler 是空依赖（folderRef 同款理由）：在里面读 settings 拿到的
+  // 是首渲染的 null，用 ref 镜像「上一份视图是不是缺配置」
+  const settingsMissingRef = useRef(false)
+  /** settings_write 的回执：nonce 每次写回 +1，0 = 还没写过 */
+  const [settingsResult, setSettingsResult] = useState({
+    nonce: 0,
+    ok: false,
+    error: null as string | null,
+  })
+  /** 一次写回在途：表单按钮期间禁用，防双击双写 */
+  const [settingsBusy, setSettingsBusy] = useState(false)
+
+  // settings 消息的两个分支（handler 是空依赖闭包，这些函数只用稳定的
+  // setState 与 ref，首渲染的版本被闭包拿到也安全）
+  const applySettingsView = (view: SettingsView): void => {
+    // 缺配置的推送/齿轮的应答都走这条。missing 翻真时清 fatal——
+    // 首开表单上还挂着红框的话，新手会以为保存也会失败
+    setSettings(view)
+    settingsMissingRef.current = view.missing
+    if (view.missing) setFatal(null)
+  }
+  const applySettingsResult = (msg: Extract<ToWebview, { type: 'settings_result' }>): void => {
+    setSettingsBusy(false)
+    setSettingsResult((r) => ({
+      nonce: r.nonce + 1,
+      ok: msg.ok,
+      error: msg.ok ? null : (msg.error ?? '写回失败'),
+    }))
+    if (!msg.ok || msg.view === undefined) return
+    const view = msg.view
+    const wasMissing = settingsMissingRef.current
+    setSettings(view)
+    settingsMissingRef.current = view.missing
+    // 首开保存成功：进对话，留一条 notice 说明下一步（proto 行为）
+    if (wasMissing && !view.missing)
+      setView((v) => ({
+        ...v,
+        items: [
+          ...v.items,
+          {
+            kind: 'notice',
+            text: `已写入 ${view.path}（权限 600），模型配好了，直接说需求即可。`,
+          },
+        ],
+      }))
+  }
 
   /** 审批答复。useCallback 固定引用——ToolRow 的 memo 靠它跳过重渲 */
   const onApprovalReply = useCallback(
@@ -409,6 +471,24 @@ export function App() {
         // 同 bg_processes：folder 由路由注入，非当前目录的任务不看
         if (msg.folder === folderRef.current) {
           setTasks(msg.tasks)
+          // 选中任务的摘要开关以这批快照为准（乐观更新被宿主真值校正——
+          // 任务不存在/写失败时回弹）
+          const cur = branchRef.current
+          const t = cur === null ? undefined : msg.tasks.find((x) => x.name === cur)
+          if (t)
+            setControls((c) =>
+              c.summaryInContext === t.summaryInContext
+                ? c
+                : { ...c, summaryInContext: t.summaryInContext },
+            )
+          // 切回恢复的选中在等这批快照：任务还活着就补基线（task_open
+          // 幂等，见 bridge 779），不在就作废（branch 交回上面的守卫）
+          const restore = restoreBranch.current
+          if (restore !== null) {
+            restoreBranch.current = null
+            if (msg.tasks.some((t) => t.name === restore))
+              post({ type: 'task_open', task: restore })
+          }
           // 改名迁移（在途的 ref 只在旧名从快照消失时结算）：选中态跟到
           // 新键（view_task 的 useEffect 跟 branch 走，自动重报）、任务
           // 视图缓存迁 key。撞名失败旧名不消失，ref 留着等下一次
@@ -435,24 +515,6 @@ export function App() {
                 return old === undefined ? rest : { ...rest, [rn.to]: old }
               })
             }
-          }
-          // 选中任务的摘要开关以这批快照为准（乐观更新被宿主真值校正——
-          // 任务不存在/写失败时回弹）
-          const cur = branchRef.current
-          const t = cur === null ? undefined : msg.tasks.find((x) => x.name === cur)
-          if (t)
-            setControls((c) =>
-              c.summaryInContext === t.summaryInContext
-                ? c
-                : { ...c, summaryInContext: t.summaryInContext },
-            )
-          // 切回恢复的选中在等这批快照：任务还活着就补基线（task_open
-          // 幂等，见 bridge 779），不在就作废（branch 交回上面的守卫）
-          const restore = restoreBranch.current
-          if (restore !== null) {
-            restoreBranch.current = null
-            if (msg.tasks.some((t) => t.name === restore))
-              post({ type: 'task_open', task: restore })
           }
           // 选中的任务被关闭了——切回对话（关闭后经历已在对话历史里）
           setBranch((b) => (b !== null && msg.tasks.every((t) => t.name !== b) ? null : b))
@@ -502,7 +564,17 @@ export function App() {
           [msg.name]: reduce(v[msg.name] ?? emptyView(), msg.event, msg.at),
         }))
       else if (msg.type === 'fatal') setFatal(msg.message)
-      else if (msg.type === 'regions') {
+      else if (msg.type === 'settings_view') applySettingsView(msg.view)
+      else if (msg.type === 'settings_result') applySettingsResult(msg)
+      else if (msg.type === 'gateway_push') {
+        setGatewayPush(msg.on)
+        setLarkCli(msg.larkCli ?? null)
+      } else if (msg.type === 'robot_state') {
+        setRobot(msg.mac ? { installed: msg.installed, on: msg.on } : null)
+      } else if (msg.type === 'gateway_check_result') {
+        setLarkCheck(msg.result)
+        setLarkBusy(false)
+      } else if (msg.type === 'regions') {
         setRegions(msg.info)
         setCtxPending(false)
       } else if (msg.type === 'compact_result')
@@ -607,6 +679,37 @@ export function App() {
       </div>
     )
 
+  // 目录栏（2026-11-17 起单根也渲染——齿轮是设置页的入口）。两个 return
+  // 共用，提成值不提成组件：里面要读一堆本函数的 state
+  const folderHead = folderList.length > 0 && (
+    <div className="folder-head">
+      <FolderTabs folders={folderList} active={folder} />
+      {/* 齿轮在「»」溢出之后、永远最右：folder-tabs flex:1 吃掉剩余宽，
+          齿轮是 flex none 的兄弟节点，溢出测量互不干扰。缺配置时也常亮
+          ——首开表单就是从它进来的那条路 */}
+      <button
+        type="button"
+        className={'folder-tab folder-gear' + (settingsPage ? ' active' : '')}
+        title={settingsPage ? '返回对话' : '设置'}
+        aria-label="设置"
+        onClick={() => {
+          if (settingsPage) setSettingsPage(false)
+          else {
+            post({ type: 'settings_get' })
+            setSettingsPage(true)
+          }
+        }}
+      >
+        <span className="codicon codicon-settings-gear" />
+      </button>
+    </div>
+  )
+
+  // 设置页 / 首开表单占满主区（proto ①③）。首开判定看 settings.missing
+  // ——没到过（null）时先让对话骨架渲染，settings_view 到了再切，避免闪
+  // 一下空表单
+  const showSettings = settingsPage || settings?.missing === true
+
   return (
     <div
       className="app"
@@ -619,297 +722,339 @@ export function App() {
       }}
     >
       {fatal !== null && <div className="fatal">{fatal}</div>}
-      {/* 多根工作区的对话头（design.md §7）：单根不渲染。切换不打断后台
-          轮——选中的文件夹决定记忆存哪，跑着的标 ● 提示还有活在后面 */}
-      {folderList.length > 1 && (
-        <div className="folder-head">
-          <FolderTabs folders={folderList} active={folder} />
-        </div>
-      )}
-      {(() => {
-        // 选中任务的投影/状态（null = 对话）。审批卡全量传，但只画在
-        // toolCallId 对得上的命令行下——看着别的任务时这里没有它，任务条
-        // 上的角标是那时唯一的信号（10-31 前注释写「切走照样弹」，实际从
-        // 6986675 起就不弹）。历史分页只在对话有：fetchHistory 回来
-        // 的是对话的历史，喂给任务视图就串台了
-        const t = branch !== null ? tasks.find((x) => x.name === branch) : undefined
-        return (
-          <Log
-            viewKey={branch ?? ''}
-            view={branch === null ? view : (taskViews[branch] ?? emptyView())}
-            running={branch === null ? running : t?.status === 'running'}
-            model={(branch === null ? controls.current : t?.current)?.model ?? null}
-            history={
-              branch === null
-                ? history
-                : (taskHistory[branch] ?? { cursor: null, more: true, loading: false })
-            }
-            approvals={approvals}
-            onApprovalReply={onApprovalReply}
-            onFetchTop={() => {
-              if (branchRef.current === null) {
-                const h = historyRef.current
-                if (!h.more || h.loading) return
-                putHistory({ ...h, loading: true })
-                post({ type: 'fetchHistory', cursor: h.cursor })
-              } else {
-                const b = branchRef.current
-                const th = taskHistoryRef.current[b] ?? freshPage()
-                if (!th.more || th.loading) return
-                putTaskHistory(b, { ...th, loading: true })
-                post({ type: 'task_fetchHistory', task: b, cursor: th.cursor })
-              }
+      {/* 对话头（design.md §7）：多根平铺 tab；单根也渲染——最右的齿轮
+          是设置页入口。切换不打断后台轮——选中的文件夹决定记忆存哪，
+          跑着的标 ● 提示还有活在后面 */}
+      {folderHead}
+      {/* 设置页 / 首开表单（占主区，flex:1——所以必须排在目录栏后面，
+          排前面会把目录栏压到面板底部，2026-11-17 主任务实测退回） */}
+      {showSettings &&
+        (settings === null ? (
+          <div className="page">
+            <div className="hint">读取配置…</div>
+          </div>
+        ) : (
+          <SettingsPage
+            view={settings}
+            result={settingsResult}
+            busy={settingsBusy}
+            onWrite={(edit) => {
+              setSettingsBusy(true)
+              post({ type: 'settings_write', edit })
             }}
-            // 「继续」按钮 = 替用户说一句「继续」：走同一个 send（对话/任务
-            // 分流、气泡上屏都在里面），core 续进上一轮（turn-resume.md）
-            onContinue={() => send('继续')}
+            onOpenFile={() => post({ type: 'settings_openFile' })}
+            push={gatewayPush}
+            onPush={(on) => post({ type: 'gateway_push_set', on })}
+            larkCli={larkCli}
+            check={larkCheck}
+            checking={larkBusy}
+            onCheck={() => {
+              setLarkBusy(true)
+              post({ type: 'gateway_check' })
+            }}
+            robot={robot}
+            onRobot={(on) => post({ type: 'robot_toggle', on })}
+            onRobotInstall={() => post({ type: 'robot_install' })}
+            onBack={() => setSettingsPage(false)}
           />
-        )
-      })()}
-      {bgItems.length > 0 && (
-        // 任务条上方的后台进程条：agent 启动的、还没退出的孤儿。全量快照
-        // 驱动——进程死了下次快照自动消失，这里不做定时轮询。放任务条
-        // 上面（用户拍板 2026-09-25）：进程是环境状态，瞄一眼就行；
-        // 任务 tab 是输入目标，离输入框近些
-        // 一条命令一行（2026-10-28 拍板 A2）：desc 标签 + 进程数与启动时刻
-        // （时刻而非时长：时长要定时器刷新）。原命令不在行内显示，悬停看
-        // title（2026-10-29 拍板：行内只有一行，长命令必截断，看不出东西）
-        <div className="bg-strip">
-          {bgItems.map((p) => (
-            <div key={p.pgid} className="bg-item" title={`${p.command}\n\npid ${p.pids.join(' ')}`}>
-              <span className="bg-dot" />
-              <span className="bg-label">{p.label}</span>
-              <span className="bg-meta">
-                {p.pids.length} 个进程 · {new Date(p.startedAt).toTimeString().slice(0, 5)} 起
-              </span>
-              <button
-                type="button"
-                className="bg-kill"
-                aria-label="结束这组后台进程"
-                onClick={() => post({ type: 'bg_kill', pgid: p.pgid, folder: folderRef.current })}
+        ))}
+      {/* 对话区（Log、任务条、Composer）在设置页开着时不卸载只隐藏：
+          Composer 的草稿（text/images/attached）是组件内 state，卸了
+          回来就没了（2026-11-17 用户实测丢草稿）。display:contents =
+          布局上等同不存在，子节点照旧参与 .app 的 flex 列；设置页期间
+          display:none 整块隐藏 */}
+      <div className="conversation" style={{ display: showSettings ? 'none' : 'contents' }}>
+        {(() => {
+          // 选中任务的投影/状态（null = 对话）。审批卡全量传，但只画在
+          // toolCallId 对得上的命令行下——看着别的任务时这里没有它，任务条
+          // 上的角标是那时唯一的信号（10-31 前注释写「切走照样弹」，实际从
+          // 6986675 起就不弹）。历史分页只在对话有：fetchHistory 回来
+          // 的是对话的历史，喂给任务视图就串台了
+          const t = branch !== null ? tasks.find((x) => x.name === branch) : undefined
+          return (
+            <Log
+              viewKey={branch ?? ''}
+              view={branch === null ? view : (taskViews[branch] ?? emptyView())}
+              running={branch === null ? running : t?.status === 'running'}
+              model={(branch === null ? controls.current : t?.current)?.model ?? null}
+              history={
+                branch === null
+                  ? history
+                  : (taskHistory[branch] ?? { cursor: null, more: true, loading: false })
+              }
+              approvals={approvals}
+              onApprovalReply={onApprovalReply}
+              onFetchTop={() => {
+                if (branchRef.current === null) {
+                  const h = historyRef.current
+                  if (!h.more || h.loading) return
+                  putHistory({ ...h, loading: true })
+                  post({ type: 'fetchHistory', cursor: h.cursor })
+                } else {
+                  const b = branchRef.current
+                  const th = taskHistoryRef.current[b] ?? freshPage()
+                  if (!th.more || th.loading) return
+                  putTaskHistory(b, { ...th, loading: true })
+                  post({ type: 'task_fetchHistory', task: b, cursor: th.cursor })
+                }
+              }}
+              // 「继续」按钮 = 替用户说一句「继续」：走同一个 send（对话/任务
+              // 分流、气泡上屏都在里面），core 续进上一轮（turn-resume.md）
+              onContinue={() => send('继续')}
+            />
+          )
+        })()}
+        {bgItems.length > 0 && (
+          // 任务条上方的后台进程条：agent 启动的、还没退出的孤儿。全量快照
+          // 驱动——进程死了下次快照自动消失，这里不做定时轮询。放任务条
+          // 上面（用户拍板 2026-09-25）：进程是环境状态，瞄一眼就行；
+          // 任务 tab 是输入目标，离输入框近些
+          // 一条命令一行（2026-10-28 拍板 A2）：desc 标签 + 进程数与启动时刻
+          // （时刻而非时长：时长要定时器刷新）。原命令不在行内显示，悬停看
+          // title（2026-10-29 拍板：行内只有一行，长命令必截断，看不出东西）
+          <div className="bg-strip">
+            {bgItems.map((p) => (
+              <div
+                key={p.pgid}
+                className="bg-item"
+                title={`${p.command}\n\npid ${p.pids.join(' ')}`}
               >
-                ×
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-      {/* 任务条（bg-strip 之下、紧贴控件区）：切任务 = 切目录同款体感——
+                <span className="bg-dot" />
+                <span className="bg-label">{p.label}</span>
+                <span className="bg-meta">
+                  {p.pids.length} 个进程 · {new Date(p.startedAt).toTimeString().slice(0, 5)} 起
+                </span>
+                <button
+                  type="button"
+                  className="bg-kill"
+                  aria-label="结束这组后台进程"
+                  onClick={() => post({ type: 'bg_kill', pgid: p.pgid, folder: folderRef.current })}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        {/* 任务条（bg-strip 之下、紧贴控件区）：切任务 = 切目录同款体感——
           点谁 = 看谁 + 输入给谁。常驻渲染：+ 是开第一个任务的唯一入口。
           running/closing 不出关闭键（停止是通用控件）；idle/error 可关闭 */}
-      <div className="branch-strip">
-        {/* 主任务的 running 点：与任务 tab 同款绿点（task-dot[running]）。
+        <div className="branch-strip">
+          {/* 主任务的 running 点：与任务 tab 同款绿点（task-dot[running]）。
             看着任务时主任务跑没跑，从这里一眼可见——和文件夹 tab 的
             running 点同一个语义 */}
-        <button
-          type="button"
-          className="branch-tab"
-          data-active={branch === null}
-          onClick={() => setBranch(null)}
-        >
-          {running && <span className="task-dot" data-status="running" />}
-          主任务
-          <PendingBadge approvals={approvals} />
-        </button>
-        {tasks.map((t) => (
-          <span
-            key={t.name}
+          <button
+            type="button"
             className="branch-tab"
-            data-active={branch === t.name}
-            data-status={t.status}
+            data-active={branch === null}
+            onClick={() => setBranch(null)}
           >
-            <span className="task-dot" data-status={t.status} />
-            {renaming === t.name ? (
-              <input
-                className="branch-rename"
-                defaultValue={t.name}
-                autoFocus
-                // 失焦即弃：双击是轻交互，误触后点到别处不该提交
-                onBlur={() => setRenaming(null)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Escape') setRenaming(null)
-                  if (e.key === 'Enter') {
-                    // 与宿主 nameOf 同规格：trim + 截 20；空或没变不打扰宿主
-                    const clean = e.currentTarget.value.trim().slice(0, 20)
-                    setRenaming(null)
-                    if (clean === '' || clean === t.name) return
-                    renameRef.current = { from: t.name, to: clean }
-                    post({ type: 'task_rename', task: t.name, name: clean })
-                  }
-                }}
-              />
-            ) : (
-              <button
-                type="button"
-                className="branch-open"
-                title={[t.error ?? t.lastText, '双击改名'].filter(Boolean).join('\n')}
-                onClick={() => {
-                  setBranch(t.name)
-                  // 基线走宿主（单一真相）：webview 的增量投影不跨 attach 存活
-                  post({ type: 'task_open', task: t.name })
-                }}
-                onDoubleClick={() => setRenaming(t.name)}
-              >
-                {t.name}
-              </button>
-            )}
-            <PendingBadge approvals={approvals} task={t.name} />
-            {/* 停止键不在这：切到该任务后输入框旁的 ■ 就是它的停止键
+            {running && <span className="task-dot" data-status="running" />}
+            主任务
+            <PendingBadge approvals={approvals} />
+          </button>
+          {tasks.map((t) => (
+            <span
+              key={t.name}
+              className="branch-tab"
+              data-active={branch === t.name}
+              data-status={t.status}
+            >
+              <span className="task-dot" data-status={t.status} />
+              {renaming === t.name ? (
+                <input
+                  className="branch-rename"
+                  defaultValue={t.name}
+                  autoFocus
+                  // 失焦即弃：双击是轻交互，误触后点到别处不该提交
+                  onBlur={() => setRenaming(null)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') setRenaming(null)
+                    if (e.key === 'Enter') {
+                      // 与宿主 nameOf 同规格：trim + 截 20；空或没变不打扰宿主
+                      const clean = e.currentTarget.value.trim().slice(0, 20)
+                      setRenaming(null)
+                      if (clean === '' || clean === t.name) return
+                      renameRef.current = { from: t.name, to: clean }
+                      post({ type: 'task_rename', task: t.name, name: clean })
+                    }
+                  }}
+                />
+              ) : (
+                <button
+                  type="button"
+                  className="branch-open"
+                  title={[t.error ?? t.lastText, '双击改名'].filter(Boolean).join('\n')}
+                  onClick={() => {
+                    setBranch(t.name)
+                    // 基线走宿主（单一真相）：webview 的增量投影不跨 attach 存活
+                    post({ type: 'task_open', task: t.name })
+                  }}
+                  onDoubleClick={() => setRenaming(t.name)}
+                >
+                  {t.name}
+                </button>
+              )}
+              <PendingBadge approvals={approvals} task={t.name} />
+              {/* 停止键不在这：切到该任务后输入框旁的 ■ 就是它的停止键
                 （用户拍板：和对话同一套）。跑着只有绿点；closing 灰点；
                 idle/error 出关闭 */}
-            {t.status !== 'running' && t.status !== 'closing' && (
-              <button
-                type="button"
-                className="task-btn task-close"
-                aria-label="关闭任务"
-                title="关闭任务（在跑会先停；经历收尾后并入主任务历史）"
-                onClick={() => post({ type: 'task_close', name: t.name })}
-              >
-                ×
-              </button>
-            )}
-          </span>
-        ))}
-        {/* 不限数、不等主任务静止（task-trunk）：入口常驻，任务多了任务条换行 */}
-        <button
-          type="button"
-          className="branch-add"
-          title={
-            branchDraft
-              ? '正在开任务（点此取消）'
-              : '开一个新任务（带已合回的历史摘要，不带当前对话）'
-          }
-          onClick={() => {
-            // 每次进新任务状态都从默认起（上次没发出去的选择不带过来）
-            if (!branchDraft) setDraft(NEW_DRAFT)
-            setBranchDraft(!branchDraft)
-          }}
-        >
-          {branchDraft ? '取消 ⑂' : '+ 任务'}
-        </button>
-      </div>
-      {branchDraft && (
-        // 开分支模式的醒目提示：placeholder 变化太弱（灰字、易错过），
-        // 用户点了 + 分支以为没反应，随手打的字被当任务书派出（2026-09-22）
-        <div className="branch-draft-bar">
-          <span>⑂ 新任务：下一条消息发出即开任务，第一行作任务名称（可先切模型、深度、审批）</span>
-          <button type="button" onClick={() => setBranchDraft(false)}>
-            取消（Esc）
+              {t.status !== 'running' && t.status !== 'closing' && (
+                <button
+                  type="button"
+                  className="task-btn task-close"
+                  aria-label="关闭任务"
+                  title="关闭任务（在跑会先停；经历收尾后并入主任务历史）"
+                  onClick={() => post({ type: 'task_close', name: t.name })}
+                >
+                  ×
+                </button>
+              )}
+            </span>
+          ))}
+          {/* 不限数、不等主任务静止（task-trunk）：入口常驻，任务多了任务条换行 */}
+          <button
+            type="button"
+            className="branch-add"
+            title={
+              branchDraft
+                ? '正在开任务（点此取消）'
+                : '开一个新任务（带已合回的历史摘要，不带当前对话）'
+            }
+            onClick={() => {
+              // 每次进新任务状态都从默认起（上次没发出去的选择不带过来）
+              if (!branchDraft) setDraft(NEW_DRAFT)
+              setBranchDraft(!branchDraft)
+            }}
+          >
+            {branchDraft ? '取消 ⑂' : '+ 任务'}
           </button>
         </div>
-      )}
-      <TurnQueueBar
-        view={branch === null ? turnQueue.main : turnQueue.tasks[branch]}
-        onCancel={(id) => post({ type: 'turnQueueCancel', id })}
-      />
-      <Composer
-        running={
-          // 新任务还没建、没在跑：控件可选、出发送键（当前流在跑也一样）
-          branchDraft
-            ? false
-            : branch === null
-              ? running
-              : tasks.find((x) => x.name === branch)?.status === 'running'
-        }
-        view={branch === null ? view : (taskViews[branch] ?? emptyView())}
-        onOpenMemory={() => {
-          // 记忆面板：开面板 + 拉计数（state 在 App，数据不进 ChatView——同 onOpenRegions）
-          setMemOpen(true)
-          setMemStats(null)
-          setMemError(null)
-          post({ type: 'reflect_panel' })
-        }}
-        controls={(() => {
-          // 新任务状态：控件显示的是待开任务的选择（task-draft.ts）
-          if (branchDraft) {
+        {branchDraft && (
+          // 开分支模式的醒目提示：placeholder 变化太弱（灰字、易错过），
+          // 用户点了 + 分支以为没反应，随手打的字被当任务书派出（2026-09-22）
+          <div className="branch-draft-bar">
+            <span>
+              ⑂ 新任务：下一条消息发出即开任务，第一行作任务名称（可先切模型、深度、审批）
+            </span>
+            <button type="button" onClick={() => setBranchDraft(false)}>
+              取消（Esc）
+            </button>
+          </div>
+        )}
+        <TurnQueueBar
+          view={branch === null ? turnQueue.main : turnQueue.tasks[branch]}
+          onCancel={(id) => post({ type: 'turnQueueCancel', id })}
+        />
+        <Composer
+          running={
+            // 新任务还没建、没在跑：控件可选、出发送键（当前流在跑也一样）
+            branchDraft
+              ? false
+              : branch === null
+                ? running
+                : tasks.find((x) => x.name === branch)?.status === 'running'
+          }
+          view={branch === null ? view : (taskViews[branch] ?? emptyView())}
+          onOpenMemory={() => {
+            // 记忆面板：开面板 + 拉计数（state 在 App，数据不进 ChatView——同 onOpenRegions）
+            setMemOpen(true)
+            setMemStats(null)
+            setMemError(null)
+            post({ type: 'reflect_panel' })
+          }}
+          controls={(() => {
+            // 新任务状态：控件显示的是待开任务的选择（task-draft.ts）
+            if (branchDraft) {
+              const { preset: _mainPreset, ...shared } = controls
+              return { ...shared, ...draftControls(controls.models, taskDraft, draft) }
+            }
+            // 控件区跟分支走（2026-09-22 拍板）：模型/深度/预设/窗口是分支
+            // session 自己的账（TaskState 带来），预设列表、贴图通道也是（模型级）；
+            // models 借主干——配置全 folder 一份
+            const t = branch === null ? undefined : tasks.find((x) => x.name === branch)
+            if (t === undefined) return controls
             const { preset: _mainPreset, ...shared } = controls
-            return { ...shared, ...draftControls(controls.models, taskDraft, draft) }
+            return {
+              ...shared,
+              current: t.current,
+              effort: t.effort,
+              effortOverridden: t.effortOverridden,
+              // 分支没选预设 = 默认，不回退成主干的
+              ...(t.preset !== undefined ? { preset: t.preset } : {}),
+              presets: t.presets,
+              imagesEnabled: t.imagesEnabled,
+              contextWindow: t.contextWindow,
+              // 审批开关跟分支走（2026-09-22 拍板，推翻早前 folder 级口径）
+              attendance: t.attendance,
+              // 历史摘要开关是 folder 级，但分支面板要用它渲染开关态——
+              // 借分支镜像带过来，切分支不掉状态
+              summaryInContext: t.summaryInContext,
+            }
+          })()}
+          // Picker 的选择打到分支 session（setModel/setEffort 带 task）
+          task={branch ?? undefined}
+          folder={folder}
+          activeEditor={activeEditor}
+          branchDraft={branchDraft}
+          draftPick={
+            branchDraft
+              ? {
+                  model: (c: ModelRef) => setDraft((d) => pickModel(d, taskDraft?.model, c)),
+                  effort: (e: Effort | null) => setDraft((d) => ({ ...d, effort: e })),
+                  attendance: (m: Attendance) => setDraft((d) => ({ ...d, attendance: m })),
+                }
+              : undefined
           }
-          // 控件区跟分支走（2026-09-22 拍板）：模型/深度/预设/窗口是分支
-          // session 自己的账（TaskState 带来），预设列表、贴图通道也是（模型级）；
-          // models 借主干——配置全 folder 一份
-          const t = branch === null ? undefined : tasks.find((x) => x.name === branch)
-          if (t === undefined) return controls
-          const { preset: _mainPreset, ...shared } = controls
-          return {
-            ...shared,
-            current: t.current,
-            effort: t.effort,
-            effortOverridden: t.effortOverridden,
-            // 分支没选预设 = 默认，不回退成主干的
-            ...(t.preset !== undefined ? { preset: t.preset } : {}),
-            presets: t.presets,
-            imagesEnabled: t.imagesEnabled,
-            contextWindow: t.contextWindow,
-            // 审批开关跟分支走（2026-09-22 拍板，推翻早前 folder 级口径）
-            attendance: t.attendance,
-            // 历史摘要开关是 folder 级，但分支面板要用它渲染开关态——
-            // 借分支镜像带过来，切分支不掉状态
-            summaryInContext: t.summaryInContext,
+          onNewBranch={(name, text, images) => {
+            setBranchDraft(false)
+            createBranch(name, text, images)
+          }}
+          onCancelBranchDraft={() => setBranchDraft(false)}
+          onSend={send}
+          onQueue={(text, images) =>
+            // 不落本地气泡：宿主发出时补推基线，它才上屏（turn-queue-bar.tsx）
+            post({
+              type: 'turnQueueAdd',
+              text,
+              ...(images.length > 0 ? { images } : {}),
+              ...(branch !== null ? { task: branch } : {}),
+            })
           }
-        })()}
-        // Picker 的选择打到分支 session（setModel/setEffort 带 task）
-        task={branch ?? undefined}
-        folder={folder}
-        activeEditor={activeEditor}
-        branchDraft={branchDraft}
-        draftPick={
-          branchDraft
-            ? {
-                model: (c: ModelRef) => setDraft((d) => pickModel(d, taskDraft?.model, c)),
-                effort: (e: Effort | null) => setDraft((d) => ({ ...d, effort: e })),
-                attendance: (m: Attendance) => setDraft((d) => ({ ...d, attendance: m })),
-              }
-            : undefined
-        }
-        onNewBranch={(name, text, images) => {
-          setBranchDraft(false)
-          createBranch(name, text, images)
-        }}
-        onCancelBranchDraft={() => setBranchDraft(false)}
-        onSend={send}
-        onQueue={(text, images) =>
-          // 不落本地气泡：宿主发出时补推基线，它才上屏（turn-queue-bar.tsx）
-          post({
-            type: 'turnQueueAdd',
-            text,
-            ...(images.length > 0 ? { images } : {}),
-            ...(branch !== null ? { task: branch } : {}),
-          })
-        }
-        onStop={() => {
-          // 停止打到当前看着的流：任务的轮走 task_stop，对话的走 interrupt
-          if (branch !== null) {
-            post({ type: 'task_stop', name: branch })
-            return
-          }
-          stopRequested.current = true
-          post({ type: 'interrupt' })
-        }}
-        onOpenRegions={() => {
-          setCtxOpen(true)
-          setCtxPending(true)
-          setCompact({ task: branch, busy: false, text: null })
-          // 上下文环跟分支走：查分支的库，不拿主干的数字骗人
-          post({ type: 'get_regions', ...(branch !== null ? { task: branch } : {}) })
-        }}
-        onNotice={(text) => {
-          // notice 落进当前看着的流——在分支里贴图失败，提示出现在分支里
-          if (branch !== null) {
-            const name = branch
-            setTaskViews((v) => ({
-              ...v,
-              [name]: {
-                ...(v[name] ?? emptyView()),
-                items: [...(v[name]?.items ?? []), { kind: 'notice', text }],
-              },
-            }))
-            return
-          }
-          setView((v) => ({ ...v, items: [...v.items, { kind: 'notice', text }] }))
-        }}
-      />
-      {ctxOpen && (
+          onStop={() => {
+            // 停止打到当前看着的流：任务的轮走 task_stop，对话的走 interrupt
+            if (branch !== null) {
+              post({ type: 'task_stop', name: branch })
+              return
+            }
+            stopRequested.current = true
+            post({ type: 'interrupt' })
+          }}
+          onOpenRegions={() => {
+            setCtxOpen(true)
+            setCtxPending(true)
+            setCompact({ task: branch, busy: false, text: null })
+            // 上下文环跟分支走：查分支的库，不拿主干的数字骗人
+            post({ type: 'get_regions', ...(branch !== null ? { task: branch } : {}) })
+          }}
+          onNotice={(text) => {
+            // notice 落进当前看着的流——在分支里贴图失败，提示出现在分支里
+            if (branch !== null) {
+              const name = branch
+              setTaskViews((v) => ({
+                ...v,
+                [name]: {
+                  ...(v[name] ?? emptyView()),
+                  items: [...(v[name]?.items ?? []), { kind: 'notice', text }],
+                },
+              }))
+              return
+            }
+            setView((v) => ({ ...v, items: [...v.items, { kind: 'notice', text }] }))
+          }}
+        />
+      </div>
+      {!showSettings && ctxOpen && (
         <ContextPanel
           info={regions}
           pending={ctxPending}
@@ -938,6 +1083,13 @@ export function App() {
               ...(branch !== null ? { task: branch } : {}),
             })
           }}
+          // 拉段开关只在任务视图显示（主任务恒开）；乐观更新 + 宿主快照同值
+          pullSegments={branch === null ? null : (tasks.find((x) => x.name === branch)?.pullSegments ?? false)}
+          onTogglePull={(value) => {
+            if (branch === null) return
+            setTasks((ts) => ts.map((t) => (t.name === branch ? { ...t, pullSegments: value } : t)))
+            post({ type: 'task_pull_set', task: branch, on: value })
+          }}
           onCompact={() => {
             setCompact({ task: branch, busy: true, text: null })
             post({ type: 'compact', ...(branch !== null ? { task: branch } : {}) })
@@ -945,7 +1097,7 @@ export function App() {
           onClose={() => setCtxOpen(false)}
         />
       )}
-      {memOpen && (
+      {!showSettings && memOpen && (
         <MemoryPanel
           stats={memStats}
           reflectTask={tasks.find((x) => x.name === '反思') ?? null}
@@ -963,7 +1115,7 @@ export function App() {
           onClose={() => setMemOpen(false)}
         />
       )}
-      {zoom !== null && (
+      {!showSettings && zoom !== null && (
         // 点浮层任意处关闭。img 上 stopPropagation：点图本身不冒泡到
         // 浮层（否则点图也关，没机会看细节）。键盘 Esc 同关——不写的话
         // 键盘用户被困在浮层里（它盖住整个面板）

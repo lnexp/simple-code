@@ -438,6 +438,10 @@ describe('AGENTS.md', () => {
     // 名词检索教训/note，与确信与否无关；不列领域清单（本仓病历不进产品段）
     expect(none).toContain('搜一遍教训与 note')
     expect(none).toContain('与确信与否无关')
+    // 过程汇报（2026-11-18）：模型行为规则，无条件在场，不跟 bin 走
+    expect(none).toContain('## 过程汇报')
+    expect(none).toContain('不要一路沉默到收尾')
+    expect(withBoth).toContain('## 过程汇报')
     // t885 常驻清单：同为 core 行为，无条件在场
     expect(none).toContain('常驻上下文（每轮全价重发）')
     expect(none).toContain('其余正文与依据按需 read')

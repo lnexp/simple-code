@@ -23,6 +23,9 @@ it('原文回放按 owner 隔离；同 step 的多条 user 按顺序配对，无
     db.exec(
       'CREATE TABLE messages(id INTEGER PRIMARY KEY, step_id INTEGER, role TEXT, content_json TEXT, state TEXT, owner TEXT)',
     )
+    // 生产 schema 的同款索引（schema.sql.ts messages_restore）——查询
+    // 带 INDEXED BY，夹具不建会直接报 no such index
+    db.exec('CREATE INDEX messages_restore ON messages(owner, state, step_id)')
     for (const [id, owner, text] of [
       [1, null, '原始问题'],
       [2, null, '原始继续'],
@@ -67,6 +70,8 @@ describe('恢复窗口（recentSteps）', () => {
       db.exec(
         'CREATE TABLE messages(id INTEGER PRIMARY KEY, step_id INTEGER, role TEXT, content_json TEXT, state TEXT, owner TEXT)',
       )
+      // 同上：查询带 INDEXED BY messages_restore，夹具要建同款索引
+      db.exec('CREATE INDEX messages_restore ON messages(owner, state, step_id)')
       // step 1-4 各一条 user 原文；live 是它们的存根
       for (const s of [1, 2, 3, 4]) {
         db.run(
@@ -76,7 +81,11 @@ describe('恢复窗口（recentSteps）', () => {
           JSON.stringify(message(`第${s}步原文`)),
         )
       }
-      const live = [1, 2, 3, 4].map((s) => ({ stepId: s, turnId: s, message: message(`第${s}步存根`) }))
+      const live = [1, 2, 3, 4].map((s) => ({
+        stepId: s,
+        turnId: s,
+        message: message(`第${s}步存根`),
+      }))
       // 窗口 2：只有 step 3、4 恢复
       const w = restoreHistoryOriginals(db, live, null, 2)
       expect(w.restoredIds).toEqual([3, 4])

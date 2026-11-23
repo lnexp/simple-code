@@ -2,8 +2,9 @@ import { utimesSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { assembleContext, type LiveMessage } from '../src/loop/assemble.ts'
+import { logRecallUnparsed } from '../src/runlog.ts'
 import {
   buildSelectorRequest,
   loadSelectorCandidates,
@@ -373,8 +374,8 @@ describe('session e2e：异步注入', () => {
       m.content.some((c) => c.type === 'text' && c.text?.startsWith('〔recall·async〕')),
     )
 
-  /** command：把 fixture 的 ls 换成别的（动作联想用） */
-  const setup = async (opts: { tail?: string } = {}) => {
+  /** tail：把 fixture 的 ls 换成别的（动作联想用）；selectorReply：选择器回什么 */
+  const setup = async (opts: { tail?: string; selectorReply?: string } = {}) => {
     const { getSession } = await import('../src/session/session.ts')
     const { readFixture } = await import('./helpers.ts')
     const dir = await workspace()
@@ -391,7 +392,7 @@ describe('session e2e：异步注入', () => {
       const body = JSON.parse(String(init?.body)) as Body
       if (JSON.stringify(body.system).includes('检索选择器')) {
         selectorCalls++
-        return new Response(textSse('lesson-alpha'))
+        return new Response(textSse(opts.selectorReply ?? 'lesson-alpha'))
       }
       main.push(body)
       // 每轮：前两步调工具，第三步收尾。第二轮起换成 ls -a：同一个 ls 跨轮
@@ -477,6 +478,27 @@ describe('session e2e：异步注入', () => {
       ).length
     expect(count(main[2]!)).toBe(1)
     expect(count(main.at(-1)!)).toBe(1) // 只有第一轮那条
+  })
+
+  // 2026-11-20：近两周 5–7% 的 recall_select 是 unparsed（回了东西、一个名字
+  // 都没认出），runlog 只记元数据，原文没记、看不出是什么格式问题
+  it('选择器回了东西却没认出名字：原文另存一份；认出名字时不存', async () => {
+    const saved = vi.mocked(logRecallUnparsed)
+    saved.mockClear()
+    for (const selectorReply of ['lesson-alpha', '我觉得都不太相关']) {
+      const { open, selectorCalls } = await setup({ selectorReply })
+      const session = await open()
+      for await (const _ of session.send('改一下 alpha')) void _
+      await session.close()
+      expect(selectorCalls()).toBe(1)
+    }
+    expect(saved).toHaveBeenCalledTimes(1) // 只有第二次
+    expect(saved.mock.calls[0]![0]).toMatchObject({
+      folder: expect.stringContaining('sc-selector-'),
+      turn: expect.any(Number),
+      model: 'm',
+      raw: '我觉得都不太相关',
+    })
   })
 
   it('动作联想：命令碰到 description 点名的程序 → 与选择器同一步拼成一条；下一步不重复；前缀守卫不报', async () => {

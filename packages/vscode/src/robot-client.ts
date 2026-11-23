@@ -1,5 +1,105 @@
 import net from 'node:net'
 
+export type LineClientDeps<T> = {
+  sockPath: string
+  /** 连上后的第一条（窗口身份，§5.5）。每次连上现取——工作区可能变了 */
+  hello: () => object
+  /** 收到一行（已 JSON.parse 成功、类型由 parse 认过）；reply 沿同连接回话 */
+  onMessage: (msg: T, reply: (obj: object) => void) => void
+  /** 行 → 类型。返回 null 的行丢弃（字段不对的坏消息别抛进宿主） */
+  parse: (line: string) => T | null
+  log?: (ev: Record<string, unknown>) => void
+  /** 日志事件名（robot_connect / gateway_connect——各自的可 grep） */
+  evName: { connect: string; disconnect: string }
+  /** [断开后的快重试, 慢重试] 毫秒。测试用小值 */
+  retryMs?: [number, number]
+}
+
+/** 一行一条 JSON 的 unix socket 客户端（robot 与 im 网关共用，§4.1） */
+export function startLineClient<T>(deps: LineClientDeps<T>): {
+  send: (status: object) => void
+  dispose: () => void
+} {
+  const [fastMs, slowMs] = deps.retryMs ?? [1000, 10_000]
+  let sock: net.Socket | null = null
+  let connected = false
+  let disposed = false
+  let tries = 0
+  let timer: NodeJS.Timeout | null = null
+  /** 最新一份 status（还没连上时先存着，连上补发） */
+  let latest: string | null = null
+  /** 这条连接上最后写出去的。status 刷新很频繁（每次目录清单重推），一样的不重发 */
+  let written: string | null = null
+
+  const write = (line: string): void => {
+    sock?.write(`${line}\n`)
+  }
+
+  const flush = (): void => {
+    if (!connected || latest === null || latest === written) return
+    write(latest)
+    written = latest
+  }
+
+  const retry = (): void => {
+    if (disposed || timer !== null) return
+    const ms = tries < FAST_TRIES ? fastMs : slowMs
+    tries++
+    timer = setTimeout(() => {
+      timer = null
+      connect()
+    }, ms)
+  }
+
+  const connect = (): void => {
+    if (disposed) return
+    const s = net.createConnection(deps.sockPath)
+    sock = s
+    let buf = ''
+    s.setEncoding('utf8')
+    s.on('connect', () => {
+      connected = true
+      tries = 0
+      written = null
+      deps.log?.({ ev: deps.evName.connect })
+      write(JSON.stringify(deps.hello()))
+      flush()
+    })
+    s.on('data', (chunk: string) => {
+      buf += chunk
+      for (let i = buf.indexOf('\n'); i >= 0; i = buf.indexOf('\n')) {
+        const line = buf.slice(0, i)
+        buf = buf.slice(i + 1)
+        const msg = deps.parse(line)
+        if (msg !== null) deps.onMessage(msg, (obj) => write(JSON.stringify(obj)))
+      }
+    })
+    // error 之后必有 close；重连只挂在 close 上，免得排两次
+    s.on('error', () => {})
+    s.on('close', () => {
+      if (sock !== s) return
+      if (connected) deps.log?.({ ev: deps.evName.disconnect })
+      sock = null
+      connected = false
+      retry()
+    })
+  }
+
+  connect()
+  return {
+    send: (status) => {
+      latest = JSON.stringify(status)
+      flush()
+    },
+    dispose: () => {
+      disposed = true
+      if (timer !== null) clearTimeout(timer)
+      sock?.destroy()
+      sock = null
+    },
+  }
+}
+
 /**
  * 连桌面机器人的 unix socket（docs/proposals/desktop-robot.md §4）。机器人是
  * 服务端，本窗口的 SC 是客户端：一条长连接，一行一条 JSON，状态每次发整份。
@@ -49,81 +149,9 @@ export function startRobotClient(deps: RobotClientDeps): {
   send: (status: object) => void
   dispose: () => void
 } {
-  const [fastMs, slowMs] = deps.retryMs ?? [1000, 10_000]
-  let sock: net.Socket | null = null
-  let connected = false
-  let disposed = false
-  let tries = 0
-  let timer: NodeJS.Timeout | null = null
-  /** 最新一份 status（还没连上时先存着，连上补发） */
-  let latest: string | null = null
-  /** 这条连接上最后写出去的。status 刷新很频繁（每次目录清单重推），一样的不重发 */
-  let written: string | null = null
-
-  const write = (line: string): void => {
-    sock?.write(`${line}\n`)
-  }
-
-  const flush = (): void => {
-    if (!connected || latest === null || latest === written) return
-    write(latest)
-    written = latest
-  }
-
-  const retry = (): void => {
-    if (disposed || timer !== null) return
-    const ms = tries < FAST_TRIES ? fastMs : slowMs
-    tries++
-    timer = setTimeout(() => {
-      timer = null
-      connect()
-    }, ms)
-  }
-
-  const connect = (): void => {
-    if (disposed) return
-    const s = net.createConnection(deps.sockPath)
-    sock = s
-    let buf = ''
-    s.setEncoding('utf8')
-    s.on('connect', () => {
-      connected = true
-      tries = 0
-      written = null
-      deps.log?.({ ev: 'robot_connect' })
-      write(JSON.stringify(deps.hello()))
-      flush()
-    })
-    s.on('data', (chunk: string) => {
-      buf += chunk
-      for (let i = buf.indexOf('\n'); i >= 0; i = buf.indexOf('\n')) {
-        const msg = parseFromRobot(buf.slice(0, i))
-        buf = buf.slice(i + 1)
-        if (msg !== null) deps.onMessage(msg, (obj) => write(JSON.stringify(obj)))
-      }
-    })
-    // error 之后必有 close；重连只挂在 close 上，免得排两次
-    s.on('error', () => {})
-    s.on('close', () => {
-      if (sock !== s) return
-      if (connected) deps.log?.({ ev: 'robot_disconnect' })
-      sock = null
-      connected = false
-      retry()
-    })
-  }
-
-  connect()
-  return {
-    send: (status) => {
-      latest = JSON.stringify(status)
-      flush()
-    },
-    dispose: () => {
-      disposed = true
-      if (timer !== null) clearTimeout(timer)
-      sock?.destroy()
-      sock = null
-    },
-  }
+  return startLineClient<FromRobot>({
+    ...deps,
+    parse: parseFromRobot,
+    evName: { connect: 'robot_connect', disconnect: 'robot_disconnect' },
+  })
 }

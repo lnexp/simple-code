@@ -35,6 +35,12 @@ import { hasPendingToolCalls, hasUnansweredUserInput, normalizeWithOrigin } from
 import { PrefixBrokenError, type PrefixGuard } from './prefix-guard.ts'
 import { isStubMessage, type RegionSizes, regionSizes } from './regions.ts'
 import { relayHit, relaySave } from './relay-cache.ts'
+import {
+  findRepeatedSuffix,
+  REPETITION_RECOVERY_PROMPT,
+  REPETITION_SCAN_CHARS,
+  RepetitionDetectedError,
+} from './repetition.ts'
 import type { StreamEvent } from './retry.ts'
 import { activateBeyondStubZone } from './summarize.ts'
 import {
@@ -310,6 +316,8 @@ export type LoopContext = {
   lastFinish?: FinishReason | undefined
   /** 已经**连续**因为输出被截断而续写了几次（有一步不需续写即清零）。见 resumeAfterTruncation */
   resumeCount?: number
+  /** 当前 turn 因正文重复自动重发了几次；轮结束后由 session 新建 ctx 归零 */
+  repetitionRetries?: number
   /**
    * 这一轮是不是报错结束的（抛异常、跑满 maxIterations、截断续写用尽）。
    * session 据此给轮记 end_state='error'，下一次 send 续进这一轮
@@ -340,6 +348,11 @@ export type LoopContext = {
    */
   usageCoversUpTo?: number
   /**
+   * 上一次真实 usage 中包含、但逻辑历史没有的请求级提示的估算量。只从预算基线
+   * 扣除，不改 step_finish 携带的真实 usage；下一次没有临时提示的成功请求会清零。
+   */
+  lastUsageExcludedInputTokens?: number
+  /**
    * 最近一次真正发出去的那份请求的**估算**总量（与面板/regions.jsonl 同一把
    * 尺子：regionSizes 各区之和）。只给 llm_usage 日志用——和响应里的真实
    * usage 记在同一行，估算误差才对得上（2026-09-28：面板与底栏数字对不上，
@@ -369,6 +382,9 @@ export type LoopContext = {
  * 输出被截断后最多续写几次。
  */
 const MAX_RESUME = 3
+
+/** 正文循环最多自动重发两次；第三次仍循环就交给用户。 */
+const MAX_REPETITION_RETRIES = 2
 
 /**
  * 顶层入口。**任何未分类的错误都不能让进程崩**（design.md §5.2 第四条地基）：
@@ -780,50 +796,29 @@ async function* runStep(ctx: LoopContext): AsyncIterable<AgentEvent> {
 async function* streamWithOverflowRecovery(
   ctx: LoopContext,
 ): AsyncGenerator<AgentEvent, Accumulator> {
+  let repetitionPrompt: string | undefined
   for (let attempt = 0; ; attempt++) {
-    // 图片缩放只在发出的一份上做（web-tools §2）：库和内存里始终原图，
-    // 每轮从库重新组装、重新压，天然幂等——跟上面 assembleForRequest 对摘要
-    // 是同一条纪律（变换发生在出口，源头不动）
-    const request = {
-      ...ctx.deps.request,
-      messages: await resizeImageParts(assembleForRequest(ctx)),
-    }
-    // **每次尝试都记**，包括 overflow 自救的第 2、3 次——那几次的分区正是
-    // 「卸载到底有没有把 ④ 压下去」的唯一证据
-    // 保底区边界按当前 live 重算一遍（快照口径）。force 路径实际卸穿了
-    // 保底区，重算出的边界偏乐观——观测误差，force 本来就是异常路径
-    const live = ctx.deps.memory?.withTurns(ctx.messages) ?? []
-    const floorStart = ctx.deps.memory
-      ? floorStartIndex(live, floorLimit(ctx.deps.memory, inputBudget(ctx)))
-      : live.length
-    const floorSet = new Set(live.slice(floorStart).map((entry) => entry.message))
-    const sizes = regionSizes(request, floorSet)
-    ctx.lastEstimate =
-      sizes.overhead + sizes.cold + sizes.warm + sizes.hot + sizes.stub + sizes.floor + sizes.live
-    const budget = inputBudget(ctx)
-    // 预算基线的坐标系跟着**真正发出去的那份**走（见 usageCoversUpTo）。
-    // 记在这里而不是外面：overflow 自救会重新拼装、重新卸载，最后一次尝试
-    // 发出去多少条才是 usage 描述的那份，在外面拼第二次会拼出不同的长度
-    ctx.usageCoversUpTo = request.messages.length
+    const { request, guardRequest, sizes, budget } = await prepareRequest(ctx, repetitionPrompt)
+    // usage 基线使用不含临时恢复提示的逻辑历史坐标；提示已经包含在上一次
+    // 请求的真实 usage 中，但不在 ctx.messages 里，不能占掉后续 assistant 的新增位置。
+    ctx.usageCoversUpTo = guardRequest.messages.length
     // 先落盘再发（见 LoopDeps.checkpoint）。在守卫之前：守卫拦下也无妨，
     // 落的是合法的 live 历史
     ctx.deps.checkpoint?.(ctx.messages)
-    let acc = emptyAccumulator()
-    const startedAt = ctx.deps.now()
-    let firstAt: number | null = null
+    let acc: Accumulator
+    let startedAt: number
+    let firstAt: number | null
     // 分区在尝试结束时写（finally）：成功带上真实 usage，失败/被拦 real=null。
     // 仍是每次尝试一行，overflow 自救那几次也在
     let real: number | null = null
     try {
       // 前缀不变式：违规抛 PrefixBrokenError，由 run 的顶层 catch 变成
       // error 事件结束本轮（不发出去——发了就是一次全价请求）
-      ctx.deps.prefixGuard?.check(request)
-      for await (const streamEv of ctx.deps.stream(request, ctx.signal)) {
-        if (firstAt === null) firstAt = ctx.deps.now()
-        const [next, agentEvs] = accumulate(acc, streamEv)
-        acc = next
-        for (const agentEv of agentEvs) yield agentEv
-      }
+      ;({ acc, startedAt, firstAt } = yield* consumeRequest(ctx, request, guardRequest))
+      ctx.lastUsageExcludedInputTokens = repetitionPrompt
+        ? estimateMessageTokens(userParts(repetitionPrompt))
+        : 0
+      repetitionPrompt = undefined
       yield {
         type: 'request_timing',
         ttftMs: (firstAt ?? startedAt) - startedAt,
@@ -833,25 +828,166 @@ async function* streamWithOverflowRecovery(
       real = totalInputTokens(acc.usage) || null
       return acc
     } catch (error) {
-      if (!isContextOverflow(error)) throw error
-      // **已经吐出去的事件不撤回。** 超限一般在流开头就报，但即使中途报了，
-      // 重发会从头再来一遍——UI 上表现为重复文本，比静默丢失好排查
-      if (attempt + 1 >= MAX_OVERFLOW_RECOVERY || !(yield* forceUnload(ctx))) {
-        // **抛而不是发 error 事件后返回。** 返回的话 runLoop 照常进下一轮，
-        // 又发一次同样超限的请求——熔断只挡住了这一步，挡不住外层循环，
-        // 结果还是无限重试（实测：上限 3 但实际发了 11 次）
-        throw new LLMStreamError({
-          kind: 'context_overflow',
-          message:
-            '上下文超过模型窗口上限，卸载历史后仍然放不下。' +
-            '先再发一条消息（超大的一步会自动出窗）；若反复出现，' +
-            '检查该模型 contextWindow 是否大于服务端实际值，或换窗口更大的模型。',
-          retryable: false,
-        })
+      if (error instanceof RepetitionDetectedError) {
+        yield { type: 'restart' }
+        repetitionPrompt = nextRepetitionPrompt(ctx, error)
+        continue
       }
+      if (!isContextOverflow(error)) throw error
+      yield* recoverContextOverflow(ctx, attempt)
     } finally {
       ctx.deps.memory?.recordRegions(sizes, budget, real)
     }
+  }
+}
+
+type PreparedRequest = {
+  request: Request
+  guardRequest: Request
+  sizes: RegionSizes
+  budget: number
+}
+
+async function prepareRequest(
+  ctx: LoopContext,
+  repetitionPrompt: string | undefined,
+): Promise<PreparedRequest> {
+  // 图片缩放只在发出的一份上做（web-tools §2）：库和内存里始终原图，
+  // 每轮从库重新组装、重新压，天然幂等——变换发生在出口，源头不动。
+  const baseMessages = await resizeImageParts(assembleForRequest(ctx))
+  const messages = repetitionPrompt
+    ? [...baseMessages, { role: 'user' as const, parts: userParts(repetitionPrompt) }]
+    : baseMessages
+  const request: Request = { ...ctx.deps.request, messages }
+  // 恢复提示只属于这次发送副本。守卫按逻辑历史检查，提示消费后不会让
+  // 下一次请求看起来像删掉了历史消息。
+  const guardRequest = repetitionPrompt ? { ...request, messages: baseMessages } : request
+  const live = ctx.deps.memory?.withTurns(ctx.messages) ?? []
+  const budget = inputBudget(ctx)
+  const floorStart = ctx.deps.memory
+    ? floorStartIndex(live, floorLimit(ctx.deps.memory, budget))
+    : live.length
+  const floorSet = new Set(live.slice(floorStart).map((entry) => entry.message))
+  const sizes = regionSizes(request, floorSet)
+  ctx.lastEstimate =
+    sizes.overhead + sizes.cold + sizes.warm + sizes.hot + sizes.stub + sizes.floor + sizes.live
+  return { request, guardRequest, sizes, budget }
+}
+
+function nextRepetitionPrompt(ctx: LoopContext, error: RepetitionDetectedError): string {
+  if (error.afterTool) {
+    throw new LLMStreamError({
+      kind: 'doom_loop',
+      message: '检测到重复输出，且本轮已经出现工具调用，已停止自动重试以避免重复执行工具。',
+      retryable: false,
+    })
+  }
+  if ((ctx.repetitionRetries ?? 0) >= MAX_REPETITION_RETRIES) {
+    throw new LLMStreamError({
+      kind: 'doom_loop',
+      message: `检测到重复输出，自动重试 ${MAX_REPETITION_RETRIES} 次后仍未恢复，已停止本轮。`,
+      retryable: false,
+    })
+  }
+  if (!canAppendUser(ctx.messages)) {
+    throw new LLMStreamError({
+      kind: 'doom_loop',
+      message: '检测到重复输出，但当前历史不能安全追加恢复提示，已停止本轮。',
+      retryable: false,
+    })
+  }
+  ctx.repetitionRetries = (ctx.repetitionRetries ?? 0) + 1
+  return REPETITION_RECOVERY_PROMPT
+}
+
+async function* recoverContextOverflow(
+  ctx: LoopContext,
+  attempt: number,
+): AsyncGenerator<AgentEvent, void> {
+  // **已经吐出去的事件不撤回。** 超限一般在流开头就报，但即使中途报了，
+  // 重发会从头再来一遍——UI 上表现为重复文本，比静默丢失好排查。
+  if (attempt + 1 < MAX_OVERFLOW_RECOVERY && (yield* forceUnload(ctx))) return
+  // **抛而不是发 error 事件后返回。** 否则外层循环会再次发同样超限的请求。
+  throw new LLMStreamError({
+    kind: 'context_overflow',
+    message:
+      '上下文超过模型窗口上限，卸载历史后仍然放不下。' +
+      '先再发一条消息（超大的一步会自动出窗）；若反复出现，' +
+      '检查该模型 contextWindow 是否大于服务端实际值，或换窗口更大的模型。',
+    retryable: false,
+  })
+}
+
+type RepetitionState = { text: string; sawToolEvent: boolean }
+
+type ConsumedRequest = { acc: Accumulator; startedAt: number; firstAt: number | null }
+
+async function* consumeRequest(
+  ctx: LoopContext,
+  request: Request,
+  guardRequest: Request,
+): AsyncGenerator<AgentEvent, ConsumedRequest> {
+  const startedAt = ctx.deps.now()
+  let firstAt: number | null = null
+  let acc = emptyAccumulator()
+  const repetition: RepetitionState = { text: '', sawToolEvent: false }
+  const requestController = linkAbortSignal(ctx.signal)
+  try {
+    ctx.deps.prefixGuard?.check(guardRequest)
+    for await (const streamEv of ctx.deps.stream(request, requestController.signal)) {
+      if (firstAt === null) firstAt = ctx.deps.now()
+      const repetitionError = observeRepetition(streamEv, repetition)
+      if (repetitionError) {
+        requestController.abort(repetitionError)
+        throw repetitionError
+      }
+      const [next, agentEvs] = accumulate(acc, streamEv)
+      acc = next
+      for (const agentEv of agentEvs) yield agentEv
+    }
+    return { acc, startedAt, firstAt }
+  } finally {
+    requestController.dispose()
+  }
+}
+
+function observeRepetition(
+  streamEv: StreamEvent,
+  state: RepetitionState,
+): RepetitionDetectedError | null {
+  if (streamEv.type === 'restart') {
+    state.text = ''
+    state.sawToolEvent = false
+  }
+  if (isToolInputEvent(streamEv)) state.sawToolEvent = true
+  if (streamEv.type === 'text_start') state.text = ''
+  if (streamEv.type !== 'text_delta') return null
+  state.text = `${state.text}${streamEv.text}`.slice(-REPETITION_SCAN_CHARS)
+  const match = findRepeatedSuffix(state.text)
+  return match ? new RepetitionDetectedError(match, state.sawToolEvent) : null
+}
+
+function isToolInputEvent(streamEv: StreamEvent): boolean {
+  return (
+    streamEv.type === 'tool_input_start' ||
+    streamEv.type === 'tool_input_delta' ||
+    streamEv.type === 'tool_input_end'
+  )
+}
+
+function linkAbortSignal(parent: AbortSignal): {
+  signal: AbortSignal
+  abort: (reason?: unknown) => void
+  dispose: () => void
+} {
+  const controller = new AbortController()
+  const forward = () => controller.abort(parent.reason)
+  if (parent.aborted) forward()
+  else parent.addEventListener('abort', forward, { once: true })
+  return {
+    signal: controller.signal,
+    abort: (reason) => controller.abort(reason),
+    dispose: () => parent.removeEventListener('abort', forward),
   }
 }
 
@@ -1509,8 +1645,15 @@ const estimateAll = (messages: Message[]): number =>
  * 缓解成「攒够摘要就触发一次」，看着像修好了。**两处必须同一个坐标系**：
  * 下面 `sinceIndex` 传的是拼装后数组的长度，见 `usageCoversUpTo` 的注释。
  */
-const currentUsage = (ctx: LoopContext): number =>
-  contextUsage(assembleForRequest(ctx), ctx.lastUsage ?? null, ctx.usageCoversUpTo ?? 0)
+const currentUsage = (ctx: LoopContext): number => {
+  const usage = contextUsage(
+    assembleForRequest(ctx),
+    ctx.lastUsage ?? null,
+    ctx.usageCoversUpTo ?? 0,
+  )
+  if (ctx.lastUsage === undefined) return usage
+  return Math.max(0, usage - (ctx.lastUsageExcludedInputTokens ?? 0))
+}
 
 /** 输入还能占多少 token。公式和取舍见 `tokens.ts` 的 `inputBudget` */
 function inputBudget(ctx: LoopContext): number {

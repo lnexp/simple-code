@@ -13,14 +13,24 @@ import type {
   WakeRequest,
   WakeResponse,
 } from '@simple-code/core'
-import { forwardBlock, forwardLine, getSession, logRun, scopeOf } from '@simple-code/core'
+import {
+  forwardBlock,
+  forwardLine,
+  getSession,
+  logRun,
+  resolveNodeBin,
+  scopeOf,
+} from '@simple-code/core'
 import * as vscode from 'vscode'
 import { createBridge } from './bridge.ts'
-import { editorRef, tabRef } from './editor-ref.ts'
+import { editorRef, fileNameFromLabel, globEscape, tabRef } from './editor-ref.ts'
+import { checkLarkCli, gatewayPaths, readGatewayConfig } from './gateway-control.ts'
+import { readPushOn, writePushOn } from './gateway-core.ts'
 import { renderHtml } from './html.ts'
 import { bestCandidate } from './openfile-resolve.ts'
-import type { Attendance, ToHost, ToWebview } from './protocol.ts'
+import type { ActiveEditor, Attendance, ToHost, ToWebview } from './protocol.ts'
 import { type RemoteSyncResult, syncRemoteSettings } from './remote.ts'
+import { installRobot, readRobotEnabled, robotInstalled, toggleRobot } from './robot.ts'
 import type { RobotFolderView } from './robot-feed.ts'
 import { createRouter, type Router } from './router.ts'
 import { asSavedChoice } from './saved-choice.ts'
@@ -63,8 +73,18 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private remoteSync: Promise<RemoteSyncResult> | undefined
   private remoteCardShown = false
 
-  /** 桌面机器人的刷新钩子（robot.ts 设）：路由层状态变了、面板显隐变了 */
-  onRobotChange: (() => void) | undefined
+  /** 机器人/网关的刷新钩子（robot.ts、gateway.ts 订阅）：路由层状态变了、
+   *  面板显隐变了。多个订阅者（im-gateway.md §5.4：各窗口单开一份 feed），
+   *  返回取消函数 */
+  private robotChangeSubs = new Set<() => void>()
+  /** 本窗口面板最后一次手打发话的时刻。0 = 没发过（im-gateway.md §5.6） */
+  onRobotChange(cb: () => void): () => void {
+    this.robotChangeSubs.add(cb)
+    return () => this.robotChangeSubs.delete(cb)
+  }
+  private fireRobotChange(): void {
+    for (const cb of this.robotChangeSubs) cb()
+  }
 
   /**
    * `state` 是**工作区级**的 Memento（`context.workspaceState`）。选全局还是
@@ -157,6 +177,37 @@ export class ChatPanel implements vscode.WebviewViewProvider {
             get: (owner) => this.state.get<Attendance>(`attendance.${owner}`) ?? null,
             set: (owner, mode) => void this.state.update(`attendance.${owner}`, mode),
           },
+          // 设置页「飞书推送」（im-gateway.md §5.6）：与网关进程读写同一个
+          // state.json 的 push 键；网关没启用（config.json 没有/enabled 不是
+          // true）→ null，设置页不显示该项
+          gatewayPush: {
+            read: () =>
+              readGatewayConfig(gatewayPaths().config) === null
+                ? null
+                : readPushOn(gatewayPaths().state),
+            write: (on) => writePushOn(gatewayPaths().state, on),
+          },
+          // 设置页「飞书推送」分区的 lark-cli 检测（2026-11-18）：路径随
+          // gateway_push 带给界面；check 跑 --version + auth status
+          gatewayLark: {
+            path: () => readGatewayConfig(gatewayPaths().config)?.larkCli ?? null,
+            check: async () => {
+              const larkCli = readGatewayConfig(gatewayPaths().config)?.larkCli
+              if (larkCli === undefined) {
+                return { larkCli: '', installed: false, error: '网关配置缺 larkCli' }
+              }
+              return checkLarkCli(await resolveNodeBin(), larkCli)
+            },
+          },
+          // 设置页「桌面机器人」开关（2026-11-18 用户拍板）：转发机器人
+          // 插件的 enable/disable 命令，进程操作不进 SC；安装复用 installRobot
+          robot: {
+            mac: process.platform === 'darwin' && vscode.env.remoteName === undefined,
+            installed: () => robotInstalled(),
+            read: () => readRobotEnabled(),
+            toggle: (on) => toggleRobot(on),
+            install: () => installRobot(),
+          },
           openExternal: (url) => vscode.env.openExternal(vscode.Uri.parse(url)),
           // vscode.open 而不是 showTextDocument：后者只收文本文件，vscode.open
           // 对图片/二进制交给对应的编辑器（PNG 会开内置预览，和 view_image 体验闭环）
@@ -217,7 +268,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         }),
       folders: () => folderList(),
       saveFolder: (f) => void this.state.update(FOLDER_KEY, f),
-      onChange: () => this.onRobotChange?.(),
+      onChange: () => this.fireRobotChange(),
     })
 
     // 上次选的文件夹可能不是 router 的 pick() 默认值（folders[0]）——
@@ -238,9 +289,13 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     view.webview.onDidReceiveMessage((msg: ToHost) => {
       // 当前文件按钮的初值：webview 的监听在 ready 之前就挂好了，这时推不丢
       if (msg.type === 'ready') this.postActiveEditor()
+      // 面板手打发话：通知网关重读（它要即时看到任务变化）
+      if (msg.type === 'send' || msg.type === 'task_send') {
+        this.fireRobotChange()
+      }
       this.router?.handle(msg)
     })
-    view.onDidChangeVisibility(() => this.onRobotChange?.())
+    view.onDidChangeVisibility(() => this.fireRobotChange())
 
     view.onDidDispose(() => {
       // **只在还是自己的时候才清。** 旧 view 的 dispose 可能在新 view 建好
@@ -248,7 +303,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       if (this.view !== view) return
       this.router?.detachAll() // 不 dispose：bridge 与 session 的生命周期见字段注释
       this.view = undefined
-      this.onRobotChange?.()
+      this.fireRobotChange()
     })
   }
 
@@ -261,14 +316,47 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   /** 底栏「当前文件」按钮（editor-ref.ts）。全窗口一份，不跟文件夹走，所以不过
    *  router。只认 file：diff 左侧（git:）、未保存的 untitled 都没路径可给。
    *  文本编辑器带选区；不是（图片/PDF 预览、notebook，activeTextEditor 为空）
-   *  就看活动标签，只带路径 */
+   *  就看活动标签，只带路径。内置图片预览 tab 的 input 是 undefined
+   *  （editor-ref.ts 注释的真机事实），只剩 label——像文件名就 findFiles
+   *  兜底，唯一命中才给（多根工作区同名不给）。seq 守卫：同步路径先到，
+   *  在途的 findFiles 结果作废（它慢一拍） */
+  private activeEditorSeq = 0
+
   postActiveEditor(): void {
+    const seq = ++this.activeEditorSeq
     const ed = vscode.window.activeTextEditor
     const doc = ed?.document
-    const editor =
-      ed !== undefined && doc !== undefined && doc.uri.scheme === 'file'
-        ? editorRef(doc.uri.fsPath, ed.selection, (i) => doc.lineAt(i).text)
-        : tabRef(vscode.window.tabGroups.activeTabGroup.activeTab?.input)
+    if (ed !== undefined && doc !== undefined && doc.uri.scheme === 'file') {
+      this.pushActiveEditor(
+        seq,
+        editorRef(doc.uri.fsPath, ed.selection, (i) => doc.lineAt(i).text),
+      )
+      return
+    }
+    const tab = vscode.window.tabGroups.activeTabGroup.activeTab
+    const direct = tabRef(tab?.input)
+    if (direct !== null || tab === undefined) {
+      this.pushActiveEditor(seq, direct)
+      return
+    }
+    const name = fileNameFromLabel(tab.label)
+    if (name === null) {
+      this.pushActiveEditor(seq, null)
+      return
+    }
+    // maxResults 2：只需要分辨「0 / 1 / 多个」，多一个都是不给
+    void vscode.workspace
+      .findFiles(`**/${globEscape(name)}`, undefined, 2)
+      .then((uris) =>
+        this.pushActiveEditor(
+          seq,
+          uris.length === 1 && uris[0] !== undefined ? { path: uris[0].fsPath } : null,
+        ),
+      )
+  }
+
+  private pushActiveEditor(seq: number, editor: ActiveEditor | null): void {
+    if (seq !== this.activeEditorSeq) return
     const msg: ToWebview = { type: 'active_editor', editor }
     void this.view?.webview.postMessage(msg)
   }
@@ -318,6 +406,20 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   }
   robotAllow(toolCallId: string): boolean {
     return this.router?.allow(toolCallId) ?? false
+  }
+  robotDeny(toolCallId: string, reason?: string): boolean {
+    return this.router?.deny(toolCallId, reason) ?? false
+  }
+  /** 网关送话进来（im-gateway.md §5.4 send）：null = 已入队/开轮 */
+  gatewaySend(folder: string, owner: string, text: string): string | null {
+    // 不能写 `?? '面板还没打开'`：bridge 成功时返回 null，?? 会把 null 也
+    // 换成错误文案——消息送达了手机却收到「没送达」（真机验收 15:00 抓到）
+    if (this.router === undefined) return '面板还没打开'
+    return this.router.gatewaySend(folder, owner, text)
+  }
+  /** 网关急停（§5.4 stop） */
+  gatewayStop(folder: string, owner: string): boolean {
+    return this.router?.gatewayStop(folder, owner) ?? false
   }
   robotFocus(folder: string, task: string | null): void {
     this.router?.focus(folder, task)

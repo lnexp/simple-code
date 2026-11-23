@@ -196,6 +196,7 @@ search 定位 turn 作据、在 progress 行注明证据形态；「没再复现
    纠正 = 用户指出 agent 说错、做错，或提出了已否决/已存在的东西；
    用户改自己的主意、补新要求不算。不靠关键词——没有纠正词的纠正
    （如「定期检查就是反思」）一样算。〔系统〕模型切换行不算用户消息。
+   任务里的轮也在 log 里，照样找；任务首轮是任务书，不算。
 3. 逐条判定。每条纠正先跑检索再定类，判定只凭命令输出：
    - 必跑："$SIMPLE_CODE_NOTE" search <主题词> --all（默认跨普通记录、教训、原则、目标、词条；主题词取纠正里的
      名词，一次多试用 OR），涉及约定再 grep AGENTS.md。报告里每条
@@ -203,10 +204,19 @@ search 定位 turn 作据、在 progress 行注明证据形态；「没再复现
    - 没跑检索的不能判「新错误」，记「未判定」。
    - 新错误：纠正前库里（note/lesson/AGENTS.md 及否决清单/代码）
      没有能避免它的内容。
-   - 重复·没想起来：有，但出错时不在上下文——条目不在常驻区，也
-     没在出错那几轮的 turn 文件里出现（grep 条目名核实）。
+   - 重复·没想起来：有，但出错时不在上下文——条目不在常驻区，没在
+     出错那几轮的 turn 文件里出现（grep 条目名核实），recall 也没推过
+     （查法见下条）。
    - 重复·想起来没用上：有，且出错时在上下文（在常驻区，或那几轮
-     turn 文件里读过、被 recall 过）。
+     turn 文件里读过、被 recall 推过）。
+   - recall 推过没推过，turn 文件里看不到，查 runlog（在项目根执行）：
+     grep -h -E '"turn":(<轮号1>|<轮号2>),' ~/.simple-code/logs/*.jsonl
+     | grep -F '"folder":"'"$PWD"'"' | grep -E '"ev":"recall_(inject|touch)"'
+     出错那几轮的 names 里有该条目 = 当轮推送；skipped 里有 = 更早推过、
+     SC 判它仍在上下文——两种都算在上下文，证据写明轮号与字段。runlog
+     只留约两周，查不到就退查 sqlite3 .simple-code/memory/state.db
+     "select turn_id, names from async_cues where turn_id in (<轮号>)"
+     （库里只有推送，没有 skipped）。
    重复必附证据：用户原话 + turn 号；既有条目路径 + 创建日期（front
    matter 的 created、git log 或条目自带日期，命令核实，不凭印象），
    且创建日期早于纠正。证据不足记「未判定」，不进重复数。
@@ -215,7 +225,9 @@ search 定位 turn 作据、在 progress 行注明证据形态；「没再复现
    where id=<turn>" 的输出。推翻已有判定（含以前的试算）同此标准。
 4. 写账本。首次用 apply_patch Add File 建，内容为下面两行表头；之后
    cat >> 追加一行，追加后 tail -3 复读。明细每条只写 turn 号、一句话、
-   类别、条目名，完整证据进报告。
+   类别、条目名，完整证据进报告。任务里的轮在 turn 号后标「(任务)」：
+   sqlite3 .simple-code/memory/state.db "select owner from turns where
+   id=<turn>" 非空即任务（任务也跑 recall 起，要分开看两边的重复数）。
    | 反思时间 | 覆盖 turn | 纠正 | 重复·没想起来 | 重复·想起来没用上 | 未判定 | 明细 |
    |---|---|---|---|---|---|---|
    反思时间取 date '+%Y-%m-%d %H:%M:%S' 输出；覆盖 turn 写「起–止」。

@@ -6,12 +6,12 @@
  * 生命周期、失败路径任务保留可重试、reload 恢复。
  */
 
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { HistoryRow, Session, SetTimer } from '@simple-code/core'
-import { listTaskManifests, MEMORY_RELATIVE, openStore } from '@simple-code/core'
+import { listTaskManifests, manifestPath, MEMORY_RELATIVE, openStore } from '@simple-code/core'
 import { describe, expect, it, vi } from 'vitest'
 import type { BridgeDeps } from '../src/bridge.ts'
 import { createBridge } from '../src/bridge.ts'
@@ -747,6 +747,31 @@ describe('分身任务接线', () => {
       .filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks')
       .at(-1)
     expect(snap?.tasks[0]?.status).toBe('idle')
+  })
+
+  it('关闭时 manifest 已不在（外部 finalize 过）→ 清条不报错，不再卡死', async () => {
+    const h = taskHarness({ realStore: true })
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'task_dispatch', brief: '外部已收尾的任务' })
+    for (let i = 0; i < 3; i++) await settle()
+    const snap0 = h.posted
+      .filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks')
+      .at(-1)
+    const name = snap0?.tasks[0]?.name
+    // 模拟外部 finalize：段已合回、manifest 已删（测试脚本/异常路径）
+    const m = listTaskManifests(h.depsFolder).find((x) => x.name === name)
+    expect(m).toBeDefined()
+    rmSync(manifestPath(h.depsFolder, m!.owner))
+    h.posted.length = 0
+    h.bridge.handle({ type: 'task_close', name: name as string })
+    for (let i = 0; i < 5; i++) await settle()
+    // 不 fatal（此前 flipTaskLive 读 manifest 直接 ENOENT，任务永远关不掉）
+    expect(h.posted.some((x) => x.type === 'fatal')).toBe(false)
+    const snap = h.posted
+      .filter((x): x is Extract<ToWebview, { type: 'tasks' }> => x.type === 'tasks')
+      .at(-1)
+    expect(snap?.tasks.some((t) => t.name === name)).toBe(false)
   })
 
   it('分支跑着时 task_send → 插话（session.send 直接入队，状态不降）', async () => {
@@ -1968,5 +1993,33 @@ describe('自动反思接线', () => {
     await settle()
     expect(h.posted.some((m) => m.type === 'reflect_result' && m.ok)).toBe(true)
     expect(readFileSync(startFile(h), 'utf8')).toContain('lastStart')
+  })
+})
+
+describe('任务拉段开关（2026-11-21 用户定：任务默认独立）', () => {
+  it('task_pull_set 写 manifest、快照反映；默认关', async () => {
+    const h = taskHarness({})
+    h.bridge.handle({ type: 'ready' })
+    await settle()
+    h.bridge.handle({ type: 'task_dispatch', brief: '调研某库\n细节' })
+    await settle()
+    await settle()
+    // 默认：快照 false，manifest 不带字段（老 manifest 语义）
+    const snap = (h: ReturnType<typeof taskHarness>) =>
+      h.posted
+        .filter((m): m is Extract<ToWebview, { type: 'tasks' }> => m.type === 'tasks')
+        .at(-1)
+    expect(snap(h)?.tasks[0]?.pullSegments).toBe(false)
+    expect(listTaskManifests(h.depsFolder)[0]?.pullSegments).toBeUndefined()
+    // 开：manifest 写 true（store 现读，跑着的任务下一轮生效），快照 true
+    h.bridge.handle({ type: 'task_pull_set', task: '调研某库', on: true })
+    await settle()
+    expect(snap(h)?.tasks[0]?.pullSegments).toBe(true)
+    expect(listTaskManifests(h.depsFolder)[0]?.pullSegments).toBe(true)
+    // 关回去：落盘 false
+    h.bridge.handle({ type: 'task_pull_set', task: '调研某库', on: false })
+    await settle()
+    expect(snap(h)?.tasks[0]?.pullSegments).toBe(false)
+    expect(listTaskManifests(h.depsFolder)[0]?.pullSegments).toBe(false)
   })
 })

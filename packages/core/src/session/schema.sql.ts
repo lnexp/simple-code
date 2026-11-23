@@ -264,8 +264,10 @@ export const MIGRATIONS = [
   // 幂等，每次开库跑一遍无害
   `ALTER TABLE messages ADD COLUMN owner TEXT`,
   `CREATE INDEX IF NOT EXISTS messages_owner ON messages(owner)`,
-  `UPDATE messages SET owner = (SELECT t.owner FROM turns t WHERE t.id = messages.turn_id)
-   WHERE owner IS NULL AND turn_id IN (SELECT id FROM turns WHERE owner IS NOT NULL)`,
+  // 老行的 owner 回填不在这里：它每次开库都要全量扫 owner IS NULL 的索引段
+  // （2026-11-18 真库（977MB）实测 0 行待回填也扫 1.9s——切目录/派任务
+  // 重建 session 每次都付，loop_lag 主源头），挪进 migrations 标记通道
+  // 一次性跑（store.ts backfillMessageOwner）
   // turn 续接（docs/proposals/turn-resume.md，2026-09-29 拍板）：轮怎么结束的
   // + 最后一次结束时刻。end_state：'done' | 'aborted' | 'error'，NULL = 老轮
   // 或进行中，按 done 对待（不续）。ended_at 单独一列而不是 started_at +

@@ -63,6 +63,21 @@ describe('REFLECT_TASK_BOOK', () => {
     expect(REFLECT_TASK_BOOK).toContain("grep -m1 '^created'")
   })
 
+  // 2026-11-20：recall 注入不进 turn 文件（存 async_cues），只 grep turn 文件会把
+  // 「推过没读」判成「没想起来」（t21875：t21864 已推、21874 skipped 仍判没想起来）。
+  // 任务也跑 recall（b800411）起要分开看主任务/任务的重复数
+  it('第五步：recall 推过查 runlog 的 names/skipped，库兜底；任务轮标记', () => {
+    const diag = REFLECT_TASK_BOOK.slice(REFLECT_TASK_BOOK.indexOf('## 第五步：自我诊断（必做）'))
+    expect(diag).toContain('~/.simple-code/logs/*.jsonl')
+    expect(diag).toContain('"ev":"recall_(inject|touch)"')
+    expect(diag).toContain('skipped 里有 = 更早推过')
+    expect(diag).toContain('from async_cues where turn_id in')
+    expect(diag).toContain('任务里的轮在 turn 号后标「(任务)」')
+    expect(diag).toContain('select owner from turns where')
+    // 模板字符串里写 \" 会被吃成 "，渲染出的命令引号错位
+    expect(diag).toContain(`grep -F '"folder":"'"$PWD"'"'`)
+  })
+
   // 2026-11-12 用户定：反思的产物就是 wiki 词条（note reflection-design-memory-5w1h）。
   // 一个机制一条、原地改写；头部三字段供到期判定（git log verified..HEAD -- files）；
   // description 带文件名才接得上触及提醒

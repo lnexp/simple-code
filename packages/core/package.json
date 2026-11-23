@@ -1,6 +1,6 @@
 {
   "name": "@simple-code/core",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": true,
   "type": "module",
   "exports": {
@@ -14,7 +14,8 @@
     "tree-sitter-bash": "0.25.0",
     "turndown": "^7.2.4",
     "web-tree-sitter": "0.25.10",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "jsonc-parser": "3.2.0"
   },
   "devDependencies": {
     "@types/turndown": "^5.0.6"

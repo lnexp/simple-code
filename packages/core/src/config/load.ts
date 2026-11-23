@@ -209,6 +209,10 @@ export async function loadConfig(
   })
 }
 
+/** 全局配置文件不存在。设置页据此类错误改走首开表单（别的配置错误
+ *  照旧红框报错）——不靠 message 前缀判断，改文案不会悄悄改行为 */
+export class MissingConfigError extends Error {}
+
 async function readJson(path: string, required = false): Promise<unknown> {
   let text: string
   try {
@@ -217,7 +221,9 @@ async function readJson(path: string, required = false): Promise<unknown> {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     if (!required) return null // 工作区覆盖文件可选；模型凭据只认用户级配置
     // 放在共用加载入口：面板、终端对话和 --models 都需要首次运行指引。
-    throw new Error(
+    // （2026-11-17 起面板侧还会拦住这个错改走设置页首开表单，终端 CLI
+    // 仍看到这段完整指引。）
+    throw new MissingConfigError(
       `还没有配置文件：${path}\n\n` +
         `请按快速开始创建配置：\nhttps://github.com/lnexp/simple-code#快速开始\n\n` +
         `配置中可用 \${SIMPLE_CODE_API_KEY} 引用密钥环境变量，别把 key 写进文件。\n` +

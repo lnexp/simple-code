@@ -236,18 +236,40 @@ export function closeSegments(db: Db, key: string, folder: string, name?: string
  * 摘要又新又多，A 顺着 B 的上下文作答（真机互串）。主任务从不关闭，它的段
  * 也就不再流进开着的任务；任务开场仍从主干复制（带出处标签）
  */
-export function pullableSegments(db: Db, key: string, below: number): SegmentRow[] {
+/** merged = true 跳过 closed 检查（拉段开关开的任务，行为回到 2026-11-19
+ *  之前：merged 即拉）。见 manifestPullSegments */
+export function pullableSegments(
+  db: Db,
+  key: string,
+  below: number,
+  merged = false,
+): SegmentRow[] {
   return db.all<SegmentRow>(
     `SELECT ${COLS} FROM segments g
      WHERE g.state = 'merged' AND g.owner <> ? AND g.step_ceil <= ?
-       AND (g.closed = 1 OR ? = '${TRUNK}')
+       AND (g.closed = 1 OR ? = '${TRUNK}' OR ?)
        AND NOT EXISTS (SELECT 1 FROM segment_pulls p WHERE p.owner = ? AND p.segment_id = g.id)
      ORDER BY g.step_floor`,
     key,
     below,
     key,
+    merged ? 1 : 0,
     key,
   )
+}
+
+/** 任务拉段开关（2026-11-21 用户定）：manifest 没写或 false = 完全独立。
+ *  主任务不走这里（无 manifest，恒开）。不 import task.ts（循环依赖，
+ *  同 manifestName） */
+export function manifestPullSegments(root: string, owner: string): boolean {
+  try {
+    const m = JSON.parse(
+      readFileSync(join(root, '.simple-code', 'tasks', `${owner}.json`), 'utf8'),
+    ) as { pullSegments?: unknown }
+    return m.pullSegments === true
+  } catch {
+    return false
+  }
 }
 
 /** 段里每条摘要行原样写进来要补的头部与路径（store.ts headOfStep） */

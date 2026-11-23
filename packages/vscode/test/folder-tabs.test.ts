@@ -108,6 +108,10 @@ describe('溢出折叠（mock 宽度）', () => {
     const host = mount([folder('/w/a'), folder('/w/b'), folder('/w/c'), folder('/w/d')], '/w/d')
     // 溢出菜单的触发器存在（还有折进去的）
     expect(host.querySelector('.folder-overflow')).not.toBeNull()
+    // 「»」不能在裁剪层里：放里面弹层被 overflow hidden 裁掉、打开时
+    // scrollIntoView 把整排 tab 滚走（11-18 窄宽度下拉目录看不到）
+    expect(host.querySelector('.folder-tabs-clip .folder-overflow')).toBeNull()
+    expect(host.querySelector('.folder-tabs > .picker .folder-overflow')).not.toBeNull()
     // 平铺区：a、d。d 是 active 从溢出区提升，b（平铺末位）给它让位
     // 挤下去——active 必须可见，代价只摊到末位这一个 tab
     const tabs = [...host.querySelectorAll('.folder-tab:not(.tab-shadow)')]

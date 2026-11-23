@@ -3,18 +3,23 @@ import { promisify } from 'node:util'
 import {
   type AgentEvent,
   type ApprovalAsk,
+  applySettingsEdit,
   type CompactResult,
   computeMemoryStats,
   type Effort,
+  GLOBAL_CONFIG_PATH,
   type ImageInput,
   lastRegionLine,
   listModels,
   logRun,
+  MissingConfigError,
   type ModelRef,
+  readSettingsView,
   regionsEstimate,
   type Session,
   type SessionOptions,
   type SetTimer,
+  type SettingsEdit,
   type TaskDispatchResponse,
   type TaskManifest,
   type TaskModelsResponse,
@@ -33,6 +38,7 @@ import {
 import type {
   ApprovalRequest,
   Attendance,
+  GatewayCheck,
   TaskDraftDefaults,
   ToHost,
   ToWebview,
@@ -120,6 +126,33 @@ export type BridgeDeps = {
    */
   openFile: (path: string, line?: number) => Thenable<unknown>
   /**
+   * 设置页实际读写的文件（2026-11-17）：本地是全局 settings.json，Remote-SSH
+   * 是 settings.remote.json（session 工厂同一个来源）。不传 = 全局默认位，
+   * 测试注临时目录
+   */
+  settingsPath?: () => Promise<string>
+  /**
+   * 设置页「飞书推送」开关（im-gateway.md §5.6）。read 返回 null = 网关没
+   * 启用；不传 = 同 null（测试、没接网关的宿主）
+   */
+  gatewayPush?: { read: () => boolean | null; write: (on: boolean) => void }
+  /**
+   * 设置页「飞书推送」分区的 lark-cli 检测（2026-11-18）：path 随
+   * gateway_push 带给界面；check 是 gateway_check 的响应
+   */
+  gatewayLark?: { path: () => string | null; check: () => Promise<GatewayCheck> }
+  /**
+   * 设置页「桌面机器人」开关（2026-11-18 用户拍板）。mac=false → 界面不
+   * 显示分区；installed=false → 显示安装按钮。不传 = 同 mac:false（测试）
+   */
+  robot?: {
+    mac: boolean
+    installed: () => boolean
+    read: () => boolean
+    toggle: (on: boolean) => Promise<void>
+    install: () => Promise<void>
+  }
+  /**
    * 上次选的模型，没选过返回 null。
    *
    * **按工作区存，不是全局。** 不回写用户级配置文件：那份文件
@@ -162,6 +195,14 @@ export type Bridge = {
   /** 机器人上点「允许」：按 toolCallId 找此刻确实在等的卡，走面板点允许的同一条路。
    *  卡已处理/已超时 = false（乱发的 toolCallId 批不了任何东西，§5.2） */
   allowToolCall: (toolCallId: string) => boolean
+  /** 手机上回「拒 / 拒 理由」（im-gateway.md §6）：同 allowToolCall 的找卡路，
+   *  结局走面板拒绝；带理由时模型读到理由。没这张卡 = false */
+  denyToolCall: (toolCallId: string, reason?: string) => boolean
+  /** 网关送话进来（§5.4 send）：主任务 resume+send、任务 resume+tasks.send。
+   *  返回 null = 已入队/开轮；字符串 = 拒绝原因（给手机回话用） */
+  gatewaySend: (owner: string, text: string) => string | null
+  /** 网关急停（§5.4 stop）：owner='' 停主任务（同面板停止按钮），否则停该任务 */
+  stopOwner: (owner: string) => boolean
   /**
    * 挂起中的审批数。路由层用它给后台文件夹的标签点角标——卡片本身不跨
    * 标签显示（怕人在没有对话上下文时误批），但「那边有事等着」要能看见
@@ -620,6 +661,14 @@ export function createBridge(deps: BridgeDeps): Bridge {
   }
   let closing: Promise<void> | null = null
 
+  /** 停主任务（面板停止按钮 / 网关 stop 的同一条路）：审批等待一并按
+   *  拒绝收场——用户点停止时不想让任何东西挂着。session 还没建是空操作 */
+  const stopMain = (): void => {
+    if (running) stopRequested = true
+    for (const id of pendingApprovals.keys()) finishApproval(id, 'deny')
+    void pending?.then((s) => s.interrupt('stop'))
+  }
+
   const getSession = (): Promise<Session> => {
     // **失败不留在缓存里**（t886）：settings.json 写坏时 loadConfig 抛异常，
     // 而 pending ??= 缓存的是 Promise 本身——rejected 的那个会一直被返回，
@@ -667,14 +716,12 @@ export function createBridge(deps: BridgeDeps): Bridge {
    */
   const onSessionReady = (session: Session): void => {
     idle ??= watchIdle(session, deps.setTimer)
-    // models 列表来自配置，一生成一次就够。**saved 恢复不行**：detach 会
-    // closeSession，重建的 session 从配置默认模型起跑——gate 连恢复带
-    // refresh 一起挡的话，第二次及以后的 session 永远拿不回用户的选择，
-    // bridge.current 也没人重置，UI 显示上次选择、请求走默认，当场分裂
-    // （真机踩过：UI 显示 model-a，请求全是 model-b）。
-    // 恢复本身幂等（setModel 同模型早退），重复跑无害
-    if (models.length === 0) models = listModels(session.config.config)
-    taskDraft ??= draftDefaults(session.config, session.defaultModel, models)
+    // models / taskDraft **每次 session 建好都重算**（2026-11-17 改）：设置页
+    // 写回 → watcher 关 session → 下次交互重建，配置里的模型清单已经变了，
+    // 沿用旧清单的话模型下拉永远缺新加的那个。重算很便宜（一次 flatMap），
+    // saved 恢复照样在其后跑（setModel 同模型早退，幂等）
+    models = listModels(session.config.config)
+    taskDraft = draftDefaults(session.config, session.defaultModel, models)
     const saved = deps.savedChoice()
     if (saved) {
       try {
@@ -804,7 +851,84 @@ export function createBridge(deps: BridgeDeps): Bridge {
       onSessionReady(session)
       post({ type: 'bg_processes', items: session.bgSnapshot() })
     } catch (error) {
+      // 缺的不是「坏了」是「还没有」：新用户第一次打开面板，红框报错换成
+      // 首开表单（设置页 2026-11-17）。别的配置错误（写坏、schema 拒收）
+      // 仍走 fatal——那个表单救不了
+      if (error instanceof MissingConfigError) {
+        post({ type: 'settings_view', view: await readSettingsView(await settingsPath()) })
+        return
+      }
       post({ type: 'fatal', message: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  /** 设置页实际读写的文件。deps 不传时用全局默认位（与 loadConfig 同回落） */
+  const settingsPath = async (): Promise<string> =>
+    (await deps.settingsPath?.()) ?? GLOBAL_CONFIG_PATH
+
+  /** 桌面机器人开关状态：mac=false 时也照发（界面据 mac 决定不显示分区） */
+  const postRobotState = (): void =>
+    post({
+      type: 'robot_state',
+      mac: deps.robot?.mac ?? false,
+      installed: deps.robot?.mac === true && deps.robot.installed(),
+      on: deps.robot?.read() ?? true,
+    })
+
+  const postSettingsView = (): void => {
+    void (async () => {
+      post({ type: 'settings_view', view: await readSettingsView(await settingsPath()) })
+      postGatewayPush()
+      postRobotState()
+    })()
+  }
+
+  const postGatewayPush = (): void =>
+    post({
+      type: 'gateway_push',
+      on: deps.gatewayPush?.read() ?? null,
+      larkCli: deps.gatewayLark?.path() ?? null,
+    })
+
+  /** 设置页「settings.json」按钮：只打开，不选中行——设置页的定位是
+   *  「看/改」，不是报错定位 */
+  const openSettingsFile = async (): Promise<void> => {
+    void deps.openFile(await settingsPath())
+  }
+
+  /**
+   * 设置页写回（2026-11-17）。成功后三件事：
+   * 1. 回 settings_result 带新视图；
+   * 2. models/current 立即跟着新配置走——模型下拉不用等下一次交互才见新模型
+   *    （session 本身仍由 watcher 的 requestReload 关闭、下次用时重建）；
+   * 3. pushState 让 webview 收到。
+   * 跑着时写回也放行：改的是配置文件，影响的是之后的轮，不打断在跑的
+   */
+  const writeSettings = async (edit: SettingsEdit): Promise<void> => {
+    try {
+      const view = await applySettingsEdit(await settingsPath(), edit)
+      models = view.models
+      // 当前模型被删/配置首建：显示跟随配置默认。仍有效的选择不动——
+      // 「这轮想用哪个」是用户的选择，不因为改了配置就丢
+      if (
+        current === null ||
+        !models.some((m) => m.provider === current?.provider && m.model === current?.model)
+      ) {
+        current = view.defaultRef
+        const spec = view.providers
+          .find((p) => p.name === view.defaultRef?.provider)
+          ?.models.find((m) => m.model === view.defaultRef?.model)
+        imagesEnabled = spec?.images ?? false
+        contextWindow = spec?.contextWindow ?? 0
+      }
+      post({ type: 'settings_result', ok: true, view })
+      pushState()
+    } catch (error) {
+      post({
+        type: 'settings_result',
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      })
     }
   }
 
@@ -1034,7 +1158,14 @@ export function createBridge(deps: BridgeDeps): Bridge {
     robotView: () => ({
       tasks: [
         // 主任务 = 用户直接对话，完成提醒始终面向它
-        { task: null, running, startedAt: currentTurnStartedAt, lastTurn, userTouched: true },
+        {
+          task: null,
+          owner: '',
+          running,
+          startedAt: currentTurnStartedAt,
+          lastTurn,
+          userTouched: true,
+        },
         ...tasks.robotViews(),
       ],
       approvals: [...pendingApprovals.values()].map((e) => e.card),
@@ -1046,6 +1177,34 @@ export function createBridge(deps: BridgeDeps): Bridge {
         return true
       }
       return false
+    },
+    denyToolCall: (toolCallId, reason) => {
+      for (const [id, e] of pendingApprovals) {
+        if (e.card.toolCallId !== toolCallId) continue
+        finishApproval(id, reason === undefined ? 'deny' : { deny: reason })
+        return true
+      }
+      return false
+    },
+    gatewaySend: (owner, text) => {
+      if (owner === '') {
+        // 与面板手打同一条路：算用户手动发话，解除排队暂停（§5.5）
+        turnQueue.resume('')
+        void send(text).catch(() => {})
+        return null
+      }
+      const name = tasks.nameOfOwner(owner)
+      if (name === null) return `电脑上没有这个任务（${owner}）`
+      turnQueue.resume(owner)
+      return tasks.send(name, text)
+    },
+    stopOwner: (owner) => {
+      if (owner !== '') {
+        const name = tasks.nameOfOwner(owner)
+        return name !== null && tasks.stop(name)
+      }
+      stopMain()
+      return true
     },
     pendingApprovals: () => pendingApprovals.size,
     rehydrateTasks: () => tasks.rehydrate(),
@@ -1093,6 +1252,55 @@ export function createBridge(deps: BridgeDeps): Bridge {
         case 'ready':
           attach()
           return
+        case 'settings_get':
+          postSettingsView()
+          return
+        case 'settings_openFile':
+          void openSettingsFile()
+          return
+        case 'settings_write':
+          void writeSettings(msg.edit)
+          return
+        case 'gateway_push_set':
+          // webview 是不可信面：只认布尔；写完回读一次，开关显示以文件为准
+          if (typeof msg.on === 'boolean') deps.gatewayPush?.write(msg.on)
+          postGatewayPush()
+          return
+        case 'robot_toggle': {
+          // 转发机器人插件命令（静默）。disable 要等 app 退出（最多 3s），
+          // 完成后回读一次再推——期间开关停旧值，不乐观翻转
+          if (typeof msg.on === 'boolean')
+            void deps.robot?.toggle(msg.on).then(postRobotState, postRobotState)
+          return
+        }
+        case 'robot_install': {
+          // 安装走 installRobot（VS Code 自己的 installExtension，错误提示
+          // 它已带）。装完重读：installed 变 true，开关接替按钮
+          void deps.robot?.install().then(postRobotState, postRobotState)
+          return
+        }
+        case 'gateway_check': {
+          // 检测按钮：宿主跑 lark-cli 两条命令，结果回填界面。check 自己
+          // 不抛（超时兜底在 checkLarkCli 里），但 catch 一层防宿主实现漏
+          const larkCli = deps.gatewayLark?.path() ?? null
+          void Promise.resolve(deps.gatewayLark?.check()).then(
+            (result) =>
+              post({
+                type: 'gateway_check_result',
+                result: result ?? {
+                  larkCli: larkCli ?? '',
+                  installed: false,
+                  error: '宿主未接检测',
+                },
+              }),
+            (error: unknown) =>
+              post({
+                type: 'gateway_check_result',
+                result: { larkCli: larkCli ?? '', installed: false, error: String(error) },
+              }),
+          )
+          return
+        }
         case 'send':
           // 用户手动发话：解除排队暂停（闹钟、任务回调直调 send，不经这里，
           // 它们开的轮正常结束不解除——docs/proposals/queued-sends.md）
@@ -1111,10 +1319,7 @@ export function createBridge(deps: BridgeDeps): Bridge {
           return
         case 'interrupt':
           // session 还没建就中断是空操作，不用判断
-          // 审批等待也一并按拒绝收场——用户点停止时不想让任何东西挂着
-          if (running) stopRequested = true
-          for (const id of pendingApprovals.keys()) finishApproval(id, 'deny')
-          void pending?.then((s) => s.interrupt('stop'))
+          stopMain()
           return
         case 'approval_reply':
           finishApproval(
@@ -1272,6 +1477,9 @@ export function createBridge(deps: BridgeDeps): Bridge {
           else postTurnQueue()
           return
         }
+        case 'task_pull_set':
+          tasks.pullSet(msg.task, msg.on)
+          return
         case 'task_stop':
           tasks.stop(msg.name)
           return

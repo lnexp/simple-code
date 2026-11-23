@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { editorRef, SELECTION_TEXT_LIMIT, type SelectionLike, tabRef } from '../src/editor-ref.ts'
+import {
+  editorRef,
+  fileNameFromLabel,
+  globEscape,
+  SELECTION_TEXT_LIMIT,
+  type SelectionLike,
+  tabRef,
+} from '../src/editor-ref.ts'
 
 /** 0 起行号 → 「第 N 行」（N 为 1 起），一眼能对上 */
 const lineText = (i: number): string => `第 ${i + 1} 行`
@@ -56,5 +63,25 @@ describe('tabRef：非文本标签 → 只带路径', () => {
     expect(tabRef({ original: file('/p/a.ts'), modified: file('/p/a.ts') })).toBeNull()
     expect(tabRef({ viewType: 'markdown.preview' })).toBeNull()
     expect(tabRef(undefined)).toBeNull()
+  })
+})
+
+describe('fileNameFromLabel / globEscape：label 兜底（内置图片预览只有 label）', () => {
+  it('像文件名的 label 认：普通、带空格、带 [] 的截图名、中间带点', () => {
+    expect(fileNameFromLabel('default-skin-preview.png')).toBe('default-skin-preview.png')
+    expect(fileNameFromLabel('屏幕快照 2026.11.20.png')).toBe('屏幕快照 2026.11.20.png')
+    expect(fileNameFromLabel('Screenshot [2].png')).toBe('Screenshot [2].png')
+  })
+  it('不像文件名的不认：面板名、无扩展名、点开头、带路径、带长后缀', () => {
+    expect(fileNameFromLabel('设置')).toBeNull()
+    expect(fileNameFromLabel('输出')).toBeNull()
+    expect(fileNameFromLabel('.gitignore')).toBeNull()
+    expect(fileNameFromLabel('docs/logo.png')).toBeNull()
+    expect(fileNameFromLabel('a — 预览')).toBeNull()
+  })
+  it('globEscape 把 glob 元字符转字面：* ? [ ] 转字符类', () => {
+    expect(globEscape('Screenshot [2].png')).toBe('Screenshot [[]2[]].png')
+    expect(globEscape('a*b?c.png')).toBe('a[*]b[?]c.png')
+    expect(globEscape('普通名字.png')).toBe('普通名字.png')
   })
 })

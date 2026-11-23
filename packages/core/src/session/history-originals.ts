@@ -22,15 +22,20 @@ export function restoreHistoryOriginals(
   if (!live.length) return { rows: [], restoredIds: [] }
   const all = [...new Set(live.map((l) => l.stepId))]
   const steps = recentSteps === undefined ? all : all.slice(-recentSteps)
-  // 窗口版用范围条件而不是 IN 列表：实测真库冷跑 IN(100 steps) 865ms
-  // （每值一次索引树寻路）比一次范围扫还慢——窗口的 step 连续，
-  // >= 下界即可等价（窗口外多余的 unloaded 行在配对时自然丢弃）
-  const windowed = recentSteps !== undefined
+  // 两个分支都用 IN(step 列表) + 强制 messages_restore(owner,state,step_id)：
+  // 范围版（step_id >= 窗口下界）会把压缩清掉存根的旧轮原文一起捞出来
+  // ——真库 209 行 live 要捞 14290 行（127 倍），冷跑 1.1s 卡事件
+  // 循环（2026-11-18 任务切换卡顿排查）。不加 INDEXED BY 时优化器给
+  // IN 选 messages_owner（owner 子树全扫 + bloom 过滤），冷跑 3.4s，
+  // 比 2026-11-06 测的 865ms 还糟——那次的结论（范围优于 IN）在
+  // messages_restore 索引落下后反了：强制走它，实测同库 2ms/112 行
   const originals = db.all<{ id: number; step_id: number; role: string; content_json: string }>(
     `SELECT id, step_id, role, content_json FROM messages
+     INDEXED BY messages_restore
      WHERE state = 'unloaded' AND owner IS ?
-       AND step_id ${windowed ? '>= ?' : 'IN (SELECT value FROM json_each(?))'} ORDER BY id`,
-    ...(windowed ? [owner, steps[0] ?? 0] : [owner, JSON.stringify(steps)]),
+       AND step_id IN (SELECT value FROM json_each(?)) ORDER BY id`,
+    owner,
+    JSON.stringify(steps),
   )
   const byRole = new Map<string, typeof originals>()
   for (const row of originals) {

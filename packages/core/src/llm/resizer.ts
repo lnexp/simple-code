@@ -4,6 +4,7 @@
  * **只动发出的一份**——调用方（run.ts 的每次 attempt）把 resize 结果直接
  * 发出去，不落库不回写 ctx。库里和内存里始终是原图，每轮从库重新组装再压
  * 一遍，天然幂等。跟摘要是同一模式：变换发生在出口，源头不动。
+ * 同一张图的压缩结果按内容缓存（image-cache.ts）——压一次，之后每轮只算哈希。
  *
  * 为什么在发送侧压而不是入口压：入口压了原图就没了，用户想回头看原图
  * （webview）只能拿到压过的；发送侧压，库里有完整原图，压坏的也只是这
@@ -22,6 +23,7 @@
  *   那是看得见的错误，可修；静默吞图是不可见的错。
  */
 import { createHash } from 'node:crypto'
+import { createShrinkCache } from './image-cache'
 import type { Capabilities, ImagePart, Message, Part } from './types'
 
 /** 长边上限（像素），Anthropic vision 的 max_dimension */
@@ -30,6 +32,8 @@ const MAX_EDGE = 2048
 const MAX_BASE64_BYTES = 5 * 1024 * 1024
 /** 压缩档 */
 const JPEG_QUALITIES = [85, 70, 55, 40]
+/** 压缩结果缓存，上限 64 张（压过的 JPEG 每张约 0.5MB，最多 30MB 量级） */
+const shrinkCached = createShrinkCache(64)
 
 /** 占位符。模型看到的是这个文本，不是空消息 */
 const omitted = (reason: string) => `[image omitted: ${reason}]`
@@ -200,7 +204,7 @@ async function shrinkToolImages(
   let changed = false
   // part.images 是 ImagePart[]（自带 type），不是入口侧的 ImageInput
   for (const img of part.images) {
-    const result = await shrinkPart(img, photon)
+    const result = await shrinkCached(img, () => shrinkPart(img, photon))
     if (result.type === 'image') {
       changed = changed || result.data !== img.data
       kept.push(result)
@@ -244,7 +248,7 @@ export async function resizeImageParts(messages: Message[]): Promise<Message[]> 
         parts.push(part)
         continue
       }
-      const result = await shrinkPart(part, photon)
+      const result = await shrinkCached(part, () => shrinkPart(part, photon))
       changed = changed || result !== part
       parts.push(result)
     }

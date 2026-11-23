@@ -51,6 +51,7 @@
     "test/task-history-dup.test.ts",
     "test/turn-queue-render.test.ts",
     "test/task-draft-render.test.ts",
+    "test/settings-wiring.test.ts",
     "test/task-rename.test.ts"
   ]
 }

@@ -34,14 +34,35 @@ export function editorRef(
 }
 
 /**
- * 活动标签不是文本编辑器时（2026-11-11 用户要图片也能加）：图片/PDF 预览是
- * TabInputCustom、notebook 是 TabInputNotebook，都有 uri——本地文件就只带路径，
- * 同 Explorer 拖入图片（dropPaths.ts：图片不内联，模型用 view_image 看）。
+ * 活动标签不是文本编辑器时（2026-11-11 用户要图片也能加）：扩展的 custom
+ * editor、notebook 标签有 uri——本地文件就只带路径，同 Explorer 拖入图片
+ * （dropPaths.ts：图片不内联，模型用 view_image 看）。
  * diff（original/modified）、webview、终端没有 uri，不给。按字段认不按类：
- * 这里不 import vscode
+ * 这里不 import vscode。
+ *
+ * 真机实测（2026-11-20，VS Code 1.144）：**内置图片预览的 input 是
+ * undefined**——ext host 的 _initInput switch 认不出的 editor 一律
+ * undefined，内置 ImagePreview/Markdown 预览没接入序列化。这类标签只剩
+ * label（文件名，无路径），走 fileNameFromLabel + findFiles 兜底（panel.ts）
  */
 export function tabRef(input: unknown): ActiveEditor | null {
   if (typeof input !== 'object' || input === null || !('uri' in input)) return null
   const uri = input.uri as { scheme?: unknown; fsPath?: unknown }
   return uri.scheme === 'file' && typeof uri.fsPath === 'string' ? { path: uri.fsPath } : null
+}
+
+/**
+ * tab 的 label 像「纯文件名」（内置图片预览只给这个）才值得 findFiles 兜底。
+ * 认定标准：无路径分隔符、有点分隔的 1-8 位字母数字扩展名、点不在开头
+ * （「设置」「输出」这类面板名、带「 — 预览」后缀的都不认）
+ */
+export function fileNameFromLabel(label: string): string | null {
+  if (label.includes('/') || label.includes('\\')) return null
+  const i = label.lastIndexOf('.')
+  return i > 0 && /^[A-Za-z0-9]{1,8}$/.test(label.slice(i + 1)) ? label : null
+}
+
+/** findFiles 的 include 是 glob：文件名里的 * ? [ ] 转成字符类，按字面匹配 */
+export function globEscape(name: string): string {
+  return name.replace(/[*?[\]]/g, (ch) => (ch === ']' ? '[]]' : `[${ch}]`))
 }
