@@ -16,7 +16,7 @@ import { sendRequest } from '../llm/client.ts'
 import type { LLMEvent } from '../llm/events.ts'
 import type { ProviderContext } from '../llm/protocol.ts'
 import { thumbnailDataUrl } from '../llm/resizer.ts'
-import type { Effort, ImageInput, Message, Part, Request } from '../llm/types.ts'
+import type { Effort, ImageInput, Message, Part, Request, Usage } from '../llm/types.ts'
 import { type ArchiveSummary, runEventArchive } from '../loop/archiver.ts'
 import { hotSummaryIds, indexTokens, type Summary } from '../loop/assemble.ts'
 import { fitIndexLine, oversizedNodes } from '../loop/index-cap.ts'
@@ -590,6 +590,10 @@ export async function getSession(
               messages.splice(0, messages.length, ...current)
               store.save(messages)
             },
+            // 跨 turn 的预算基线：ctx 每轮重建，lastUsage 不落库就丢，
+            // 新轮首请求退化成全量估算误触发 budget（2026-11-20 实测）
+            saveUsageBaseline: (usage: Usage, anchor: string) =>
+              store.writeUsageBaseline(usage, anchor),
           }
         : {}),
       requestApproval: options.requestApproval,
@@ -1213,12 +1217,16 @@ export async function getSession(
       if (compacting) return { ok: false, message: '已经在压缩了' }
       if (!store) return { ok: false, message: '这个会话不落盘，没有可压缩的内容' }
       compacting = true
+      const usageBaseline = store.readUsageBaseline()
       const ctx: LoopContext = {
         messages,
         tasks,
         deps,
         signal: new AbortController().signal,
         relayCache,
+        ...(usageBaseline
+          ? { lastUsage: usageBaseline.usage, usageAnchor: usageBaseline.anchor }
+          : {}),
       }
       let unloaded = 0
       let estimated: number | null = null
@@ -1396,6 +1404,9 @@ export async function getSession(
       const controller = new AbortController()
       running = controller
       interject = { current: new AbortController() }
+      // 上一轮的真实 usage 与它覆盖的末尾锚点（跨 turn 恢复）：没有它，
+      // 新轮首请求的 currentUsage 是全量估算，比真实值高 1.6 倍以上
+      const usageBaseline = store?.readUsageBaseline() ?? null
       const ctx: LoopContext = {
         messages,
         tasks,
@@ -1403,6 +1414,9 @@ export async function getSession(
         signal: controller.signal,
         interject,
         relayCache,
+        ...(usageBaseline
+          ? { lastUsage: usageBaseline.usage, usageAnchor: usageBaseline.anchor }
+          : {}),
       }
       const persist = () => {
         // 历史是 loop 内部重新赋值的（normalize 返回新数组），要同步回来

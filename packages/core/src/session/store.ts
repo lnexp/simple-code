@@ -6,7 +6,7 @@ import {
   type WriteStream,
 } from 'node:fs'
 import { dirname, join } from 'node:path'
-import type { Message, Part } from '../llm/types.ts'
+import type { Message, Part, Usage } from '../llm/types.ts'
 import type {
   AsyncCue,
   LiveMessage,
@@ -327,6 +327,12 @@ export type Store = {
   /** 前缀不变式基线（prefix-guard.ts）：本会话域上一次请求的指纹 JSON */
   readPrefixBaseline(): string | null
   writePrefixBaseline(fingerprint: string): void
+  /**
+   * 预算基线的真实用量（见 schema.sql.ts 的 usage_baseline 注释）。null =
+   * 没有记录（新库 / 从没跑过），调用方按「没有基线」处理
+   */
+  readUsageBaseline(): { usage: Usage; anchor: string } | null
+  writeUsageBaseline(usage: Usage, anchor: string): void
   /**
    * 前缀改写放行票（prefix-guard.ts 的 ticket）：set 落票、take 读并删。
    * 按 owner 分票——主任务和任务各压各的，谁的票只放行谁的下一次请求
@@ -1251,6 +1257,58 @@ function buildStore(
            fingerprint = excluded.fingerprint, updated_at = excluded.updated_at`,
         scope?.owner ?? '',
         fingerprint,
+        new Date().toISOString(),
+      )
+    },
+
+    readUsageBaseline: () => {
+      const row = db.all<{
+        input_tokens: number
+        output_tokens: number
+        cache_creation_tokens: number
+        cache_read_tokens: number
+        reasoning_tokens: number
+        anchor: string
+      }>(
+        `SELECT input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+                reasoning_tokens, anchor
+           FROM usage_baseline WHERE owner = ?`,
+        scope?.owner ?? '',
+      )[0]
+      if (!row) return null
+      return {
+        usage: {
+          inputTokens: row.input_tokens,
+          outputTokens: row.output_tokens,
+          cacheCreationInputTokens: row.cache_creation_tokens,
+          cacheReadInputTokens: row.cache_read_tokens,
+          reasoningTokens: row.reasoning_tokens,
+        },
+        anchor: row.anchor,
+      }
+    },
+
+    writeUsageBaseline: (usage, anchor) => {
+      db.run(
+        `INSERT INTO usage_baseline (owner, input_tokens, output_tokens,
+                                     cache_creation_tokens, cache_read_tokens,
+                                     reasoning_tokens, anchor, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(owner) DO UPDATE SET
+           input_tokens = excluded.input_tokens,
+           output_tokens = excluded.output_tokens,
+           cache_creation_tokens = excluded.cache_creation_tokens,
+           cache_read_tokens = excluded.cache_read_tokens,
+           reasoning_tokens = excluded.reasoning_tokens,
+           anchor = excluded.anchor,
+           updated_at = excluded.updated_at`,
+        scope?.owner ?? '',
+        usage.inputTokens,
+        usage.outputTokens,
+        usage.cacheCreationInputTokens,
+        usage.cacheReadInputTokens,
+        usage.reasoningTokens,
+        anchor,
         new Date().toISOString(),
       )
     },

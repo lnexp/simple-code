@@ -207,6 +207,25 @@ CREATE TABLE IF NOT EXISTS task_results (
   created_at TEXT NOT NULL,
   taken_at   TEXT
 );
+
+-- 预算基线的真实用量（2026-11-20 本土补丁）：loop 的 lastUsage 只在同一个
+-- turn 内存在，新 turn 新建 ctx 就丢了 → currentUsage 退化成全量估算
+-- （6.2-sol 实测真实 276,598 被估成 455,243，1.65 倍），轮末第一句话就误
+-- 触发 budget 压缩。这里按会话域存上一次响应的真实 usage + 它覆盖的末尾
+-- 消息锚点（指纹），新 turn 恢复后只对新增部分估算。
+--
+-- 存锚点而不是下标：装配数组会随摘要顶替/卸载变化，下标跨轮不可靠；找不到
+-- 锚点就退回全量估算（和没有这张表时一样，安全方向）。
+CREATE TABLE IF NOT EXISTS usage_baseline (
+  owner                 TEXT PRIMARY KEY,
+  input_tokens          INTEGER NOT NULL,
+  output_tokens         INTEGER NOT NULL,
+  cache_creation_tokens INTEGER NOT NULL,
+  cache_read_tokens     INTEGER NOT NULL,
+  reasoning_tokens      INTEGER NOT NULL,
+  anchor                TEXT NOT NULL,
+  updated_at            TEXT NOT NULL
+);
 `
 
 /**

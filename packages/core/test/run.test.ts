@@ -12,7 +12,7 @@ import type { RegionSizes } from '../src/loop/regions.ts'
 import { relayHit, relaySave } from '../src/loop/relay-cache.ts'
 import { REPETITION_RECOVERY_PROMPT } from '../src/loop/repetition.ts'
 import type { StreamEvent } from '../src/loop/retry.ts'
-import { type LoopContext, type LoopDeps, run } from '../src/loop/run.ts'
+import { anchorOf, type LoopContext, type LoopDeps, run } from '../src/loop/run.ts'
 import { estimateMessageTokens } from '../src/loop/tokens.ts'
 import type { Tool, ToolContext, ToolOutput } from '../src/tools/types.ts'
 import { makePng, mulberry32 } from './make-png'
@@ -73,6 +73,8 @@ async function drive(options: {
   memory?: LoopDeps['memory']
   /** 上一轮 API 返回的真实 usage。预算判断以它为基线 */
   lastUsage?: Usage
+  /** 基线覆盖到的末尾消息指纹（跨 turn 从 usage_baseline 恢复的那些） */
+  usageAnchor?: string
   /** 覆盖 request.maxTokens。预算要给输出留出这么多 */
   maxTokens?: number
   /** 注入 deps.reloadSystem，观测卸载触发点有没有调它 */
@@ -116,6 +118,7 @@ async function drive(options: {
     ...(options.interject ? { interject: options.interject } : {}),
     ...(options.lastFinish ? { lastFinish: options.lastFinish } : {}),
     ...(options.lastUsage ? { lastUsage: options.lastUsage } : {}),
+    ...(options.usageAnchor ? { usageAnchor: options.usageAnchor } : {}),
   }
 
   const events: AgentEvent[] = []
@@ -2992,5 +2995,76 @@ describe('拒答透传（finish.refusal → error 事件，2026-09-27 欠账补�
   it('普通 stop 无 refusal：不 yield error', async () => {
     const h = await drive({ rounds: [says('好的')] })
     expect(h.events.filter((e) => e.type === 'error')).toHaveLength(0)
+  })
+})
+
+/**
+ * 跨 turn 的预算基线（usage_baseline）：ctx 每轮重建，`lastUsage` 不落库就
+ * 丢，新轮首请求的 currentUsage 退化成本地全量估算。6.2-sol 实测真实
+ * 276,598 被估成 455,243（1.65 倍），轮末第一句话就误触发 budget 压缩
+ * （2026-11-20 真机）。恢复基线 + 锚点后只估新增。
+ */
+describe('跨 turn 的预算基线（usage_baseline 恢复）', () => {
+  /** 密集 JSON：短字符、token 密度高，全量估算一定越过 1000 的窗口 */
+  const dense = (entries: number): string =>
+    JSON.stringify(Array.from({ length: entries }, (_, i) => ({ file: `a${i}.ts`, line: i })))
+
+  const history = (longText: string): Message[] => [
+    { role: 'user', parts: [{ type: 'text', text: longText }] },
+    { role: 'assistant', parts: [{ type: 'text', text: '好的' }] },
+    { role: 'user', parts: [{ type: 'text', text: '接着' }] },
+  ]
+
+  it('有基线：真实 300 + 锚点后新增，不触发卸载', async () => {
+    const m = spyMemory()
+    const longText = dense(400)
+    const longUser: Message = { role: 'user', parts: [{ type: 'text', text: longText }] }
+    const real = usage()
+    real.inputTokens = 300 // 窗口 1000、预算 900：真实只用了 300
+
+    await drive({
+      messages: history(longText),
+      memory: m.memory,
+      lastUsage: real,
+      usageAnchor: anchorOf(longUser),
+      rounds: [says('好的')],
+    })
+
+    expect(m.cold.flat().length).toBe(0)
+  })
+
+  it('对照：同样的历史没有基线 → 全量估算越过预算，触发卸载', async () => {
+    const m = spyMemory()
+    const longText = dense(400)
+
+    await drive({
+      messages: history(longText),
+      memory: m.memory,
+      rounds: [says('好的')],
+    })
+
+    expect(m.cold.flat().length).toBeGreaterThan(0)
+  })
+
+  it('锚点对图片内容归一化：发送时缩放不改指纹', () => {
+    // 库里存原图、发出时缩放（resizer）：指纹含 base64 的话，含图会话的
+    // 锚点跨 turn 永远匹配不上，等于没有基线
+    const original = anchorOf({
+      role: 'user',
+      parts: [
+        { type: 'text', text: '看图' },
+        { type: 'image', data: 'ORIGINAL_BASE64', mimeType: 'image/png' },
+      ],
+    })
+    const resized = anchorOf({
+      role: 'user',
+      parts: [
+        { type: 'text', text: '看图' },
+        { type: 'image', data: 'RESIZED_BASE64', mimeType: 'image/jpeg' },
+      ],
+    })
+    expect(resized).toBe(original)
+    // 文本不同仍要区分开，否则锚点会串到别的消息
+    expect(anchorOf({ role: 'user', parts: [{ type: 'text', text: '另一条' }] })).not.toBe(original)
   })
 })
